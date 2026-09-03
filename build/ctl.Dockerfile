@@ -17,8 +17,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" \
 
 FROM alpine:3.20
 
+# 预建数据目录并赋属主：命名卷首次挂载会继承该目录的属主，
+# 避免 bind mount 时容器内非 root 用户无写权限（SQLite 报错 14）。
 RUN apk add --no-cache ca-certificates tzdata wget \
-    && addgroup -S lanet && adduser -S lanet -G lanet
+    && addgroup -S lanet && adduser -S lanet -G lanet \
+    && mkdir -p /data && chown -R lanet:lanet /data
 
 COPY --from=builder /out/lanet-ctl /usr/local/bin/lanet-ctl
 

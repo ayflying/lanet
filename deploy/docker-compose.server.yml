@@ -20,7 +20,9 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/data
+      # 命名卷：首次挂载自动继承镜像内 /data 属主（lanet），
+      # 避免 bind mount 的 root 目录权限问题。
+      - lanet-ctl-data:/data
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/healthz"]
       interval: 15s
@@ -37,3 +39,6 @@ services:
       - "4001:4001/tcp"
       - "4001:4001/udp"
     # 中继无 HTTP 健康端点，仅保证进程存活自动拉起。
+
+volumes:
+  lanet-ctl-data:
