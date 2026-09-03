@@ -1,0 +1,38 @@
+# =================================================================================
+# Lanet 客户端容器编排（Linux 主机 / 需真实 TUN 联网时使用）。
+# 镜像由 GitHub Actions 自动编译并推送（.github/workflows/docker.yml）。
+#
+#   启动：docker compose -f deploy/docker-compose.agent.yml up -d
+#
+# 使用前先改环境变量：
+#   PVN_CTL_ADDR  控制面地址（必填，如 http://192.168.50.217:8000）
+#   PVN_MODE      create=创建群组 / join=凭邀请加入
+#   PVN_INVITE    join 模式的邀请码
+#   PVN_NAME      节点名称（必填）
+#   PVN_GROUP     create 模式的群组名称
+# =================================================================================
+
+services:
+  agent:
+    image: ghcr.io/ayflying/lanet-agent:latest
+    container_name: lanet-agent
+    restart: unless-stopped
+    # TUN 网卡与 P2P 打洞需要的能力与设备。
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    network_mode: host
+    environment:
+      # gcmd Arguments 会被 gf 自动映射为 LANET_AGENT_XXX 环境变量
+      #（命令名 pvn-agent → 前缀 LANET_AGENT_）。
+      LANET_AGENT_CTL: ${PVN_CTL_ADDR:-http://127.0.0.1:8000}
+      LANET_AGENT_MODE: ${PVN_MODE:-join}
+      LANET_AGENT_INVITE: ${PVN_INVITE:-}
+      LANET_AGENT_NAME: ${PVN_NAME:-lanet-node}
+      LANET_AGENT_OS: linux
+      LANET_AGENT_GROUP: ${PVN_GROUP:-default}
+      LANET_AGENT_TUN: ${PVN_TUN:-pvn0}
+      LANET_AGENT_MTU: ${PVN_MTU:-1400}
+      # 容器内必须启用真实 TUN（内存 TUN 无组网意义）。
+      LANET_AGENT_REALTUN: "true"
