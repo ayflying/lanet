@@ -1,0 +1,86 @@
+# =================================================================================
+# Lanet Windows 发行包 CI：打 v* tag 时交叉编译 Windows 可执行文件，
+# 打包 zip（含官方 wintun.dll）并上传到 GitHub Release。
+#
+# 产物：
+#   lanet-agent-windows-amd64.zip   （客户端，含 wintun.dll + README）
+#   lanet-ctl-windows-amd64.exe     （服务端控制面，服务器一般用容器/Linux）
+#   lanet-relay-windows-amd64.exe   （中继）
+#
+# ⚠️ wintun.dll 不打入 exe（运行时从 exe 同目录或 System32 加载），
+#    发行包必须附带与 GOARCH 匹配的 wintun.dll。
+# =================================================================================
+
+name: release-windows
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  WIN_TUN_VERSION: "0.14.1"
+
+jobs:
+  build:
+    name: Build Windows binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build (amd64)
+        shell: bash
+        run: |
+          mkdir -p dist
+          LDFLAGS="-s -w -X main.version=${GITHUB_REF_NAME}"
+          for target in \
+            "lanet-agent ./app/agent/cmd/pvn-agent" \
+            "lanet-ctl ./app/ctl" \
+            "lanet-relay ./app/relay"; do
+            name=$(echo $target | cut -d' ' -f1)
+            path=$(echo $target | cut -d' ' -f2)
+            GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+              go build -trimpath -ldflags "$LDFLAGS" -o "dist/${name}-windows-amd64.exe" "$path"
+          done
+
+      - name: Download Wintun and pack agent zip
+        shell: bash
+        run: |
+          curl -fsSL -o wintun.zip "https://www.wintun.net/builds/wintun-${WIN_TUN_VERSION}.zip"
+          mkdir -p dist/lanet-agent-windows-amd64
+          cp dist/lanet-agent-windows-amd64.exe dist/lanet-agent-windows-amd64/
+          unzip -j wintun.zip "wintun/bin/amd64/wintun.dll" \
+            -d dist/lanet-agent-windows-amd64/
+          cp packaging/agent-windows-README.txt dist/lanet-agent-windows-amd64/README.txt
+          cd dist
+          zip -r "lanet-agent-windows-amd64.zip" lanet-agent-windows-amd64
+          sha256sum *.zip *.exe > checksums-windows-amd64.txt
+
+      - name: Upload artifacts (workflow artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanet-windows-amd64
+          path: |
+            dist/*.zip
+            dist/*.exe
+            dist/checksums-windows-amd64.txt
+
+      - name: Attach to GitHub Release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/lanet-agent-windows-amd64.zip
+            dist/lanet-ctl-windows-amd64.exe
+            dist/lanet-relay-windows-amd64.exe
+            dist/checksums-windows-amd64.txt
+          generate_release_notes: true
