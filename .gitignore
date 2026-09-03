@@ -1,0 +1,9 @@
+pvnctl
+*.exe
+*.test
+*.out
+database/
+manifest/output/
+resource/output/
+.idea/
+.vscode/
