@@ -8,6 +8,12 @@ import (
 	"github.com/ayflying/pvn/app/ctl/internal/service/node"
 )
 
+// tempDBPath 返回测试专用的临时 SQLite 文件路径。
+func tempDBPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "groups.db")
+}
+
 // 持久化验证：创建群组 + 成员加入 + 地址通告后，
 // 用同一个数据库文件重新打开注册表，所有数据必须完整恢复。
 
