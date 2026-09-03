@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ayflying/pvn/app/agent/internal/service/netmap"
+	netmapclient "github.com/ayflying/pvn/pkg/netmapclient"
 	"github.com/ayflying/pvn/pkg/protocol"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -22,7 +22,7 @@ import (
 
 // GroupNetMap 隧道服务所需的 NetMap 能力；由 netmap.Client 实现。
 type GroupNetMap interface {
-	Resolve(virtualIP string) (netmap.Route, bool)
+	Resolve(virtualIP string) (netmapclient.Route, bool)
 }
 
 // RelaySource 提供可用中继候选；由 peersource.Client（控制面候选接口）实现。
@@ -174,7 +174,7 @@ func hasCircuit(address ma.Multiaddr) bool {
 	return err == nil
 }
 
-func describeDirect(route netmap.Route, err error) string {
+func describeDirect(route netmapclient.Route, err error) string {
 	if err != nil {
 		return fmt.Sprintf("peer=%s addrs=%v err=%v", route.PeerID, route.Addrs, err)
 	}

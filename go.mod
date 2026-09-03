@@ -6,6 +6,7 @@ require (
 	github.com/gogf/gf/v2 v2.10.3
 	github.com/libp2p/go-libp2p v0.44.0
 	github.com/multiformats/go-multiaddr v0.16.0
+	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 )
 
 require (
@@ -112,6 +113,7 @@ require (
 	golang.org/x/text v0.28.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	golang.org/x/tools v0.36.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect

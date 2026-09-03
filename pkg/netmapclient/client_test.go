@@ -1,4 +1,4 @@
-package netmap
+package netmapclient
 
 import (
 	"context"

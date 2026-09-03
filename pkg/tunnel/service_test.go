@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ayflying/pvn/app/agent/internal/service/netmap"
+	netmapclient "github.com/ayflying/pvn/pkg/netmapclient"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -13,21 +13,21 @@ import (
 )
 
 type fakeNetmap struct {
-	routes []netmap.Route
+	routes []netmapclient.Route
 }
 
-func (f *fakeNetmap) Refresh(ctx context.Context) (netmap.Snapshot, error) {
-	return netmap.Snapshot{}, nil
+func (f *fakeNetmap) Refresh(ctx context.Context) (netmapclient.Snapshot, error) {
+	return netmapclient.Snapshot{}, nil
 }
-func (f *fakeNetmap) Current() netmap.Snapshot { return netmap.Snapshot{} }
-func (f *fakeNetmap) Routes() []netmap.Route   { return f.routes }
-func (f *fakeNetmap) Resolve(virtualIP string) (netmap.Route, bool) {
+func (f *fakeNetmap) Current() netmapclient.Snapshot { return netmapclient.Snapshot{} }
+func (f *fakeNetmap) Routes() []netmapclient.Route   { return f.routes }
+func (f *fakeNetmap) Resolve(virtualIP string) (netmapclient.Route, bool) {
 	for _, route := range f.routes {
 		if route.VirtualIP == virtualIP {
 			return route, true
 		}
 	}
-	return netmap.Route{}, false
+	return netmapclient.Route{}, false
 }
 func (f *fakeNetmap) Announce(ctx context.Context, addrs []string) error  { return nil }
 func (f *fakeNetmap) RunLoop(ctx context.Context, interval time.Duration) {}

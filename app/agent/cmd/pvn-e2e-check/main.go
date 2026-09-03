@@ -19,11 +19,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ayflying/pvn/app/agent/internal/service/netmap"
 	"github.com/ayflying/pvn/app/agent/internal/service/peersource"
-	tunnelsvc "github.com/ayflying/pvn/app/agent/internal/service/tunnel"
+	"github.com/ayflying/pvn/pkg/netmapclient"
 	p2pkit "github.com/ayflying/pvn/pkg/p2pkit"
 	"github.com/ayflying/pvn/pkg/protocol"
+	tunnelsvc "github.com/ayflying/pvn/pkg/tunnel"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 )
@@ -111,7 +111,7 @@ func main() {
 	})
 
 	// 7. AgentA：拉取群组 NetMap → 按虚拟 IP 通过隧道服务建流（直连优先，失败走中继）。
-	netmapA := netmap.NewClient(ctlBaseURL, hostA.ID().String())
+	netmapA := netmapclient.NewClient(ctlBaseURL, hostA.ID().String())
 	snapshot, err := netmapA.Refresh(ctx)
 	if err != nil {
 		log.Fatalf("agent-a refresh netmap: %v", err)
