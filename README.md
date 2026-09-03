@@ -33,17 +33,50 @@ Lanet 是一个自研的群组制 P2P 虚拟局域网系统：客户端创建群
 
 ## 快速开始
 
+### 方式一：Docker Compose 部署服务端（推荐）
+
+镜像由 CI 自动编译发布到 GHCR（`linux/amd64` + `linux/arm64`）：
+
 ```bash
-# 启动控制面（默认 :8000）
-go run ./app/ctl
+git clone https://github.com/ayflying/lanet.git && cd lanet
+docker compose -f deploy/docker-compose.server.yml up -d
+```
 
-# 启动中继（需公网可达，注册到 ctl）
-go run ./cmd/pvn-relay -ctl http://<ctl地址>:8000 -name relay-1
+该编排启动两个服务：
 
-# 客户端创建群组
+| 服务 | 镜像 | 端口 | 说明 |
+|---|---|---|---|
+| ctl | `ghcr.io/ayflying/lanet-ctl:latest` | 8000/tcp | 控制面 API，数据持久化在 `./data` |
+| relay | `ghcr.io/ayflying/lanet-relay:latest` | 4001/tcp+udp | P2P 中继兜底转发 |
+
+### 方式二：客户端容器（Linux 主机）
+
+```bash
+PVN_CTL_ADDR=http://<服务端IP>:8000 PVN_NAME=pc1 \
+PVN_MODE=join PVN_INVITE=<邀请码> \
+docker compose -f deploy/docker-compose.agent.yml up -d
+```
+
+需要 `NET_ADMIN` 权限与 `/dev/net/tun`（编排文件已声明）。
+
+### 方式三：Windows 客户端（发行包）
+
+从 [Releases](https://github.com/ayflying/lanet/releases) 下载 `lanet-agent-windows-amd64.zip`，解压后**以管理员身份**运行（`wintun.dll` 必须与 exe 同目录）：
+
+```powershell
+# 创建群组（第一个节点）
+.\lanet-agent-windows-amd64.exe -ctl http://<服务端IP>:8000 -mode create -name my-pc -group "我的局域网"
+
+# 凭邀请码加入
+.\lanet-agent-windows-amd64.exe -ctl http://<服务端IP>:8000 -mode join -invite <邀请码> -name pc2
+```
+
+### 方式四：源码运行（开发调试）
+
+```bash
+go run ./app/ctl                                  # 控制面（默认 :8000）
+go run ./app/relay                                # 中继（默认监听 4001）
 go run ./app/agent/cmd/pvn-agent -mode create -name alpha -ctl http://<ctl地址>:8000
-
-# 其他成员凭邀请码加入
 go run ./app/agent/cmd/pvn-agent -mode join -name beta -invite <邀请码> -ctl http://<ctl地址>:8000
 ```
 
@@ -78,6 +111,24 @@ go test ./...
 go run ./app/agent/cmd/pvn-e2e-check
 ```
 
+## CI/CD
+
+| 流水线 | 触发 | 产物 |
+|---|---|---|
+| `docker` | push main / `v*` tag | 3 个容器镜像推 GHCR（amd64+arm64）：`lanet-ctl` / `lanet-relay` / `lanet-agent`，tag 版本号 + latest |
+| `release-windows` | `v*` tag / 手动 | Windows x64 发行包（agent zip 含 wintun.dll + ctl/relay exe + checksums）附加到 GitHub Release |
+
+镜像地址：
+
+```
+ghcr.io/ayflying/lanet-ctl:latest
+ghcr.io/ayflying/lanet-relay:latest
+ghcr.io/ayflying/lanet-agent:latest
+```
+
+> 容器镜像均为私有，拉取前需 `docker login ghcr.io`。
+> Windows 发行包中的 `wintun.dll` 来自 [wintun.net 官方 0.14.1](https://www.wintun.net/)，不打入 exe（运行时从 exe 同目录加载），因此必须随包分发。
+
 ## 目录结构
 
 工程由 `gf init -m` 脚手架生成，遵循 GoFrame 官方工程规范：
@@ -105,6 +156,10 @@ pkg/                          跨应用共享库
   tunnel/        隧道服务（直连→中继三段降级）
   netmapclient/  NetMap 客户端
   tundevice/     TUN 设备与路由器
+build/                        容器镜像 Dockerfile（ctl/relay/agent）
+deploy/                       容器编排（服务端 / 客户端）
+packaging/                    发行包附带文件（如 Windows README）
+.github/workflows/            CI：docker（容器镜像）、release-windows（Windows 发行包）
 ```
 
 接口走 gf 标准链路：`api`（声明 Req/Res 与路由）→ `controller`（实现）→ `service`（接口）→ `logic`（实现），
@@ -118,5 +173,7 @@ Go · GoFrame v2 · go-libp2p v0.44 · wireguard/tun
 
 - [x] 群组/成员/邀请码落库 SQLite（重启不丢）
 - [x] 邀请码过期、成员踢出、群主权限
+- [x] 容器镜像 CI（GHCR，amd64+arm64）与服务端/客户端编排
+- [x] Windows 发行包 CI（交叉编译 + wintun.dll 打包 → Release）
 - [ ] 真实跨机带宽实测
 - [ ] 子网路由（未装客户端的内网设备互通）
