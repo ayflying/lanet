@@ -1,0 +1,182 @@
+package tunnel
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/ayflying/pvn/app/agent/internal/service/netmap"
+	"github.com/ayflying/pvn/pkg/protocol"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	ma "github.com/multiformats/go-multiaddr"
+)
+
+// 隧道策略：同一群组成员之间建立流式连接。
+// 1. 对端通告了可达地址 → 先直连（P2P，带宽不受中继限制）。
+// 2. 直连失败 → 从 RelaySource 取候选中继，Circuit Relay v2 预约后经 /p2p-circuit 转发保底。
+// 3. 建立连接后打开 /pvn/tunnel/1.0.0 流收发数据。
+
+// GroupNetMap 隧道服务所需的 NetMap 能力；由 netmap.Client 实现。
+type GroupNetMap interface {
+	Resolve(virtualIP string) (netmap.Route, bool)
+}
+
+// RelaySource 提供可用中继候选；由 peersource.Client（控制面候选接口）实现。
+type RelaySource interface {
+	Candidates(ctx context.Context, number int) ([]peer.AddrInfo, error)
+}
+
+type Service struct {
+	mu          sync.Mutex
+	self        host.Host
+	netmapCli   GroupNetMap
+	relays      RelaySource
+	dialTimeout time.Duration
+	relayUsed   map[string]bool // 对端最近一次是否经中继
+}
+
+func New(self host.Host, netmapCli GroupNetMap, relays RelaySource) *Service {
+	return &Service{
+		self:        self,
+		netmapCli:   netmapCli,
+		relays:      relays,
+		dialTimeout: 8 * time.Second,
+		relayUsed:   make(map[string]bool),
+	}
+}
+
+// OpenStreamToVirtualIP 按虚拟 IP 连接对端并打开隧道流。
+// 返回流与是否经中继（用于状态展示与带宽诊断）。
+func (s *Service) OpenStreamToVirtualIP(ctx context.Context, virtualIP string) (network.Stream, bool, error) {
+	route, ok := s.netmapCli.Resolve(virtualIP)
+	if !ok {
+		return nil, false, fmt.Errorf("virtual IP %s not in group netmap", virtualIP)
+	}
+	target, err := peer.Decode(route.PeerID)
+	if err != nil {
+		return nil, false, fmt.Errorf("decode peer id %q: %w", route.PeerID, err)
+	}
+
+	dialCtx, cancel := context.WithTimeout(ctx, s.dialTimeout)
+	defer cancel()
+
+	// 1) 直连尝试：用通告地址主动建连。
+	var directErr error
+	if len(route.Addrs) > 0 {
+		addrs := make([]ma.Multiaddr, 0, len(route.Addrs))
+		for _, raw := range route.Addrs {
+			if addr, addrErr := ma.NewMultiaddr(raw); addrErr == nil {
+				addrs = append(addrs, addr)
+			}
+		}
+		if len(addrs) > 0 {
+			directErr = s.self.Connect(dialCtx, peer.AddrInfo{ID: target, Addrs: addrs})
+			if directErr == nil {
+				stream, streamErr := s.openTunnel(dialCtx, target)
+				if streamErr == nil {
+					s.markRelay(route.PeerID, false)
+					return stream, false, nil
+				}
+				directErr = streamErr
+			}
+		}
+	}
+
+	// 2) 已有连接（可能由打洞/AutoRelay 建立）直接开流。
+	if s.self.Network().Connectedness(target) == network.Connected {
+		stream, streamErr := s.openTunnel(dialCtx, target)
+		if streamErr == nil {
+			viaRelay := hasCircuit(stream.Conn().RemoteMultiaddr())
+			s.markRelay(route.PeerID, viaRelay)
+			return stream, viaRelay, nil
+		}
+	}
+
+	// 3) 中继保底：逐个候选 Relay 预约，成功即经中继转发。
+	stream, relayErr := s.openViaRelay(ctx, target)
+	if relayErr != nil {
+		return nil, false, fmt.Errorf("direct and relay dial both failed: direct=%v relay=%v",
+			describeDirect(route, directErr), relayErr)
+	}
+	s.markRelay(route.PeerID, true)
+	return stream, true, nil
+}
+
+func (s *Service) openTunnel(ctx context.Context, target peer.ID) (network.Stream, error) {
+	return s.self.NewStream(ctx, target, protocol.Tunnel)
+}
+
+func (s *Service) openViaRelay(ctx context.Context, target peer.ID) (network.Stream, error) {
+	candidates, err := s.relays.Candidates(ctx, 2)
+	if err != nil {
+		return nil, fmt.Errorf("fetch relay candidates: %w", err)
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no relay candidates available")
+	}
+	var lastErr error
+	for _, candidate := range candidates {
+		reserveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, reserveErr := client.Reserve(reserveCtx, s.self, candidate)
+		cancel()
+		if reserveErr != nil {
+			lastErr = fmt.Errorf("reserve on %s: %w", candidate.ID, reserveErr)
+			continue
+		}
+		circuitAddr := candidate.Addrs[0].
+			Encapsulate(ma.StringCast("/p2p/" + candidate.ID.String())).
+			Encapsulate(ma.StringCast("/p2p-circuit/p2p/" + target.String()))
+		connectCtx, cancelConnect := context.WithTimeout(ctx, s.dialTimeout)
+		connectErr := s.self.Connect(connectCtx, peer.AddrInfo{ID: target, Addrs: []ma.Multiaddr{circuitAddr}})
+		cancelConnect()
+		if connectErr != nil {
+			lastErr = fmt.Errorf("connect via %s: %w", candidate.ID, connectErr)
+			continue
+		}
+		stream, streamErr := s.openTunnel(ctx, target)
+		if streamErr != nil {
+			lastErr = fmt.Errorf("open tunnel via %s: %w", candidate.ID, streamErr)
+			continue
+		}
+		return stream, nil
+	}
+	return nil, lastErr
+}
+
+func (s *Service) markRelay(peerID string, viaRelay bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.relayUsed[peerID] = viaRelay
+}
+
+// LastPathUsed 返回对端最近一次链路类型：direct / relay / unknown。
+func (s *Service) LastPathUsed(peerID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if used, ok := s.relayUsed[peerID]; ok {
+		if used {
+			return "relay"
+		}
+		return "direct"
+	}
+	return "unknown"
+}
+
+func hasCircuit(address ma.Multiaddr) bool {
+	if address == nil {
+		return false
+	}
+	_, err := address.ValueForProtocol(ma.P_CIRCUIT)
+	return err == nil
+}
+
+func describeDirect(route netmap.Route, err error) string {
+	if err != nil {
+		return fmt.Sprintf("peer=%s addrs=%v err=%v", route.PeerID, route.Addrs, err)
+	}
+	return fmt.Sprintf("peer=%s addrs=%v (no address or already connected)", route.PeerID, route.Addrs)
+}
