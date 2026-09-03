@@ -80,9 +80,36 @@ type Registry struct {
 	groupsByInvite map[string]*Group
 	groupByPeer    map[string]string
 	announcedAddrs map[string][]string
+
+	// store 为 SQLite 持久化层；为 nil 时退化为纯内存模式（仅测试使用）。
+	store *store
 }
 
+// NewRegistry 创建纯内存注册表（无持久化，仅供测试与本地实验）。
 func NewRegistry() (*Registry, error) {
+	return newRegistry(nil)
+}
+
+// NewPersistentRegistry 打开（必要时初始化）SQLite 数据库并加载已有群组数据。
+// 服务重启后所有群组、成员、邀请码与通告地址均自动恢复。
+func NewPersistentRegistry(ctx context.Context, dbPath string) (*Registry, error) {
+	st, err := openStore(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	reg, err := newRegistry(st)
+	if err != nil {
+		_ = st.Close()
+		return nil, err
+	}
+	if err := reg.restore(ctx); err != nil {
+		_ = st.Close()
+		return nil, err
+	}
+	return reg, nil
+}
+
+func newRegistry(st *store) (*Registry, error) {
 	base, err := netip.ParsePrefix(baseCIDR)
 	if err != nil {
 		return nil, fmt.Errorf("parse base CIDR: %w", err)
@@ -94,7 +121,79 @@ func NewRegistry() (*Registry, error) {
 		groupsByInvite: make(map[string]*Group),
 		groupByPeer:    make(map[string]string),
 		announcedAddrs: make(map[string][]string),
+		store:          st,
 	}, nil
+}
+
+// restore 从 SQLite 加载全部群组、成员与通告地址，重建内存索引。
+func (r *Registry) restore(ctx context.Context) error {
+	if r.store == nil {
+		return nil
+	}
+	rows, err := r.store.loadGroups(ctx)
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		grp := &Group{
+			ID:            row.ID,
+			Name:          row.Name,
+			CreatorPeerID: row.CreatorPeerID,
+			InviteCode:    row.InviteCode,
+			CIDR:          row.CIDR,
+			CreatedAt:     time.Now(),
+			Version:       row.Version,
+		}
+		members, err := r.store.loadMembersByGroup(ctx, row.ID)
+		if err != nil {
+			return err
+		}
+		if err := r.rebuildGroup(grp, members); err != nil {
+			return err
+		}
+		if row.SubnetIndex > r.nextSubnet-1 {
+			r.nextSubnet = row.SubnetIndex + 1
+		}
+	}
+	addrs, err := r.store.loadAnnouncedAddrs(ctx)
+	if err != nil {
+		return err
+	}
+	for peerID, list := range addrs {
+		r.announcedAddrs[peerID] = list
+	}
+	return nil
+}
+
+// rebuildGroup 依据已加载的成员行重建群组的节点注册表（含已用 IP 状态）。
+func (r *Registry) rebuildGroup(grp *Group, members []memberRow) error {
+	token := "grp-" + randomString(24)
+	registry, err := node.NewRegistry(grp.CIDR, []string{token})
+	if err != nil {
+		return fmt.Errorf("rebuild registry for group %s: %w", grp.ID, err)
+	}
+	// 直接按已分配的虚拟 IP 恢复成员，避免 IPAM 重新分配导致漂移。
+	for _, m := range members {
+		if err := registry.RestoreNode(node.Node{
+			PeerID: m.PeerID, Name: m.Name, OS: m.OS, VirtualIP: m.VirtualIP,
+		}); err != nil {
+			return fmt.Errorf("restore member %s of group %s: %w", m.PeerID, grp.ID, err)
+		}
+		r.groupByPeer[m.PeerID] = grp.ID
+	}
+	grp.registry = registry
+	grp.enrollToken = token
+	r.groupsByID[grp.ID] = grp
+	r.groupsByInvite[grp.InviteCode] = grp
+	return nil
+}
+
+// Close 关闭底层 SQLite 连接；纯内存模式为空操作。
+func (r *Registry) Close() error {
+	if r.store == nil {
+		return nil
+	}
+	return r.store.Close()
 }
 
 func (r *Registry) Create(ctx context.Context, input CreateInput) (*Group, node.Node, error) {
@@ -130,7 +229,6 @@ func (r *Registry) Create(ctx context.Context, input CreateInput) (*Group, node.
 		registry:      registry,
 		enrollToken:   token,
 	}
-	r.nextSubnet++
 
 	creator, err := registry.Enroll(ctx, node.EnrollRequest{
 		Token: token, PeerID: input.PeerID, Name: input.Name, OS: input.OS,
@@ -139,6 +237,27 @@ func (r *Registry) Create(ctx context.Context, input CreateInput) (*Group, node.
 		return nil, node.Node{}, err
 	}
 
+	// 先落库，成功后更新内存索引，保证重启后完整恢复。
+	if r.store != nil {
+		if err := r.store.insertGroup(ctx, groupRow{
+			ID:            grp.ID,
+			Name:          grp.Name,
+			CreatorPeerID: grp.CreatorPeerID,
+			InviteCode:    grp.InviteCode,
+			CIDR:          grp.CIDR,
+			SubnetIndex:   r.nextSubnet,
+			Version:       grp.Version,
+		}); err != nil {
+			return nil, node.Node{}, err
+		}
+		if err := r.store.insertMember(ctx, grp.ID, memberRow{
+			PeerID: creator.PeerID, Name: creator.Name, OS: creator.OS, VirtualIP: creator.VirtualIP,
+		}); err != nil {
+			return nil, node.Node{}, err
+		}
+	}
+
+	r.nextSubnet++
 	r.groupsByID[grp.ID] = grp
 	r.groupsByInvite[inviteCode] = grp
 	r.groupByPeer[input.PeerID] = grp.ID
@@ -167,6 +286,16 @@ func (r *Registry) Join(ctx context.Context, input JoinInput) (*Group, node.Node
 	if err != nil {
 		return nil, node.Node{}, err
 	}
+	if r.store != nil {
+		if err := r.store.insertMember(ctx, grp.ID, memberRow{
+			PeerID: member.PeerID, Name: member.Name, OS: member.OS, VirtualIP: member.VirtualIP,
+		}); err != nil {
+			return nil, node.Node{}, err
+		}
+		if err := r.store.bumpGroupVersion(ctx, grp.ID); err != nil {
+			return nil, node.Node{}, err
+		}
+	}
 	r.groupByPeer[input.PeerID] = grp.ID
 	grp.Version++
 	return grp, member, nil
@@ -189,6 +318,11 @@ func (r *Registry) Announce(ctx context.Context, input AnnounceInput) error {
 	}
 	if len(addrs) == 0 {
 		return gerror.New("no valid addresses provided")
+	}
+	if r.store != nil {
+		if err := r.store.replaceAnnouncedAddrs(ctx, input.PeerID, addrs); err != nil {
+			return err
+		}
 	}
 	r.announcedAddrs[input.PeerID] = addrs
 	return nil

@@ -10,12 +10,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -29,20 +31,16 @@ import (
 )
 
 func main() {
-	ctlPort := flag.Int("ctl-port", 8000, "本地控制面 HTTP 端口")
-	flag.Parse()
-	ctlBaseURL := fmt.Sprintf("http://127.0.0.1:%d", *ctlPort)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// 1. 启动真实控制面子进程。
-	stopCtl, err := startControlPlane(*ctlPort)
+	// 1. 启动真实控制面子进程（随机空闲端口 + 独立临时 SQLite 库）。
+	stopCtl, ctlBaseURL, err := startControlPlane()
 	if err != nil {
 		log.Fatalf("start control plane: %v", err)
 	}
 	defer stopCtl()
-	if err = waitHealthy(ctx, ctlBaseURL, 15*time.Second); err != nil {
+	if err = waitHealthy(ctx, ctlBaseURL, 20*time.Second); err != nil {
 		log.Fatalf("control plane health: %v", err)
 	}
 	log.Printf("control-plane ready at %s", ctlBaseURL)
@@ -169,14 +167,32 @@ func multiaddrStrings(h host.Host) []string {
 	return items
 }
 
-// startControlPlane 以子进程方式启动真实 ctl 服务，监听指定端口。
-func startControlPlane(port int) (func(), error) {
+// startControlPlane 以子进程方式启动真实 ctl 服务。
+// 先本机探测一个空闲端口，再通过 PVN_CTL_ADDR 覆盖监听地址；
+// 每次验证使用独立的临时 SQLite 数据库，避免多实例共享数据库文件产生锁冲突，
+// 也保证 e2e 数据不会污染正式库；验证结束后随临时目录一并清理。
+func startControlPlane() (func(), string, error) {
+	tmpDir, err := os.MkdirTemp("", "pvn-e2e-db-*")
+	if err != nil {
+		return nil, "", fmt.Errorf("create temp dir for e2e db: %w", err)
+	}
+	port, err := freePort(18080)
+	if err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return nil, "", fmt.Errorf("find free port: %w", err)
+	}
+	dbPath := filepath.Join(tmpDir, "ctl.db")
 	cmd := exec.Command("go", "run", "./app/ctl")
-	cmd.Env = append(osEnviron(), "GF_GCFG_ADDRESS=127.0.0.1", fmt.Sprintf("GF_SERVER_HTTP_PORT=%d", port))
+	cmd.Env = append(osEnviron(),
+		fmt.Sprintf("PVN_CTL_ADDR=127.0.0.1:%d", port),
+		"PVN_CTL_DB="+dbPath,
+	)
 	cmd.Dir = repoRoot()
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("launch ctl process: %w", err)
+		_ = os.RemoveAll(tmpDir)
+		return nil, "", fmt.Errorf("launch ctl process: %w", err)
 	}
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	stopped := false
 	return func() {
 		if stopped {
@@ -185,7 +201,20 @@ func startControlPlane(port int) (func(), error) {
 		stopped = true
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
-	}, nil
+		_ = os.RemoveAll(tmpDir)
+	}, baseURL, nil
+}
+
+// freePort 从 start 开始找到第一个未被占用的 TCP 端口。
+func freePort(start int) (int, error) {
+	for port := start; port < start+200; port++ {
+		conn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			_ = conn.Close()
+			return port, nil
+		}
+	}
+	return 0, errors.New("no free port in range")
 }
 
 func waitHealthy(ctx context.Context, baseURL string, timeout time.Duration) error {

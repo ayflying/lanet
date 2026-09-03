@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 
 	"github.com/ayflying/pvn/app/ctl/internal/service"
@@ -22,6 +24,11 @@ var (
 		Brief: "start PVN control plane",
 		Func: func(ctx context.Context, parser *gcmd.Parser) error {
 			server := g.Server()
+			// PVN_CTL_ADDR 允许部署时覆盖监听地址（如 127.0.0.1:18080），
+			// 优先级高于 config.yaml 的 server.address。
+			if addr := os.Getenv("PVN_CTL_ADDR"); addr != "" {
+				server.SetAddr(addr)
+			}
 			server.Group("/", func(group *ghttp.RouterGroup) {
 				group.Middleware(ghttp.MiddlewareHandlerResponse)
 				group.GET("/healthz", func(request *ghttp.Request) {
@@ -142,7 +149,18 @@ var (
 	}
 )
 
+// mustNewGroupRegistry 初始化群组注册表：
+// 优先使用 PVN_CTL_DB 指定的 SQLite 文件（重启不丢数据）；
+// 未设置时退化为纯内存模式（本地快速实验）。
 func mustNewGroupRegistry() *groupservice.Registry {
+	if dbPath := os.Getenv("PVN_CTL_DB"); dbPath != "" {
+		registry, err := groupservice.NewPersistentRegistry(context.Background(), dbPath)
+		if err != nil {
+			panic(fmt.Sprintf("open group database %s: %v", dbPath, err))
+		}
+		g.Log().Infof(context.Background(), "group registry backed by SQLite: %s", dbPath)
+		return registry
+	}
 	registry, err := groupservice.NewRegistry()
 	if err != nil {
 		panic(err)

@@ -79,6 +79,32 @@ func (r *Registry) Enroll(ctx context.Context, input EnrollRequest) (Node, error
 	return node, nil
 }
 
+// RestoreNode 将已持久化的节点按原虚拟 IP 恢复进注册表（用于服务重启后的数据回放）。
+// 若 PeerID 已存在则视为重复恢复，直接忽略。
+func (r *Registry) RestoreNode(input Node) error {
+	peerID := input.PeerID
+	if peerID == "" || input.VirtualIP == "" {
+		return gerror.New("peer_id and virtual_ip are required for restore")
+	}
+	address, err := netip.ParseAddr(input.VirtualIP)
+	if err != nil {
+		return fmt.Errorf("parse virtual IP %s: %w", input.VirtualIP, err)
+	}
+	if !r.prefix.Contains(address) {
+		return gerror.New("virtual IP is outside of registry CIDR")
+	}
+	if _, ok := r.nodes[peerID]; ok {
+		return nil
+	}
+	if existing, used := r.usedIPs[address]; used && existing != peerID {
+		return gerror.New("virtual IP already assigned to another peer")
+	}
+	node := Node{PeerID: peerID, Name: input.Name, OS: input.OS, VirtualIP: input.VirtualIP, EnrolledAt: time.Now()}
+	r.nodes[node.PeerID] = node
+	r.usedIPs[address] = node.PeerID
+	return nil
+}
+
 func (r *Registry) List(ctx context.Context) []Node {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
