@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -21,6 +22,7 @@ type groupRow struct {
 	Name          string
 	CreatorPeerID string
 	InviteCode    string
+	InviteExpires *time.Time // nil 表示邀请码永久有效
 	CIDR          string
 	SubnetIndex   int
 	Version       uint64
@@ -31,6 +33,7 @@ type memberRow struct {
 	Name      string
 	OS        string
 	VirtualIP string
+	Role      string // "owner" 或 "member"
 }
 
 func openStore(path string) (*store, error) {
@@ -57,6 +60,7 @@ CREATE TABLE IF NOT EXISTS groups (
 	name            TEXT NOT NULL,
 	creator_peer_id TEXT NOT NULL,
 	invite_code     TEXT NOT NULL UNIQUE,
+	invite_expires_at DATETIME,
 	cidr            TEXT NOT NULL,
 	subnet_index    INTEGER NOT NULL UNIQUE,
 	version         INTEGER NOT NULL DEFAULT 1,
@@ -68,6 +72,7 @@ CREATE TABLE IF NOT EXISTS members (
 	name        TEXT NOT NULL,
 	os          TEXT NOT NULL DEFAULT '',
 	virtual_ip  TEXT NOT NULL,
+	role        TEXT NOT NULL DEFAULT 'member',
 	enrolled_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_members_group ON members(group_id);
@@ -91,9 +96,9 @@ func (s *store) Close() error {
 
 func (s *store) insertGroup(ctx context.Context, row groupRow) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO groups (id, name, creator_peer_id, invite_code, cidr, subnet_index, version)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		row.ID, row.Name, row.CreatorPeerID, row.InviteCode, row.CIDR, row.SubnetIndex, row.Version)
+		`INSERT INTO groups (id, name, creator_peer_id, invite_code, invite_expires_at, cidr, subnet_index, version)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		row.ID, row.Name, row.CreatorPeerID, row.InviteCode, row.InviteExpires, row.CIDR, row.SubnetIndex, row.Version)
 	if err != nil {
 		return fmt.Errorf("insert group %s: %w", row.ID, err)
 	}
@@ -108,9 +113,20 @@ func (s *store) bumpGroupVersion(ctx context.Context, id string) error {
 	return nil
 }
 
+// updateInvite 落库新的邀请码与过期时间（expires 可为 nil 表示永久有效）。
+func (s *store) updateInvite(ctx context.Context, groupID, inviteCode string, expires *time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE groups SET invite_code = ?, invite_expires_at = ? WHERE id = ?`,
+		inviteCode, expires, groupID)
+	if err != nil {
+		return fmt.Errorf("update invite of %s: %w", groupID, err)
+	}
+	return nil
+}
+
 func (s *store) loadGroups(ctx context.Context) ([]groupRow, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, creator_peer_id, invite_code, cidr, subnet_index, version FROM groups`)
+		`SELECT id, name, creator_peer_id, invite_code, invite_expires_at, cidr, subnet_index, version FROM groups`)
 	if err != nil {
 		return nil, fmt.Errorf("load groups: %w", err)
 	}
@@ -118,7 +134,7 @@ func (s *store) loadGroups(ctx context.Context) ([]groupRow, error) {
 	var items []groupRow
 	for rows.Next() {
 		var row groupRow
-		if err := rows.Scan(&row.ID, &row.Name, &row.CreatorPeerID, &row.InviteCode, &row.CIDR, &row.SubnetIndex, &row.Version); err != nil {
+		if err := rows.Scan(&row.ID, &row.Name, &row.CreatorPeerID, &row.InviteCode, &row.InviteExpires, &row.CIDR, &row.SubnetIndex, &row.Version); err != nil {
 			return nil, fmt.Errorf("scan group row: %w", err)
 		}
 		items = append(items, row)
@@ -140,19 +156,33 @@ func (s *store) maxSubnetIndex(ctx context.Context) (int, error) {
 // --- 成员 ---
 
 func (s *store) insertMember(ctx context.Context, groupID string, row memberRow) error {
+	role := row.Role
+	if role == "" {
+		role = "member"
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO members (group_id, peer_id, name, os, virtual_ip)
-		 VALUES (?, ?, ?, ?, ?)`,
-		groupID, row.PeerID, row.Name, row.OS, row.VirtualIP)
+		`INSERT INTO members (group_id, peer_id, name, os, virtual_ip, role)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		groupID, row.PeerID, row.Name, row.OS, row.VirtualIP, role)
 	if err != nil {
 		return fmt.Errorf("insert member %s: %w", row.PeerID, err)
 	}
 	return nil
 }
 
+// deleteMember 移除成员；announced_addrs 由外键级联删除。
+func (s *store) deleteMember(ctx context.Context, groupID, peerID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM members WHERE group_id = ? AND peer_id = ?`, groupID, peerID)
+	if err != nil {
+		return fmt.Errorf("delete member %s of %s: %w", peerID, groupID, err)
+	}
+	return nil
+}
+
 func (s *store) loadMembersByGroup(ctx context.Context, groupID string) ([]memberRow, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT peer_id, name, os, virtual_ip FROM members WHERE group_id = ? ORDER BY virtual_ip`, groupID)
+		`SELECT peer_id, name, os, virtual_ip, role FROM members WHERE group_id = ? ORDER BY virtual_ip`, groupID)
 	if err != nil {
 		return nil, fmt.Errorf("load members of %s: %w", groupID, err)
 	}
@@ -160,7 +190,7 @@ func (s *store) loadMembersByGroup(ctx context.Context, groupID string) ([]membe
 	var items []memberRow
 	for rows.Next() {
 		var row memberRow
-		if err := rows.Scan(&row.PeerID, &row.Name, &row.OS, &row.VirtualIP); err != nil {
+		if err := rows.Scan(&row.PeerID, &row.Name, &row.OS, &row.VirtualIP, &row.Role); err != nil {
 			return nil, fmt.Errorf("scan member row: %w", err)
 		}
 		items = append(items, row)

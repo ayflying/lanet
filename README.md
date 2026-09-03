@@ -49,6 +49,25 @@ go run ./app/agent/cmd/pvn-agent -mode join -name beta -invite <邀请码> -ctl 
 
 成员入组后获得群内虚拟 IP（如 `100.64.0.2`），直接 `ping` 组内成员的虚拟 IP 即可互通。
 
+### 群主管理
+
+创建者即群主（`role=owner`），拥有以下专属能力：
+
+```bash
+# 重置邀请码（旧码立即作废；valid_seconds 缺省为永久有效）
+curl -X POST http://<ctl>/v1/groups/invite/reset \
+  -d '{"operator_peer_id":"<群主peer>","group_id":"g0","valid_seconds":86400}'
+
+# 踢出成员（回收虚拟 IP、清除通告地址，被踢者立即离开局域网）
+curl -X POST http://<ctl>/v1/groups/kick \
+  -d '{"operator_peer_id":"<群主peer>","group_id":"g0","target_peer_id":"<被踢peer>"}'
+```
+
+群组数据（群组/成员/角色/邀请码及有效期/通告地址）存储于 SQLite（WAL 模式），服务重启后自动恢复。通过环境变量控制：
+
+- `PVN_CTL_DB`：SQLite 数据库路径；未设置时退化为内存模式（重启丢数据）
+- `PVN_CTL_ADDR`：监听地址覆盖（如 `127.0.0.1:18090`），优先于 config.yaml
+
 ## 验证
 
 ```bash
@@ -82,7 +101,7 @@ Go · GoFrame v2 · go-libp2p v0.44 · wireguard/tun
 
 ## Roadmap
 
-- [ ] 群组/成员/邀请码落库（当前内存版，重启丢失）
-- [ ] 邀请码过期、成员踢出、群主权限
+- [x] 群组/成员/邀请码落库 SQLite（重启不丢）
+- [x] 邀请码过期、成员踢出、群主权限
 - [ ] 真实跨机带宽实测
 - [ ] 子网路由（未装客户端的内网设备互通）

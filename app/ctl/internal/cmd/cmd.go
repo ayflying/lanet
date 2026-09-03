@@ -86,6 +86,43 @@ var (
 					request.Response.WriteJson(g.Map{"status": "announced"})
 				})
 
+				// 群主重置邀请码：旧码立即作废，新码可选有效期（秒）。
+				group.POST("/v1/groups/invite/reset", func(request *ghttp.Request) {
+					var input groupservice.ResetInviteInput
+					if err := request.Parse(&input); err != nil {
+						writeError(request, http.StatusBadRequest, err.Error())
+						return
+					}
+					code, expires, err := groupRegistry.ResetInvite(request.Context(), input)
+					if err != nil {
+						writeError(request, http.StatusForbidden, err.Error())
+						return
+					}
+					request.Response.WriteJson(g.Map{
+						"invite_code":        code,
+						"invite_expires_at": expires,
+					})
+				})
+
+				// 群主踢出成员：回收虚拟 IP 并清除其通告地址。
+				group.POST("/v1/groups/kick", func(request *ghttp.Request) {
+					var input groupservice.KickInput
+					if err := request.Parse(&input); err != nil {
+						writeError(request, http.StatusBadRequest, err.Error())
+						return
+					}
+					removed, err := groupRegistry.Kick(request.Context(), input)
+					if err != nil {
+						writeError(request, http.StatusForbidden, err.Error())
+						return
+					}
+					request.Response.WriteJson(g.Map{
+						"kicked":     input.TargetPeerID,
+						"virtual_ip": removed.VirtualIP,
+						"status":     "removed",
+					})
+				})
+
 				// NetMap：仅返回同一群组的成员（虚拟 IP + PeerID + 可达地址）。
 				group.GET("/v1/groups/netmap", func(request *ghttp.Request) {
 					peerID := request.GetQuery("peer_id").String()

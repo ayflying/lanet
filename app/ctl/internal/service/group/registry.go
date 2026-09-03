@@ -22,6 +22,9 @@ const (
 	baseCIDR          = "100.64.0.0/16"
 	inviteCodeCharset = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 	inviteCodeLength  = 10
+
+	roleOwner  = "owner"
+	roleMember = "member"
 )
 
 type CreateInput struct {
@@ -43,14 +46,33 @@ type AnnounceInput struct {
 	Addrs  []string `json:"addrs"`
 }
 
+type ResetInviteInput struct {
+	// OperatorPeerID 操作者，必须是群主。
+	OperatorPeerID string `json:"operator_peer_id"`
+	// GroupID 目标群组。
+	GroupID string `json:"group_id"`
+	// ValidSeconds 新邀请码有效期（秒）；0 或缺省表示永久有效。
+	ValidSeconds int `json:"valid_seconds"`
+}
+
+type KickInput struct {
+	// OperatorPeerID 操作者，必须是群主。
+	OperatorPeerID string `json:"operator_peer_id"`
+	// GroupID 目标群组。
+	GroupID string `json:"group_id"`
+	// TargetPeerID 被踢成员。
+	TargetPeerID string `json:"target_peer_id"`
+}
+
 type Group struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	CreatorPeerID string    `json:"creator_peer_id"`
-	InviteCode    string    `json:"invite_code"`
-	CIDR          string    `json:"cidr"`
-	CreatedAt     time.Time `json:"created_at"`
-	Version       uint64    `json:"version"`
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	CreatorPeerID string     `json:"creator_peer_id"`
+	InviteCode    string     `json:"invite_code"`
+	InviteExpires *time.Time `json:"invite_expires_at,omitempty"`
+	CIDR          string     `json:"cidr"`
+	CreatedAt     time.Time  `json:"created_at"`
+	Version       uint64     `json:"version"`
 
 	registry    *node.Registry
 	enrollToken string
@@ -61,6 +83,7 @@ type MemberView struct {
 	Name      string   `json:"name"`
 	OS        string   `json:"os"`
 	VirtualIP string   `json:"virtual_ip"`
+	Role      string   `json:"role"`
 	Addrs     []string `json:"addrs"`
 }
 
@@ -72,6 +95,7 @@ type NetMap struct {
 	Members   []MemberView `json:"members"`
 }
 
+// Registry 追加角色索引：ownerByGroup 记录每群群主，memberRoleByPeer 记录成员角色。
 type Registry struct {
 	mu             sync.RWMutex
 	base           netip.Prefix
@@ -80,6 +104,7 @@ type Registry struct {
 	groupsByInvite map[string]*Group
 	groupByPeer    map[string]string
 	announcedAddrs map[string][]string
+	memberRole     map[string]string // peerID → owner/member
 
 	// store 为 SQLite 持久化层；为 nil 时退化为纯内存模式（仅测试使用）。
 	store *store
@@ -121,6 +146,7 @@ func newRegistry(st *store) (*Registry, error) {
 		groupsByInvite: make(map[string]*Group),
 		groupByPeer:    make(map[string]string),
 		announcedAddrs: make(map[string][]string),
+		memberRole:     make(map[string]string),
 		store:          st,
 	}, nil
 }
@@ -140,6 +166,7 @@ func (r *Registry) restore(ctx context.Context) error {
 			Name:          row.Name,
 			CreatorPeerID: row.CreatorPeerID,
 			InviteCode:    row.InviteCode,
+			InviteExpires: row.InviteExpires,
 			CIDR:          row.CIDR,
 			CreatedAt:     time.Now(),
 			Version:       row.Version,
@@ -180,6 +207,15 @@ func (r *Registry) rebuildGroup(grp *Group, members []memberRow) error {
 			return fmt.Errorf("restore member %s of group %s: %w", m.PeerID, grp.ID, err)
 		}
 		r.groupByPeer[m.PeerID] = grp.ID
+		role := m.Role
+		if role == "" {
+			if m.PeerID == grp.CreatorPeerID {
+				role = roleOwner
+			} else {
+				role = roleMember
+			}
+		}
+		r.memberRole[m.PeerID] = role
 	}
 	grp.registry = registry
 	grp.enrollToken = token
@@ -244,6 +280,7 @@ func (r *Registry) Create(ctx context.Context, input CreateInput) (*Group, node.
 			Name:          grp.Name,
 			CreatorPeerID: grp.CreatorPeerID,
 			InviteCode:    grp.InviteCode,
+			InviteExpires: nil, // 创建时邀请码永久有效
 			CIDR:          grp.CIDR,
 			SubnetIndex:   r.nextSubnet,
 			Version:       grp.Version,
@@ -251,7 +288,8 @@ func (r *Registry) Create(ctx context.Context, input CreateInput) (*Group, node.
 			return nil, node.Node{}, err
 		}
 		if err := r.store.insertMember(ctx, grp.ID, memberRow{
-			PeerID: creator.PeerID, Name: creator.Name, OS: creator.OS, VirtualIP: creator.VirtualIP,
+			PeerID: creator.PeerID, Name: creator.Name, OS: creator.OS,
+			VirtualIP: creator.VirtualIP, Role: roleOwner,
 		}); err != nil {
 			return nil, node.Node{}, err
 		}
@@ -261,6 +299,7 @@ func (r *Registry) Create(ctx context.Context, input CreateInput) (*Group, node.
 	r.groupsByID[grp.ID] = grp
 	r.groupsByInvite[inviteCode] = grp
 	r.groupByPeer[input.PeerID] = grp.ID
+	r.memberRole[input.PeerID] = roleOwner
 	return grp, creator, nil
 }
 
@@ -275,6 +314,10 @@ func (r *Registry) Join(ctx context.Context, input JoinInput) (*Group, node.Node
 	if !ok {
 		return nil, node.Node{}, gerror.New("invalid invite code")
 	}
+	// 邀请码过期校验。
+	if grp.InviteExpires != nil && time.Now().After(*grp.InviteExpires) {
+		return nil, node.Node{}, gerror.New("invite code has expired")
+	}
 	if existingGroupID, exists := r.groupByPeer[input.PeerID]; exists {
 		if existingGroupID != grp.ID {
 			return nil, node.Node{}, gerror.New("peer already belongs to another group")
@@ -288,7 +331,8 @@ func (r *Registry) Join(ctx context.Context, input JoinInput) (*Group, node.Node
 	}
 	if r.store != nil {
 		if err := r.store.insertMember(ctx, grp.ID, memberRow{
-			PeerID: member.PeerID, Name: member.Name, OS: member.OS, VirtualIP: member.VirtualIP,
+			PeerID: member.PeerID, Name: member.Name, OS: member.OS,
+			VirtualIP: member.VirtualIP, Role: roleMember,
 		}); err != nil {
 			return nil, node.Node{}, err
 		}
@@ -297,8 +341,89 @@ func (r *Registry) Join(ctx context.Context, input JoinInput) (*Group, node.Node
 		}
 	}
 	r.groupByPeer[input.PeerID] = grp.ID
+	r.memberRole[input.PeerID] = roleMember
 	grp.Version++
 	return grp, member, nil
+}
+
+// ResetInvite 群主重置邀请码：旧码立即作废，新码可选有效期。
+func (r *Registry) ResetInvite(ctx context.Context, input ResetInviteInput) (string, *time.Time, error) {
+	if input.OperatorPeerID == "" || input.GroupID == "" {
+		return "", nil, gerror.New("operator_peer_id and group_id are required")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	grp, ok := r.groupsByID[input.GroupID]
+	if !ok {
+		return "", nil, gerror.New("unknown group")
+	}
+	if r.memberRole[input.OperatorPeerID] != roleOwner || r.groupByPeer[input.OperatorPeerID] != grp.ID {
+		return "", nil, gerror.New("only the group owner can reset the invite code")
+	}
+
+	newCode := randomString(inviteCodeLength)
+	var expires *time.Time
+	// ValidSeconds > 0 设置未来过期点；负值表示立即过期（测试与紧急封禁场景）。
+	if input.ValidSeconds != 0 {
+		t := time.Now().Add(time.Duration(input.ValidSeconds) * time.Second)
+		expires = &t
+	}
+	if r.store != nil {
+		if err := r.store.updateInvite(ctx, grp.ID, newCode, expires); err != nil {
+			return "", nil, err
+		}
+		if err := r.store.bumpGroupVersion(ctx, grp.ID); err != nil {
+			return "", nil, err
+		}
+	}
+	delete(r.groupsByInvite, grp.InviteCode) // 旧码立即作废
+	grp.InviteCode = newCode
+	grp.InviteExpires = expires
+	grp.Version++
+	r.groupsByInvite[newCode] = grp
+	return newCode, expires, nil
+}
+
+// Kick 群主将成员移出群组：回收虚拟 IP、清除通告、作废其组内身份。
+func (r *Registry) Kick(ctx context.Context, input KickInput) (*node.Node, error) {
+	if input.OperatorPeerID == "" || input.GroupID == "" || input.TargetPeerID == "" {
+		return nil, gerror.New("operator_peer_id, group_id and target_peer_id are required")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	grp, ok := r.groupsByID[input.GroupID]
+	if !ok {
+		return nil, gerror.New("unknown group")
+	}
+	if r.memberRole[input.OperatorPeerID] != roleOwner || r.groupByPeer[input.OperatorPeerID] != grp.ID {
+		return nil, gerror.New("only the group owner can kick members")
+	}
+	if input.TargetPeerID == input.OperatorPeerID {
+		return nil, gerror.New("the owner cannot kick themselves")
+	}
+	if r.groupByPeer[input.TargetPeerID] != grp.ID {
+		return nil, gerror.New("target peer is not a member of this group")
+	}
+
+	removed, err := grp.registry.RemoveNode(input.TargetPeerID)
+	if err != nil {
+		return nil, err
+	}
+	if r.store != nil {
+		if err := r.store.deleteMember(ctx, grp.ID, input.TargetPeerID); err != nil {
+			return nil, err
+		}
+		if err := r.store.bumpGroupVersion(ctx, grp.ID); err != nil {
+			return nil, err
+		}
+	}
+	delete(r.groupByPeer, input.TargetPeerID)
+	delete(r.memberRole, input.TargetPeerID)
+	delete(r.announcedAddrs, input.TargetPeerID)
+	grp.Version++
+	return &removed, nil
 }
 
 func (r *Registry) Announce(ctx context.Context, input AnnounceInput) error {
@@ -343,11 +468,16 @@ func (r *Registry) NetMapFor(ctx context.Context, peerID string) (*NetMap, error
 
 	members := make([]MemberView, 0, 8)
 	for _, item := range grp.registry.List(ctx) {
+		role := r.memberRole[item.PeerID]
+		if role == "" {
+			role = roleMember
+		}
 		members = append(members, MemberView{
 			PeerID:    item.PeerID,
 			Name:      item.Name,
 			OS:        item.OS,
 			VirtualIP: item.VirtualIP,
+			Role:      role,
 			Addrs:     append([]string(nil), r.announcedAddrs[item.PeerID]...),
 		})
 	}

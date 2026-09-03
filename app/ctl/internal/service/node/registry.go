@@ -105,6 +105,22 @@ func (r *Registry) RestoreNode(input Node) error {
 	return nil
 }
 
+// RemoveNode 将成员移出注册表并回收其虚拟 IP（供群主踢人使用）。
+// 被回收的 IP 会重新进入可用池；若 PeerID 不存在则报错。
+func (r *Registry) RemoveNode(peerID string) (Node, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	node, ok := r.nodes[peerID]
+	if !ok {
+		return Node{}, gerror.New("peer is not a member of this group")
+	}
+	delete(r.nodes, peerID)
+	if address, err := netip.ParseAddr(node.VirtualIP); err == nil {
+		delete(r.usedIPs, address)
+	}
+	return node, nil
+}
+
 func (r *Registry) List(ctx context.Context) []Node {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
