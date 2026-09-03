@@ -80,20 +80,35 @@ go run ./app/agent/cmd/pvn-e2e-check
 
 ## 目录结构
 
+工程由 `gf init -m` 脚手架生成，遵循 GoFrame 官方工程规范：
+
 ```
-app/
-  ctl/        控制面：群组、中继目录、健康检查
-  agent/      客户端入口：pvn-agent、pvn-e2e-check
-cmd/
-  pvn-relay/        中继节点
-  pvn-relay-check/  中继自检工具
-pkg/
-  p2pkit/     libp2p Host 封装
-  protocol/   协议定义（/pvn/tunnel/1.0.0）
-  tunnel/     隧道服务（直连→中继三段降级）
+app/                          gf mono-repo 应用目录
+  ctl/                        控制面（HTTP 服务，gf 规范分层）
+    api/                      接口定义层：Req/Res + 路由声明（group/health/relay）
+    internal/
+      cmd/                    入口：服务注册 + 路由绑定
+      controller/             控制器：实现 api 接口，委托 service
+      logic/                  业务实现：group（SQLite 持久化）、node（IPAM）、relaydir
+      model/                  api/logic 共享视图结构
+      service/                接口定义层（logic 实现后注册）
+      consts/ hack/ manifest/ gf 脚手架标准目录
+  agent/                      客户端
+    cmd/pvn-agent/            客户端入口（gcmd 声明式参数）
+    cmd/pvn-e2e-check/        端到端验证
+    internal/service/         peersource、tunnel 接收端
+  relay/                      中继（libp2p Circuit Relay v2，gcmd 子命令：relay/check）
+    internal/cmd/             中继入口
+pkg/                          跨应用共享库
+  p2pkit/        libp2p Host 封装
+  protocol/      协议定义（/pvn/tunnel/1.0.0）
+  tunnel/        隧道服务（直连→中继三段降级）
   netmapclient/  NetMap 客户端
-  tundevice/  TUN 设备与路由器
+  tundevice/     TUN 设备与路由器
 ```
+
+接口走 gf 标准链路：`api`（声明 Req/Res 与路由）→ `controller`（实现）→ `service`（接口）→ `logic`（实现），
+响应统一为 `MiddlewareHandlerResponse` 包装（`{code, message, data}`），入参校验用 gf `v:` 规则。
 
 ## 技术栈
 

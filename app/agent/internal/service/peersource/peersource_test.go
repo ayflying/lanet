@@ -25,7 +25,7 @@ func TestCandidates(t *testing.T) {
 			t.Fatalf("unexpected request: %s", request.URL.String())
 		}
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"candidates":[{"peer_id":"` + id.String() + `","addrs":["/ip4/127.0.0.1/tcp/4001"]}]}`))
+		_, _ = writer.Write([]byte(`{"code":0,"message":"OK","data":{"candidates":[{"peer_id":"` + id.String() + `","addrs":["/ip4/127.0.0.1/tcp/4001"]}]}}`))
 	}))
 	defer server.Close()
 

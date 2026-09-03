@@ -45,15 +45,22 @@ func (r *relayCandidates) Candidates(ctx context.Context, number int) ([]peer.Ad
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("relay candidates: status %d", resp.StatusCode)
 	}
-	var payload struct {
-		Candidates []struct {
-			PeerID string   `json:"peer_id"`
-			Addrs  []string `json:"addrs"`
-		} `json:"candidates"`
+	var envelope struct {
+		Code int `json:"code"`
+		Data struct {
+			Candidates []struct {
+				PeerID string   `json:"peer_id"`
+				Addrs  []string `json:"addrs"`
+			} `json:"candidates"`
+		} `json:"data"`
 	}
-	if err = json.Unmarshal(raw, &payload); err != nil {
+	if err = json.Unmarshal(raw, &envelope); err != nil {
 		return nil, err
 	}
+	if envelope.Code != 0 {
+		return nil, fmt.Errorf("relay candidates: code %d", envelope.Code)
+	}
+	payload := envelope.Data
 	out := make([]peer.AddrInfo, 0, len(payload.Candidates))
 	for _, item := range payload.Candidates {
 		id, err := peer.Decode(item.PeerID)
@@ -88,11 +95,21 @@ func postJSON(url string, payload map[string]any) (map[string]any, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(raw))
 	}
-	var out map[string]any
-	if err = json.Unmarshal(raw, &out); err != nil {
+	var envelope struct {
+		Code    int            `json:"code"`
+		Message string         `json:"message"`
+		Data    map[string]any `json:"data"`
+	}
+	if err = json.Unmarshal(raw, &envelope); err != nil {
 		return nil, err
 	}
-	return out, nil
+	if envelope.Code != 0 {
+		return nil, fmt.Errorf("code %d: %s", envelope.Code, envelope.Message)
+	}
+	if envelope.Data == nil {
+		envelope.Data = map[string]any{}
+	}
+	return envelope.Data, nil
 }
 
 // configureTUN 给 TUN 网卡配置虚拟 IP。Windows 走 netsh，Linux 走 ip 命令。

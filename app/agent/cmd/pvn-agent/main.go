@@ -13,12 +13,14 @@ package main
 
 import (
 	"context"
-	"flag"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/gogf/gf/v2/os/gcmd"
+	"github.com/gogf/gf/v2/os/gctx"
 
 	"github.com/ayflying/pvn/pkg/netmapclient"
 	p2pkit "github.com/ayflying/pvn/pkg/p2pkit"
@@ -29,22 +31,46 @@ import (
 )
 
 func main() {
+	command := gcmd.Command{
+		Name:   "pvn-agent",
+		Usage:  "pvn-agent",
+		Brief:  "Lanet 客户端：入网（建群/凭邀请加入）→ TUN 虚拟网卡 → P2P 隧道转发",
+		Arguments: []gcmd.Argument{
+			{Name: "ctl", Short: "c", Default: "http://127.0.0.1:8000", Brief: "控制面地址"},
+			{Name: "mode", Short: "m", Default: "join", Brief: "create=创建群组; join=凭邀请加入"},
+			{Name: "invite", Short: "i", Default: "", Brief: "邀请码（join 模式必填）"},
+			{Name: "name", Short: "n", Default: "", Brief: "节点名称（必填）"},
+			{Name: "os", Default: defaultOS(), Brief: "操作系统标识"},
+			{Name: "group", Short: "g", Default: "default", Brief: "群组名称（create 模式）"},
+			{Name: "tun", Short: "t", Default: "pvn0", Brief: "TUN 网卡名"},
+			{Name: "mtu", Default: "1400", Brief: "TUN MTU"},
+			{Name: "real-tun", Default: "false", Brief: "创建真实 TUN 网卡（需管理员权限）；默认内存 TUN 仅用于联调"},
+		},
+		Func: func(ctx context.Context, parser *gcmd.Parser) (err error) {
+			runAgent(ctx, parser)
+			return nil
+		},
+	}
+	command.Run(gctx.GetInitCtx())
+}
+
+// runAgent 客户端主流程（参数由 gcmd Parser 提供）。
+func runAgent(ctx context.Context, parser *gcmd.Parser) {
 	var (
-		ctlURL     = flag.String("ctl", "http://127.0.0.1:8000", "控制面地址")
-		mode       = flag.String("mode", "join", "create=创建群组; join=凭邀请加入")
-		inviteCode = flag.String("invite", "", "邀请码（join 模式必填）")
-		name       = flag.String("name", "", "节点名称（必填）")
-		osName     = flag.String("os", defaultOS(), "操作系统标识")
-		groupName  = flag.String("group", "default", "群组名称（create 模式）")
-		tunName    = flag.String("tun", "pvn0", "TUN 网卡名")
-		mtu        = flag.Int("mtu", 1400, "TUN MTU")
-		realTUN    = flag.Bool("real-tun", false, "创建真实 TUN 网卡（需管理员权限）；默认内存 TUN 仅用于联调")
+		ctlURL     = parser.GetOpt("ctl").String()
+		mode       = parser.GetOpt("mode").String()
+		inviteCode = parser.GetOpt("invite").String()
+		name       = parser.GetOpt("name").String()
+		osName     = parser.GetOpt("os").String()
+		groupName  = parser.GetOpt("group").String()
+		tunName    = parser.GetOpt("tun").String()
+		mtu        = parser.GetOpt("mtu").Int()
+		realTUN    = parser.GetOpt("real-tun").Bool()
 	)
-	flag.Parse()
-	if *name == "" {
+	if name == "" {
 		log.Fatalf("必须指定 -name 节点名称")
 	}
-	if *mode == "join" && *inviteCode == "" {
+	if mode == "join" && inviteCode == "" {
 		log.Fatalf("join 模式必须提供 -invite 邀请码")
 	}
 
@@ -55,7 +81,7 @@ func main() {
 	hostSpec := p2pkit.HostSpec{
 		UserAgent: "pvn-agent/0.1.0",
 	}
-	if *realTUN {
+	if realTUN {
 		hostSpec.ListenAddrs = []string{"/ip4/0.0.0.0/tcp/0", "/ip4/0.0.0.0/udp/0/quic-v1"}
 	} else {
 		hostSpec.ListenAddrs = []string{"/ip4/127.0.0.1/tcp/0", "/ip4/127.0.0.1/udp/0/quic-v1"}
@@ -69,11 +95,11 @@ func main() {
 	log.Printf("节点 PeerID=%s", peerID)
 
 	// 2. 入网：建群或加入。
-	netmapCli := netmapclient.NewClient(*ctlURL, peerID)
+	netmapCli := netmapclient.NewClient(ctlURL, peerID)
 	var myIP string
-	if *mode == "create" {
-		resp, err := postJSON(*ctlURL+"/v1/groups/create", map[string]any{
-			"peer_id": peerID, "name": *name, "os": *osName, "group_name": *groupName,
+	if mode == "create" {
+		resp, err := postJSON(ctlURL+"/v1/groups/create", map[string]any{
+			"peer_id": peerID, "name": name, "os": osName, "group_name": groupName,
 		})
 		if err != nil {
 			log.Fatalf("创建群组: %v", err)
@@ -82,8 +108,8 @@ func main() {
 		myIP = resp["creator"].(map[string]any)["virtual_ip"].(string)
 		log.Printf("群组已创建，邀请码=%s（请分享给要加入的成员）", invite)
 	} else {
-		resp, err := postJSON(*ctlURL+"/v1/groups/join", map[string]any{
-			"invite_code": *inviteCode, "peer_id": peerID, "name": *name, "os": *osName,
+		resp, err := postJSON(ctlURL+"/v1/groups/join", map[string]any{
+			"invite_code": inviteCode, "peer_id": peerID, "name": name, "os": osName,
 		})
 		if err != nil {
 			log.Fatalf("加入群组: %v", err)
@@ -94,18 +120,18 @@ func main() {
 
 	// 3. 创建 TUN 网卡并配置虚拟 IP。
 	var device tundevice.Device
-	if *realTUN {
-		device, err = tundevice.NewNative(*tunName, *mtu)
+	if realTUN {
+		device, err = tundevice.NewNative(tunName, mtu)
 		if err != nil {
 			log.Fatalf("创建 TUN 网卡: %v", err)
 		}
-		if err = configureTUN(*tunName, myIP, 24); err != nil {
+		if err = configureTUN(tunName, myIP, 24); err != nil {
 			_ = device.Close()
 			log.Fatalf("配置 TUN 网卡地址: %v", err)
 		}
-		log.Printf("TUN 网卡 %s 已创建，虚拟 IP=%s", *tunName, myIP)
+		log.Printf("TUN 网卡 %s 已创建，虚拟 IP=%s", tunName, myIP)
 	} else {
-		device, _, err = tundevice.NewMemory(*mtu)
+		device, _, err = tundevice.NewMemory(mtu)
 		if err != nil {
 			log.Fatalf("创建内存 TUN: %v", err)
 		}
@@ -139,7 +165,7 @@ func main() {
 		log.Printf("通告地址失败（不影响运行，将周期重试）: %v", err)
 	}
 
-	tunnelSvc := tunnelsvc.New(node, netmapCli, newRelayCandidates(*ctlURL))
+	tunnelSvc := tunnelsvc.New(node, netmapCli, newRelayCandidates(ctlURL))
 	router := tundevice.New(device, tunnelSvc)
 	go router.Run(ctx)
 
@@ -169,3 +195,4 @@ func main() {
 	<-ctx.Done()
 	log.Printf("收到退出信号，正在关闭")
 }
+

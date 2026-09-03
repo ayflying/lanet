@@ -56,6 +56,13 @@ func NewClient(baseURL, peerID string) *Client {
 	}
 }
 
+// apiEnvelope gf MiddlewareHandlerResponse 的标准响应包装。
+type apiEnvelope struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data"`
+}
+
 // Refresh 拉取一次 NetMap 并更新本地路由表。
 func (c *Client) Refresh(ctx context.Context) (Snapshot, error) {
 	if c.peerID == "" {
@@ -74,9 +81,16 @@ func (c *Client) Refresh(ctx context.Context) (Snapshot, error) {
 	if response.StatusCode != http.StatusOK {
 		return Snapshot{}, fmt.Errorf("request netmap: unexpected status %s", response.Status)
 	}
-	var snapshot Snapshot
-	if err = json.NewDecoder(response.Body).Decode(&snapshot); err != nil {
+	var envelope apiEnvelope
+	if err = json.NewDecoder(response.Body).Decode(&envelope); err != nil {
 		return Snapshot{}, fmt.Errorf("decode netmap: %w", err)
+	}
+	if envelope.Code != 0 {
+		return Snapshot{}, fmt.Errorf("netmap: %s", envelope.Message)
+	}
+	var snapshot Snapshot
+	if err = json.Unmarshal(envelope.Data, &snapshot); err != nil {
+		return Snapshot{}, fmt.Errorf("decode netmap data: %w", err)
 	}
 	snapshot.FetchedAt = time.Now()
 
@@ -142,6 +156,13 @@ func (c *Client) Announce(ctx context.Context, addrs []string) error {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("announce addresses: unexpected status %s", response.Status)
+	}
+	var envelope apiEnvelope
+	if err = json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		return fmt.Errorf("decode announce response: %w", err)
+	}
+	if envelope.Code != 0 {
+		return fmt.Errorf("announce addresses: %s", envelope.Message)
 	}
 	return nil
 }

@@ -19,7 +19,12 @@ type Candidate struct {
 }
 
 type candidateResponse struct {
-	Candidates []Candidate `json:"candidates"`
+	// gf MiddlewareHandlerResponse 标准包装：业务数据在 data 字段。
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    struct {
+		Candidates []Candidate `json:"candidates"`
+	} `json:"data"`
 }
 
 type Client struct {
@@ -74,7 +79,10 @@ func (c *Client) Candidates(ctx context.Context, number int) ([]peer.AddrInfo, e
 	if err = json.NewDecoder(response.Body).Decode(&payload); err != nil {
 		return nil, fmt.Errorf("decode relay candidates: %w", err)
 	}
-	return toAddrInfos(payload.Candidates)
+	if payload.Code != 0 {
+		return nil, fmt.Errorf("relay candidates: %s", payload.Message)
+	}
+	return toAddrInfos(payload.Data.Candidates)
 }
 
 func (c *Client) AutoRelayPeerSource() autorelay.PeerSource {

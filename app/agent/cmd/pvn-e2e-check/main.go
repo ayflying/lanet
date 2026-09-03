@@ -257,9 +257,19 @@ func mustPostJSON(url string, payload map[string]any) map[string]any {
 	if resp.StatusCode != http.StatusOK {
 		log.Fatalf("post %s: status %d body %s", url, resp.StatusCode, string(raw))
 	}
-	var out map[string]any
-	if err = json.Unmarshal(raw, &out); err != nil {
+	var envelope struct {
+		Code    int            `json:"code"`
+		Message string         `json:"message"`
+		Data    map[string]any `json:"data"`
+	}
+	if err = json.Unmarshal(raw, &envelope); err != nil {
 		log.Fatalf("decode response from %s: %v", url, err)
 	}
-	return out
+	if envelope.Code != 0 {
+		log.Fatalf("post %s: code %d message %s", url, envelope.Code, envelope.Message)
+	}
+	if envelope.Data == nil {
+		envelope.Data = map[string]any{}
+	}
+	return envelope.Data
 }
