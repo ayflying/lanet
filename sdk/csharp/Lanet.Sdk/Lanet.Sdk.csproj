@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.1;net8.0</TargetFrameworks>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <RootNamespace>Lanet.Sdk</RootNamespace>
+    <AssemblyName>Lanet.Sdk</AssemblyName>
+    <PackageId>Lanet.Sdk</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Lanet</Authors>
+    <Description>Lanet 群组制 P2P 虚拟局域网 ws-gateway 客户端（Unity / .NET / MAUI）</Description>
+    <!-- Unity 2021+ 兼容：不使用需 IsExternalInit 的语法 -->
+  </PropertyGroup>
+
+</Project>

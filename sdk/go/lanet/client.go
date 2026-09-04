@@ -46,6 +46,7 @@ import (
 	"github.com/ayflying/pvn/pkg/tunnel"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
+	libprotocol "github.com/libp2p/go-libp2p/core/protocol"
 )
 
 // Stream 是隧道流的对外视图：io.ReadWriteCloser + 链路信息。
@@ -54,10 +55,14 @@ type Stream interface {
 	// CloseWrite 半关闭写端：发送完毕必须调用，
 	// 对端才能 ReadAll 判 EOF（Windows 语义尤其如此）。
 	CloseWrite() error
+	// Reset 强制中止流（异常场景，不等对端）。
+	Reset() error
 	// ViaRelay 本流是否经中继转发（false 即 P2P 直连）。
 	ViaRelay() bool
 	// Protocol 流上的协议 ID。
 	Protocol() string
+	// RemotePeer 对端 PeerID 文本。
+	RemotePeer() string
 }
 
 // streamAdapter 把 libp2p network.Stream 适配为 SDK 的 Stream。
@@ -69,6 +74,9 @@ type streamAdapter struct {
 func (s streamAdapter) CloseWrite() error { return s.Stream.CloseWrite() }
 func (s streamAdapter) ViaRelay() bool    { return s.viaRelay }
 func (s streamAdapter) Protocol() string  { return string(s.Stream.Protocol()) }
+
+// RemotePeer 返回对端 PeerID 文本。
+func (s streamAdapter) RemotePeer() string { return s.Stream.Conn().RemotePeer().String() }
 
 // Handler 收到入向流时的回调。
 type Handler func(stream Stream)
@@ -183,6 +191,8 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 
 	// 3. 隧道服务。
 	c.tunnelSvc = tunnel.New(node, c.netmapCli, c.peerSource)
+	// 4. 端口转发入向服务（对端可经本节点 DialPortFWD 访问本机 TCP 服务）。
+	c.enablePortFWD()
 	return c, nil
 }
 
@@ -208,6 +218,16 @@ func (c *Client) OnStream(handler Handler) {
 // 返回流与是否经中继。用完必须 Close；发送完毕建议 CloseWrite。
 func (c *Client) Dial(ctx context.Context, virtualIP string) (Stream, bool, error) {
 	raw, viaRelay, err := c.tunnelSvc.OpenStreamToVirtualIP(ctx, virtualIP)
+	if err != nil {
+		return nil, false, err
+	}
+	return streamAdapter{Stream: raw, viaRelay: viaRelay}, viaRelay, nil
+}
+
+// DialProtocol 同 Dial，但指定应用层协议 ID（对端需已注册该协议处理器）。
+// 用于自定义应用协议（如网关、端口转发之外的扩展场景）。
+func (c *Client) DialProtocol(ctx context.Context, virtualIP string, protoID string) (Stream, bool, error) {
+	raw, viaRelay, err := c.tunnelSvc.OpenStreamToVirtualIPProtocol(ctx, virtualIP, libprotocol.ID(protoID))
 	if err != nil {
 		return nil, false, err
 	}

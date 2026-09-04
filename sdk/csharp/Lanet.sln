@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Lanet.Sdk", "Lanet.Sdk\Lanet.Sdk.csproj", "{88AE6E44-DA0A-4287-860F-D02DDA532FC2}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Lanet.Demo", "Lanet.Demo\Lanet.Demo.csproj", "{5C639A30-8DDE-4C86-95C5-228A54D31D64}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{88AE6E44-DA0A-4287-860F-D02DDA532FC2}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{88AE6E44-DA0A-4287-860F-D02DDA532FC2}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{88AE6E44-DA0A-4287-860F-D02DDA532FC2}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{88AE6E44-DA0A-4287-860F-D02DDA532FC2}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5C639A30-8DDE-4C86-95C5-228A54D31D64}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5C639A30-8DDE-4C86-95C5-228A54D31D64}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5C639A30-8DDE-4C86-95C5-228A54D31D64}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5C639A30-8DDE-4C86-95C5-228A54D31D64}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

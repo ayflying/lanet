@@ -11,3 +11,7 @@ resource/output/
 .testbin/
 .workbuddy/
 node_modules/
+# C# 构建产物
+sdk/csharp/**/bin/
+sdk/csharp/**/obj/
+*.user

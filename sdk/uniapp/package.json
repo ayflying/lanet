@@ -1,0 +1,28 @@
+{
+  "name": "@lanet/sdk-uniapp",
+  "version": "0.1.0",
+  "description": "Lanet ws-gateway 客户端：uniapp / 微信小程序 / H5 / Node 接入群组网格",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test/gateway.mjs"
+  },
+  "keywords": [
+    "lanet",
+    "p2p",
+    "vpn",
+    "uniapp",
+    "weapp",
+    "websocket",
+    "gateway"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}

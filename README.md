@@ -174,6 +174,28 @@ const stream = await node.dial('100.64.0.2')  // 按虚拟 IP 开流
 （直连 echo 往返 ~100ms），详见 [sdk/web/README.md](sdk/web/README.md)。
 受浏览器沙箱限制无 TUN/虚拟 IP 路由能力；组内 TCP 服务桥接（portfwd）见 Roadmap。
 
+### ws-gateway + C# / uniapp SDK（网关接入模式）
+
+无法运行 libp2p 的运行时（C#/Unity、微信小程序等）经 **ws-gateway** 接入：
+网关以 Go SDK 节点身份入群，客户端用一条 WebSocket 走统一的二进制帧协议
+（auth / dial / data / close，见 `pkg/gatewayproto`）。
+
+```bash
+# 网关服务（加入指定群组；-invite 省略则创建新群组并打印邀请码）
+go run ./app/gateway/cmd/pvn-gateway -ctl http://ctl:8000 -invite XXXXXXXXXX
+```
+
+- **C# SDK**（`sdk/csharp`，NuGet 包 `Lanet.Sdk`，netstandard2.1 + net8.0）：
+  `DialAsync(ip, port)` / `DialProtocolAsync` / `OnStream`，Unity 2021+ 可用；
+- **uniapp SDK**（`sdk/uniapp`，npm 包 `@lanet/sdk-uniapp`）：
+  自动适配 uni / wx / H5，小程序要求网关走 wss + 备案域名；
+- Go SDK 节点自动获得 **PortFWD 端口转发**能力（`/pvn/portfwd/1.0.0`）：
+  网关客户端 dial 的 `ip:port` 由目标节点 net.Dial 到本机/内网服务，
+  远程桌面、数据库等 TCP 应用由此桥接。
+
+三端互通已本机实测 PASS：js 客户端（自定义协议 echo 1ms、PortFWD 3ms）、
+.NET 客户端（echo 15ms、PortFWD 25ms）。详见各 SDK 目录 README。
+
 ## 中继兜底与数据库运维
 
 ### relay 链路说明
@@ -236,13 +258,19 @@ app/                          gf mono-repo 应用目录
     internal/service/         tunnel 接收端
   relay/                      中继（libp2p Circuit Relay v2，gcmd 子命令：relay/check）
     internal/cmd/             中继入口
+  gateway/                    ws-gateway（C#/uniapp 等运行时的网关接入）
+    cmd/pvn-gateway/          网关入口
+    internal/gateway/         WS 帧协议服务（auth/dial/data/close）
 sdk/                          对外 SDK
-  go/lanet/                   Go SDK（入网 / Dial / OnStream / Run）
+  go/lanet/                   Go SDK（入网 / Dial / DialPortFWD / OnStream / Run）
   web/                        Web SDK（js-libp2p：浏览器/Node 节点入网互开流）
+  csharp/                     C# SDK（Unity/.NET/MAUI，经 ws-gateway 接入）
+  uniapp/                     uniapp SDK（小程序/H5/Node，经 ws-gateway 接入）
 pkg/                          跨应用共享库
   p2pkit/        libp2p Host 封装（含 webrtc-direct 传输层）
   peersource/    中继候选客户端（控制面 /v1/relays/candidates）
-  protocol/      协议定义（/pvn/tunnel/1.0.0）
+  protocol/      协议定义（/pvn/tunnel/1.0.0、/pvn/portfwd/1.0.0）
+  gatewayproto/  ws-gateway 帧协议（Go/C#/JS 三端同构）
   tunnel/        隧道服务（直连→中继三段降级）
   netmapclient/  NetMap 客户端
   tundevice/     TUN 设备与路由器
@@ -269,9 +297,11 @@ Go · GoFrame v2 · go-libp2p v0.44 · wireguard/tun
 - [x] Go SDK（`sdk/go/lanet`：New / Dial / OnStream / Run，宿主程序十几行代码入网）
 - [x] Web SDK（`sdk/web`：js-libp2p 浏览器/Node 入网、Dial、OnStream；与 Go 节点互通实测通过）
 - [x] relay 支持 WebSocket 监听（tcp 与 ws 共享 4001 端口）+ ctl CORS（浏览器直连前提）
+- [x] portfwd 端口转发协议（Go SDK 节点自动启用；浏览器/C#/小程序经网关桥接组内 TCP 服务）
+- [x] ws-gateway（`app/gateway`）+ C# SDK（`sdk/csharp`）+ uniapp SDK（`sdk/uniapp`），三端帧协议同构，互通实测通过
 - [ ] 虚拟 IP 成员下线回收（长期测试场景）
 - [ ] 真实跨机带宽实测
 - [ ] 子网路由（未装客户端的内网设备互通）
 - [ ] Web SDK 浏览器端 webrtc-direct 直连实测（NAT 穿透场景，需公网 STUN/TURN）
-- [ ] portfwd 协议（浏览器经 Go 节点桥接组内 TCP 服务：远程桌面 / 数据库）
+- [ ] ctl API key 鉴权（网关/SDK 场景下管理操作的权限控制）
 - [ ] ctl API key 鉴权（SDK 场景下管理操作的权限控制）
