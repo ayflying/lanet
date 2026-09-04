@@ -3,6 +3,8 @@ package p2pkit
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
@@ -11,6 +13,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 type HostSpec struct {
@@ -18,6 +21,11 @@ type HostSpec struct {
 	RelayService bool
 	RelaySource  autorelay.PeerSource
 	UserAgent    string
+	// WebRTC 是否启用 webrtc-direct 传输层（浏览器 js-libp2p 可直连）。
+	// 启用后自动在 ListenAddrs 基础上追加 /udp/<同端口+1>/webrtc-direct，
+	// 或由 WebRTCAddrs 显式指定监听地址。
+	WebRTC      bool
+	WebRTCAddrs []string
 }
 
 // NewHost 创建 libp2p Host。
@@ -36,6 +44,15 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 
 	if len(spec.ListenAddrs) > 0 {
 		options = append(options, libp2p.ListenAddrStrings(spec.ListenAddrs...))
+	}
+	if spec.WebRTC {
+		addrs := spec.WebRTCAddrs
+		if len(addrs) == 0 {
+			addrs = defaultWebRTCAddrs(spec.ListenAddrs)
+		}
+		if len(addrs) > 0 {
+			options = append(options, libp2p.ListenAddrStrings(addrs...))
+		}
 	}
 	if spec.RelayService {
 		options = append(options,
@@ -56,6 +73,45 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 		return nil, fmt.Errorf("create libp2p host: %w", err)
 	}
 	return h, nil
+}
+
+// defaultWebRTCAddrs 依据 TCP/QUIC 监听地址推导 webrtc-direct 监听地址：
+// 端口 = 原 UDP 端口 + 101（避开 quic 端口），同网段监听。
+// 仅识别 /ip4 与 /ip6 的 udp quic 地址；无匹配时返回空（不额外监听）。
+func defaultWebRTCAddrs(listenAddrs []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, raw := range listenAddrs {
+		addr, err := ma.NewMultiaddr(raw)
+		if err != nil {
+			continue
+		}
+		ipComponent, ipErr := addr.ValueForProtocol(ma.P_IP4)
+		if ipErr != nil {
+			ipComponent, ipErr = addr.ValueForProtocol(ma.P_IP6)
+		}
+		if ipErr != nil {
+			continue
+		}
+		udpComponent, udpErr := addr.ValueForProtocol(ma.P_UDP)
+		if udpErr != nil {
+			continue
+		}
+		port := 101
+		if udpComponent != "0" {
+			if parsed, parseErr := strconv.Atoi(udpComponent); parseErr == nil {
+				port = parsed + 101
+			}
+		}
+		target := fmt.Sprintf("/ip%s/%s/udp/%d/webrtc-direct",
+			map[bool]string{true: "4", false: "6"}[strings.Contains(ipComponent, ".")],
+			ipComponent, port)
+		if !seen[target] {
+			seen[target] = true
+			out = append(out, target)
+		}
+	}
+	return out
 }
 
 func AddrInfo(h host.Host) peer.AddrInfo {

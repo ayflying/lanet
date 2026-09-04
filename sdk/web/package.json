@@ -1,0 +1,35 @@
+{
+  "name": "@lanet/sdk-web",
+  "version": "0.1.0",
+  "description": "Lanet P2P virtual LAN web SDK — join a Lanet group from the browser via js-libp2p (WebTransport / WebRTC + circuit relay)",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "scripts": {
+    "demo": "npx serve demo",
+    "test:interop": "node test/interop.mjs"
+  },
+  "keywords": [
+    "lanet",
+    "libp2p",
+    "p2p",
+    "vpn",
+    "webrtc",
+    "webtransport"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@chainsafe/libp2p-noise": "^17.0.0",
+    "@chainsafe/libp2p-yamux": "^8.0.1",
+    "@libp2p/circuit-relay-v2": "^4.2.13",
+    "@libp2p/identify": "^4.1.14",
+    "@libp2p/webrtc": "^6.0.32",
+    "@libp2p/webtransport": "^6.0.39",
+    "@libp2p/websockets": "^10.1.21",
+    "@multiformats/multiaddr": "^13.0.3",
+    "libp2p": "^3.3.11"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

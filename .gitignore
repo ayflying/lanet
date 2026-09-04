@@ -7,3 +7,7 @@ manifest/output/
 resource/output/
 .idea/
 .vscode/
+.codegraph/
+.testbin/
+.workbuddy/
+node_modules/

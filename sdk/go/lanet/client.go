@@ -87,6 +87,8 @@ type Config struct {
 	GroupName string
 	// ListenAddrs 覆盖默认监听地址（默认 tcp/udp 全部随机端口）。
 	ListenAddrs []string
+	// WebRTC 启用 webrtc-direct 传输层（默认开启），浏览器节点可直连本节点。
+	WebRTC *bool
 	// NetMapInterval 周期任务间隔，默认 15s。
 	NetMapInterval time.Duration
 	// DialTimeout 开流超时，默认 8s。
@@ -145,12 +147,18 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	c.peerSource = peersource.NewClient(cfg.CTLURL)
 	listenAddrs := cfg.ListenAddrs
 	if len(listenAddrs) == 0 {
-		listenAddrs = []string{"/ip4/0.0.0.0/tcp/0", "/ip4/0.0.0.0/udp/0/quic-v1"}
+		// tcp + ws（浏览器可直连）+ quic；webrtc-direct 由 WebRTC 选项追加。
+		listenAddrs = []string{
+			"/ip4/0.0.0.0/tcp/0",
+			"/ip4/0.0.0.0/tcp/0/ws",
+			"/ip4/0.0.0.0/udp/0/quic-v1",
+		}
 	}
 	node, err := p2pkit.NewHost(ctx, p2pkit.HostSpec{
 		UserAgent:   "lanet-sdk-go/1.0.0",
 		RelaySource: c.peerSource.AutoRelayPeerSource(),
 		ListenAddrs: listenAddrs,
+		WebRTC:      cfg.WebRTC == nil || *cfg.WebRTC,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("lanet: create host: %w", err)

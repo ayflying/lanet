@@ -35,6 +35,11 @@ var (
 			}
 			server.Group("/", func(group *ghttp.RouterGroup) {
 				group.Middleware(ghttp.MiddlewareHandlerResponse)
+				// CORS：网页 SDK 从浏览器直连 ctl（join/netmap/announce/relays）。
+				group.Middleware(func(r *ghttp.Request) {
+					r.Response.CORSDefault()
+					r.Middleware.Next()
+				})
 				ctl := controller.New()
 				group.Bind(
 					ctl.Health,

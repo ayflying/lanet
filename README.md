@@ -157,11 +157,22 @@ client.Run(ctx)
 
 完整 API 与示例见 [sdk/go/lanet/README.md](sdk/go/lanet/README.md)。
 
-### Web SDK（规划中）
+### Web SDK（`sdk/web`，npm 包名 `@lanet/sdk-web`）
 
-浏览器接入基于 **信令（ctl 上的 WebSocket）+ WebRTC**：网页作为一个真正的
-P2P 节点加入群组，可通过 Go 节点桥接访问组内 TCP 服务（远程桌面、数据库等）。
-受浏览器沙箱限制，无 TUN/虚拟 IP 能力，详见 Roadmap。
+网页作为一个**真正的 P2P 节点**加入群组：js-libp2p（WebSocket + WebRTC +
+Circuit Relay v2），与 Go 节点互开隧道流（`/pvn/tunnel/1.0.0`）。
+直连优先（ws / webrtc-direct）、relay 电路兜底，无需独立信令服务器。
+
+```js
+import { createNode } from '@lanet/sdk-web'
+const node = await createNode({ ctlURL, inviteCode, name: 'web-demo' })
+const stream = await node.dial('100.64.0.2')  // 按虚拟 IP 开流
+```
+
+联调工具：`go run ./app/agent/cmd/pvn-web-echo`（Go echo 节点，打印邀请码）+
+`node sdk/web/test/interop.mjs`（Node 互通验证）。浏览器与 Go 互通已本机实测
+（直连 echo 往返 ~100ms），详见 [sdk/web/README.md](sdk/web/README.md)。
+受浏览器沙箱限制无 TUN/虚拟 IP 路由能力；组内 TCP 服务桥接（portfwd）见 Roadmap。
 
 ## 中继兜底与数据库运维
 
@@ -221,11 +232,16 @@ app/                          gf mono-repo 应用目录
   agent/                      客户端
     cmd/pvn-agent/            客户端入口（gcmd 声明式参数）
     cmd/pvn-e2e-check/        端到端验证
-    internal/service/         peersource、tunnel 接收端
+    cmd/pvn-web-echo/         Web SDK 联调 echo 节点
+    internal/service/         tunnel 接收端
   relay/                      中继（libp2p Circuit Relay v2，gcmd 子命令：relay/check）
     internal/cmd/             中继入口
+sdk/                          对外 SDK
+  go/lanet/                   Go SDK（入网 / Dial / OnStream / Run）
+  web/                        Web SDK（js-libp2p：浏览器/Node 节点入网互开流）
 pkg/                          跨应用共享库
-  p2pkit/        libp2p Host 封装
+  p2pkit/        libp2p Host 封装（含 webrtc-direct 传输层）
+  peersource/    中继候选客户端（控制面 /v1/relays/candidates）
   protocol/      协议定义（/pvn/tunnel/1.0.0）
   tunnel/        隧道服务（直连→中继三段降级）
   netmapclient/  NetMap 客户端
@@ -251,9 +267,11 @@ Go · GoFrame v2 · go-libp2p v0.44 · wireguard/tun
 - [x] Windows 发行包 CI（交叉编译 + wintun.dll 打包 → Release）
 - [x] 真实跨机联测（217/243/Windows 三机，6 方向隧道 + relay 兜底 + 边界场景，见「真机联测记录」）
 - [x] Go SDK（`sdk/go/lanet`：New / Dial / OnStream / Run，宿主程序十几行代码入网）
+- [x] Web SDK（`sdk/web`：js-libp2p 浏览器/Node 入网、Dial、OnStream；与 Go 节点互通实测通过）
+- [x] relay 支持 WebSocket 监听（tcp 与 ws 共享 4001 端口）+ ctl CORS（浏览器直连前提）
 - [ ] 虚拟 IP 成员下线回收（长期测试场景）
 - [ ] 真实跨机带宽实测
 - [ ] 子网路由（未装客户端的内网设备互通）
-- [ ] Web SDK 阶段 1：ctl 信令 WebSocket + Go host 启用 WebRTC transport + npm 包（浏览器作为 P2P 节点入网）
-- [ ] Web SDK 阶段 2：portfwd 协议（浏览器经 Go 节点桥接组内 TCP 服务：远程桌面 / 数据库）
+- [ ] Web SDK 浏览器端 webrtc-direct 直连实测（NAT 穿透场景，需公网 STUN/TURN）
+- [ ] portfwd 协议（浏览器经 Go 节点桥接组内 TCP 服务：远程桌面 / 数据库）
 - [ ] ctl API key 鉴权（SDK 场景下管理操作的权限控制）

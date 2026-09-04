@@ -17,7 +17,7 @@ import (
 )
 
 func runRelay(ctx context.Context) {
-	listenAddr := flag.String("listen", "/ip4/0.0.0.0/tcp/4001,/ip4/0.0.0.0/udp/4001/quic-v1", "comma-separated libp2p listen addresses")
+	listenAddr := flag.String("listen", "/ip4/0.0.0.0/tcp/4001,/ip4/0.0.0.0/tcp/4001/ws,/ip4/0.0.0.0/udp/4001/quic-v1", "comma-separated libp2p listen addresses")
 	ctlURL := flag.String("ctl", os.Getenv("PVN_RELAY_CTL"), "控制面地址（如 http://ctl:8000），用于自注册与心跳；留空跳过注册")
 	region := flag.String("region", envOr("PVN_RELAY_REGION", "default"), "地域标识")
 	flag.Parse()

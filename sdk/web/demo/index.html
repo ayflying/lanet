@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Lanet Web SDK demo</title>
+<script type="importmap">
+{
+  "imports": {
+    "libp2p": "https://esm.sh/libp2p@3.3.11",
+    "@chainsafe/libp2p-noise": "https://esm.sh/@chainsafe/libp2p-noise@17.0.0",
+    "@chainsafe/libp2p-yamux": "https://esm.sh/@chainsafe/libp2p-yamux@8.0.1",
+    "@libp2p/circuit-relay-v2": "https://esm.sh/@libp2p/circuit-relay-v2@4.2.13",
+    "@libp2p/identify": "https://esm.sh/@libp2p/identify@4.1.14",
+    "@libp2p/webrtc": "https://esm.sh/@libp2p/webrtc@6.0.32",
+    "@libp2p/webtransport": "https://esm.sh/@libp2p/webtransport@6.0.39",
+    "@libp2p/websockets": "https://esm.sh/@libp2p/websockets@10.1.21",
+    "@multiformats/multiaddr": "https://esm.sh/@multiformats/multiaddr@13.0.3"
+  }
+}
+</script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; background: #141414; color: #e6e6e6; }
+  h1 { font-size: 18px; } fieldset { border: 1px solid #333; border-radius: 8px; margin: 12px 0; }
+  label { display: block; margin: 8px 0 4px; font-size: 13px; color: #aaa; }
+  input { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #333; border-radius: 6px; background: #1e1e1e; color: #eee; }
+  button { padding: 8px 16px; margin: 8px 8px 0 0; border: 0; border-radius: 6px; background: #2563eb; color: white; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #log { white-space: pre-wrap; background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 12px; min-height: 160px; font: 12px/1.6 ui-monospace, monospace; }
+  .info { font-size: 13px; color: #9ca3af; }
+</style>
+</head>
+<body>
+<h1>Lanet 网页节点 demo</h1>
+<p class="info">本页面作为一个真正的 P2P 节点加入 Lanet 群组（js-libp2p：WebSocket/WebRTC 直连 + Circuit Relay 兜底）。服务端请配合 Go echo 节点：go run ./app/agent/cmd/pvn-web-echo</p>
+
+<fieldset>
+  <legend>入网</legend>
+  <label>控制面地址（ctlURL）</label>
+  <input id="ctl" value="http://127.0.0.1:8000">
+  <label>邀请码（inviteCode）</label>
+  <input id="invite" placeholder="grp 邀请码，来自 Go echo 节点启动日志">
+  <button id="join">加入群组</button>
+  <span id="status" class="info"></span>
+</fieldset>
+
+<fieldset>
+  <legend>按虚拟 IP 开流（echo 测试）</legend>
+  <label>目标虚拟 IP（同群 Go 节点）</label>
+  <input id="target" placeholder="100.64.0.2">
+  <label>消息</label>
+  <input id="msg" value="hello from browser">
+  <button id="dial" disabled>Dial + Echo</button>
+</fieldset>
+
+<div id="log"></div>
+
+<script type="module">
+  const log = (line) => { document.getElementById('log').textContent += line + '\n' }
+  let node = null
+
+  document.getElementById('join').onclick = async () => {
+    const ctlURL = document.getElementById('ctl').value.trim()
+    const inviteCode = document.getElementById('invite').value.trim()
+    document.getElementById('status').textContent = '加入中…'
+    try {
+      const { createNode } = await import('../src/index.js')
+      node = await createNode({ ctlURL, inviteCode, name: 'web-demo' })
+      document.getElementById('status').textContent = `已入网 peer=${node.peerId.slice(-8)} 虚拟IP=${node.virtualIP}`
+      document.getElementById('dial').disabled = false
+      node.onStream(async (stream) => {
+        log(`[入向流] protocol=${stream.protocol} viaRelay=${stream.viaRelay}`)
+        const chunks = []
+        stream.onMessage(data => chunks.push(data))
+        setTimeout(async () => {
+          const total = chunks.reduce((n, c) => n + c.length, 0)
+          const out = new Uint8Array(total)
+          let off = 0
+          for (const c of chunks) { out.set(c, off); off += c.length }
+          stream.send(out) // echo
+          await stream.closeWrite()
+        }, 500)
+      })
+    } catch (err) {
+      document.getElementById('status').textContent = '失败：' + err.message
+      log('[错误] ' + (err.stack ?? err.message))
+    }
+  }
+
+  document.getElementById('dial').onclick = async () => {
+    const targetIP = document.getElementById('target').value.trim()
+    const msg = document.getElementById('msg').value
+    try {
+      const t0 = performance.now()
+      const stream = await node.dial(targetIP)
+      const reply = []
+      stream.onMessage(data => reply.push(data))
+      stream.send(new TextEncoder().encode(msg))
+      await stream.closeWrite()
+
+      const sent = new TextEncoder().encode(msg).length
+      await new Promise((resolve, reject) => {
+        const timer = setInterval(() => {
+          const total = reply.reduce((n, c) => n + c.length, 0)
+          if (total >= sent) { clearInterval(timer); resolve() }
+        }, 50)
+        setTimeout(() => { clearInterval(timer); reject(new Error('echo 超时')) }, 15000)
+      })
+
+      const ms = (performance.now() - t0).toFixed(0)
+      const total = new Uint8Array(reply.reduce((n, c) => n + c.length, 0))
+      let off = 0
+      for (const c of reply) { total.set(c, off); off += c.length }
+      log(`[dial ${targetIP}] viaRelay=${stream.viaRelay} ${ms}ms 回显=${JSON.stringify(new TextDecoder().decode(total))}`)
+      stream.abort()
+    } catch (err) {
+      log('[dial 错误] ' + (err.stack ?? err.message))
+    }
+  }
+</script>
+</body>
+</html>
