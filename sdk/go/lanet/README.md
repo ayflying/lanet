@@ -230,13 +230,72 @@ client.Host().SetStreamHandler("/myapp/1.0.0", func(s network.Stream) {
 stream, viaRelay, err := client.DialProtocol(ctx, "100.64.0.2", "/myapp/1.0.0")
 ```
 
+### 入向防火墙：控制谁能访问我的服务
+
+入向 PortFWD（本机/局域网服务暴露）默认**全拒绝（deny-all）**——
+未配置规则时，任何成员的 `DialPortFWD` 请求都会被拒绝。三种模式：
+
+| 模式 | 行为 |
+|---|---|
+| `deny-all`（默认） | 拒绝一切入向转发 |
+| `allow-list` | 按规则放行：来源（虚拟 IP / CIDR / `*`）+ 端口（单值 / 范围 / `*`） |
+| `allow-all` | 全开：任意成员访问任意端口 |
+
+```go
+// 编程接口（也可在 Web 控制台操作，两者热更新等价）
+client.SetFirewall(lanet.FirewallModeAllowList, []firewall.Rule{
+	{Source: "100.64.0.5", Port: "3389"},     // 指定成员访问指定端口
+	{Source: "100.64.1.0/24", Port: "80"},    // 指定网段
+	{Source: "*", Port: "5000-5010"},         // 任意成员访问端口范围
+})
+mode, rules := client.Firewall() // 读取当前快照
+```
+
+判定发生在向内网目标发起 TCP 连接**之前**；来源未知（不在成员表）的
+请求除 `allow-all` 外一律拒绝。
+
+### 局域网端口转发：把内网其他设备暴露给群内
+
+映射表模式：入向请求端口命中 `Listen` 时转发到 `Target`（本机所在
+真实局域网内的设备）：
+
+```go
+client, _ := lanet.New(ctx, lanet.Config{
+	Name: "home-node",
+	Standalone: true,
+	NetworkKey: "our-secret-net",
+	LANForwards: []lanet.LANForward{
+		{Listen: 5000, Target: "192.168.1.100:5000"}, // 群内访问 <本节点IP>:5000 → NAS
+		{Listen: 3389, Target: "192.168.1.101:3389"}, // → 内网远程桌面
+	},
+	StateFile: "lanet-state.json", // 控制台状态持久化（可选）
+})
+// 运行中热更新：
+client.SetLANForwards([]lanet.LANForward{{Listen: 8080, Target: "192.168.1.102:80"}})
+```
+
+未命中映射表的放行端口回退到本机 `127.0.0.1`（原有行为）。
+入向转发统一受防火墙约束——**先过防火墙，再查映射表**。
+
+### Web 控制台
+
+每个节点默认自带控制台：`http://127.0.0.1:8900`（端口占用自动向后尝试至 8910）。
+`Config.ConsoleAddr` 可改地址，设为 `"-"` 关闭。功能：
+
+- **成员与链路**：实时成员表 + 每个成员最近链路（direct / relay）；
+- **入向防火墙**：模式切换 + 规则增删，保存即时生效；
+- **局域网转发**：映射表增删，保存即时生效；
+- 规则变更自动持久化到 `Config.StateFile`（未配置则仅内存）。
+
+编程接口与控制台等价：`Firewall/SetFirewall/LANForwards/SetLANForwards`。
+
 ### Run / Close 生命周期
 
 - `New` 返回即已入网（群组创建/加入完成），可立即 `Dial`；
 - `Run(ctx)` 负责周期通告地址、刷新 NetMap、续期中继预约——**必须有人调用**，
   否则中继兜底链路会失效（直连不受影响）。典型写法：主 goroutine 里 `client.Run(ctx)`，
   业务逻辑在其他 goroutine；或 `go client.Run(ctx)` 后主逻辑自己阻塞；
-- `Close()` 释放 libp2p Host；`ctx` 取消时 `Run` 返回，随后 `defer client.Close()`。
+- `Close()` 释放 libp2p Host 并停止控制台；`ctx` 取消时 `Run` 返回，随后 `defer client.Close()`。
 
 ## 常见问题
 

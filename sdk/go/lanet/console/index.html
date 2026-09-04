@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lanet 节点控制台</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --line:#e2e4e9; --txt:#1c1e21; --muted:#6b7280;
+          --accent:#2f6fed; --ok:#1a9e6e; --bad:#d5484a; }
+  * { box-sizing:border-box; margin:0; }
+  body { font:14px/1.6 system-ui,"Segoe UI","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--txt); padding:20px; }
+  h1 { font-size:18px; margin-bottom:4px; }
+  h2 { font-size:15px; margin:0 0 12px; }
+  .sub { color:var(--muted); font-size:12px; margin-bottom:18px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; max-width:1100px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:500; }
+  .kv { display:flex; gap:8px; font-size:13px; margin:3px 0; }
+  .kv b { min-width:80px; font-weight:500; color:var(--muted); }
+  .tag { display:inline-block; padding:0 8px; border-radius:10px; font-size:12px; }
+  .tag.direct { background:#e2f4ec; color:#127a55; }
+  .tag.relay { background:#fdeeee; color:#b03a3c; }
+  .tag.unknown { background:#eef0f3; color:#6b7280; }
+  select, input[type=text], input[type=number] {
+    padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:13px; width:100%; }
+  .row { display:flex; gap:8px; margin:8px 0; align-items:center; }
+  .row input, .row select { flex:1; }
+  button { padding:7px 14px; border:0; border-radius:6px; background:var(--accent); color:#fff;
+           font-size:13px; cursor:pointer; }
+  button.ghost { background:#eef0f3; color:var(--txt); }
+  button.del { background:none; color:var(--bad); padding:2px 6px; }
+  .msg { font-size:12px; margin-top:8px; min-height:18px; }
+  .msg.ok { color:var(--ok); } .msg.bad { color:var(--bad); }
+  .empty { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<h1>Lanet 节点控制台</h1>
+<div class="sub" id="addrLine">加载中…</div>
+<div class="grid">
+
+  <div class="card">
+    <h2>成员与链路</h2>
+    <div id="members" class="empty">加载中…</div>
+  </div>
+
+  <div class="card">
+    <h2>入向防火墙</h2>
+    <div class="row">
+      <select id="fwMode">
+        <option value="deny-all">默认全拒绝（deny-all）</option>
+        <option value="allow-list">按规则放行（allow-list）</option>
+        <option value="allow-all">端口全开（allow-all）</option>
+      </select>
+    </div>
+    <div id="ruleList"></div>
+    <div class="row">
+      <input type="text" id="rSrc" placeholder="来源：虚拟 IP / 网段 / *（任意成员）">
+      <input type="text" id="rPort" placeholder="端口：3389 / 5000-5010 / *" style="flex:.6">
+      <button onclick="addRule()">添加</button>
+    </div>
+    <button onclick="saveFirewall()">保存防火墙</button>
+    <button class="ghost" onclick="loadState()">刷新</button>
+    <div class="msg" id="fwMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>局域网端口转发</h2>
+    <div class="sub" style="margin-bottom:8px">群内成员访问「本节点虚拟 IP : Listen」时，转发到局域网设备 Target。</div>
+    <div id="fwdList"></div>
+    <div class="row">
+      <input type="number" id="fListen" placeholder="Listen 端口" style="flex:.5">
+      <input type="text" id="fTarget" placeholder="目标 192.168.1.100:5000">
+      <button onclick="addForward()">添加</button>
+    </div>
+    <button onclick="saveForwards()">保存转发映射</button>
+    <button class="ghost" onclick="loadState()">刷新</button>
+    <div class="msg" id="fwdMsg"></div>
+  </div>
+
+</div>
+<script>
+let S = null;
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function loadState() {
+  const r = await fetch('/api/state');
+  S = await r.json();
+  const i = S.info;
+  $('addrLine').textContent = `虚拟 IP ${i.virtual_ip} · 节点 ${i.peer_id.slice(0,16)}… · 网络 ${i.group || i.group_id}`;
+  $('members').innerHTML = S.members.length === 0
+    ? '<span class="empty">暂未发现其他成员（等待 DHT / mDNS 发现）</span>'
+    : '<table><tr><th>名称</th><th>虚拟 IP</th><th>链路</th></tr>' +
+      S.members.map(m =>
+        `<tr><td>${esc(m.name)}</td><td>${esc(m.virtual_ip)}</td>` +
+        `<td><span class="tag ${esc(m.path)}">${esc(m.path)}</span></td></tr>`).join('') +
+      '</table>';
+  $('fwMode').value = S.mode;
+  renderRules(); renderForwards();
+}
+function renderRules() {
+  $('ruleList').innerHTML = S.rules.length === 0
+    ? '<div class="empty" style="margin:8px 0">暂无放行规则</div>'
+    : '<table><tr><th>来源</th><th>端口</th><th></th></tr>' +
+      S.rules.map((r, idx) =>
+        `<tr><td>${esc(r.source)}</td><td>${esc(r.port)}</td>` +
+        `<td><button class="del" onclick="S.rules.splice(${idx},1);renderRules()">删除</button></td></tr>`).join('') +
+      '</table>';
+}
+function renderForwards() {
+  $('fwdList').innerHTML = S.forwards.length === 0
+    ? '<div class="empty" style="margin:8px 0">暂无转发映射</div>'
+    : '<table><tr><th>Listen</th><th>Target</th><th></th></tr>' +
+      S.forwards.map((f, idx) =>
+        `<tr><td>${f.listen}</td><td>${esc(f.target)}</td>` +
+        `<td><button class="del" onclick="S.forwards.splice(${idx},1);renderForwards()">删除</button></td></tr>`).join('') +
+      '</table>';
+}
+function addRule() {
+  const src = $('rSrc').value.trim(), port = $('rPort').value.trim();
+  if (!src || !port) { flash('fwMsg', '请填写来源与端口', false); return; }
+  S.rules.push({ source: src, port });
+  $('rSrc').value = ''; $('rPort').value = '';
+  renderRules();
+}
+function addForward() {
+  const listen = parseInt($('fListen').value, 10), target = $('fTarget').value.trim();
+  if (!listen || listen < 1 || listen > 65535 || !target) { flash('fwdMsg', '请填写有效端口与目标地址', false); return; }
+  S.forwards.push({ listen, target });
+  $('fListen').value = ''; $('fTarget').value = '';
+  renderForwards();
+}
+async function saveFirewall() {
+  const r = await fetch('/api/firewall', { method:'PUT',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ mode: $('fwMode').value, rules: S.rules }) });
+  flash('fwMsg', r.ok ? '防火墙已保存并生效' : '保存失败', r.ok);
+  loadState();
+}
+async function saveForwards() {
+  const r = await fetch('/api/forwards', { method:'PUT',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ forwards: S.forwards }) });
+  flash('fwdMsg', r.ok ? '转发映射已保存并生效' : '保存失败', r.ok);
+  loadState();
+}
+function flash(id, text, ok) { $(id).textContent = text; $(id).className = 'msg ' + (ok ? 'ok' : 'bad'); }
+loadState(); setInterval(loadState, 10000);
+</script>
+</body>
+</html>

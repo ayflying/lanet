@@ -37,8 +37,10 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/ayflying/pvn/pkg/firewall"
 	"github.com/ayflying/pvn/pkg/netmapclient"
 	"github.com/ayflying/pvn/pkg/p2pkit"
 	"github.com/ayflying/pvn/pkg/peersource"
@@ -119,6 +121,24 @@ type Config struct {
 	// 空且未启用 mDNS 时无法跨网发现；可填 serverless.DefaultBootstrap
 	// 加入公共 DHT 网络，或直接填任意已在网成员的 multiaddr（每台节点都是种子）。
 	Bootstrap []string
+	// LANForwards 局域网端口转发初始映射表：入向请求端口命中 Listen 时，
+	// 转发到 Target（本机所在真实局域网内的设备地址，如 192.168.1.100:5000）。
+	// 运行中可经 Web 控制台热更新；入向转发始终受防火墙约束（默认全拒绝）。
+	LANForwards []LANForward
+	// ConsoleAddr 内置 Web 控制台监听地址，默认 127.0.0.1:8900
+	// （端口被占用时自动向后尝试到 8910）；设为 "-" 关闭控制台。
+	ConsoleAddr string
+	// StateFile 控制台状态（防火墙规则 + 转发映射）持久化文件路径；
+	// 空 = 仅内存，节点重启后回到 Config 初始值。
+	StateFile string
+}
+
+// LANForward 一条局域网端口转发映射。
+type LANForward struct {
+	// Listen 转发端口（群内成员看到的端口）。
+	Listen int `json:"listen"`
+	// Target 真实目标地址 "IP:端口"（如 192.168.1.100:5000）。
+	Target string `json:"target"`
 }
 
 // Client 一个已入网的 SDK 节点。
@@ -137,6 +157,12 @@ type Client struct {
 	created bool // 是否为本 SDK 创建的群组
 
 	handlers []Handler
+
+	fw         *firewall.Firewall // 入向转发防火墙（默认 deny-all）
+	fwMu       sync.RWMutex
+	forwards   []LANForward // 局域网转发映射表（热更新）
+	statePath  string       // 状态持久化文件
+	consoleSrv *http.Server // 内置 Web 控制台
 }
 
 // Info 节点入网后的身份信息。
@@ -264,8 +290,17 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	} else {
 		c.tunnelSvc = tunnel.New(node, c.netmapCli, c.peerSource)
 	}
-	// 4. 端口转发入向服务（对端可经本节点 DialPortFWD 访问本机 TCP 服务）。
+	// 4. 端口转发入向服务：防火墙（默认 deny-all）+ 局域网映射表。
+	c.fw = firewall.New()
+	c.forwards = append([]LANForward(nil), cfg.LANForwards...)
+	c.statePath = cfg.StateFile
+	c.loadState()
 	c.enablePortFWD()
+	// 5. 内置 Web 控制台。
+	if err = c.startConsole(); err != nil {
+		_ = node.Close()
+		return nil, err
+	}
 	return c, nil
 }
 
@@ -366,7 +401,12 @@ func (c *Client) Run(ctx context.Context) {
 }
 
 // Close 关闭节点与底层连接。
-func (c *Client) Close() error { return c.node.Close() }
+func (c *Client) Close() error {
+	if c.consoleSrv != nil {
+		_ = c.consoleSrv.Close()
+	}
+	return c.node.Close()
+}
 
 // handleInbound 入向流分发到已注册的 Handler。
 func (c *Client) handleInbound(stream network.Stream) {

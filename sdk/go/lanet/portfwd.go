@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,21 +47,38 @@ func (c *Client) DialPortFWD(ctx context.Context, target PortFWDTarget) (net.Con
 	}, nil
 }
 
-// enablePortFWD 注册端口转发入向处理器（默认开启）：
-// 对端发来 PortFWD 流时，向 header 中的地址发起 TCP 连接并双向搬运。
+// enablePortFWD 注册端口转发入向处理器（默认开启）。
+// 入向请求判定链：来源虚拟 IP + 请求端口过防火墙（默认 deny-all）→
+// 命中局域网映射表则转发到 LAN 设备，否则回退本机 127.0.0.1。
 func (c *Client) enablePortFWD() {
 	c.node.SetStreamHandler(protocol.PortFWD, func(stream network.Stream) {
+		// 1. 来源判定：PeerID 反查虚拟 IP；未知来源无法过防火墙。
+		srcIP := c.virtualIPByPeer(stream.Conn().RemotePeer().String())
 		addr, err := readPortFWDHeader(stream)
 		if err != nil {
 			c.logf("portfwd 读取目标地址失败: %v", err)
 			_ = stream.Reset()
 			return
 		}
-		// 目标为本节点虚拟 IP 时映射到 loopback：
-		// SDK 节点无 TUN，虚拟 IP 在本机 OS 上不可路由。
-		if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil && host == c.myIP {
-			if _, port, p2 := net.SplitHostPort(addr); p2 == nil {
-				addr = net.JoinHostPort("127.0.0.1", port)
+		_, portStr, splitErr := net.SplitHostPort(addr)
+		port := 0
+		if splitErr == nil {
+			port, _ = strconv.Atoi(portStr)
+		}
+		// 2. 防火墙：默认全拒绝，需在控制台放行（或 allow-all）。
+		if !c.fw.Allow(srcIP, port) {
+			c.logf("portfwd 拒绝：来源=%s（%s） 端口=%d 不在放行规则内", srcIP, shortPeer(stream.Conn().RemotePeer().String()), port)
+			_ = stream.Reset()
+			return
+		}
+		// 3. 目标解析：映射表优先（转发到局域网设备），否则本机回环。
+		if target, ok := c.matchForward(port); ok {
+			addr = target
+		} else if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil && host == c.myIP {
+			// 目标为本节点虚拟 IP 时映射到 loopback：
+			// SDK 节点无 TUN，虚拟 IP 在本机 OS 上不可路由。
+			if _, port2, p2 := net.SplitHostPort(addr); p2 == nil {
+				addr = net.JoinHostPort("127.0.0.1", port2)
 			}
 		}
 		var dialer net.Dialer
@@ -72,9 +90,49 @@ func (c *Client) enablePortFWD() {
 			_ = stream.Reset()
 			return
 		}
-		c.logf("portfwd: %s 经本节点转发", addr)
+		c.logf("portfwd 放行：来源=%s → %s", srcIP, addr)
 		pipeBoth(streamAdapter{Stream: stream}, target)
 	})
+}
+
+// virtualIPByPeer 由 PeerID 反查成员虚拟 IP（两种入网模式通用）。
+func (c *Client) virtualIPByPeer(peerID string) string {
+	if c.disc != nil {
+		for _, m := range c.disc.Peers() {
+			if m.PeerID == peerID {
+				return m.VirtualIP
+			}
+		}
+		return ""
+	}
+	if c.netmapCli != nil {
+		for _, m := range c.netmapCli.Current().Members {
+			if m.PeerID == peerID {
+				return m.VirtualIP
+			}
+		}
+	}
+	return ""
+}
+
+// matchForward 端口命中局域网映射表时返回目标地址。
+func (c *Client) matchForward(port int) (string, bool) {
+	c.fwMu.RLock()
+	defer c.fwMu.RUnlock()
+	for _, f := range c.forwards {
+		if f.Listen == port && f.Target != "" {
+			return f.Target, true
+		}
+	}
+	return "", false
+}
+
+// shortPeer PeerID 展示缩写。
+func shortPeer(peerID string) string {
+	if len(peerID) > 12 {
+		return peerID[:12] + "…"
+	}
+	return peerID
 }
 
 // writePortFWDHeader 写入 2 字节大端长度 + 目标地址。
