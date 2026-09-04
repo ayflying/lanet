@@ -17,9 +17,10 @@ func runRelayCheck() {
 	defer cancel()
 
 	relay, err := p2pkit.NewHost(ctx, p2pkit.HostSpec{
-		ListenAddrs:  []string{"/ip4/127.0.0.1/tcp/0", "/ip4/127.0.0.1/udp/0/quic-v1"},
-		RelayService: true,
-		UserAgent:    "pvn-relay-check-relay/0.1.0",
+		ListenAddrs:           []string{"/ip4/127.0.0.1/tcp/0", "/ip4/127.0.0.1/udp/0/quic-v1"},
+		RelayService:          true,
+		RelayServiceDedicated: true,
+		UserAgent:             "pvn-relay-check-relay/0.1.0",
 	})
 	if err != nil {
 		log.Fatalf("start local relay: %v", err)

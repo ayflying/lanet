@@ -102,6 +102,8 @@ client.OnStream(func(stream lanet.Stream) {
 | `NetMapInterval` | time.Duration | `15s` | 周期任务（NetMap 刷新/通告/中继预约）间隔 |
 | `DialTimeout` | time.Duration | `8s` | 开流超时 |
 | `Quiet` | bool | `false` | 为 true 时不打日志 |
+| `Standalone` | bool | `false` | 无服务器模式：不依赖 ctl/relay，DHT+mDNS 自动发现组网 |
+| `Bootstrap` | []string | `[]` | Standalone 专用：DHT 引导节点（`lanet.DefaultBootstrap` 或已在网成员地址） |
 
 ## API 一览
 
@@ -133,6 +135,48 @@ type Stream interface {
 ```
 
 ## 进阶用法
+
+### 无服务器模式（Standalone）：不部署 ctl/relay 也能组网
+
+`Standalone: true` 开启后**不需要部署任何自己的服务器**：
+节点同时运行 DHT server 与 relay service（客户端即服务端），
+通过 **mDNS（局域网自动发现）+ DHT（跨网发现）** 找到同群成员并自动建连。
+`Dial / OnStream / DialPortFWD` 等 API 与常规模式完全一致：
+
+```go
+client, err := lanet.New(ctx, lanet.Config{
+	Name:       "my-node",
+	Standalone: true,
+	InviteCode: "grp-standalone-xxxx", // 留空则自动生成随机邀请码（本节点创建新群组）
+	// 可选：DHT 引导节点；不填则局域网内仅靠 mDNS 发现
+	Bootstrap: []string{lanet.DefaultBootstrap}, // 加入公共 DHT 网络
+})
+info := client.Info()
+log.Printf("虚拟 IP=%s（自动派生），邀请码=%s", info.VirtualIP, info.InviteCode)
+```
+
+工作方式：
+
+- **群组即邀请码**：成员发现记录的键由邀请码派生（`SHA256`），不知道邀请码
+  就无法在 DHT 上定位该群；建连后还会经 `/lanet/info/1.0.0` 校验双方群指纹，
+  异群节点自动忽略；
+- **虚拟 IP 自动派生**：无控制面分配，按 `SHA256(群密钥, PeerID)` 确定性映射到
+  `100.64.x.x`，同群成员各自本地计算即可得到一致结果（`NetMap()` 可列出成员表）；
+- **节点即服务端**：每个节点无条件运行 Circuit Relay v2 hop 中继（默认资源配额）
+  与 kad-dht server 模式；公网可达的成员自然成为群内的引导与中继节点，
+  NAT 后成员经 DCUtR 打洞直连，打洞失败经可达成员中继兜底；
+- **引导（Bootstrap）**：跨网发现的冷启动入口，三选一——
+  1. 填 `lanet.DefaultBootstrap`（libp2p 官方公共 DHT 引导节点），
+     注意国内网络可达性需实测，不通时换 2/3；
+  2. 填任意已在网成员的 multiaddr（`<addr>/p2p/<peerID>`，每台节点都是种子）；
+  3. 不填：纯局域网（mDNS 自动发现）或通过 portfwd/其他渠道带外交换地址。
+
+已验证（2026-09-05，本机 e2e `pvn-serverless-check`）：同邀请码双节点无 ctl/relay，
+mDNS 秒级互发现 + info 交换，按派生虚拟 IP 双向 echo 直连往返 PASS；
+`go test ./pkg/serverless/` 覆盖 info 往返与 hop 中继预约。
+
+当前限制：NAT 后节点在打洞成功前无法被直连（成员表中的中继候选打洞后可用）；
+跨机/跨网场景（公共 DHT 引导）待真机实测；虚拟 IP 冲突未仲裁（群规模大时注意）。
 
 ### PortFWD：访问对端节点的 TCP 服务
 

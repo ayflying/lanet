@@ -26,6 +26,16 @@ type HostSpec struct {
 	// 或由 WebRTCAddrs 显式指定监听地址。
 	WebRTC      bool
 	WebRTCAddrs []string
+	// HolePunching 启用 DCUtR 打洞（独立于 RelaySource；无服务器模式用）。
+	HolePunching bool
+	// RelayServiceDedicated 专用中继模式：无限配额 + 强制声明公网可达。
+	// 普通 P2P 节点（客户端即服务端）不要开启，用 RelayService 即可。
+	RelayServiceDedicated bool
+	// RelayServiceAlways 无条件启动 Circuit Relay v2 hop 服务。
+	// libp2p 内建 EnableRelayService 只在判定「公网可达」后才启动，
+	// NAT 后节点永远等不到该事件；「节点即服务端」语义下需要
+	// 打洞成功后立即具备中继能力，故用底层 relayv2.New 直接注册。
+	RelayServiceAlways bool
 }
 
 // NewHost 创建 libp2p Host。
@@ -55,10 +65,15 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 		}
 	}
 	if spec.RelayService {
-		options = append(options,
-			libp2p.ForceReachabilityPublic(),
-			libp2p.EnableRelayService(relayv2.WithInfiniteLimits()),
-		)
+		if spec.RelayServiceDedicated {
+			options = append(options,
+				libp2p.ForceReachabilityPublic(),
+				libp2p.EnableRelayService(relayv2.WithInfiniteLimits()),
+			)
+		} else {
+			// 节点即服务端：默认配额，可达性交给 AutoNAT 真实探测。
+			options = append(options, libp2p.EnableRelayService())
+		}
 	}
 	if spec.RelaySource != nil {
 		options = append(options,
@@ -66,11 +81,20 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 			libp2p.EnableHolePunching(),
 			libp2p.EnableAutoRelayWithPeerSource(spec.RelaySource),
 		)
+	} else if spec.HolePunching {
+		options = append(options, libp2p.EnableHolePunching())
 	}
 
 	h, err := libp2p.New(options...)
 	if err != nil {
 		return nil, fmt.Errorf("create libp2p host: %w", err)
+	}
+	if spec.RelayServiceAlways {
+		// 底层 hop 服务：默认资源配额，不受 reachability 事件约束。
+		if _, err = relayv2.New(h); err != nil {
+			_ = h.Close()
+			return nil, fmt.Errorf("start relay service: %w", err)
+		}
 	}
 	return h, nil
 }

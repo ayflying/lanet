@@ -23,6 +23,10 @@ Lanet（群组制 P2P 虚拟局域网）对外提供四套 SDK，按运行环境
 - 数据在成员之间端到端传输，relay 只在打洞失败时兜底转发；
 - ctl 只负责目录（NetMap / 邀请码 / 中继候选），**不在数据路径上**。
 
+Go SDK 另支持**无服务器模式（Standalone）**：不部署 ctl/relay，节点同时充当
+DHT server 与中继（客户端即服务端），经 mDNS + DHT 自动发现同群成员组网。
+详见 [Go SDK → 无服务器模式](./go/lanet/README.md)。
+
 ### 2. ws-gateway 网关中转（C# / uniapp SDK）
 
 ```

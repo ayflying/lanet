@@ -23,9 +23,10 @@ func runRelay(ctx context.Context) {
 	flag.Parse()
 
 	host, err := p2pkit.NewHost(ctx, p2pkit.HostSpec{
-		ListenAddrs:  splitAddresses(*listenAddr),
-		RelayService: true,
-		UserAgent:    "pvn-relay/0.1.0",
+		ListenAddrs:           splitAddresses(*listenAddr),
+		RelayService:          true,
+		RelayServiceDedicated: true,
+		UserAgent:             "pvn-relay/0.1.0",
 	})
 	if err != nil {
 		log.Fatalf("start relay: %v", err)

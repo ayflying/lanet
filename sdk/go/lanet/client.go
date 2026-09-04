@@ -31,6 +31,8 @@ package lanet
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,9 +42,10 @@ import (
 	"time"
 
 	"github.com/ayflying/pvn/pkg/netmapclient"
-	"github.com/ayflying/pvn/pkg/peersource"
 	"github.com/ayflying/pvn/pkg/p2pkit"
+	"github.com/ayflying/pvn/pkg/peersource"
 	"github.com/ayflying/pvn/pkg/protocol"
+	"github.com/ayflying/pvn/pkg/serverless"
 	"github.com/ayflying/pvn/pkg/tunnel"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -103,6 +106,16 @@ type Config struct {
 	DialTimeout time.Duration
 	// Quiet 为 true 时不打日志。
 	Quiet bool
+	// Standalone 无服务器模式：不依赖 ctl/relay，经 DHT + mDNS 自动发现
+	// 同群成员组网。开启后 CTLURL 可留空；InviteCode 必填（留空则自动
+	// 生成随机邀请码，本节点创建新群组）。每个节点同时运行 DHT server
+	// 与 relay service（客户端即服务端），公网可达成员自动成为群内
+	// 引导与中继节点。
+	Standalone bool
+	// Bootstrap 仅 Standalone 模式生效：DHT 引导节点 multiaddr 列表。
+	// 空且未启用 mDNS 时仅凭邀请码无法跨网发现；可填 serverless.DefaultBootstrap
+	// 加入公共 DHT，或直接填任意已在网成员的 multiaddr。
+	Bootstrap []string
 }
 
 // Client 一个已入网的 SDK 节点。
@@ -112,6 +125,7 @@ type Client struct {
 	peerSource *peersource.Client
 	netmapCli  *netmapclient.Client
 	tunnelSvc  *tunnel.Service
+	disc       *serverless.Discovery // Standalone 模式的本地发现服务
 
 	peerID  string
 	groupID string
@@ -124,20 +138,28 @@ type Client struct {
 
 // Info 节点入网后的身份信息。
 type Info struct {
-	PeerID   string `json:"peer_id"`
-	GroupID  string `json:"group_id"`
-	Group    string `json:"group"`
+	PeerID    string `json:"peer_id"`
+	GroupID   string `json:"group_id"`
+	Group     string `json:"group"`
 	VirtualIP string `json:"virtual_ip"`
 	// Created 仅创建模式为 true（同时携带 InviteCode）。
-	Created bool   `json:"created,omitempty"`
+	Created    bool   `json:"created,omitempty"`
 	InviteCode string `json:"invite_code,omitempty"`
 }
 
-// New 创建节点并入网：InviteCode 为空则创建新群组（本节点成为群主），
-// 否则凭邀请码加入。创建/加入失败即返回错误。
+// New 创建节点并入网：
+//   - 常规模式：CTLURL 必填；InviteCode 为空则创建新群组，否则凭码加入。
+//   - Standalone 模式：CTLURL 留空；InviteCode 为空则自动生成随机邀请码
+//     （本节点创建新群组），经 DHT + mDNS 自动发现同群成员。
 func New(ctx context.Context, cfg Config) (*Client, error) {
-	if cfg.CTLURL == "" || cfg.Name == "" {
-		return nil, fmt.Errorf("lanet: CTLURL 与 Name 为必填项")
+	if cfg.Standalone && cfg.CTLURL != "" {
+		return nil, fmt.Errorf("lanet: Standalone 模式不需要 CTLURL")
+	}
+	if !cfg.Standalone && cfg.CTLURL == "" {
+		return nil, fmt.Errorf("lanet: CTLURL 为必填项（或开启 Standalone 无服务器模式）")
+	}
+	if cfg.Name == "" {
+		return nil, fmt.Errorf("lanet: Name 为必填项")
 	}
 	if cfg.OS == "" {
 		cfg.OS = defaultOS()
@@ -148,11 +170,18 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = 8 * time.Second
 	}
+	if cfg.Standalone && cfg.InviteCode == "" {
+		// 自动生成随机邀请码：本节点即群主，Info().InviteCode 分享给成员。
+		buf := make([]byte, 8)
+		if _, err := rand.Read(buf); err != nil {
+			return nil, fmt.Errorf("lanet: 生成邀请码: %w", err)
+		}
+		cfg.InviteCode = "grp-standalone-" + hex.EncodeToString(buf)
+	}
 
 	c := &Client{cfg: cfg}
 
-	// 1. libp2p Host：打洞 + 自动中继（候选来自控制面）。
-	c.peerSource = peersource.NewClient(cfg.CTLURL)
+	// 1. libp2p Host。
 	listenAddrs := cfg.ListenAddrs
 	if len(listenAddrs) == 0 {
 		// tcp + ws（浏览器可直连）+ quic；webrtc-direct 由 WebRTC 选项追加。
@@ -162,12 +191,22 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 			"/ip4/0.0.0.0/udp/0/quic-v1",
 		}
 	}
-	node, err := p2pkit.NewHost(ctx, p2pkit.HostSpec{
-		UserAgent:   "lanet-sdk-go/1.0.0",
-		RelaySource: c.peerSource.AutoRelayPeerSource(),
+	spec := p2pkit.HostSpec{
+		UserAgent:   "lanet-sdk-go/1.1.0",
 		ListenAddrs: listenAddrs,
 		WebRTC:      cfg.WebRTC == nil || *cfg.WebRTC,
-	})
+	}
+	var disc *serverless.Discovery
+	if cfg.Standalone {
+		// 无服务器：节点即服务端（无条件启动 hop 中继），打洞直连优先，
+		// 成员表充当 relay 候选。
+		spec.RelayServiceAlways = true
+		spec.HolePunching = true
+	} else {
+		c.peerSource = peersource.NewClient(cfg.CTLURL)
+		spec.RelaySource = c.peerSource.AutoRelayPeerSource()
+	}
+	node, err := p2pkit.NewHost(ctx, spec)
 	if err != nil {
 		return nil, fmt.Errorf("lanet: create host: %w", err)
 	}
@@ -176,21 +215,50 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	c.logf("节点 PeerID=%s", c.peerID)
 
 	// 2. 入网。
-	c.netmapCli = netmapclient.NewClient(cfg.CTLURL, c.peerID)
-	if cfg.InviteCode == "" {
-		if err = c.createGroup(ctx); err != nil {
+	if cfg.Standalone {
+		disc, err = serverless.New(ctx, node, serverless.Config{
+			InviteCode: cfg.InviteCode,
+			Name:       cfg.Name,
+			Bootstrap:  cfg.Bootstrap,
+			EnableMDNS: true,
+			Interval:   cfg.NetMapInterval,
+			Quiet:      cfg.Quiet,
+		})
+		if err == nil {
+			err = disc.Start(ctx)
+		}
+		if err != nil {
 			_ = node.Close()
 			return nil, err
 		}
+		c.disc = disc
+		c.groupID = "standalone"
+		c.group = "standalone-" + serverless.GroupFingerprint(disc.GroupKey())
+		c.myIP = disc.SelfVirtualIP()
+		c.cfg.InviteCode = cfg.InviteCode
+		c.created = true
+		c.logf("无服务器模式入网：虚拟 IP=%s，邀请码=%s", c.myIP, c.cfg.InviteCode)
 	} else {
-		if err = c.joinGroup(ctx); err != nil {
-			_ = node.Close()
-			return nil, err
+		c.netmapCli = netmapclient.NewClient(cfg.CTLURL, c.peerID)
+		if cfg.InviteCode == "" {
+			if err = c.createGroup(ctx); err != nil {
+				_ = node.Close()
+				return nil, err
+			}
+		} else {
+			if err = c.joinGroup(ctx); err != nil {
+				_ = node.Close()
+				return nil, err
+			}
 		}
 	}
 
-	// 3. 隧道服务。
-	c.tunnelSvc = tunnel.New(node, c.netmapCli, c.peerSource)
+	// 3. 隧道服务（standalone 用本地发现实现 NetMap/中继候选接口）。
+	if cfg.Standalone {
+		c.tunnelSvc = tunnel.New(node, disc, disc)
+	} else {
+		c.tunnelSvc = tunnel.New(node, c.netmapCli, c.peerSource)
+	}
 	// 4. 端口转发入向服务（对端可经本节点 DialPortFWD 访问本机 TCP 服务）。
 	c.enablePortFWD()
 	return c, nil
@@ -237,16 +305,34 @@ func (c *Client) DialProtocol(ctx context.Context, virtualIP string, protoID str
 // LastPathUsed 返回到对端最近一次链路类型：direct / relay / unknown。
 func (c *Client) LastPathUsed(peerID string) string { return c.tunnelSvc.LastPathUsed(peerID) }
 
-// NetMap 当前群组成员目录快照。
-func (c *Client) NetMap() netmapclient.Snapshot { return c.netmapCli.Current() }
+// NetMap 当前群组成员目录快照。Standalone 模式返回本地发现的成员表。
+func (c *Client) NetMap() netmapclient.Snapshot {
+	if c.disc != nil {
+		members := make([]netmapclient.Member, 0)
+		for _, m := range c.disc.Peers() {
+			members = append(members, netmapclient.Member{
+				PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, Addrs: m.Addrs,
+			})
+		}
+		return netmapclient.Snapshot{
+			GroupID: c.groupID, GroupName: c.group,
+			CIDR: "100.64.0.0/16", Members: members,
+		}
+	}
+	return c.netmapCli.Current()
+}
 
 // Host 暴露底层 libp2p Host（进阶用法：自定义协议等）。
 func (c *Client) Host() host.Host { return c.node }
 
-// Run 阻塞运行周期任务（刷新 NetMap / 通告地址 / 补充中继预约），
-// 直到 ctx 取消。典型用法：lanet client 入网后 go 或直接调用本方法，
-// 业务逻辑在其他 goroutine 中运行。
+// Run 阻塞运行周期任务，直到 ctx 取消。
+//   - Standalone：周期 DHT 广播与发现（mDNS 持续运行）。
+//   - 常规：刷新 NetMap / 通告地址 / 补充中继预约。
 func (c *Client) Run(ctx context.Context) {
+	if c.disc != nil {
+		c.disc.Run(ctx)
+		return
+	}
 	// 入网后先完成一次通告 + 中继预约（兜底链路关键步骤）。
 	c.announce(ctx)
 	if err := p2pkit.EnsureRelayReservation(ctx, c.node, c.peerSource.AutoRelayPeerSource(), 2); err != nil {
@@ -367,8 +453,8 @@ func (c *Client) post(ctx context.Context, path string, payload, out any) error 
 		return fmt.Errorf("status %d: %s", resp.StatusCode, string(raw))
 	}
 	var envelope struct {
-		Code    int         `json:"code"`
-		Message string      `json:"message"`
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
 		Data    json.RawMessage `json:"data"`
 	}
 	if err = json.Unmarshal(raw, &envelope); err != nil {

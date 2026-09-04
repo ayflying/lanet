@@ -21,9 +21,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ayflying/pvn/pkg/peersource"
 	"github.com/ayflying/pvn/pkg/netmapclient"
 	p2pkit "github.com/ayflying/pvn/pkg/p2pkit"
+	"github.com/ayflying/pvn/pkg/peersource"
 	"github.com/ayflying/pvn/pkg/protocol"
 	tunnelsvc "github.com/ayflying/pvn/pkg/tunnel"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -48,9 +48,10 @@ func main() {
 
 	// 2. 启动 Relay 并注册到控制面。
 	relay, err := p2pkit.NewHost(ctx, p2pkit.HostSpec{
-		ListenAddrs:  []string{"/ip4/127.0.0.1/tcp/0", "/ip4/127.0.0.1/udp/0/quic-v1"},
-		RelayService: true,
-		UserAgent:    "pvn-e2e-relay/0.1.0",
+		ListenAddrs:           []string{"/ip4/127.0.0.1/tcp/0", "/ip4/127.0.0.1/udp/0/quic-v1"},
+		RelayService:          true,
+		RelayServiceDedicated: true,
+		UserAgent:             "pvn-e2e-relay/0.1.0",
 	})
 	if err != nil {
 		log.Fatalf("start relay: %v", err)

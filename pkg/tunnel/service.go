@@ -127,6 +127,9 @@ func (s *Service) openViaRelay(ctx context.Context, target peer.ID, proto libpro
 	}
 	var lastErr error
 	for _, candidate := range candidates {
+		if candidate.ID == target {
+			continue // 目标自己不能当中继（直连都失败了，自我中继无意义）
+		}
 		reserveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		_, reserveErr := client.Reserve(reserveCtx, s.self, candidate)
 		cancel()
