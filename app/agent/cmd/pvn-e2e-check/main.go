@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ayflying/pvn/app/agent/internal/service/peersource"
+	"github.com/ayflying/pvn/pkg/peersource"
 	"github.com/ayflying/pvn/pkg/netmapclient"
 	p2pkit "github.com/ayflying/pvn/pkg/p2pkit"
 	"github.com/ayflying/pvn/pkg/protocol"

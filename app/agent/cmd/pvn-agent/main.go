@@ -22,7 +22,7 @@ import (
 	"github.com/gogf/gf/v2/os/gcmd"
 	"github.com/gogf/gf/v2/os/gctx"
 
-	"github.com/ayflying/pvn/app/agent/internal/service/peersource"
+	"github.com/ayflying/pvn/pkg/peersource"
 	"github.com/ayflying/pvn/pkg/netmapclient"
 	p2pkit "github.com/ayflying/pvn/pkg/p2pkit"
 	"github.com/ayflying/pvn/pkg/protocol"

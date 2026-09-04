@@ -128,6 +128,41 @@ go run ./app/agent/cmd/pvn-e2e-check
 - 探针/测试客户端每次 join 都会占用一个虚拟 IP（100.64.x.x 池），频繁重启会持续消耗；正式使用无需关心，长期自动化测试建议建独立群组或实现成员回收。
 - Windows 端回显类自测程序需注意 libp2p 流的半关闭语义：发送完成后 `CloseWrite()` 半关闭写端，对端才能用 `ReadAll` 判定 EOF，否则双方互等死锁。
 
+## SDK
+
+Lanet 对外提供两套 SDK，让其他项目以编程方式接入群组网格：
+
+### Go SDK（`sdk/go/lanet`）
+
+把任意 Go 程序变成网格中的一个节点：入网、开流、接流，十几行代码完成。
+
+```go
+client, err := lanet.New(ctx, lanet.Config{
+	CTLURL: "http://ctl.example.com:8000",
+	Name:   "my-service",
+	GroupName: "my-group", // 或填 InviteCode 凭邀请码加入
+})
+defer client.Close()
+
+// 按虚拟 IP 开流（直连优先、中继兜底，与 agent 一致）
+stream, viaRelay, _ := client.Dial(ctx, "100.64.0.2")
+defer stream.Close()
+
+// 接收入向流
+client.OnStream(func(stream lanet.Stream) { /* ... */ })
+
+// 周期维护（NetMap 刷新 / 地址通告 / 中继预约），阻塞直到 ctx 取消
+client.Run(ctx)
+```
+
+完整 API 与示例见 [sdk/go/lanet/README.md](sdk/go/lanet/README.md)。
+
+### Web SDK（规划中）
+
+浏览器接入基于 **信令（ctl 上的 WebSocket）+ WebRTC**：网页作为一个真正的
+P2P 节点加入群组，可通过 Go 节点桥接访问组内 TCP 服务（远程桌面、数据库等）。
+受浏览器沙箱限制，无 TUN/虚拟 IP 能力，详见 Roadmap。
+
 ## 中继兜底与数据库运维
 
 ### relay 链路说明
@@ -215,6 +250,10 @@ Go · GoFrame v2 · go-libp2p v0.44 · wireguard/tun
 - [x] 容器镜像 CI（GHCR，amd64+arm64）与服务端/客户端编排
 - [x] Windows 发行包 CI（交叉编译 + wintun.dll 打包 → Release）
 - [x] 真实跨机联测（217/243/Windows 三机，6 方向隧道 + relay 兜底 + 边界场景，见「真机联测记录」）
+- [x] Go SDK（`sdk/go/lanet`：New / Dial / OnStream / Run，宿主程序十几行代码入网）
 - [ ] 虚拟 IP 成员下线回收（长期测试场景）
 - [ ] 真实跨机带宽实测
 - [ ] 子网路由（未装客户端的内网设备互通）
+- [ ] Web SDK 阶段 1：ctl 信令 WebSocket + Go host 启用 WebRTC transport + npm 包（浏览器作为 P2P 节点入网）
+- [ ] Web SDK 阶段 2：portfwd 协议（浏览器经 Go 节点桥接组内 TCP 服务：远程桌面 / 数据库）
+- [ ] ctl API key 鉴权（SDK 场景下管理操作的权限控制）
