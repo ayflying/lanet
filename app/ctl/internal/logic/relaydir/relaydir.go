@@ -25,13 +25,28 @@ func NewRelayDirectory() *RelayDirectory {
 	return &RelayDirectory{updatedAt: time.Now()}
 }
 
+// staleAfter 候选失联阈值：超过该时长没有心跳/注册刷新的候选视为失效，
+// 不再返回给 agent（agent 拿到失效候选会在拨号上浪费时间）。
+// relay 端心跳间隔 30s，阈值取其 5 倍以容忍偶发丢心跳。
+const staleAfter = 150 * time.Second
+
 func (d *RelayDirectory) List(ctx context.Context, limit int) ([]model.RelayCandidate, error) {
 	if limit < 1 || limit > 10 {
 		return nil, gerror.New("limit must be between 1 and 10")
 	}
 
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	// 顺带清理失联候选（List 是最高频访问点，在这里惰性清理免维护后台协程）。
+	alive := d.candidates[:0]
+	for _, item := range d.candidates {
+		if now.Sub(item.LastSeenAt) <= staleAfter {
+			alive = append(alive, item)
+		}
+	}
+	d.candidates = alive
+
 	items := append([]model.RelayCandidate(nil), d.candidates...)
 	sort.Slice(items, func(i, j int) bool { return items[i].Score > items[j].Score })
 	if len(items) > limit {

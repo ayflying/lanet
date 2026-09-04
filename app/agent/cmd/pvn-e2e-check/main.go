@@ -28,6 +28,7 @@ import (
 	tunnelsvc "github.com/ayflying/pvn/pkg/tunnel"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
+	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 )
 
 func main() {
@@ -84,6 +85,9 @@ func main() {
 	log.Printf("agent-b joined ipB=%s", ipB)
 
 	// 5. 双方通告可达地址，并连接 Relay 作为中继/打洞备用路径。
+	// 同时双方向 relay 预约（Reservation）：Circuit Relay v2 要求目标 peer
+	// 在 relay 上有预约，否则对端经中继拨号时会被 NO_RESERVATION 拒绝。
+	// 这正是 agent 主流程 EnsureRelayReservation 所做的事情。
 	mustPostJSON(ctlBaseURL+"/v1/groups/announce", map[string]any{"peer_id": hostA.ID().String(), "addrs": multiaddrStrings(hostA)})
 	mustPostJSON(ctlBaseURL+"/v1/groups/announce", map[string]any{"peer_id": hostB.ID().String(), "addrs": multiaddrStrings(hostB)})
 	if err = hostA.Connect(ctx, relayInfo); err != nil {
@@ -91,6 +95,12 @@ func main() {
 	}
 	if err = hostB.Connect(ctx, relayInfo); err != nil {
 		log.Fatalf("agent-b connect relay: %v", err)
+	}
+	if _, err = relayclient.Reserve(ctx, hostA, relayInfo); err != nil {
+		log.Fatalf("agent-a relay reservation: %v", err)
+	}
+	if _, err = relayclient.Reserve(ctx, hostB, relayInfo); err != nil {
+		log.Fatalf("agent-b relay reservation: %v", err)
 	}
 
 	// 6. AgentB 作为被叫方：监听隧道流，回显数据。

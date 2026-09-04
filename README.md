@@ -111,6 +111,28 @@ go test ./...
 go run ./app/agent/cmd/pvn-e2e-check
 ```
 
+## 中继兜底与数据库运维
+
+### relay 链路说明
+
+- relay 启动时通过 `-ctl http://<ctl>:8000` 向控制面**自注册**，之后每 30s 心跳保活；心跳失联会自动重新注册。容器编排（`deploy/docker-compose.server.yml`）已默认配置。
+- 容器 NAT 环境下 relay 通告的默认是容器内网地址，外部 agent 不可达——用 `PVN_RELAY_ADVERTISE` 显式指定宿主可达地址（逗号分隔 multiaddr，如 `/ip4/1.2.3.4/tcp/4001,/ip4/1.2.3.4/udp/4001/quic-v1`）。
+- agent 入网后会**主动向 relay 预约**（`EnsureRelayReservation`，周期补充）：Circuit Relay v2 要求目标 peer 必须有 Reservation，否则对端经中继拨号会报 `NO_RESERVATION(204)`。AutoRelay 只在节点自认不可达时才预约，公网可达节点必须靠主动预约兜底。
+- ctl 对超过 150s 无心跳的候选做惰性清理，agent 不会拿到失效 relay。
+
+### 数据库运维子命令（ctl 二进制）
+
+通过 `PVN_CTL_DB` 指定库路径（缺省 `./lanet.db`），容器内可直接 `docker exec`：
+
+```bash
+lanet-ctl migrate              # 显式跑 schema 版本化迁移并打印版本
+lanet-ctl dbversion            # 查看当前迁移版本
+lanet-ctl backup [dest]        # VACUUM INTO 一致性备份（缺省自动带纳秒时间戳）
+lanet-ctl repair               # 损坏库自动修复：先备份→直迁→失败则导出可读数据→重建灌回
+```
+
+schema 迁移采用账本表 `schema_migrations` 记录版本，迁移以有序切片内嵌在代码中；**禁止修改已发布的迁移，只允许追加新版本**。
+
 ## CI/CD
 
 | 流水线 | 触发 | 产物 |
