@@ -22,6 +22,7 @@ import (
 	"github.com/gogf/gf/v2/os/gcmd"
 	"github.com/gogf/gf/v2/os/gctx"
 
+	"github.com/ayflying/pvn/app/agent/internal/service/peersource"
 	"github.com/ayflying/pvn/pkg/netmapclient"
 	p2pkit "github.com/ayflying/pvn/pkg/p2pkit"
 	"github.com/ayflying/pvn/pkg/protocol"
@@ -32,9 +33,9 @@ import (
 
 func main() {
 	command := gcmd.Command{
-		Name:   "pvn-agent",
-		Usage:  "pvn-agent",
-		Brief:  "Lanet 客户端：入网（建群/凭邀请加入）→ TUN 虚拟网卡 → P2P 隧道转发",
+		Name:  "pvn-agent",
+		Usage: "pvn-agent",
+		Brief: "Lanet 客户端：入网（建群/凭邀请加入）→ TUN 虚拟网卡 → P2P 隧道转发",
 		Arguments: []gcmd.Argument{
 			{Name: "ctl", Short: "c", Default: "http://127.0.0.1:8000", Brief: "控制面地址"},
 			{Name: "mode", Short: "m", Default: "join", Brief: "create=创建群组; join=凭邀请加入"},
@@ -78,8 +79,13 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 	defer stop()
 
 	// 1. 创建 libp2p Host（含打洞与自动中继能力）。
+	// RelaySource 提供 relay 候选：AutoRelay 会据此尽早连接 relay 并完成预约，
+	// 使本节点可被其他成员经中继访问（否则对端走中继时会被 NO_RESERVATION 拒绝）。
+	// relay 候选地址来自控制面 /v1/relays/candidates，先建轻量 client 再建 host。
+	peerSource := peersource.NewClient(ctlURL).AutoRelayPeerSource()
 	hostSpec := p2pkit.HostSpec{
-		UserAgent: "pvn-agent/0.1.0",
+		UserAgent:   "pvn-agent/0.1.0",
+		RelaySource: peerSource,
 	}
 	if realTUN {
 		hostSpec.ListenAddrs = []string{"/ip4/0.0.0.0/tcp/0", "/ip4/0.0.0.0/udp/0/quic-v1"}
@@ -165,11 +171,21 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 		log.Printf("通告地址失败（不影响运行，将周期重试）: %v", err)
 	}
 
+	// 5.1 主动向 relay 预约（兜底链路的关键一步）：
+	// AutoRelay 只在节点自认不可达时才预约，公网可达节点不会预约，
+	// 会导致其他成员经中继访问本节点时报 NO_RESERVATION。
+	// 因此入网后立即主动预约一次，失败不阻塞（周期任务会重试）。
+	if err := p2pkit.EnsureRelayReservation(ctx, node, peerSource, 2); err != nil {
+		log.Printf("relay 预约暂未成功（将周期重试）: %v", err)
+	} else {
+		log.Printf("relay 预约完成，可被组内成员经中继访问")
+	}
+
 	tunnelSvc := tunnelsvc.New(node, netmapCli, newRelayCandidates(ctlURL))
 	router := tundevice.New(device, tunnelSvc)
 	go router.Run(ctx)
 
-	// 6. 周期任务：刷新 NetMap + 重新通告地址（地址可能变化）。
+	// 6. 周期任务：刷新 NetMap + 重新通告地址 + 补充 relay 预约（预约会过期）。
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
@@ -187,6 +203,10 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 					addrs = append(addrs, addr.String())
 				}
 				_ = netmapCli.Announce(ctx, addrs)
+				// 预约有有效期，周期性补充（已有时 Reserve 也会刷新有效期）。
+				if err := p2pkit.EnsureRelayReservation(ctx, node, peerSource, 2); err != nil {
+					log.Printf("relay 预约补充失败（下个周期重试）: %v", err)
+				}
 			}
 		}
 	}()
@@ -195,4 +215,3 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 	<-ctx.Done()
 	log.Printf("收到退出信号，正在关闭")
 }
-

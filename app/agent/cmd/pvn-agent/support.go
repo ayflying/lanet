@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 // relayCandidates 直接实现控制面候选查询，返回 peer.AddrInfo。
@@ -67,9 +68,17 @@ func (r *relayCandidates) Candidates(ctx context.Context, number int) ([]peer.Ad
 		if err != nil {
 			continue
 		}
-		addrs := make([]string, 0, len(item.Addrs))
-		out = append(out, peer.AddrInfo{ID: id})
-		_ = addrs
+		addrs := make([]ma.Multiaddr, 0, len(item.Addrs))
+		for _, raw := range item.Addrs {
+			if addr, addrErr := ma.NewMultiaddr(raw); addrErr == nil {
+				addrs = append(addrs, addr)
+			}
+		}
+		if len(addrs) == 0 {
+			// 没有可用地址的候选无法用于建连，跳过。
+			continue
+		}
+		out = append(out, peer.AddrInfo{ID: id, Addrs: addrs})
 	}
 	return out, nil
 }
