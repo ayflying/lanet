@@ -46,46 +46,18 @@ func openStore(path string) (*store, error) {
 	// modernc/sqlite 多连接写同一文件容易 SQLITE_BUSY，收敛为单写连接。
 	db.SetMaxOpenConns(1)
 	s := &store{db: db}
-	if err := s.migrate(); err != nil {
+	// 版本化迁移（账本表 schema_migrations 记录进度，逐版本推进）。
+	if _, err := s.Migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
+// migrate 保留为兼容入口：旧调用点（测试等）走版本化迁移。
 func (s *store) migrate() error {
-	const schema = `
-CREATE TABLE IF NOT EXISTS groups (
-	id              TEXT PRIMARY KEY,
-	name            TEXT NOT NULL,
-	creator_peer_id TEXT NOT NULL,
-	invite_code     TEXT NOT NULL UNIQUE,
-	invite_expires_at DATETIME,
-	cidr            TEXT NOT NULL,
-	subnet_index    INTEGER NOT NULL UNIQUE,
-	version         INTEGER NOT NULL DEFAULT 1,
-	created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS members (
-	group_id    TEXT NOT NULL REFERENCES groups(id),
-	peer_id     TEXT PRIMARY KEY,
-	name        TEXT NOT NULL,
-	os          TEXT NOT NULL DEFAULT '',
-	virtual_ip  TEXT NOT NULL,
-	role        TEXT NOT NULL DEFAULT 'member',
-	enrolled_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_members_group ON members(group_id);
-CREATE TABLE IF NOT EXISTS announced_addrs (
-	peer_id  TEXT NOT NULL REFERENCES members(peer_id) ON DELETE CASCADE,
-	addr     TEXT NOT NULL,
-	PRIMARY KEY (peer_id, addr)
-);
-`
-	if _, err := s.db.Exec(schema); err != nil {
-		return fmt.Errorf("migrate group schema: %w", err)
-	}
-	return nil
+	_, err := s.Migrate(context.Background())
+	return err
 }
 
 func (s *store) Close() error {
