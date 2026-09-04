@@ -1,14 +1,14 @@
 // Package serverless 提供无控制面的群组成员发现：
 //
 //   - DHT（kad-dht，ModeAutoServer）：跨网段发现。每个节点把
-//     「本群 rendezvous key」作为 provider 记录发布到 DHT 网络
-//     （默认公共 IPFS DHT），同群成员通过 FindProviders 互相找到。
-//     key 由邀请码派生，不知道邀请码就无法定位群组（弱隐私边界）。
-//   - mDNS：局域网零配置发现（service tag 派生自群密钥，同群才互见）。
+//     「本网络 rendezvous key」作为 provider 记录发布到 DHT 网络
+//     （默认公共 IPFS DHT），同网络成员通过 FindProviders 互相找到。
+//     key 由网络密钥（NetworkKey）派生，不知道密钥就无法定位网络（弱隐私边界）。
+//   - mDNS：局域网零配置发现（service tag 派生自网络密钥，同网络才互见）。
 //   - 节点即服务端：每个节点默认运行 relay service 与 DHT server 模式，
-//     公网可达的成员自然成为群内的引导与中继节点。
+//     公网可达的成员自然成为网络内的引导与中继节点。
 //
-// 发现到同群成员后主动建连并交换信息（/lanet/info/1.0.0），
+// 发现到同网络成员后主动建连并交换信息（/lanet/info/1.0.0），
 // 本地维护成员表；对外实现 tunnel.GroupNetMap（按虚拟 IP 解析）
 // 与 tunnel.RelaySource（中继候选），SDK 的 Dial/OnStream 语义不变。
 package serverless
@@ -19,9 +19,18 @@ import (
 	"fmt"
 )
 
-// GroupKey 由邀请码派生群组密钥（32 字节）。
-func GroupKey(inviteCode string) []byte {
-	h := sha256.Sum256([]byte("lanet-group-v1:" + inviteCode))
+// PublicNetworkKey 公共网络密钥：Standalone 模式下 NetworkKey 留空时使用。
+// 所有未设置网络密钥的节点都加入同一张公共 P2P 网络，互相可见可连接；
+// 想私有组网请各自约定相同的 NetworkKey。
+const PublicNetworkKey = "lanet/public"
+
+// GroupKey 由网络密钥派生群组密钥（32 字节）。
+// 网络密钥留空时按公共网络密钥处理。
+func GroupKey(networkKey string) []byte {
+	if networkKey == "" {
+		networkKey = PublicNetworkKey
+	}
+	h := sha256.Sum256([]byte("lanet-group-v1:" + networkKey))
 	return h[:]
 }
 
@@ -30,7 +39,7 @@ func RendezvousKey(groupKey []byte) string {
 	return "/lanet/group/" + hex.EncodeToString(groupKey[:12])
 }
 
-// MdnsTag 局域网 mDNS service tag（同群节点才互相可见）。
+// MdnsTag 局域网 mDNS service tag（同网络节点才互相可见）。
 func MdnsTag(groupKey []byte) string {
 	return "_lanet-" + hex.EncodeToString(groupKey[:4])
 }

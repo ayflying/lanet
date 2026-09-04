@@ -30,9 +30,11 @@ const ProtocolInfo = "/lanet/info/1.0.0"
 
 // Config 发现服务配置。
 type Config struct {
-	// InviteCode 必填：群组密钥来源（同群成员持同一邀请码）。
-	InviteCode string
-	// Name 本节点名称（随 info 协议交换给同群成员）。
+	// NetworkKey 网络密钥：相同密钥的节点组成同一张 P2P 网络。
+	// 留空 = 加入公共网络（所有留空节点互通，见 PublicNetworkKey）；
+	// 填写任意非空字符串 = 私有网络，只有持相同密钥的节点能互相发现与连接。
+	NetworkKey string
+	// Name 本节点名称（随 info 协议交换给同网络成员）。
 	Name string
 	// Bootstrap DHT 引导节点 multiaddr 列表；为空时仅 mDNS（纯局域网）。
 	// 传入 DefaultBootstrap 可加入公共 DHT 网络。
@@ -75,16 +77,13 @@ type Discovery struct {
 
 // New 创建并启动发现服务：连引导节点、初始化 DHT、启动 mDNS。
 func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
-	if cfg.InviteCode == "" {
-		return nil, fmt.Errorf("serverless: InviteCode 必填")
-	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = 30 * time.Second
 	}
 	d := &Discovery{
 		host:     h,
 		cfg:      cfg,
-		groupKey: GroupKey(cfg.InviteCode),
+		groupKey: GroupKey(cfg.NetworkKey), // 空密钥按公共网络处理
 		members:  make(map[string]*Member),
 	}
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
@@ -98,7 +97,7 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		kaddht.Mode(kaddht.ModeAutoServer),
 		kaddht.BootstrapPeers(bootstraps...),
 	}
-	d.dht, err = kaddht.New(ctx, h, dhtOpts...)
+	d.dht, err = kaddht.New(h, dhtOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("serverless: init dht: %w", err)
 	}

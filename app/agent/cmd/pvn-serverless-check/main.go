@@ -18,7 +18,7 @@ import (
 )
 
 func main() {
-	invite := "grp-standalone-e2e-check"
+	networkKey := "net-standalone-e2e-check"
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -26,7 +26,7 @@ func main() {
 	nodeA, err := lanet.New(ctx, lanet.Config{
 		Name:       "node-a",
 		Standalone: true,
-		InviteCode: invite,
+		NetworkKey: networkKey,
 	})
 	if err != nil {
 		fmt.Printf("FAIL 创建节点 A: %v\n", err)
@@ -41,7 +41,7 @@ func main() {
 	nodeB, err := lanet.New(ctx, lanet.Config{
 		Name:       "node-b",
 		Standalone: true,
-		InviteCode: invite,
+		NetworkKey: networkKey,
 		Bootstrap:  bootstraps,
 	})
 	if err != nil {

@@ -31,8 +31,6 @@ package lanet
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -93,6 +91,7 @@ type Config struct {
 	// OS 操作系统标识，留空取 runtime.GOOS。
 	OS string
 	// InviteCode 凭邀请码加入群组；留空则创建新群组。
+	// 仅常规模式（CTLURL 非空）使用；Standalone 模式请改用 NetworkKey。
 	InviteCode string
 	// GroupName 创建模式下的群组名称（Join 模式忽略）。
 	GroupName string
@@ -107,14 +106,18 @@ type Config struct {
 	// Quiet 为 true 时不打日志。
 	Quiet bool
 	// Standalone 无服务器模式：不依赖 ctl/relay，经 DHT + mDNS 自动发现
-	// 同群成员组网。开启后 CTLURL 可留空；InviteCode 必填（留空则自动
-	// 生成随机邀请码，本节点创建新群组）。每个节点同时运行 DHT server
-	// 与 relay service（客户端即服务端），公网可达成员自动成为群内
-	// 引导与中继节点。
+	// 同网络成员组网。开启后 CTLURL 可留空；网络归属由 NetworkKey 决定
+	// （留空 = 公共网络）。每个节点同时运行 DHT server 与 relay service
+	// （客户端即服务端），公网可达成员自动成为网络内的引导与中继节点。
 	Standalone bool
+	// NetworkKey 仅 Standalone 模式生效：网络密钥。
+	//   - 留空：加入公共网络——所有未设置密钥的节点在同一张大网内互相可见可连；
+	//   - 填写非空值（任意约定字符串）：加入私有网络，只有持相同密钥的节点
+	//     能互相发现与连接（密钥经 SHA256 派生，不可反推）。
+	NetworkKey string
 	// Bootstrap 仅 Standalone 模式生效：DHT 引导节点 multiaddr 列表。
-	// 空且未启用 mDNS 时仅凭邀请码无法跨网发现；可填 serverless.DefaultBootstrap
-	// 加入公共 DHT，或直接填任意已在网成员的 multiaddr。
+	// 空且未启用 mDNS 时无法跨网发现；可填 serverless.DefaultBootstrap
+	// 加入公共 DHT 网络，或直接填任意已在网成员的 multiaddr（每台节点都是种子）。
 	Bootstrap []string
 }
 
@@ -149,8 +152,8 @@ type Info struct {
 
 // New 创建节点并入网：
 //   - 常规模式：CTLURL 必填；InviteCode 为空则创建新群组，否则凭码加入。
-//   - Standalone 模式：CTLURL 留空；InviteCode 为空则自动生成随机邀请码
-//     （本节点创建新群组），经 DHT + mDNS 自动发现同群成员。
+//   - Standalone 模式：CTLURL 留空；NetworkKey 留空 = 公共网络，
+//     填写相同 NetworkKey 的节点组成私有网络，经 DHT + mDNS 自动发现。
 func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Standalone && cfg.CTLURL != "" {
 		return nil, fmt.Errorf("lanet: Standalone 模式不需要 CTLURL")
@@ -170,13 +173,12 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = 8 * time.Second
 	}
-	if cfg.Standalone && cfg.InviteCode == "" {
-		// 自动生成随机邀请码：本节点即群主，Info().InviteCode 分享给成员。
-		buf := make([]byte, 8)
-		if _, err := rand.Read(buf); err != nil {
-			return nil, fmt.Errorf("lanet: 生成邀请码: %w", err)
+	if cfg.Standalone {
+		// 网络密钥：NetworkKey 优先；兼容回退 InviteCode（旧用法）；
+		// 都为空 = 公共网络（所有留空节点互通）。
+		if cfg.NetworkKey == "" {
+			cfg.NetworkKey = cfg.InviteCode
 		}
-		cfg.InviteCode = "grp-standalone-" + hex.EncodeToString(buf)
 	}
 
 	c := &Client{cfg: cfg}
@@ -217,7 +219,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	// 2. 入网。
 	if cfg.Standalone {
 		disc, err = serverless.New(ctx, node, serverless.Config{
-			InviteCode: cfg.InviteCode,
+			NetworkKey: cfg.NetworkKey,
 			Name:       cfg.Name,
 			Bootstrap:  cfg.Bootstrap,
 			EnableMDNS: true,
@@ -235,9 +237,12 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		c.groupID = "standalone"
 		c.group = "standalone-" + serverless.GroupFingerprint(disc.GroupKey())
 		c.myIP = disc.SelfVirtualIP()
-		c.cfg.InviteCode = cfg.InviteCode
 		c.created = true
-		c.logf("无服务器模式入网：虚拟 IP=%s，邀请码=%s", c.myIP, c.cfg.InviteCode)
+		if cfg.NetworkKey == "" {
+			c.logf("无服务器模式入网（公共网络）：虚拟 IP=%s", c.myIP)
+		} else {
+			c.logf("无服务器模式入网（私有网络）：虚拟 IP=%s，网络密钥=%s", c.myIP, cfg.NetworkKey)
+		}
 	} else {
 		c.netmapCli = netmapclient.NewClient(cfg.CTLURL, c.peerID)
 		if cfg.InviteCode == "" {

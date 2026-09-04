@@ -41,11 +41,11 @@ func TestInfoExchange(t *testing.T) {
 	ha := testHost(t, false)
 	hb := testHost(t, false)
 
-	da, err := New(ctx, ha, Config{InviteCode: "grp-test", Name: "node-a"})
+	da, err := New(ctx, ha, Config{NetworkKey: "grp-test", Name: "node-a"})
 	if err != nil {
 		t.Fatalf("new discovery A: %v", err)
 	}
-	db, err := New(ctx, hb, Config{InviteCode: "grp-test", Name: "node-b"})
+	db, err := New(ctx, hb, Config{NetworkKey: "grp-test", Name: "node-b"})
 	if err != nil {
 		t.Fatalf("new discovery B: %v", err)
 	}
@@ -89,5 +89,24 @@ func TestRelayServiceHopReservation(t *testing.T) {
 	_, err := client.Reserve(reserveCtx, ha, peer.AddrInfo{ID: hb.ID(), Addrs: hb.Addrs()})
 	if err != nil {
 		t.Fatalf("reserve on non-dedicated relay service: %v", err)
+	}
+}
+
+// TestNetworkKeySemantics 网络密钥语义：留空 = 公共网络（同 key），
+// 不同密钥 = 互相隔离。
+func TestNetworkKeySemantics(t *testing.T) {
+	empty := GroupKey("")
+	if string(empty) != string(GroupKey(PublicNetworkKey)) {
+		t.Fatalf("GroupKey(\"\") should equal GroupKey(PublicNetworkKey)")
+	}
+	if string(GroupKey("alpha")) == string(GroupKey("beta")) {
+		t.Fatalf("different keys must derive different group keys")
+	}
+	// 不同密钥的 rendezvous / mDNS 标识必须不同（网络隔离的基础）。
+	if RendezvousKey(GroupKey("alpha")) == RendezvousKey(GroupKey("beta")) {
+		t.Fatalf("rendezvous keys of different networks must differ")
+	}
+	if MdnsTag(GroupKey("alpha")) == MdnsTag(GroupKey("beta")) {
+		t.Fatalf("mdns tags of different networks must differ")
 	}
 }

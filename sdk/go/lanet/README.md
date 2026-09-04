@@ -103,6 +103,7 @@ client.OnStream(func(stream lanet.Stream) {
 | `DialTimeout` | time.Duration | `8s` | 开流超时 |
 | `Quiet` | bool | `false` | 为 true 时不打日志 |
 | `Standalone` | bool | `false` | 无服务器模式：不依赖 ctl/relay，DHT+mDNS 自动发现组网 |
+| `NetworkKey` | string | `""` | Standalone 专用：网络密钥。留空 = 公共网络（所有留空节点互通）；相同密钥 = 私有网络 |
 | `Bootstrap` | []string | `[]` | Standalone 专用：DHT 引导节点（`lanet.DefaultBootstrap` 或已在网成员地址） |
 
 ## API 一览
@@ -140,30 +141,40 @@ type Stream interface {
 
 `Standalone: true` 开启后**不需要部署任何自己的服务器**：
 节点同时运行 DHT server 与 relay service（客户端即服务端），
-通过 **mDNS（局域网自动发现）+ DHT（跨网发现）** 找到同群成员并自动建连。
+通过 **mDNS（局域网自动发现）+ DHT（跨网发现）** 找到同网络成员并自动建连。
 `Dial / OnStream / DialPortFWD` 等 API 与常规模式完全一致：
 
 ```go
 client, err := lanet.New(ctx, lanet.Config{
 	Name:       "my-node",
 	Standalone: true,
-	InviteCode: "grp-standalone-xxxx", // 留空则自动生成随机邀请码（本节点创建新群组）
+	NetworkKey: "our-secret-net", // 网络密钥：相同密钥的节点组成同一张私有网络
 	// 可选：DHT 引导节点；不填则局域网内仅靠 mDNS 发现
 	Bootstrap: []string{lanet.DefaultBootstrap}, // 加入公共 DHT 网络
 })
 info := client.Info()
-log.Printf("虚拟 IP=%s（自动派生），邀请码=%s", info.VirtualIP, info.InviteCode)
+log.Printf("虚拟 IP=%s（自动派生）", info.VirtualIP)
 ```
+
+**网络密钥（NetworkKey）规则**：
+
+| NetworkKey | 网络归属 | 谁能互连 |
+|---|---|---|
+| 留空 | **公共网络** | 所有未设置密钥的节点都在同一张大网内，互相可见可连（开放网络，勿传敏感数据） |
+| 任意非空字符串 | **私有网络** | 只有持**相同密钥**的节点能互相发现与连接 |
+
+密钥经 `SHA256` 派生网络标识，不可反推明文；两套密钥之间完全隔离
+（DHT rendezvous、mDNS tag、建连后群指纹校验三层都是独立的）。
 
 工作方式：
 
-- **群组即邀请码**：成员发现记录的键由邀请码派生（`SHA256`），不知道邀请码
-  就无法在 DHT 上定位该群；建连后还会经 `/lanet/info/1.0.0` 校验双方群指纹，
-  异群节点自动忽略；
-- **虚拟 IP 自动派生**：无控制面分配，按 `SHA256(群密钥, PeerID)` 确定性映射到
-  `100.64.x.x`，同群成员各自本地计算即可得到一致结果（`NetMap()` 可列出成员表）；
+- **网络即密钥**：成员发现记录的键由网络密钥派生（`SHA256`），不知道密钥
+  就无法在 DHT 上定位该网络；建连后还会经 `/lanet/info/1.0.0` 校验双方网络指纹，
+  异网络节点自动忽略；
+- **虚拟 IP 自动派生**：无控制面分配，按 `SHA256(网络密钥, PeerID)` 确定性映射到
+  `100.64.x.x`，同网络成员各自本地计算即可得到一致结果（`NetMap()` 可列出成员表）；
 - **节点即服务端**：每个节点无条件运行 Circuit Relay v2 hop 中继（默认资源配额）
-  与 kad-dht server 模式；公网可达的成员自然成为群内的引导与中继节点，
+  与 kad-dht server 模式；公网可达的成员自然成为网络内的引导与中继节点，
   NAT 后成员经 DCUtR 打洞直连，打洞失败经可达成员中继兜底；
 - **引导（Bootstrap）**：跨网发现的冷启动入口，三选一——
   1. 填 `lanet.DefaultBootstrap`（libp2p 官方公共 DHT 引导节点），
@@ -171,9 +182,10 @@ log.Printf("虚拟 IP=%s（自动派生），邀请码=%s", info.VirtualIP, info
   2. 填任意已在网成员的 multiaddr（`<addr>/p2p/<peerID>`，每台节点都是种子）；
   3. 不填：纯局域网（mDNS 自动发现）或通过 portfwd/其他渠道带外交换地址。
 
-已验证（2026-09-05，本机 e2e `pvn-serverless-check`）：同邀请码双节点无 ctl/relay，
-mDNS 秒级互发现 + info 交换，按派生虚拟 IP 双向 echo 直连往返 PASS；
-`go test ./pkg/serverless/` 覆盖 info 往返与 hop 中继预约。
+已验证（2026-09-05，本机 e2e `pvn-serverless-check`，libp2p v0.49 + kad-dht v0.42）：
+相同 NetworkKey 双节点无 ctl/relay，mDNS 秒级互发现 + info 交换，
+按派生虚拟 IP 双向 echo 直连往返 PASS；
+`go test ./pkg/serverless/` 覆盖 info 往返、hop 中继预约与网络密钥隔离语义。
 
 当前限制：NAT 后节点在打洞成功前无法被直连（成员表中的中继候选打洞后可用）；
 跨机/跨网场景（公共 DHT 引导）待真机实测；虚拟 IP 冲突未仲裁（群规模大时注意）。
