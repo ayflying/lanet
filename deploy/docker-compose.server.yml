@@ -35,6 +35,10 @@ services:
     image: ghcr.io/ayflying/lanet-relay:latest
     container_name: lanet-relay
     restart: unless-stopped
+    # 自注册到 ctl：agent 通过 /v1/relays/candidates 发现本中继。
+    command: ["-ctl", "http://ctl:8000", "-region", "default"]
+    depends_on:
+      - ctl
     ports:
       - "4001:4001/tcp"
       - "4001:4001/udp"
