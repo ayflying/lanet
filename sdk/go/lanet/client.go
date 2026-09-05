@@ -420,6 +420,9 @@ func (c *Client) DialProtocol(ctx context.Context, virtualIP string, protoID str
 	if err != nil {
 		return nil, false, err
 	}
+	if raw == nil {
+		return nil, false, fmt.Errorf("lanet: 拨号 %s 返回空流（内部错误）", virtualIP)
+	}
 	return streamAdapter{Stream: raw, viaRelay: viaRelay}, viaRelay, nil
 }
 

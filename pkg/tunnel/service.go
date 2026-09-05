@@ -154,6 +154,10 @@ func (s *Service) openViaRelay(ctx context.Context, target peer.ID, proto libpro
 		}
 		return stream, nil
 	}
+	if lastErr == nil {
+		// 候选全被排除（如唯一候选就是目标自身）等情况。
+		lastErr = fmt.Errorf("no usable relay candidate (excluded target %s)", target)
+	}
 	return nil, lastErr
 }
 
