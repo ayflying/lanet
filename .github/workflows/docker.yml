@@ -44,6 +44,9 @@ jobs:
           - name: agent
             dockerfile: build/agent.Dockerfile
             image: lanet-agent
+          - name: node
+            dockerfile: build/node.Dockerfile
+            image: lanet-node
 
     steps:
       - name: Checkout

@@ -26,6 +26,9 @@ func main() {
 
 	client, err := lanet.New(ctx, lanet.Config{
 		CTLURL: *ctlURL, Name: *name, InviteCode: *invite, GroupName: "web-demo-group",
+		// echo 节点职责就是对外提供应用流：放行全部来源的流与端口转发。
+		FirewallMode:  lanet.FirewallModeAllowList,
+		FirewallRules: []lanet.FirewallRule{{Source: "*", Proto: lanet.FirewallProtoAny, Port: "*"}},
 	})
 	if err != nil {
 		log.Fatalf("入网失败: %v", err)
