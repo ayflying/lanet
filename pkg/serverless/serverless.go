@@ -17,6 +17,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	ma "github.com/multiformats/go-multiaddr"
+	madns "github.com/multiformats/go-multiaddr-dns"
 	mh "github.com/multiformats/go-multihash"
 )
 
@@ -89,7 +90,7 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
 
 	// 1. DHT：默认每台节点都是 server（客户端即服务端）。
-	bootstraps, err := parseBootstrap(cfg.Bootstrap)
+	bootstraps, err := parseBootstrap(ctx, cfg.Bootstrap)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +113,7 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 
 // Start 完成引导连接、DHT 自举与信息协议注册。非阻塞部分尽力而为。
 func (d *Discovery) Start(ctx context.Context) error {
-	for _, b := range parseBootstrapQuiet(d.cfg.Bootstrap) {
+	for _, b := range parseBootstrapQuiet(ctx, d.cfg.Bootstrap) {
 		dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		if err := d.host.Connect(dialCtx, b); err != nil {
 			d.logf("引导节点连接失败（不影响运行）: %v", err)
@@ -368,26 +369,39 @@ func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 }
 
 // parseBootstrap 解析引导节点地址。
-func parseBootstrap(addrs []string) ([]peer.AddrInfo, error) {
+// parseBootstrap 解析引导地址：支持普通 multiaddr 与 /dnsaddr/（经
+// DNS TXT 记录解析出具体地址列表，含 /p2p 节点 ID，如官方公共 DHT）。
+func parseBootstrap(ctx context.Context, addrs []string) ([]peer.AddrInfo, error) {
 	out := make([]peer.AddrInfo, 0, len(addrs))
 	for _, raw := range addrs {
 		ma0, err := ma.NewMultiaddr(raw)
 		if err != nil {
 			return nil, fmt.Errorf("serverless: 引导地址 %q 非法: %w", raw, err)
 		}
-		ai, err := peer.AddrInfoFromP2pAddr(ma0)
-		if err != nil || ai == nil {
-			// dnsaddr 无 /p2p 后缀也可作为引导（解析时确定 ID）。
-			out = append(out, peer.AddrInfo{Addrs: []ma.Multiaddr{ma0}})
-			continue
+		resolved := []ma.Multiaddr{ma0}
+		if _, errIsDNS := ma0.ValueForProtocol(ma.P_DNSADDR); errIsDNS == nil {
+			rs, rerr := madns.DefaultResolver.Resolve(ctx, ma0)
+			if rerr != nil {
+				return nil, fmt.Errorf("serverless: dnsaddr %q 解析失败: %w", raw, rerr)
+			}
+			if len(rs) == 0 {
+				continue
+			}
+			resolved = rs
 		}
-		out = append(out, *ai)
+		for _, r := range resolved {
+			ai, err := peer.AddrInfoFromP2pAddr(r)
+			if err != nil || ai == nil {
+				continue // 无 /p2p 组件的地址无法确定节点 ID，跳过
+			}
+			out = append(out, *ai)
+		}
 	}
 	return out, nil
 }
 
-func parseBootstrapQuiet(addrs []string) []peer.AddrInfo {
-	out, _ := parseBootstrap(addrs)
+func parseBootstrapQuiet(ctx context.Context, addrs []string) []peer.AddrInfo {
+	out, _ := parseBootstrap(ctx, addrs)
 	return out
 }
 
