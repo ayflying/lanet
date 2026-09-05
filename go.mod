@@ -3,13 +3,16 @@ module github.com/ayflying/pvn
 go 1.25.7
 
 require (
+	github.com/getlantern/systray v1.2.2
 	github.com/gogf/gf/v2 v2.10.3
 	github.com/gorilla/websocket v1.5.3
 	github.com/ipfs/go-cid v0.6.2
 	github.com/libp2p/go-libp2p v0.49.0
 	github.com/libp2p/go-libp2p-kad-dht v0.42.2
 	github.com/multiformats/go-multiaddr v0.16.1
+	github.com/multiformats/go-multiaddr-dns v0.6.0
 	github.com/multiformats/go-multihash v0.2.3
+	golang.org/x/sys v0.47.0
 	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 	modernc.org/sqlite v1.58.0
 )
@@ -37,7 +40,6 @@ require (
 	github.com/getlantern/hex v0.0.0-20190417191902-c6586a6fe0b7 // indirect
 	github.com/getlantern/hidden v0.0.0-20190325191715-f02dbb02be55 // indirect
 	github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f // indirect
-	github.com/getlantern/systray v1.2.2 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-stack/stack v1.8.0 // indirect
@@ -78,7 +80,6 @@ require (
 	github.com/mr-tron/base58 v1.3.0 // indirect
 	github.com/multiformats/go-base32 v0.1.0 // indirect
 	github.com/multiformats/go-base36 v0.2.0 // indirect
-	github.com/multiformats/go-multiaddr-dns v0.6.0 // indirect
 	github.com/multiformats/go-multiaddr-fmt v0.1.0 // indirect
 	github.com/multiformats/go-multibase v0.3.0 // indirect
 	github.com/multiformats/go-multicodec v0.10.0 // indirect
@@ -136,7 +137,6 @@ require (
 	golang.org/x/mod v0.38.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260717140457-bdb89881bb75 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/time v0.15.0 // indirect

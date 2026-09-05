@@ -33,41 +33,37 @@ Lanet 是一个自研的群组制 P2P 虚拟局域网系统：客户端创建群
 
 ## 快速开始
 
-### 方式一：Docker Compose 部署服务端（推荐）
+### 方式一：Docker Compose 部署公网节点（仅 Linux）
 
-镜像由 CI 自动编译发布到 GHCR（`linux/amd64` + `linux/arm64`）：
+镜像由 CI 自动编译发布到 GHCR（`linux/amd64` + `linux/arm64`）。典型用法：
+把根目录 `docker-compose.yml` 放到一台**有公网 IP 的 VPS** 上，充当整个网络的
+引导 + 中继节点，让各自 NAT 后的成员稳定互通：
 
 ```bash
 git clone https://github.com/ayflying/lanet.git && cd lanet
-docker compose -f deploy/docker-compose.server.yml up -d
+vim docker-compose.yml   # 直接在 environment 段改：节点名 / 网络密钥 / 控制台密码
+docker compose up -d
 ```
 
-该编排启动两个服务：
+| 配置项 | 说明 |
+|---|---|
+| `LANET_NAME` | 节点名称（成员表中的虚拟域名） |
+| `LANET_NETWORK_KEY` | 网络密钥，与要服务的群组一致（留空 = 公共网络） |
+| `LANET_CONSOLE` | `0.0.0.0:8900` = 允许外网访问控制台；`127.0.0.1:8900` = 仅本机 |
+| `LANET_CONSOLE_PASSWORD` | 控制台密码（外网开放时务必设置） |
 
-| 服务 | 镜像 | 端口 | 说明 |
-|---|---|---|---|
-| ctl | `ghcr.io/ayflying/lanet-ctl:latest` | 8000/tcp | 控制面 API，数据持久化在 `./data` |
-| relay | `ghcr.io/ayflying/lanet-relay:latest` | 4001/tcp+udp | P2P 中继兜底转发 |
+数据（`node.key` / `lanet.json` / 日志）持久化在 `lanet-node-data` 命名卷。
+防火墙放行 `8900/tcp` + `4001/tcp` + `4001/udp`。
 
-### 方式二：客户端容器（Linux 主机）
-
-```bash
-PVN_CTL_ADDR=http://<服务端IP>:8000 PVN_NAME=pc1 \
-PVN_MODE=join PVN_INVITE=<邀请码> \
-docker compose -f deploy/docker-compose.agent.yml up -d
-```
-
-需要 `NET_ADMIN` 权限与 `/dev/net/tun`（编排文件已声明）。
-
-### 方式三：Windows / Linux 单程序（发行包，推荐）
+### 方式二：Windows / Linux 单程序（发行包，推荐）
 
 从 [Releases](https://github.com/ayflying/lanet/releases) 下载对应平台压缩包并解压。
 **只有一个程序 `lanet`**——客户端与服务端一体，无需部署任何服务器。
 
-**Windows 双击即用**：右键以管理员身份运行 `lanet.exe`（无黑框窗口），
-桌面托盘出现图标、浏览器自动打开 Web 控制台；在「节点配置」里填好
-节点名称与网络密钥，保存后重启程序即完成入网。托盘右键可打开控制台或退出。
-`wintun.dll` 必须与 `lanet.exe` 同目录。
+**Windows 双击即用**：双击 `lanet.exe`，在 UAC 弹窗点「是」即可（程序内置
+管理员清单，无需右键提权）。无黑框窗口，桌面托盘出现图标、浏览器自动打开
+Web 控制台；在「节点配置」里填好节点名称与网络密钥，保存后重启程序即完成
+入网。托盘右键可打开控制台或退出。`wintun.dll` 必须与 `lanet.exe` 同目录。
 
 ```powershell
 # 命令行方式（可选，参数会覆盖 lanet.json 配置文件）
@@ -85,7 +81,7 @@ docker compose -f deploy/docker-compose.agent.yml up -d
 SDK 侧对应 `Config.ConsolePassword`。容器镜像默认已监听 `0.0.0.0`（环境变量
 `LANET_CONSOLE`），远程暴露时同样务必设置 `LANET_CONSOLE_PASSWORD`。
 
-### 方式四：源码运行（开发调试）
+### 方式三：源码运行（开发调试）
 
 ```bash
 go run ./app/ctl                                  # 控制面（默认 :8000）
@@ -214,7 +210,7 @@ go run ./app/gateway/cmd/pvn-gateway -ctl http://ctl:8000 -invite XXXXXXXXXX
 
 ### relay 链路说明
 
-- relay 启动时通过 `-ctl http://<ctl>:8000` 向控制面**自注册**，之后每 30s 心跳保活；心跳失联会自动重新注册。容器编排（`deploy/docker-compose.server.yml`）已默认配置。
+- relay 启动时通过 `-ctl http://<ctl>:8000` 向控制面**自注册**，之后每 30s 心跳保活；心跳失联会自动重新注册。
 - 容器 NAT 环境下 relay 通告的默认是容器内网地址，外部 agent 不可达——用 `PVN_RELAY_ADVERTISE` 显式指定宿主可达地址（逗号分隔 multiaddr，如 `/ip4/1.2.3.4/tcp/4001,/ip4/1.2.3.4/udp/4001/quic-v1`）。
 - agent 入网后会**主动向 relay 预约**（`EnsureRelayReservation`，周期补充）：Circuit Relay v2 要求目标 peer 必须有 Reservation，否则对端经中继拨号会报 `NO_RESERVATION(204)`。AutoRelay 只在节点自认不可达时才预约，公网可达节点必须靠主动预约兜底。
 - ctl 对超过 150s 无心跳的候选做惰性清理，agent 不会拿到失效 relay。
@@ -249,8 +245,8 @@ schema 迁移采用账本表 `schema_migrations` 记录版本，迁移以有序�
 
 | 发行包 | 内容 |
 |---|---|
-| `lanet-{版本}-windows-amd64.zip` | lanet-agent / ctl / relay / node（exe）+ wintun.dll + README + VERSION |
-| `lanet-{版本}-linux-amd64.tar.gz` | lanet-agent / ctl / relay / node + VERSION |
+| `lanet-{版本}-windows-amd64.zip` | lanet.exe（单程序）+ wintun.dll + README + VERSION |
+| `lanet-{版本}-linux-amd64.tar.gz` | lanet（单程序）+ VERSION |
 | `lanet-{版本}-linux-arm64.tar.gz` | 同上（arm64） |
 | `sha256sums.txt` | 全部压缩包校验和 |
 
@@ -307,9 +303,9 @@ pkg/                          跨应用共享库
   tunnel/        隧道服务（直连→中继三段降级）
   netmapclient/  NetMap 客户端
   tundevice/     TUN 设备与路由器
-build/                        容器镜像 Dockerfile（ctl/relay/agent）
-deploy/                       容器编排（服务端 / 客户端）
-packaging/                    发行包附带文件（README、logo 图标）
+build/                        容器镜像 Dockerfile（ctl/relay/agent/node）
+docker-compose.yml           公网节点容器编排（仅 Linux，配置直接写在文件里）
+packaging/                    发行包附带文件（README、logo 图标、Windows 提权清单）
 .github/workflows/            CI：docker（容器镜像）、release（全平台压缩发行包）
 ```
 

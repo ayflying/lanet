@@ -24,7 +24,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -253,13 +252,13 @@ func applyUpdate() error {
 
 	log.Printf("[update] 开始下载 %s", assetName)
 	archivePath := filepath.Join(workDir, assetName)
-	sum, err := downloadToFile(assetURL, archivePath)
+	sum, err := downloadToFile(assetURL, archivePath, upd.token)
 	if err != nil {
 		return fmt.Errorf("下载失败: %w", err)
 	}
 	// sha256 校验（对比发行包内 sha256sums.txt）。
 	if sumsURL := sha256sumsURL(assetURL, assetName); sumsURL != "" {
-		if err = verifySHA256(sumsURL, assetName, sum); err != nil {
+		if err = verifySHA256(sumsURL, assetName, sum, upd.token); err != nil {
 			return fmt.Errorf("校验失败: %w", err)
 		}
 		log.Printf("[update] sha256 校验通过 %s", hex.EncodeToString(sum)[:16]+"…")
@@ -293,12 +292,15 @@ func sha256sumsURL(assetURL, assetName string) string {
 	return strings.TrimSuffix(assetURL, assetName) + "sha256sums.txt"
 }
 
-func verifySHA256(sumsURL, assetName string, sum []byte) error {
+func verifySHA256(sumsURL, assetName string, sum []byte, token string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sumsURL, nil)
 	if err != nil {
 		return err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -322,12 +324,17 @@ func verifySHA256(sumsURL, assetName string, sum []byte) error {
 	return fmt.Errorf("sha256sums.txt 中找不到 %s", assetName)
 }
 
-func downloadToFile(url, path string) ([]byte, error) {
+func downloadToFile(url, path, token string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
+	}
+	// 私有仓库的发行包必须带 Token（browser_download_url 302 到签名对象存储，
+	// 跳转后不再需要鉴权，多余的头无副作用）。
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -467,13 +474,13 @@ func extOf() string {
 }
 
 // spawnSelf 以当前参数启动一个新进程（独立进程组，不随父进程退出）。
+// Windows：新 exe 内嵌 requireAdministrator 清单，非提权父进程 CreateProcess
+// 会报 740，此时降级 ShellExecute "runas"（已提权则无感，未提权弹 UAC 确认）。
 func spawnSelf() error {
-	exe := selfExe()
-	cmd := exec.Command(exe, os.Args[1:]...)
-	cmd.Dir = filepath.Dir(exe)
-	cmd.Stdout, cmd.Stderr = nil, nil
-	cmd.SysProcAttr = spawnSysProcAttr
-	return cmd.Start()
+	if elevated, err := spawnSelfWindows(); elevated || err != nil {
+		return err // Windows 路径已处理（含提权降级）
+	}
+	return nil
 }
 
 // restartSelf 延迟拉起新进程后退出当前进程（延迟用于让 HTTP 响应先送达）。

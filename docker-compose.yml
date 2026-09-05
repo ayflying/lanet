@@ -1,18 +1,14 @@
 # =================================================================================
-# Lanet 单节点容器编排（lanet-node：客户端=服务端一体，项目唯一组件）。
-# 典型用途：部署在一台有公网 IP 的 VPS 上，充当整个网络的引导 + 中继节点，
+# Lanet 公网节点容器编排（仅 Linux；Windows 用发行包 lanet.exe，与此文件无关）。
+# 用途：部署在一台有公网 IP 的 VPS 上，充当整个网络的引导 + 中继节点，
 # 让各自 NAT 后的成员稳定互通（直连优先，打洞失败经本节点中继转发）。
-# 镜像由 GitHub Actions 自动编译并推送（.github/workflows/docker.yml）。
+# 镜像由 GitHub Actions 自动构建推送：ghcr.io/ayflying/lanet-node（linux/amd64+arm64）。
 #
-#   启动：在 deploy/ 目录创建 .env 文件（参考下方示例）后
+#   启动：改好下方 environment 后
 #         docker compose up -d
+#   防火墙放行：8900/tcp（控制台）+ 4001/tcp + 4001/udp（P2P 直连与打洞）
 #
-# .env 示例：
-#   LANET_NAME=vps-node
-#   LANET_NETWORK_KEY=lanet-test
-#   LANET_CONSOLE_PASSWORD=请改成强密码
-#
-# 环境变量说明（pvn-node 原生读取，非 compose 插值）：
+# 配置直接改本文件的 environment 段（保存后 docker compose up -d 重建生效）：
 #   LANET_NAME              节点名称（成员表中的虚拟域名）
 #   LANET_NETWORK_KEY       网络密钥；与要服务的群组保持一致（留空 = 公共网络）
 #   LANET_CONSOLE           控制台监听地址：0.0.0.0:8900 = 允许外网访问；
@@ -28,14 +24,14 @@ services:
     container_name: lanet-node
     restart: unless-stopped
     environment:
-      LANET_NAME: ${LANET_NAME:-vps-node}
-      LANET_NETWORK_KEY: ${LANET_NETWORK_KEY:-}
+      LANET_NAME: vps-node
+      LANET_NETWORK_KEY: lanet-test
       # ---- 控制台：能否外网访问 + 访问密码 ----
-      LANET_CONSOLE: ${LANET_CONSOLE:-0.0.0.0:8900}
-      LANET_CONSOLE_PASSWORD: ${LANET_CONSOLE_PASSWORD:-}
-      LANET_BOOTSTRAP: ${LANET_BOOTSTRAP:-public}
+      LANET_CONSOLE: 0.0.0.0:8900
+      LANET_CONSOLE_PASSWORD: "请改成强密码"
+      LANET_BOOTSTRAP: public
       # ---- 固定 P2P 端口，防火墙只需放行 4001/tcp + 4001/udp ----
-      LANET_LISTEN: ${LANET_LISTEN:-/ip4/0.0.0.0/tcp/4001,/ip4/0.0.0.0/udp/4001/quic-v1}
+      LANET_LISTEN: "/ip4/0.0.0.0/tcp/4001,/ip4/0.0.0.0/udp/4001/quic-v1"
     ports:
       - "8900:8900"      # Web 控制台（仅当 LANET_CONSOLE=0.0.0.0:8900 时对外有意义）
       - "4001:4001/tcp"  # P2P 直连与中继流量
