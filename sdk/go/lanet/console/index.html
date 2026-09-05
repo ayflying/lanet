@@ -14,6 +14,16 @@
   .sub { color:var(--muted); font-size:12px; margin-bottom:18px; }
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; max-width:1100px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .tabs { display:flex; gap:4px; max-width:1100px; margin-bottom:14px; border-bottom:2px solid var(--line); }
+  .tab { padding:9px 18px; border:0; background:none; color:var(--muted); font-size:14px; cursor:pointer;
+         border-radius:8px 8px 0 0; border-bottom:2px solid transparent; margin-bottom:-2px; }
+  .tab:hover { color:var(--txt); background:#eceef2; }
+  .tab.active { color:var(--accent); font-weight:600; border-bottom-color:var(--accent); background:none; }
+  .tab .badge { display:inline-block; min-width:18px; padding:0 5px; margin-left:5px; border-radius:9px;
+                background:#eef0f3; color:var(--muted); font-size:11px; font-weight:400; text-align:center; }
+  .panel { display:none; max-width:1100px; }
+  .panel.active { display:block; }
+  .panel .card { max-width:1100px; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
   th { color:var(--muted); font-weight:500; }
@@ -39,13 +49,21 @@
 <body>
 <h1>Lanet 节点控制台</h1>
 <div class="sub" id="addrLine">加载中…</div>
-<div class="grid">
+<div class="tabs">
+  <button class="tab active" data-panel="pMembers" onclick="switchTab(this)">成员与链路 <span class="badge" id="bMembers">0</span></button>
+  <button class="tab" data-panel="pFirewall" onclick="switchTab(this)">入向防火墙 <span class="badge" id="bRules">0</span></button>
+  <button class="tab" data-panel="pForwards" onclick="switchTab(this)">端口转发 <span class="badge" id="bForwards">0</span></button>
+  <button class="tab" data-panel="pConfig" id="tabConfig" onclick="switchTab(this)" style="display:none">节点配置</button>
+</div>
 
+<div class="panel active" id="pMembers">
   <div class="card">
     <h2>成员与链路</h2>
     <div id="members" class="empty">加载中…</div>
   </div>
+</div>
 
+<div class="panel" id="pFirewall">
   <div class="card">
     <h2>入向防火墙</h2>
     <div class="row">
@@ -72,7 +90,9 @@
     <button class="ghost" onclick="loadState()">刷新</button>
     <div class="msg" id="fwMsg"></div>
   </div>
+</div>
 
+<div class="panel" id="pForwards">
   <div class="card">
     <h2>局域网端口转发</h2>
     <div class="sub" style="margin-bottom:8px">群内成员访问「本节点虚拟 IP : Listen」时，转发到局域网设备 Target。</div>
@@ -86,8 +106,10 @@
     <button class="ghost" onclick="loadState()">刷新</button>
     <div class="msg" id="fwdMsg"></div>
   </div>
+</div>
 
-  <div class="card" id="cfgCard" style="display:none">
+<div class="panel" id="pConfig">
+  <div class="card">
     <h2>节点配置 <span class="tag unknown">保存后重启程序生效</span></h2>
     <div class="sub" style="margin-bottom:8px">写入程序同目录 lanet.json。防火墙与端口转发即时生效无需重启；此处的防火墙字段仅作为下次启动的初始值。</div>
     <div class="kv"><b>节点名称</b><input type="text" id="cName"></div>
@@ -130,7 +152,15 @@ async function loadState() {
         `<td><span class="tag ${esc(m.path)}">${esc(m.path)}</span></td></tr>`).join('') +
       '</table>';
   $('fwMode').value = S.mode;
+  $('bMembers').textContent = S.members.length;
+  $('bRules').textContent = S.rules.length;
+  $('bForwards').textContent = S.forwards.length;
   renderRules(); renderForwards();
+}
+
+function switchTab(btn) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === btn));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === btn.dataset.panel));
 }
 function renderRules() {
   $('ruleList').innerHTML = S.rules.length === 0
@@ -182,7 +212,42 @@ async function saveForwards() {
   loadState();
 }
 function flash(id, text, ok) { $(id).textContent = text; $(id).className = 'msg ' + (ok ? 'ok' : 'bad'); }
-loadState(); setInterval(loadState, 10000);
+
+// ---- 节点配置（仅宿主程序注册了 /api/node-config 时显示页签，SDK 库内使用自动隐藏） ----
+async function loadNodeConfig() {
+  try {
+    const r = await fetch('/api/node-config');
+    if (!r.ok) return;
+    const c = await r.json();
+    $('tabConfig').style.display = '';
+    $('cName').value = c.name || '';
+    $('cKey').value = c.network_key || '';
+    $('cBoot').value = c.bootstrap || 'public';
+    $('cFW').value = c.firewall || 'allow-all';
+    $('cConsole').value = c.console || '';
+    $('cListen').value = c.listen || '';
+    $('cIdentity').value = c.identity || '';
+    $('cNoPublic').checked = !!c.no_public_dht;
+  } catch (e) { /* 无此接口（纯 SDK 场景）：保持页签隐藏 */ }
+}
+async function saveNodeConfig() {
+  const body = {
+    name: $('cName').value.trim(),
+    network_key: $('cKey').value,
+    bootstrap: $('cBoot').value.trim() || 'public',
+    firewall: $('cFW').value,
+    console: $('cConsole').value.trim(),
+    listen: $('cListen').value.trim(),
+    no_public_dht: $('cNoPublic').checked,
+  };
+  if (!body.name || !body.console) { flash('cfgMsg', '节点名称与控制台地址不能为空', false); return; }
+  const r = await fetch('/api/node-config', { method: 'PUT',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+  const res = await r.json().catch(() => ({}));
+  flash('cfgMsg', r.ok ? '已保存，重启程序后生效' : ('保存失败' + (res.error ? '：' + res.error : '')), r.ok);
+}
+
+loadState(); loadNodeConfig(); setInterval(loadState, 10000);
 </script>
 </body>
 </html>
