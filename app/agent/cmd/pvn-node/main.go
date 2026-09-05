@@ -117,6 +117,14 @@ func main() {
 			effProbe = 20 * time.Second
 		}
 	}
+	eff := nodeRuntime{
+		Name:        effName,
+		NetworkKey:  effKey,
+		Console:     effConsole,
+		Listen:      effListen,
+		Firewall:    effFW,
+		NoPublicDHT: effNoPublic,
+	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s noPublicDHT=%v version=%s config=%s",
@@ -141,7 +149,7 @@ func main() {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	extra := nodeConfigRoutes(*config)
+	extra := nodeConfigRoutes(*config, eff)
 	for pattern, handler := range updateRoutes(cancel) {
 		extra[pattern] = handler
 	}
@@ -425,8 +433,25 @@ func (nc *nodeConfig) save(path string) error {
 	return os.Rename(tmp, path)
 }
 
+// nodeRuntime 当前进程实际生效的运行参数。可能来自命令行/环境变量，
+// 与 lanet.json 保存值不一致（配置页据此提示「重启后才切换」）。
+type nodeRuntime struct {
+	Name        string
+	NetworkKey  string
+	Console     string
+	Listen      string
+	Firewall    string
+	NoPublicDHT bool
+}
+
+// networkID 运行时网络标识（与 SDK/控制台页眉一致）：standalone- + 群组指纹。
+func networkID(networkKey string) string {
+	return "standalone-" + serverless.GroupFingerprint(serverless.GroupKey(networkKey))
+}
+
 // nodeConfigRoutes 节点配置 API：GET 读取 / PUT 保存（写回 lanet.json，重启生效）。
-func nodeConfigRoutes(path string) map[string]http.HandlerFunc {
+// GET 同时返回 runtime（当前进程实际生效值），前端据此提示与文件保存值的差异。
+func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc {
 	read := func() nodeConfig {
 		var nc nodeConfig
 		if data, err := os.ReadFile(path); err == nil {
@@ -449,6 +474,16 @@ func nodeConfigRoutes(path string) map[string]http.HandlerFunc {
 				"listen":        nc.Listen,
 				"no_public_dht": nc.NoPublicDHT,
 				"probe_seconds": nc.ProbeSec,
+				"runtime": map[string]any{
+					"name":          eff.Name,
+					"network_key":   eff.NetworkKey,
+					"network_id":    networkID(eff.NetworkKey),
+					"network_text":  networkLabel(eff.NetworkKey),
+					"console":       eff.Console,
+					"listen":        eff.Listen,
+					"firewall":      eff.Firewall,
+					"no_public_dht": eff.NoPublicDHT,
+				},
 			})
 		},
 		"PUT /api/node-config": func(w http.ResponseWriter, r *http.Request) {

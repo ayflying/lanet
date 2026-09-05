@@ -167,6 +167,7 @@
   <div class="card">
     <h2>节点配置 <span class="tag unknown">保存后重启程序生效</span></h2>
     <div class="sub" style="margin-bottom:8px">写入程序同目录 lanet.json，保存后重启程序生效。控制台默认仅本机可访问（127.0.0.1）；改为 0.0.0.0:8900 允许远程时，请务必同时设置控制台密码。</div>
+    <div class="sub" id="cRuntime" style="display:none;margin-bottom:8px;padding:8px 10px;border:1px solid #d8dee9;border-radius:6px;background:#f6f8fa"></div>
     <div class="kv"><b>节点名称</b><input type="text" id="cName"></div>
     <div class="kv"><b>网络密钥</b><input type="text" id="cKey" placeholder="留空 = 公共网络；相同密钥 = 同一私有网络"></div>
     <div class="kv"><b>控制台</b><input type="text" id="cConsole" placeholder="127.0.0.1:8900 = 仅本机，0.0.0.0:8900 = 允许远程，- = 关闭"></div>
@@ -301,7 +302,21 @@ async function loadNodeConfig() {
     $('cListen').value = c.listen || '';
     $('cIdentity').value = c.identity || '';
     $('cNoPublic').checked = !!c.no_public_dht;
+    renderRuntimeBanner(c);
   } catch (e) { /* 无此接口（纯 SDK 场景）：保持页签隐藏 */ }
+}
+
+// renderRuntimeBanner 显示当前进程实际生效的网络（可能来自启动参数，与文件保存值不同）。
+function renderRuntimeBanner(c) {
+  const banner = $('cRuntime');
+  const rt = c.runtime;
+  if (!rt) { banner.style.display = 'none'; return; }
+  const keyDesc = rt.network_key ? '私有密钥 <b>' + esc(rt.network_key) + '</b>' : '公共网络（未设密钥）';
+  const sameKey = (rt.network_key || '') === (c.network_key || '');
+  const diffWarn = sameKey
+    ? '与下方保存值一致。'
+    : '<b style="color:#c0392b">与下方保存的网络密钥不一致</b>——当前仍运行在上方所示网络，修改保存并重启程序后才会切换。';
+  banner.innerHTML = '<b>当前进程运行中：</b>网络 <b>' + esc(rt.network_id || '') + '</b>（' + keyDesc + '）。' + diffWarn;
 }
 async function saveNodeConfig() {
   const body = {
