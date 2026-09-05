@@ -48,7 +48,7 @@ var client = await LanetGatewayClient.ConnectAsync(new GatewayOptions
 Console.WriteLine($"入网成功: 虚拟IP={client.Info.VirtualIP}, 群组={client.Info.Group}");
 
 // 2. 访问网格内 TCP 服务（目标节点虚拟 IP + 其本机端口）
-var stream = await client.DialAsync("100.64.0.3", 9999);
+var stream = await client.DialAsync("10.7.0.3", 9999);
 await stream.WriteStringAsync("hello");
 await stream.CloseWriteAsync();                       // 对端读到 EOF（务必调用）
 byte[] reply = await stream.ReadAllAsync();           // 读到对端 EOF 为止
@@ -56,7 +56,7 @@ Console.WriteLine(Encoding.UTF8.GetString(reply));
 stream.Dispose();
 
 // 3. 自定义协议流（对端节点注册了该协议处理器时）
-var s2 = await client.DialProtocolAsync("100.64.0.3", "/myapp/1.0.0");
+var s2 = await client.DialProtocolAsync("10.7.0.3", "/myapp/1.0.0");
 
 // 4. 心跳（长连接建议每 30s 一次）
 await client.PingAsync();

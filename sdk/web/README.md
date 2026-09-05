@@ -47,7 +47,7 @@ node.onStream(async (stream) => {
 })
 
 // 3. 按虚拟 IP 主动开流
-const stream = await node.dial('100.64.0.2')
+const stream = await node.dial('10.7.0.2')
 stream.send(new TextEncoder().encode('hello'))
 await stream.closeWrite() // 请求体发送完毕，等对端回包后 EOF
 ```

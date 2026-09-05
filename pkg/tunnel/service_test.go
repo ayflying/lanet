@@ -51,7 +51,7 @@ func TestOpenStreamRejectsUnknownVirtualIP(t *testing.T) {
 	self := newTestHost(t)
 	defer self.Close()
 	service := New(self, &fakeNetmap{}, fakeRelaySource{})
-	if _, _, err := service.OpenStreamToVirtualIP(context.Background(), "100.64.0.99"); err == nil {
+	if _, _, err := service.OpenStreamToVirtualIP(context.Background(), "10.7.0.99"); err == nil {
 		t.Fatal("expected unknown virtual IP to be rejected")
 	}
 }

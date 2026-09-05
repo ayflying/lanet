@@ -23,11 +23,11 @@ func TestRefreshParsesGroupSnapshot(t *testing.T) {
 			"data": map[string]any{
 				"group_id":   "g0",
 				"group_name": "alpha",
-				"cidr":       "100.64.0.0/24",
+				"cidr":       "10.7.0.0/24",
 				"version":    3,
 				"members": []map[string]any{
-					{"peer_id": "peer-a", "name": "a", "os": "windows", "virtual_ip": "100.64.0.2", "addrs": []string{}},
-					{"peer_id": "peer-b", "name": "b", "os": "linux", "virtual_ip": "100.64.0.3", "addrs": []string{"/ip4/203.0.113.5/udp/4001/quic-v1"}},
+					{"peer_id": "peer-a", "name": "a", "os": "windows", "virtual_ip": "10.7.0.2", "addrs": []string{}},
+					{"peer_id": "peer-b", "name": "b", "os": "linux", "virtual_ip": "10.7.0.3", "addrs": []string{"/ip4/203.0.113.5/udp/4001/quic-v1"}},
 				},
 			},
 		})
@@ -44,10 +44,10 @@ func TestRefreshParsesGroupSnapshot(t *testing.T) {
 	}
 
 	routes := client.Routes()
-	if len(routes) != 2 || routes[0].VirtualIP != "100.64.0.2" || routes[1].VirtualIP != "100.64.0.3" {
+	if len(routes) != 2 || routes[0].VirtualIP != "10.7.0.2" || routes[1].VirtualIP != "10.7.0.3" {
 		t.Fatalf("routes not sorted as expected: %+v", routes)
 	}
-	route, ok := client.Resolve("100.64.0.3")
+	route, ok := client.Resolve("10.7.0.3")
 	if !ok || route.PeerID != "peer-b" || len(route.Addrs) != 1 {
 		t.Fatalf("resolve failed: %+v ok=%v", route, ok)
 	}

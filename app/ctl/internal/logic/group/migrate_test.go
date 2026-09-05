@@ -99,11 +99,11 @@ CREATE TABLE announced_addrs (
 		t.Fatalf("legacy schema: %v", err)
 	}
 	if _, err := raw.Exec(`INSERT INTO groups (id, name, creator_peer_id, invite_code, cidr, subnet_index)
-		VALUES ('g0','legacy','peer-a','CODE123456','100.64.0.0/24',0)`); err != nil {
+		VALUES ('g0','legacy','peer-a','CODE123456','10.7.0.0/24',0)`); err != nil {
 		t.Fatalf("insert legacy group: %v", err)
 	}
 	if _, err := raw.Exec(`INSERT INTO members (group_id, peer_id, name, virtual_ip, role)
-		VALUES ('g0','peer-a','owner-a','100.64.0.2','owner')`); err != nil {
+		VALUES ('g0','peer-a','owner-a','10.7.0.2','owner')`); err != nil {
 		t.Fatalf("insert legacy member: %v", err)
 	}
 	raw.Close()
@@ -153,7 +153,7 @@ func TestSnapshotBackup(t *testing.T) {
 
 	// 写入数据（不经 Registry，直接 SQL 保持测试聚焦迁移模块）。
 	if _, err := st.db.Exec(`INSERT INTO groups (id, name, creator_peer_id, invite_code, cidr, subnet_index)
-		VALUES ('g0','bak','peer-a','CODE123456','100.64.0.0/24',0)`); err != nil {
+		VALUES ('g0','bak','peer-a','CODE123456','10.7.0.0/24',0)`); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -219,12 +219,12 @@ func TestRepairRebuildWithData(t *testing.T) {
 		t.Fatalf("openStore: %v", err)
 	}
 	if _, err := st.db.Exec(`INSERT INTO groups (id, name, creator_peer_id, invite_code, cidr, subnet_index, version)
-		VALUES ('g0','fixme','peer-a','CODE123456','100.64.0.0/24',0,5)`); err != nil {
+		VALUES ('g0','fixme','peer-a','CODE123456','10.7.0.0/24',0,5)`); err != nil {
 		t.Fatalf("seed group: %v", err)
 	}
 	if _, err := st.db.Exec(`INSERT INTO members (group_id, peer_id, name, os, virtual_ip, role)
-		VALUES ('g0','peer-a','owner-a','linux','100.64.0.2','owner'),
-		       ('g0','peer-b','member-b','windows','100.64.0.3','member')`); err != nil {
+		VALUES ('g0','peer-a','owner-a','linux','10.7.0.2','owner'),
+		       ('g0','peer-b','member-b','windows','10.7.0.3','member')`); err != nil {
 		t.Fatalf("seed members: %v", err)
 	}
 	if _, err := st.db.Exec(`INSERT INTO announced_addrs (peer_id, addr) VALUES

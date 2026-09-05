@@ -34,7 +34,7 @@ namespace Lanet.Sdk
     /// <code>
     /// var client = await LanetGatewayClient.ConnectAsync(new GatewayOptions {
     ///     Url = "ws://host:8700/gateway", InviteCode = "XXXXXX" });
-    /// var stream = await client.DialAsync("100.64.0.3", 8080);
+    /// var stream = await client.DialAsync("10.7.0.3", 8080);
     /// await stream.WriteStringAsync("ping");
     /// await stream.CloseWriteAsync();
     /// byte[] reply = await stream.ReadAllAsync();

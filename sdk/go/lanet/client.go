@@ -22,7 +22,7 @@
 //	})
 //
 //	// 按虚拟 IP 主动开流（可选）。
-//	stream, viaRelay, err := client.Dial(ctx, "100.64.x.x")
+//	stream, viaRelay, err := client.Dial(ctx, "10.7.x.x")
 //
 //	client.Run(ctx) // 阻塞：周期刷新 NetMap / 通告地址 / 补充中继预约
 //
@@ -440,7 +440,7 @@ func (c *Client) NetMap() netmapclient.Snapshot {
 		}
 		return netmapclient.Snapshot{
 			GroupID: c.groupID, GroupName: c.group,
-			CIDR: "100.64.0.0/16", Members: members,
+			CIDR: "10.7.0.0/16", Members: members,
 		}
 	}
 	return c.netmapCli.Current()

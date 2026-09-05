@@ -63,7 +63,7 @@ client, err := lanet.New(ctx, lanet.Config{
 ### 场景 C：主动开流（echo 请求-响应）
 
 ```go
-stream, viaRelay, err := client.Dial(ctx, "100.64.0.2")
+stream, viaRelay, err := client.Dial(ctx, "10.7.0.2")
 if err != nil {
 	log.Fatal(err)
 }
@@ -178,7 +178,7 @@ log.Printf("虚拟 IP=%s（自动派生）", info.VirtualIP)
   就无法在 DHT 上定位该网络；建连后还会经 `/lanet/info/1.0.0` 校验双方网络指纹，
   异网络节点自动忽略；
 - **虚拟 IP 自动派生**：无控制面分配，按 `SHA256(网络密钥, PeerID)` 确定性映射到
-  `100.64.x.x`，同网络成员各自本地计算即可得到一致结果（`NetMap()` 可列出成员表）；
+  `10.7.x.x`，同网络成员各自本地计算即可得到一致结果（`NetMap()` 可列出成员表）；
 - **节点即服务端**：每个节点无条件运行 Circuit Relay v2 hop 中继（默认资源配额）
   与 kad-dht server 模式；公网可达的成员自然成为网络内的引导与中继节点，
   NAT 后成员经 DCUtR 打洞直连，打洞失败经可达成员中继兜底；
@@ -224,7 +224,7 @@ log.Printf("虚拟 IP=%s（自动派生）", info.VirtualIP)
 
 ```go
 conn, err := client.DialPortFWD(ctx, lanet.PortFWDTarget{
-	VirtualIP: "100.64.0.2",
+	VirtualIP: "10.7.0.2",
 	Port:      3389, // 对端节点本机的远程桌面端口
 })
 if err != nil {
@@ -254,7 +254,7 @@ client.Host().SetStreamHandler("/myapp/1.0.0", func(s network.Stream) {
 })
 
 // 客户端
-stream, viaRelay, err := client.DialProtocol(ctx, "100.64.0.2", "/myapp/1.0.0")
+stream, viaRelay, err := client.DialProtocol(ctx, "10.7.0.2", "/myapp/1.0.0")
 ```
 
 ### 入向防火墙：统一管控三类暴露面
@@ -286,8 +286,8 @@ stream, viaRelay, err := client.DialProtocol(ctx, "100.64.0.2", "/myapp/1.0.0")
 ```go
 // 编程接口（也可在 Web 控制台操作，两者热更新等价）
 client.SetFirewall(lanet.FirewallModeAllowList, []lanet.FirewallRule{
-	{Source: "100.64.0.5", Port: "3389"},                  // TCP：指定成员访问指定端口
-	{Source: "100.64.1.0/24", Proto: lanet.FirewallProtoUDP, Port: "53"}, // UDP：网段内可用 DNS
+	{Source: "10.7.0.5", Port: "3389"},                  // TCP：指定成员访问指定端口
+	{Source: "10.7.1.0/24", Proto: lanet.FirewallProtoUDP, Port: "53"}, // UDP：网段内可用 DNS
 	{Source: "*", Proto: "/pvn/tunnel/1.0.0"},             // 应用流：放行 Tunnel 协议
 	{Source: "*", Proto: lanet.FirewallProtoAny, Port: "*"}, // 全部协议与端口
 })

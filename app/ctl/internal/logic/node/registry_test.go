@@ -6,7 +6,7 @@ import (
 )
 
 func TestEnrollAllocatesStableVirtualIP(t *testing.T) {
-	registry, err := NewRegistry("100.64.10.0/24", []string{"valid-token"})
+	registry, err := NewRegistry("10.7.10.0/24", []string{"valid-token"})
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
@@ -15,8 +15,8 @@ func TestEnrollAllocatesStableVirtualIP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enroll first node: %v", err)
 	}
-	if first.VirtualIP != "100.64.10.2" {
-		t.Fatalf("first virtual IP = %s, want 100.64.10.2", first.VirtualIP)
+	if first.VirtualIP != "10.7.10.2" {
+		t.Fatalf("first virtual IP = %s, want 10.7.10.2", first.VirtualIP)
 	}
 
 	retry, err := registry.Enroll(context.Background(), EnrollRequest{Token: "valid-token", PeerID: "peer-a", Name: "windows-a", OS: "windows"})
@@ -31,13 +31,13 @@ func TestEnrollAllocatesStableVirtualIP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enroll second node: %v", err)
 	}
-	if second.VirtualIP != "100.64.10.3" {
-		t.Fatalf("second virtual IP = %s, want 100.64.10.3", second.VirtualIP)
+	if second.VirtualIP != "10.7.10.3" {
+		t.Fatalf("second virtual IP = %s, want 10.7.10.3", second.VirtualIP)
 	}
 }
 
 func TestEnrollRejectsInvalidToken(t *testing.T) {
-	registry, err := NewRegistry("100.64.10.0/24", []string{"valid-token"})
+	registry, err := NewRegistry("10.7.10.0/24", []string{"valid-token"})
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestEnrollRejectsInvalidToken(t *testing.T) {
 }
 
 func TestNewRegistryRejectsNon24CIDR(t *testing.T) {
-	if _, err := NewRegistry("100.64.10.0/16", []string{"token"}); err == nil {
+	if _, err := NewRegistry("10.7.10.0/16", []string{"token"}); err == nil {
 		t.Fatal("expected non-/24 CIDR to be rejected for MVP")
 	}
 }

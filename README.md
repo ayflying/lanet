@@ -26,7 +26,7 @@ Lanet 是一个自研的群组制 P2P 虚拟局域网系统：客户端创建群
 
 ## 核心特性
 
-- **群组隔离**：每群从 `100.64.0.0/16` 池分配独立 /24 子网；NetMap 仅返回同群成员，跨群天然不可见。
+- **群组隔离**：每群从 `10.7.0.0/16` 池分配独立 /24 子网；NetMap 仅返回同群成员，跨群天然不可见。
 - **三段隧道策略**：直连优先 → 复用已有连接开流 → Circuit Relay v2 中继保底，全程自动降级。
 - **虚拟网卡**：基于 `wireguard/tun` 的真实 TUN 设备，支持 Windows / Linux / macOS，本地测试可用内存回环设备。
 - **打洞能力**：AutoNAT + DCUtR 打洞 + AutoRelay，典型 NAT 环境下即可直连。
@@ -80,7 +80,7 @@ go run ./app/agent/cmd/pvn-agent -mode create -name alpha -ctl http://<ctl地址
 go run ./app/agent/cmd/pvn-agent -mode join -name beta -invite <邀请码> -ctl http://<ctl地址>:8000
 ```
 
-成员入组后获得群内虚拟 IP（如 `100.64.0.2`），直接 `ping` 组内成员的虚拟 IP 即可互通。
+成员入组后获得群内虚拟 IP（如 `10.7.0.2`），直接 `ping` 组内成员的虚拟 IP 即可互通。
 
 ### 群主管理
 
@@ -125,7 +125,7 @@ go run ./app/agent/cmd/pvn-e2e-check
 
 注意事项（实测经验）：
 
-- 探针/测试客户端每次 join 都会占用一个虚拟 IP（100.64.x.x 池），频繁重启会持续消耗；正式使用无需关心，长期自动化测试建议建独立群组或实现成员回收。
+- 探针/测试客户端每次 join 都会占用一个虚拟 IP（10.7.x.x 池），频繁重启会持续消耗；正式使用无需关心，长期自动化测试建议建独立群组或实现成员回收。
 - Windows 端回显类自测程序需注意 libp2p 流的半关闭语义：发送完成后 `CloseWrite()` 半关闭写端，对端才能用 `ReadAll` 判定 EOF，否则双方互等死锁。
 
 ## SDK
@@ -145,7 +145,7 @@ client, err := lanet.New(ctx, lanet.Config{
 defer client.Close()
 
 // 按虚拟 IP 开流（直连优先、中继兜底，与 agent 一致）
-stream, viaRelay, _ := client.Dial(ctx, "100.64.0.2")
+stream, viaRelay, _ := client.Dial(ctx, "10.7.0.2")
 defer stream.Close()
 
 // 接收入向流
@@ -166,7 +166,7 @@ Circuit Relay v2），与 Go 节点互开隧道流（`/pvn/tunnel/1.0.0`）。
 ```js
 import { createNode } from '@lanet/sdk-web'
 const node = await createNode({ ctlURL, inviteCode, name: 'web-demo' })
-const stream = await node.dial('100.64.0.2')  // 按虚拟 IP 开流
+const stream = await node.dial('10.7.0.2')  // 按虚拟 IP 开流
 ```
 
 联调工具：`go run ./app/agent/cmd/pvn-web-echo`（Go echo 节点，打印邀请码）+

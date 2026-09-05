@@ -131,8 +131,8 @@ func TestOwnerKicksMemberAndIPIsRecycled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("kick: %v", err)
 	}
-	if removed.VirtualIP != "100.64.0.3" {
-		t.Fatalf("kicked member virtual IP = %s, want 100.64.0.3", removed.VirtualIP)
+	if removed.VirtualIP != "10.7.0.3" {
+		t.Fatalf("kicked member virtual IP = %s, want 10.7.0.3", removed.VirtualIP)
 	}
 
 	// 被踢成员立即从 NetMap 消失。
@@ -148,11 +148,11 @@ func TestOwnerKicksMemberAndIPIsRecycled(t *testing.T) {
 		t.Fatal("kicked peer should not belong to any group")
 	}
 
-	// 回收的 IP 被下一个新成员复用（100.64.0.3 是最小可用位）。
+	// 回收的 IP 被下一个新成员复用（10.7.0.3 是最小可用位）。
 	if _, memberC, err := registry.Join(ctx, JoinInput{
 		InviteCode: grp.InviteCode, PeerID: "peer-c", Name: "c", OS: "linux",
-	}); err != nil || memberC.VirtualIP != "100.64.0.3" {
-		t.Fatalf("recycled IP = %s err = %v, want 100.64.0.3", memberC.VirtualIP, err)
+	}); err != nil || memberC.VirtualIP != "10.7.0.3" {
+		t.Fatalf("recycled IP = %s err = %v, want 10.7.0.3", memberC.VirtualIP, err)
 	}
 }
 

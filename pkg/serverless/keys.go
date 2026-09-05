@@ -45,14 +45,15 @@ func MdnsTag(groupKey []byte) string {
 }
 
 // DeriveVirtualIP 无控制面模式下按（群密钥, PeerID）确定性派生虚拟 IP。
-// 地址空间 100.64.1.1 ~ 100.64.254.254（约 6.4 万），冲突概率随群规模缓慢上升，
+// 地址空间 10.7.1.1 ~ 10.7.254.254（约 6.4 万），冲突概率随群规模缓慢上升，
 // 冲突时表现为两个成员互相 Dial 打到对方（SDK NetMap 会同时列出，可人工发现）。
+// 注意：不使用 100.64.0.0/10（CGNAT 段），避免与 Tailscale 等同类工具的虚拟网卡冲突。
 func DeriveVirtualIP(groupKey []byte, peerID string) string {
 	buf := make([]byte, 0, len(groupKey)+len(peerID))
 	buf = append(buf, groupKey...)
 	buf = append(buf, peerID...)
 	h := sha256.Sum256(buf)
-	return fmt.Sprintf("100.64.%d.%d", int(h[0])%254+1, int(h[1])%254+1)
+	return fmt.Sprintf("10.7.%d.%d", int(h[0])%254+1, int(h[1])%254+1)
 }
 
 // GroupFingerprint 群组指纹短串（展示/日志用，8 hex）。

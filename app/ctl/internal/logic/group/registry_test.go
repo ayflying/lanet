@@ -18,11 +18,11 @@ func TestCreateGroupAllocatesSubnetAndEnrollsCreator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create group: %v", err)
 	}
-	if creator.VirtualIP != "100.64.0.2" {
-		t.Fatalf("creator virtual IP = %s, want 100.64.0.2", creator.VirtualIP)
+	if creator.VirtualIP != "10.7.0.2" {
+		t.Fatalf("creator virtual IP = %s, want 10.7.0.2", creator.VirtualIP)
 	}
-	if grp.CIDR != "100.64.0.0/24" {
-		t.Fatalf("group CIDR = %s, want 100.64.0.0/24", grp.CIDR)
+	if grp.CIDR != "10.7.0.0/24" {
+		t.Fatalf("group CIDR = %s, want 10.7.0.0/24", grp.CIDR)
 	}
 	if len(grp.InviteCode) != inviteCodeLength {
 		t.Fatalf("invite code length = %d, want %d", len(grp.InviteCode), inviteCodeLength)
@@ -44,10 +44,10 @@ func TestMembersJoinViaInviteAndShareSubnet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("join group: %v", err)
 	}
-	if memberB.VirtualIP != "100.64.0.3" {
-		t.Fatalf("member virtual IP = %s, want 100.64.0.3", memberB.VirtualIP)
+	if memberB.VirtualIP != "10.7.0.3" {
+		t.Fatalf("member virtual IP = %s, want 10.7.0.3", memberB.VirtualIP)
 	}
-	if !strings.HasPrefix(memberB.VirtualIP, "100.64.0.") {
+	if !strings.HasPrefix(memberB.VirtualIP, "10.7.0.") {
 		t.Fatalf("member not in group subnet: %s", memberB.VirtualIP)
 	}
 }

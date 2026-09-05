@@ -33,7 +33,7 @@ func newFakeCTL(t *testing.T, invite string) *httptest.Server {
 		}
 		write(w, map[string]any{
 			"group":       map[string]any{"id": "grp-1", "name": req.GroupName},
-			"creator":     map[string]any{"peer_id": req.PeerID, "virtual_ip": "100.64.0.1"},
+			"creator":     map[string]any{"peer_id": req.PeerID, "virtual_ip": "10.7.0.1"},
 			"invite_code": "grp-test-invite-code",
 		})
 	})
@@ -51,7 +51,7 @@ func newFakeCTL(t *testing.T, invite string) *httptest.Server {
 		}
 		write(w, map[string]any{
 			"group":  map[string]any{"id": "grp-1", "name": "fake-group"},
-			"member": map[string]any{"peer_id": req.PeerID, "virtual_ip": "100.64.0.2"},
+			"member": map[string]any{"peer_id": req.PeerID, "virtual_ip": "10.7.0.2"},
 		})
 	})
 
@@ -59,7 +59,7 @@ func newFakeCTL(t *testing.T, invite string) *httptest.Server {
 		write(w, map[string]any{
 			"group_id":   "grp-1",
 			"group_name": "fake-group",
-			"cidr":       "100.64.0.0/24",
+			"cidr":       "10.7.0.0/24",
 			"version":    1,
 			"members":    []any{},
 		})
@@ -96,8 +96,8 @@ func TestNewCreatesGroup(t *testing.T) {
 	if info.GroupID != "grp-1" {
 		t.Errorf("group id = %q, want grp-1", info.GroupID)
 	}
-	if info.VirtualIP != "100.64.0.1" {
-		t.Errorf("virtual ip = %q, want 100.64.0.1", info.VirtualIP)
+	if info.VirtualIP != "10.7.0.1" {
+		t.Errorf("virtual ip = %q, want 10.7.0.1", info.VirtualIP)
 	}
 	if !info.Created || info.InviteCode == "" {
 		t.Errorf("created = %v, invite = %q; want created with invite", info.Created, info.InviteCode)
@@ -124,8 +124,8 @@ func TestNewJoinsGroupWithInvite(t *testing.T) {
 	defer client.Close()
 
 	info := client.Info()
-	if info.VirtualIP != "100.64.0.2" {
-		t.Errorf("virtual ip = %q, want 100.64.0.2", info.VirtualIP)
+	if info.VirtualIP != "10.7.0.2" {
+		t.Errorf("virtual ip = %q, want 10.7.0.2", info.VirtualIP)
 	}
 	if info.Created {
 		t.Error("join mode should not be marked as created")

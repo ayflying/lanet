@@ -42,7 +42,7 @@ const (
 
 // Rule 放行规则。
 type Rule struct {
-	// Source 来源虚拟 IP（100.64.x.x）、CIDR（100.64.0.0/16）或 "*"（任意成员）。
+	// Source 来源虚拟 IP（10.7.x.x）、CIDR（10.7.0.0/16）或 "*"（任意成员）。
 	Source string `json:"source"`
 	// Proto 协议维度：
 	//   - "tcp"（默认/留空）：TCP 端口（PortFWD 与 TUN 入向 TCP）；

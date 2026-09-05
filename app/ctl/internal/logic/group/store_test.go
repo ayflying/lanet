@@ -73,7 +73,7 @@ func TestPersistentRegistryRestoresAfterReopen(t *testing.T) {
 		t.Fatal("restored subnet counter lost; new group reuses old CIDR")
 	}
 
-	// 2. 成员与虚拟 IP 恢复：creator 仍是 100.64.0.2。
+	// 2. 成员与虚拟 IP 恢复：creator 仍是 10.7.0.2。
 	netmap, err := second.NetMapFor(ctx, "peer-a")
 	if err != nil {
 		t.Fatalf("netmap for restored creator: %v", err)
@@ -95,8 +95,8 @@ func TestPersistentRegistryRestoresAfterReopen(t *testing.T) {
 	if creatorIP != creator.VirtualIP {
 		t.Fatalf("creator virtual IP after restore = %s, want %s", creatorIP, creator.VirtualIP)
 	}
-	if memberBIP != "100.64.0.3" {
-		t.Fatalf("member-b virtual IP after restore = %s, want 100.64.0.3", memberBIP)
+	if memberBIP != "10.7.0.3" {
+		t.Fatalf("member-b virtual IP after restore = %s, want 10.7.0.3", memberBIP)
 	}
 
 	// 3. 邀请码恢复：凭旧邀请码仍能加入。
@@ -124,18 +124,18 @@ func TestPersistentRegistryRestoresAfterReopen(t *testing.T) {
 }
 
 func TestRestoreNodeRejectsForeignIP(t *testing.T) {
-	registry, err := node.NewRegistry("100.64.7.0/24", []string{"token"})
+	registry, err := node.NewRegistry("10.7.7.0/24", []string{"token"})
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
 	if err = registry.RestoreNode(node.Node{PeerID: "peer-x", VirtualIP: "10.0.0.99"}); err == nil {
 		t.Fatal("expected foreign virtual IP to be rejected")
 	}
-	if err = registry.RestoreNode(node.Node{PeerID: "peer-x", VirtualIP: "100.64.7.2"}); err != nil {
+	if err = registry.RestoreNode(node.Node{PeerID: "peer-x", VirtualIP: "10.7.7.2"}); err != nil {
 		t.Fatalf("restore in-subnet node: %v", err)
 	}
 	// 重复恢复同一 PeerID 应幂等。
-	if err = registry.RestoreNode(node.Node{PeerID: "peer-x", VirtualIP: "100.64.7.2"}); err != nil {
+	if err = registry.RestoreNode(node.Node{PeerID: "peer-x", VirtualIP: "10.7.7.2"}); err != nil {
 		t.Fatalf("duplicate restore should be idempotent: %v", err)
 	}
 }

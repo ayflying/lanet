@@ -61,7 +61,7 @@ const client = await createGatewayClient({
 console.log('经网关入群:', client.info().group, '虚拟IP:', client.info().virtualIP)
 
 // 2. 访问网格内 TCP 服务（目标节点虚拟 IP + 其本机端口）
-const stream = await client.dial('100.64.0.3', 9999)
+const stream = await client.dial('10.7.0.3', 9999)
 stream.write('hello')                 // string 自动 UTF-8；也接受 Uint8Array
 stream.closeWrite()                   // 对端读到 EOF（务必调用）
 const reply = await stream.readAll()  // 读到对端 EOF 为止
@@ -69,7 +69,7 @@ console.log(new TextDecoder().decode(reply))
 stream.close()
 
 // 3. 自定义协议流（对端节点注册了该协议处理器时）
-const s2 = await client.dialProtocol('100.64.0.3', '/myapp/1.0.0')
+const s2 = await client.dialProtocol('10.7.0.3', '/myapp/1.0.0')
 
 // 4. 连接级回调
 client.onError(err => console.error('连接错误', err))

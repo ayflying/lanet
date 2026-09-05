@@ -52,7 +52,7 @@ async function main () {
     name: 'node-test-client',
     socketFactory: nodeSocketFactory
   })
-  assert(client.info().virtualIP.startsWith('100.64.'),
+  assert(client.info().virtualIP.startsWith('10.7.'),
     `鉴权通过（经网关身份入群 group=${client.info().group} gw_ip=${client.info().virtualIP}）`)
 
   // 2. 自定义协议直开流：对 go-service 节点的 /pvn/tunnel/1.0.0（echo）。

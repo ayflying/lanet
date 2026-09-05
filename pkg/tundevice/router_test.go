@@ -83,8 +83,8 @@ func TestRouterForwardsBothWays(t *testing.T) {
 	defer cancel()
 
 	hostA, hostB := newPair(t)
-	ipA := [4]byte{100, 64, 0, 2}
-	ipB := [4]byte{100, 64, 0, 3}
+	ipA := [4]byte{10, 7, 0, 2}
+	ipB := [4]byte{10, 7, 0, 3}
 
 	// B 端：隧道流直接回环——把收到的包写回流，模拟"对端网卡收到后回包"。
 	// 更真实的做法是 B 的 Router 写进 B 的 TUN，再由测试注入 B 的出向包；
@@ -100,8 +100,8 @@ func TestRouterForwardsBothWays(t *testing.T) {
 	}
 	defer tunB.Close()
 
-	routesA := &stubNetmap{routes: map[string]peer.ID{"100.64.0.3": hostB.ID()}}
-	routesB := &stubNetmap{routes: map[string]peer.ID{"100.64.0.2": hostA.ID()}}
+	routesA := &stubNetmap{routes: map[string]peer.ID{"10.7.0.3": hostB.ID()}}
+	routesB := &stubNetmap{routes: map[string]peer.ID{"10.7.0.2": hostA.ID()}}
 	routerA := New(tunA, tunnel.New(hostA, routesA, stubRelay{}))
 	_ = New(tunB, tunnel.New(hostB, routesB, stubRelay{})) // routerB
 
@@ -127,7 +127,7 @@ func TestRouterForwardsBothWays(t *testing.T) {
 		t.Fatalf("connect a->b: %v", err)
 	}
 
-	// A 的应用发出一个包，目的 100.64.0.3。
+	// A 的应用发出一个包，目的 10.7.0.3。
 	payload := []byte("hello-over-tun")
 	if _, err := tunA.Write([][]byte{buildIPv4(ipA, ipB, payload)}, 0); err != nil {
 		t.Fatalf("write tun a: %v", err)

@@ -7,7 +7,7 @@
  */
 import { createNode } from '../src/index.js'
 
-const [, , ctlURL = 'http://127.0.0.1:8000', inviteCode, targetIP = '100.64.2.2'] = process.argv
+const [, , ctlURL = 'http://127.0.0.1:8000', inviteCode, targetIP = '10.7.2.2'] = process.argv
 if (!inviteCode) {
   console.error('用法: node test/interop.mjs <ctlURL> <inviteCode> <targetVirtualIP>')
   process.exit(1)
