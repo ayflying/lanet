@@ -76,7 +76,9 @@ func (r *Router) forwardPacket(ctx context.Context, packet []byte) error {
 	}
 	version := packet[0] >> 4
 	if version != 4 {
-		return fmt.Errorf("unsupported IP version %d", version)
+		// 非 IPv4 包（Windows/macOS 会向 TUN 发 IPv6 多播与邻居发现等）
+		// 属正常噪音，静默丢弃，避免日志刷屏。
+		return nil
 	}
 	destination := fmt.Sprintf("%d.%d.%d.%d", packet[16], packet[17], packet[18], packet[19])
 

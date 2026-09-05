@@ -48,6 +48,7 @@ import (
 	"github.com/ayflying/pvn/pkg/peersource"
 	"github.com/ayflying/pvn/pkg/protocol"
 	"github.com/ayflying/pvn/pkg/serverless"
+	"github.com/ayflying/pvn/pkg/tundevice"
 	"github.com/ayflying/pvn/pkg/tunnel"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -161,6 +162,13 @@ type Config struct {
 	// 配置后身份跨重启稳定，虚拟 IP 恒定，其他成员可始终按本节点名称连入。
 	// 文件不存在时自动生成并写回（权限 0600）。
 	IdentityFile string
+	// Tun 创建 TUN 虚拟网卡，启用 IP 层互通：组内成员可通过虚拟 IP 直接
+	// ping 本机、访问任意 TCP/UDP 端口（入向仍受防火墙约束）。
+	// Windows 需管理员权限、Linux 需 /dev/net/tun + CAP_NET_ADMIN；
+	// 创建失败时自动降级为仅应用层（Dial/PortFWD 不受影响），不阻断入网。
+	Tun bool
+	// TunName TUN 网卡名，默认 "lanet"。
+	TunName string
 }
 
 // LoadOrCreateIdentity 加载（或首次生成）Ed25519 节点身份密钥。
@@ -214,6 +222,9 @@ type Client struct {
 	consoleSrv   *http.Server // 内置 Web 控制台
 	consoleURL   string       // 控制台实际访问地址（端口回退后）
 	sessionToken string       // 控制台会话令牌（设置 ConsolePassword 后生成）
+
+	tunMu     sync.Mutex
+	tunDevice tundevice.Device // TUN 虚拟网卡（cfg.Tun 且创建成功时非 nil）
 }
 
 // Info 节点入网后的身份信息。
@@ -361,6 +372,11 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	c.statePath = cfg.StateFile
 	c.loadState()
 	c.enablePortFWD()
+	// 4.5 TUN 虚拟网卡（IP 层互通，可选）：放在防火墙初始化之后，
+	// Router 的入向 IP 包判定复用同一套防火墙规则。
+	if cfg.Tun {
+		c.startTUN(ctx)
+	}
 	// 5. 内置 Web 控制台。
 	if err = c.startConsole(); err != nil {
 		_ = node.Close()
@@ -494,6 +510,38 @@ func (c *Client) NetMap() netmapclient.Snapshot {
 // Host 暴露底层 libp2p Host（进阶用法：自定义协议等）。
 func (c *Client) Host() host.Host { return c.node }
 
+// startTUN 创建 TUN 虚拟网卡并启动 IP 包路由（IP 层互通：ping / 任意 TCP/UDP 直达虚拟 IP）。
+// 创建或配置失败时仅降级为应用层模式并记日志，不阻断入网（常见原因：
+// Windows 非管理员运行、Linux 无 /dev/net/tun 或 CAP_NET_ADMIN）。
+func (c *Client) startTUN(ctx context.Context) {
+	name := c.cfg.TunName
+	if name == "" {
+		name = "lanet"
+	}
+	device, err := tundevice.NewNative(name, 1400)
+	if err != nil {
+		c.logf("TUN 网卡创建失败（自动降级为仅应用层，虚拟 IP 不支持 ping；Windows 需管理员权限运行）: %v", err)
+		return
+	}
+	if err = tundevice.ConfigureTUN(name, c.myIP, 24); err != nil {
+		_ = device.Close()
+		c.logf("TUN 网卡地址配置失败（自动降级为仅应用层）: %v", err)
+		return
+	}
+	c.tunMu.Lock()
+	c.tunDevice = device
+	c.tunMu.Unlock()
+	router := tundevice.New(device, c.tunnelSvc)
+	router.SetFirewall(c.fw)
+	// 设备生命周期与 ctx 绑定：退出时关闭设备，Router.Run 随 Read 错误退出。
+	go func() {
+		<-ctx.Done()
+		_ = device.Close()
+	}()
+	go router.Run(ctx)
+	c.logf("TUN 网卡 %s 已就绪（虚拟 IP=%s）：组内成员可通过虚拟 IP 直接访问本机（ping/任意端口，入向受防火墙约束）", name, c.myIP)
+}
+
 // Run 阻塞运行周期任务，直到 ctx 取消。
 //   - Standalone：周期 DHT 广播与发现（mDNS 持续运行）。
 //   - 常规：刷新 NetMap / 通告地址 / 补充中继预约。
@@ -531,6 +579,12 @@ func (c *Client) Run(ctx context.Context) {
 
 // Close 关闭节点与底层连接。
 func (c *Client) Close() error {
+	c.tunMu.Lock()
+	if c.tunDevice != nil {
+		_ = c.tunDevice.Close()
+		c.tunDevice = nil
+	}
+	c.tunMu.Unlock()
 	if c.consoleSrv != nil {
 		_ = c.consoleSrv.Close()
 	}

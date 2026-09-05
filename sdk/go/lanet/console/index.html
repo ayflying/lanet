@@ -196,6 +196,11 @@
         <input type="checkbox" id="cNoPublic"> 关闭公共 DHT 兜底（纯私有种子 + mDNS）
       </label>
     </div>
+    <div class="row">
+      <label style="display:flex;gap:6px;align-items:center">
+        <input type="checkbox" id="cTun"> 虚拟网卡 TUN（IP 层互通：ping / 任意端口直达虚拟 IP，需管理员权限运行）
+      </label>
+    </div>
     <button onclick="saveNodeConfig()">保存节点配置</button>
     <div class="msg" id="cfgMsg"></div>
   </div>
@@ -373,6 +378,7 @@ async function loadNodeConfig() {
     $('cListen').value = c.listen || '';
     $('cIdentity').value = c.identity || '';
     $('cNoPublic').checked = !!c.no_public_dht;
+    $('cTun').checked = c.tun === undefined ? true : !!c.tun;
     renderRuntimeBanner(c);
   } catch (e) { /* 无此接口（纯 SDK 场景）：保持页签隐藏 */ }
 }
@@ -398,6 +404,7 @@ async function saveNodeConfig() {
     clear_password: $('cClearPW').checked,
     listen: $('cListen').value.trim(),
     no_public_dht: $('cNoPublic').checked,
+    tun: $('cTun').checked,
   };
   if (!body.name || !body.console) { flash('cfgMsg', '节点名称与控制台地址不能为空', false); return; }
   const r = await fetch('/api/node-config', { method: 'PUT',

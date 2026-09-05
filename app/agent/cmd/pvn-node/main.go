@@ -62,6 +62,8 @@ func main() {
 			"防火墙模式：deny-all / allow-list / allow-all；不传则读配置文件")
 		listen = flag.String("listen", envOr("LANET_LISTEN", ""),
 			"覆盖监听地址（逗号分隔）；默认 tcp/ws/quic 全部随机端口")
+		tun = flag.String("tun", "@@unset@@",
+			"虚拟网卡 TUN（IP 层互通：ping/任意端口直达虚拟 IP）；true/false，缺省读配置文件（默认 true）")
 		noPublic = flag.Bool("no-public-dht",
 			envOr("LANET_NO_PUBLIC_DHT", "") == "1" || strings.EqualFold(envOr("LANET_NO_PUBLIC_DHT", ""), "true"),
 			"私有网络下关闭公共 DHT 兜底（纯私有种子 + mDNS）")
@@ -108,6 +110,11 @@ func main() {
 	effConsolePW := firstNonEmpty(*consolePW, nc.ConsolePassword)
 	effFW := firstNonEmpty(*fw, nc.Firewall, "allow-all")
 	effListen := firstNonEmpty(*listen, nc.Listen)
+	// TUN 默认开启：配置文件缺省字段（nil）视为 true，命令行显式 true/false 优先。
+	effTun := nc.Tun == nil || *nc.Tun
+	if *tun != "@@unset@@" {
+		effTun = strings.EqualFold(*tun, "true") || *tun == "1"
+	}
 	effNoPublic := *noPublic || nc.NoPublicDHT
 	effProbe := *probe
 	if effProbe <= 0 {
@@ -124,11 +131,12 @@ func main() {
 		Listen:      effListen,
 		Firewall:    effFW,
 		NoPublicDHT: effNoPublic,
+		Tun:         effTun,
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s noPublicDHT=%v version=%s config=%s",
-		effName, effKey, effFW, effConsole, effNoPublic, version, *config)
+	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s noPublicDHT=%v tun=%v version=%s config=%s",
+		effName, effKey, effFW, effConsole, effNoPublic, effTun, version, *config)
 
 	switch strings.TrimSpace(effBootstrap) {
 	case "", "none":
@@ -164,6 +172,7 @@ func main() {
 		ConsolePassword:  effConsolePW,
 		StateFile:        filepath.Join(filepath.Dir(*config), "state.json"),
 		ConsoleExtra:     extra,
+		Tun:              effTun,
 	}
 	switch effFW {
 	case "allow-list":
@@ -381,6 +390,7 @@ type nodeConfig struct {
 	Listen          string `json:"listen"`
 	NoPublicDHT     bool   `json:"no_public_dht"`
 	ProbeSec        int    `json:"probe_seconds"`
+	Tun             *bool  `json:"tun,omitempty"`          // 虚拟网卡 TUN；nil = 默认开启（兼容旧配置文件）
 	GitHubToken     string `json:"github_token,omitempty"` // 私有仓库检查更新用（contents:read）
 
 	bootstrapAddrs []string `json:"-"` // 运行时由 Bootstrap 解析而来
@@ -417,8 +427,12 @@ func defaultNodeConfig(exeDir string) *nodeConfig {
 		Console:    "127.0.0.1:8900",
 		Firewall:   "allow-all",
 		ProbeSec:   20,
+		Tun:        boolPtr(true),
 	}
 }
+
+// boolPtr 返回布尔指针（配置文件可选字段用）。
+func boolPtr(v bool) *bool { return &v }
 
 // save 原子写入配置文件。
 func (nc *nodeConfig) save(path string) error {
@@ -442,6 +456,7 @@ type nodeRuntime struct {
 	Listen      string
 	Firewall    string
 	NoPublicDHT bool
+	Tun         bool
 }
 
 // networkID 运行时网络标识（与 SDK/控制台页眉一致）：standalone- + 群组指纹。
@@ -462,6 +477,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 	return map[string]http.HandlerFunc{
 		"GET /api/node-config": func(w http.ResponseWriter, r *http.Request) {
 			nc := read()
+			tunOn := nc.Tun == nil || *nc.Tun
 			writeJSONLocal(w, http.StatusOK, map[string]any{
 				"config_path":   path,
 				"name":          nc.Name,
@@ -474,6 +490,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				"listen":        nc.Listen,
 				"no_public_dht": nc.NoPublicDHT,
 				"probe_seconds": nc.ProbeSec,
+				"tun":           tunOn,
 				"runtime": map[string]any{
 					"name":          eff.Name,
 					"network_key":   eff.NetworkKey,
@@ -483,6 +500,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 					"listen":        eff.Listen,
 					"firewall":      eff.Firewall,
 					"no_public_dht": eff.NoPublicDHT,
+					"tun":           eff.Tun,
 				},
 			})
 		},
@@ -516,6 +534,9 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				req.ProbeSec = 20
 			}
 			prev := read()
+			if req.Tun == nil {
+				req.Tun = prev.Tun // 页面未提供（旧版控制台）时保留原值
+			}
 			req.Identity = prev.Identity // 身份文件路径只读，防止控制台误改导致身份丢失
 			// 密码语义：clear_password=true → 清除；传了非空密码 → 覆盖；否则保持不变。
 			// GET 不回传密码明文，所以 req.ConsolePassword 为空时不能当作"删除"。

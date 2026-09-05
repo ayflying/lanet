@@ -12,6 +12,8 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
+
+	"github.com/ayflying/pvn/pkg/tundevice"
 )
 
 // relayCandidates 直接实现控制面候选查询，返回 peer.AddrInfo。
@@ -121,29 +123,7 @@ func postJSON(url string, payload map[string]any) (map[string]any, error) {
 	return envelope.Data, nil
 }
 
-// configureTUN 给 TUN 网卡配置虚拟 IP。Windows 走 netsh，Linux 走 ip 命令。
+// configureTUN 给 TUN 网卡配置虚拟 IP（实现已共享到 tundevice 包）。
 func configureTUN(name, ip string, prefixBits int) error {
-	switch runtime.GOOS {
-	case "windows":
-		return run("netsh", "interface", "ip", "set", "address",
-			"name="+name, "source=static", "addr="+ip, "mask=255.255.255.0")
-	case "linux":
-		if err := run("ip", "addr", "add", fmt.Sprintf("%s/%d", ip, prefixBits), "dev", name); err != nil {
-			return err
-		}
-		return run("ip", "link", "set", "dev", name, "up")
-	case "darwin":
-		return run("ifconfig", name, ip, ip, "up")
-	default:
-		return fmt.Errorf("unsupported OS %q", runtime.GOOS)
-	}
-}
-
-func run(name string, args ...string) error {
-	cmd := execCommand(name, args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s %s: %v: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
-	}
-	return nil
+	return tundevice.ConfigureTUN(name, ip, prefixBits)
 }
