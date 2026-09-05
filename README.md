@@ -92,6 +92,12 @@ go run ./app/agent/cmd/pvn-agent -mode join -name beta -invite <邀请码> -ctl 
 
 成员入组后获得群内虚拟 IP（如 `10.7.0.2`），直接 `ping` 组内成员的虚拟 IP 即可互通。
 
+**虚拟地址（域名式连接）**：每个成员还拥有一个稳定好记的虚拟地址
+`<节点名>.lanet`（如 `yunloli.lanet`，节点名自动规范化为 DNS 标签；
+组内重名自动追加后缀，控制台成员表可直接查看/复制）。SDK 的
+`Dial` / `DialPortFWD` 目标支持虚拟 IP、完整虚拟地址、短名与原始
+成员名四种写法，成员重启换 IP 后按名字连接依然有效。
+
 ### 群主管理
 
 创建者即群主（`role=owner`），拥有以下专属能力：

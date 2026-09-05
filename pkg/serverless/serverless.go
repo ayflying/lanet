@@ -86,6 +86,9 @@ type Member struct {
 	Source    string    `json:"source"`     // dht / dht-private / mdns
 	FirstSeen time.Time `json:"first_seen"` // 首次发现时间（即上线时间）
 	LastSeen  time.Time `json:"last_seen"`  // 最近一次出现（发现/握手/入向信息）时间
+	// Hostname 本成员的虚拟主机名（含 .lanet 后缀，如 yunloli.lanet）。
+	// 由当前成员表确定性推导，重名自动追加后缀。
+	Hostname string `json:"hostname,omitempty"`
 }
 
 // Discovered 新成员被发现（尚未连通也会触发；连通并确认同群后 Name 有效）。
@@ -218,13 +221,21 @@ func (d *Discovery) GroupKey() []byte { return d.groupKey }
 // OnDiscovered 注册新成员回调。
 func (d *Discovery) OnDiscovered(cb Discovered) { d.onDiscovered = append(d.onDiscovered, cb) }
 
-// Peers 当前成员表快照（不含自身）。
+// Peers 当前成员表快照（不含自身）。Hostname 按当前成员表推导。
 func (d *Discovery) Peers() []Member {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	out := make([]Member, 0, len(d.members))
+	refs := make([]MemberRef, 0, len(d.members))
 	for _, m := range d.members {
 		out = append(out, *m)
+		refs = append(refs, MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+	}
+	hosts := Hostnames(refs)
+	for i := range out {
+		if label := hosts[out[i].PeerID]; label != "" {
+			out[i].Hostname = label + "." + VirtualDomain
+		}
 	}
 	return out
 }

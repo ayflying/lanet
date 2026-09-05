@@ -21,6 +21,9 @@ type Member struct {
 	OS        string   `json:"os"`
 	VirtualIP string   `json:"virtual_ip"`
 	Addrs     []string `json:"addrs"`
+	// Hostname 虚拟主机名（含 .lanet 后缀，如 yunloli.lanet）。
+	// 仅 Standalone（本地发现）模式由成员表推导填充；控制面模式暂无。
+	Hostname string `json:"hostname,omitempty"`
 	// FirstSeen/LastSeen 仅 Standalone（本地发现）模式有值；
 	// 控制面 NetMap 无此概念，为零值。
 	FirstSeen time.Time `json:"first_seen,omitempty"`

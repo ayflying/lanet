@@ -36,7 +36,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -225,6 +224,8 @@ type Info struct {
 	VirtualIP string `json:"virtual_ip"`
 	// Name 节点名称（Standalone 即配置名；常规模式为创建/加入时登记的名）。
 	Name string `json:"name,omitempty"`
+	// VirtualHost 本节点的虚拟地址（<规范化名>.lanet，组内重名自动带后缀）。
+	VirtualHost string `json:"virtual_host,omitempty"`
 	// Created 仅创建模式为 true（同时携带 InviteCode）。
 	Created    bool   `json:"created,omitempty"`
 	InviteCode string `json:"invite_code,omitempty"`
@@ -372,11 +373,35 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 func (c *Client) Info() Info {
 	return Info{
 		PeerID: c.peerID, GroupID: c.groupID, Group: c.group,
-		VirtualIP:  c.myIP,
-		Name:       c.cfg.Name,
-		Created:    c.created,
-		InviteCode: c.cfg.InviteCode,
+		VirtualIP:   c.myIP,
+		Name:        c.cfg.Name,
+		VirtualHost: c.selfHostname(),
+		Created:     c.created,
+		InviteCode:  c.cfg.InviteCode,
 	}
+}
+
+// selfHostname 本节点的虚拟地址：把自己并入当前成员表后按同一规则推导，
+// 保证与远端节点计算出的本节点地址一致（组内重名时自动带 -xxxx 后缀）。
+func (c *Client) selfHostname() string {
+	if c.cfg.Name == "" {
+		return ""
+	}
+	refs := []serverless.MemberRef{{PeerID: c.peerID, Name: c.cfg.Name, VirtualIP: c.myIP}}
+	if c.disc != nil {
+		for _, m := range c.disc.Peers() {
+			refs = append(refs, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+		}
+	} else if c.netmapCli != nil {
+		for _, m := range c.netmapCli.Current().Members {
+			refs = append(refs, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+		}
+	}
+	hosts := serverless.Hostnames(refs)
+	if label := hosts[c.peerID]; label != "" {
+		return label + "." + serverless.VirtualDomain
+	}
+	return ""
 }
 
 // OnStream 注册入向流处理器（协议 Tunnel）。可注册多个，按序调用。
@@ -387,31 +412,30 @@ func (c *Client) OnStream(handler Handler) {
 	}
 }
 
-// resolveVirtualIP 虚拟域名解析：目标可以是虚拟 IP（原样返回），
-// 也可以是节点名称（成员表 Name 匹配，即「虚拟域名」——成员重启后
-// 虚拟 IP 变化也不影响按名称连入）。
+// resolveVirtualIP 虚拟地址解析：目标可以是虚拟 IP、
+// <成员名>.lanet 完整虚拟地址、短名或原始成员名（详见 serverless.ResolveTarget）。
+// 解析基于实时成员表——成员重启后虚拟 IP 变化不影响按名字连入。
 func (c *Client) resolveVirtualIP(target string) (string, error) {
-	target = strings.TrimSpace(target)
-	if target == "" {
-		return "", fmt.Errorf("lanet: 目标为空")
+	m, err := c.resolveMember(target)
+	if err != nil {
+		return "", err
 	}
-	if net.ParseIP(target) != nil {
-		return target, nil
-	}
-	var hit []string
-	for _, m := range c.NetMap().Members {
-		if m.Name == target {
-			hit = append(hit, m.VirtualIP)
+	return m.VirtualIP, nil
+}
+
+// resolveMember 把连接目标解析为成员（serverless.ResolveTarget 的两种入网模式适配）。
+func (c *Client) resolveMember(target string) (serverless.MemberRef, error) {
+	var members []serverless.MemberRef
+	if c.disc != nil {
+		for _, m := range c.disc.Peers() {
+			members = append(members, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+		}
+	} else if c.netmapCli != nil {
+		for _, m := range c.netmapCli.Current().Members {
+			members = append(members, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
 		}
 	}
-	switch len(hit) {
-	case 1:
-		return hit[0], nil
-	case 0:
-		return "", fmt.Errorf("lanet: 未找到节点 %q（虚拟域名支持成员名称，当前成员表 %d 人；该成员可能尚未被发现）", target, len(c.NetMap().Members))
-	default:
-		return "", fmt.Errorf("lanet: 存在 %d 个名为 %q 的节点，请改用虚拟 IP 指定", len(hit), target)
-	}
+	return serverless.ResolveTarget(members, target)
 }
 
 // Dial 按虚拟 IP 打开到对端的隧道流（直连优先，中继兜底）。
@@ -456,7 +480,7 @@ func (c *Client) NetMap() netmapclient.Snapshot {
 		for _, m := range c.disc.Peers() {
 			members = append(members, netmapclient.Member{
 				PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, Addrs: m.Addrs,
-				FirstSeen: m.FirstSeen, LastSeen: m.LastSeen,
+				Hostname: m.Hostname, FirstSeen: m.FirstSeen, LastSeen: m.LastSeen,
 			})
 		}
 		return netmapclient.Snapshot{
