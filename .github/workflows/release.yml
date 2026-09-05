@@ -87,12 +87,17 @@ jobs:
       # 私钥在仓库 Secret SELFUPDATE_SIGNING_KEY（PEM PKCS#8），只在 CI 内短暂出现。
       # P2P 自更新以此清单为信任锚：节点内置公钥验签，≥3 成员清单一致才升级。
       # 未配置 Secret 时跳过（P2P 更新链路静默不生效，GitHub 更新路径不受影响）。
+      # 注意：不能写成 if: secrets.X != '' —— if 条件里不允许 secrets 上下文，
+      # 会触发 workflow 校验失败（整个流水线 0 job 启动即失败）。
       - name: Sign binary (P2P self-update manifest)
-        if: ${{ secrets.SELFUPDATE_SIGNING_KEY != '' }}
         shell: bash
         env:
           SELFUPDATE_SIGNING_KEY: ${{ secrets.SELFUPDATE_SIGNING_KEY }}
         run: |
+          if [ -z "$SELFUPDATE_SIGNING_KEY" ]; then
+            echo "未配置 SELFUPDATE_SIGNING_KEY，跳过签名"
+            exit 0
+          fi
           go run ./cmd/sign-manifest \
             -version "${VERSION}" \
             -platform "${{ matrix.goos }}/${{ matrix.goarch }}" \
@@ -181,8 +186,8 @@ jobs:
           rm -f *.sha256
 
       # 合并各平台签名分片为全网统一清单（P2P 自更新信任锚）。
+      # 无分片（未配置签名密钥）时脚本内自动跳过；不用 if: secrets（上下文不可用）。
       - name: Merge update manifests
-        if: ${{ secrets.SELFUPDATE_SIGNING_KEY != '' }}
         shell: bash
         run: |
           cd dist
