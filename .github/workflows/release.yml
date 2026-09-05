@@ -1,0 +1,151 @@
+# =================================================================================
+# Lanet 发行包 CI：交叉编译全平台可执行文件并打包压缩，上传到 GitHub Release。
+#
+# 触发：push 到 main（代码/VERSION/打包脚本变更）、v* tag、手动 workflow_dispatch。
+# 版本号：根目录 VERSION 文件（三段式，如 0.2.1）。改代码先改 VERSION 再提交。
+#
+# 产物（全部压缩，不直接上传 exe）：
+#   lanet-{版本}-windows-amd64.zip    含 lanet-agent/ctl/relay/node.exe + wintun.dll + README
+#   lanet-{版本}-linux-amd64.tar.gz   含 lanet-agent/ctl/relay/node
+#   lanet-{版本}-linux-arm64.tar.gz   同上（arm64）
+#   sha256sums.txt                    全部压缩包校验和
+#
+# ⚠️ wintun.dll 不打入 exe（运行时从 exe 同目录或 System32 加载），
+#    Windows 包必须附带与 GOARCH 匹配的 wintun.dll。
+# =================================================================================
+
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - "build/**"
+      - "packaging/**"
+      - "VERSION"
+      - ".github/workflows/release.yml"
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  WIN_TUN_VERSION: "0.14.1"
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+            pack: zip
+          - goos: linux
+            goarch: amd64
+            ext: ""
+            pack: tar.gz
+          - goos: linux
+            goarch: arm64
+            ext: ""
+            pack: tar.gz
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Read version
+        run: echo "VERSION=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_ENV"
+
+      - name: Build binaries
+        shell: bash
+        run: |
+          DIR="dist/lanet-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "$DIR"
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          for target in \
+            "lanet-agent ./app/agent/cmd/pvn-agent" \
+            "lanet-ctl ./app/ctl" \
+            "lanet-relay ./app/relay" \
+            "lanet-node ./app/agent/cmd/pvn-node"; do
+            name=${target%% *}
+            path=${target#* }
+            GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+              go build -trimpath -ldflags "$LDFLAGS" -o "$DIR/$name${{ matrix.ext }}" "$path"
+          done
+          echo "$VERSION" > "$DIR/VERSION"
+
+      - name: Attach wintun.dll and README (windows)
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: |
+          curl -fsSL -o wintun.zip "https://www.wintun.net/builds/wintun-${WIN_TUN_VERSION}.zip"
+          unzip -j wintun.zip "wintun/bin/amd64/wintun.dll" -d "dist/lanet-windows-amd64/"
+          cp packaging/agent-windows-README.txt "dist/lanet-windows-amd64/README.txt"
+
+      - name: Pack archive
+        shell: bash
+        run: |
+          cd dist
+          ARCHIVE="lanet-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.pack }}"
+          if [ "${{ matrix.pack }}" = "zip" ]; then
+            zip -r "$ARCHIVE" "lanet-${{ matrix.goos }}-${{ matrix.goarch }}"
+          else
+            tar -czf "$ARCHIVE" "lanet-${{ matrix.goos }}-${{ matrix.goarch }}"
+          fi
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanet-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/lanet-*.zip
+            dist/lanet-*.tar.gz
+            dist/lanet-*.sha256
+          retention-days: 30
+
+  release:
+    name: Attach to GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        run: echo "VERSION=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_ENV"
+
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Merge checksums
+        shell: bash
+        run: |
+          cd dist
+          cat *.sha256 > sha256sums.txt
+          rm -f *.sha256
+
+      - name: Attach to GitHub Release (tag v${{ env.VERSION }})
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          files: |
+            dist/lanet-*.zip
+            dist/lanet-*.tar.gz
+            dist/sha256sums.txt
+          generate_release_notes: true

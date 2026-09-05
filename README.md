@@ -222,8 +222,26 @@ schema 迁移采用账本表 `schema_migrations` 记录版本，迁移以有序�
 
 | 流水线 | 触发 | 产物 |
 |---|---|---|
-| `docker` | push main / `v*` tag | 3 个容器镜像推 GHCR（amd64+arm64）：`lanet-ctl` / `lanet-relay` / `lanet-agent`，tag 版本号 + latest |
-| `release-windows` | `v*` tag / 手动 | Windows x64 发行包（agent zip 含 wintun.dll + ctl/relay exe + checksums）附加到 GitHub Release |
+| `docker` | push main / `v*` tag | 4 个容器镜像推 GHCR（amd64+arm64）：`lanet-ctl` / `lanet-relay` / `lanet-agent` / `lanet-node`，含 VERSION 文件版本号 tag + latest |
+| `release` | push main / `v*` tag / 手动 | 全平台发行压缩包附加到 GitHub Release（见下） |
+
+### 版本号与发行流程
+
+版本号唯一来源是根目录 **`VERSION` 文件**（三段式，如 `0.2.1`）：
+
+1. **每次代码修改先改 VERSION 再提交**（版本号 +1）；
+2. `docker` 流水线读取 VERSION，镜像获得 `0.2.1` 版本 tag（外加 latest / main / sha）；
+3. `release` 流水线自动交叉编译并打包发行文件（**全部压缩，不直接上传 exe**）：
+
+| 发行包 | 内容 |
+|---|---|
+| `lanet-{版本}-windows-amd64.zip` | lanet-agent / ctl / relay / node（exe）+ wintun.dll + README + VERSION |
+| `lanet-{版本}-linux-amd64.tar.gz` | lanet-agent / ctl / relay / node + VERSION |
+| `lanet-{版本}-linux-arm64.tar.gz` | 同上（arm64） |
+| `sha256sums.txt` | 全部压缩包校验和 |
+
+- 发行包同时创建/更新 GitHub Release（tag `v{VERSION}`）；
+- 各二进制由 `-ldflags "-X main.version={VERSION}"` 注入版本，启动日志可见（如 `[node] 启动 ... version=0.2.1`），可用于部署核验。
 
 镜像地址：
 
@@ -231,6 +249,7 @@ schema 迁移采用账本表 `schema_migrations` 记录版本，迁移以有序�
 ghcr.io/ayflying/lanet-ctl:latest
 ghcr.io/ayflying/lanet-relay:latest
 ghcr.io/ayflying/lanet-agent:latest
+ghcr.io/ayflying/lanet-node:latest
 ```
 
 > 容器镜像均为私有，拉取前需 `docker login ghcr.io`。

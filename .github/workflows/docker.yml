@@ -1,9 +1,10 @@
 # =================================================================================
-# Lanet 容器镜像 CI：自动编译服务端（ctl/relay）与客户端（agent）镜像，
-# 推送到 ghcr.io/ayflying/lanet-{ctl,relay,agent}。
+# Lanet 容器镜像 CI：自动编译服务端（ctl/relay）与客户端（agent/node）镜像，
+# 推送到 ghcr.io/ayflying/lanet-{ctl,relay,agent,node}。
 #
-# 触发：push 到 main（含代码/Dockerfile/CI 变更）或手动 workflow_dispatch。
-# 标签策略：分支名 / 语义化版本 tag（v1.2.3 → 1.2.3, 1.2, 1）/ latest。
+# 触发：push 到 main（含代码/Dockerfile/CI/VERSION 变更）或手动 workflow_dispatch。
+# 标签策略：分支名 / 语义化版本 tag（v1.2.3 → 1.2.3, 1.2, 1）/ 根目录 VERSION
+# 文件内容（如 0.2.1）/ latest。改代码先改 VERSION 再提交，镜像即带版本号。
 # =================================================================================
 
 name: docker
@@ -17,6 +18,7 @@ on:
       - "go.mod"
       - "go.sum"
       - "build/**"
+      - "VERSION"
       - ".github/workflows/docker.yml"
   workflow_dispatch:
 
@@ -52,6 +54,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Read version from VERSION file
+        id: ver
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -72,6 +78,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+            type=raw,value=${{ steps.ver.outputs.version }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,format=short
 

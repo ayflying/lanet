@@ -32,6 +32,9 @@ import (
 // echoProto 节点间探测回显协议。
 const echoProto = libprotocol.ID("/lanet/echo/1.0.0")
 
+// version 由 CI 经 -ldflags "-X main.version=<VERSION 文件内容>" 注入。
+var version = "dev"
+
 func main() {
 	var (
 		name      = flag.String("name", envOr("LANET_NAME", "node"), "节点名称（成员表中的虚拟域名）")
@@ -51,7 +54,7 @@ func main() {
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s noPublicDHT=%v", *name, *key, *fw, *console, *noPublic)
+	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s noPublicDHT=%v version=%s", *name, *key, *fw, *console, *noPublic, version)
 
 	// 引导节点列表。
 	var bootstraps []string

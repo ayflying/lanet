@@ -32,6 +32,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 )
 
+// version 由 CI 经 -ldflags "-X main.version=<VERSION 文件内容>" 注入。
+var version = "dev"
+
 func main() {
 	command := gcmd.Command{
 		Name:  "pvn-agent",
@@ -74,6 +77,7 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 	if name == "" {
 		log.Fatalf("必须指定 -name 节点名称")
 	}
+	log.Printf("[agent] pvn-agent version=%s", version)
 	if mode == "join" && inviteCode == "" {
 		log.Fatalf("join 模式必须提供 -invite 邀请码")
 	}
@@ -87,7 +91,7 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 	// relay 候选地址来自控制面 /v1/relays/candidates，先建轻量 client 再建 host。
 	peerSource := peersource.NewClient(ctlURL).AutoRelayPeerSource()
 	hostSpec := p2pkit.HostSpec{
-		UserAgent:   "pvn-agent/0.1.0",
+		UserAgent:   "pvn-agent/" + version,
 		RelaySource: peerSource,
 	}
 	if realTUN {
