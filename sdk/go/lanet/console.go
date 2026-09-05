@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sort"
 	"strings"
 	"time"
 
@@ -223,6 +224,7 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		PeerID    string `json:"peer_id"`
 		Name      string `json:"name"`
 		VirtualIP string `json:"virtual_ip"`
+		Hostname  string `json:"hostname"` // 虚拟地址（如 yunloli.lanet），可能为空
 		Online    bool   `json:"online"`
 		Path      string `json:"path"`
 		FirstSeen int64  `json:"first_seen"` // Unix 秒，0 = 未知
@@ -236,8 +238,9 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		}
 		mv := memberView{
 			PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP,
-			Online: online,
-			Path:   c.LastPathUsed(m.PeerID),
+			Hostname: m.Hostname,
+			Online:   online,
+			Path:     c.LastPathUsed(m.PeerID),
 		}
 		if !m.FirstSeen.IsZero() {
 			mv.FirstSeen = m.FirstSeen.Unix()
@@ -247,6 +250,17 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		}
 		members = append(members, mv)
 	}
+	// 稳定排序：在线成员在前（按最后活跃时间倒序），离线成员沉底（同样按最后活跃倒序）；
+	// 相同时间按虚拟 IP 兜底，保证刷新轮询时列表不跳动。
+	sort.Slice(members, func(i, j int) bool {
+		if members[i].Online != members[j].Online {
+			return members[i].Online
+		}
+		if members[i].LastSeen != members[j].LastSeen {
+			return members[i].LastSeen > members[j].LastSeen
+		}
+		return members[i].VirtualIP < members[j].VirtualIP
+	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"info":     c.Info(),
 		"members":  members,

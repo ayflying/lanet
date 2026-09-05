@@ -60,6 +60,7 @@
   button { padding:7px 14px; border:0; border-radius:6px; background:var(--accent); color:#fff;
            font-size:13px; cursor:pointer; }
   button.ghost { background:#eef0f3; color:var(--txt); }
+  button.ghost:disabled { opacity:.45; cursor:default; }
   button.del { background:none; color:var(--bad); padding:2px 6px; }
   .msg { font-size:12px; margin-top:8px; min-height:18px; }
   .msg.ok { color:var(--ok); } .msg.bad { color:var(--bad); }
@@ -114,7 +115,20 @@
 <div class="panel active" id="pMembers">
   <div class="card">
     <h2>成员与链路</h2>
+    <div class="row" style="margin:0 0 10px">
+      <input type="text" id="mSearch" placeholder="搜索：设备名 / 虚拟地址 / 虚拟 IP / PeerID" oninput="mPage=1;renderMembers()">
+      <select id="mFilter" style="flex:0 0 140px" onchange="mPage=1;renderMembers()">
+        <option value="all">全部状态</option>
+        <option value="online">仅在线</option>
+        <option value="offline">仅离线</option>
+      </select>
+    </div>
     <div id="members" class="empty">加载中…</div>
+    <div class="row" id="mPager" style="display:none;margin:10px 0 0;justify-content:flex-end">
+      <button class="ghost" id="mPrev" onclick="mPage--;renderMembers()">上一页</button>
+      <span class="sub" id="mPageInfo" style="margin:0 10px;align-self:center"></span>
+      <button class="ghost" id="mNext" onclick="mPage++;renderMembers()">下一页</button>
+    </div>
   </div>
 </div>
 
@@ -196,29 +210,71 @@ async function loadState() {
   const i = S.info;
   const nodeName = i.name || (i.peer_id ? i.peer_id.slice(0, 16) + '…' : '节点');
   $('nodeTitle').textContent = nodeName;
-  $('addrLine').textContent = `虚拟 IP ${i.virtual_ip} · 节点 ${i.peer_id.slice(0,16)}… · 网络 ${i.group || i.group_id}`;
-  $('members').innerHTML = S.members.length === 0
-    ? '<span class="empty">暂未发现其他成员（等待 DHT / mDNS 发现）</span>'
-    : '<table><tr><th>设备</th><th>虚拟 IP</th><th>状态</th><th>链路</th><th>上线时间</th></tr>' +
-      S.members.map(m => {
-        const label = m.name || (m.peer_id ? m.peer_id.slice(0, 10) + '…' : '未知设备');
-        const pid = m.name ? '<span class="pid"> (' + esc(m.peer_id.slice(0, 8)) + '…)</span>' : '';
-        const path = m.online
-          ? (m.path === 'relay' ? '<span class="tag relay">中继</span>'
-            : m.path === 'direct' ? '<span class="tag direct">直连</span>'
-            : '<span class="tag unknown">已连接</span>')
-          : '<span class="tag unknown">—</span>';
-        const since = m.first_seen ? relTime(m.first_seen) : '—';
-        return `<tr><td class="mname">${esc(label)}${pid}</td><td>${esc(m.virtual_ip)}</td>` +
-          `<td><span class="tag ${m.online ? 'online' : 'offline'}"><span class="dot ${m.online ? 'on' : 'off'}"></span>${m.online ? '在线' : '离线'}</span></td>` +
-          `<td>${path}</td><td>${esc(since)}</td></tr>`;
-      }).join('') +
-      '</table>';
+  $('addrLine').textContent = `虚拟 IP ${i.virtual_ip}` +
+    (i.virtual_host ? ` · 虚拟地址 ${i.virtual_host}` : '') +
+    ` · 节点 ${i.peer_id.slice(0,16)}… · 网络 ${i.group || i.group_id}`;
+  $('members').innerHTML = '';
+  renderMembers();
   $('fwMode').value = S.mode;
-  $('bMembers').textContent = S.members.length;
   $('bRules').textContent = S.rules.length;
   $('bForwards').textContent = S.forwards.length;
   renderRules(); renderForwards();
+}
+
+// ---- 成员列表：后端已按「在线在前 + 最后活跃倒序」稳定排序，这里做筛选/搜索/分页 ----
+const M_PAGE_SIZE = 50;
+let mPage = 1;
+
+function filteredMembers() {
+  const q = $('mSearch').value.trim().toLowerCase();
+  const f = $('mFilter').value;
+  return S.members.filter(m => {
+    if (f === 'online' && !m.online) return false;
+    if (f === 'offline' && m.online) return false;
+    if (!q) return true;
+    return [m.name, m.virtual_ip, m.hostname, m.peer_id]
+      .some(v => (v || '').toLowerCase().includes(q));
+  });
+}
+
+function renderMembers() {
+  const list = filteredMembers();
+  $('bMembers').textContent = S.members.length;
+  const pages = Math.max(1, Math.ceil(list.length / M_PAGE_SIZE));
+  if (mPage > pages) mPage = pages;
+  if (mPage < 1) mPage = 1;
+  if (list.length === 0) {
+    $('members').innerHTML = S.members.length === 0
+      ? '<span class="empty">暂未发现其他成员（等待 DHT / mDNS 发现）</span>'
+      : '<span class="empty">没有匹配的成员</span>';
+    $('mPager').style.display = 'none';
+    return;
+  }
+  const page = list.slice((mPage - 1) * M_PAGE_SIZE, mPage * M_PAGE_SIZE);
+  $('members').innerHTML =
+    '<table><tr><th>设备</th><th>虚拟地址</th><th>虚拟 IP</th><th>状态</th><th>链路</th><th>上线时间</th><th>最后活跃</th></tr>' +
+    page.map(m => {
+      const label = m.name || (m.peer_id ? m.peer_id.slice(0, 10) + '…' : '未知设备');
+      const pid = m.name ? '<span class="pid"> (' + esc(m.peer_id.slice(0, 8)) + '…)</span>' : '';
+      const host = m.hostname
+        ? `<span class="vhost" title="点击复制虚拟地址" onclick="copyText('${esc(m.hostname)}', this)">${esc(m.hostname)}</span>`
+        : '<span class="tag unknown">—</span>';
+      const path = m.online
+        ? (m.path === 'relay' ? '<span class="tag relay">中继</span>'
+          : m.path === 'direct' ? '<span class="tag direct">直连</span>'
+          : '<span class="tag unknown">已连接</span>')
+        : '<span class="tag unknown">—</span>';
+      const since = m.first_seen ? relTime(m.first_seen) : '—';
+      const last = m.last_seen ? relTime(m.last_seen) : '—';
+      return `<tr><td class="mname">${esc(label)}${pid}</td><td>${host}</td><td>${esc(m.virtual_ip)}</td>` +
+        `<td><span class="tag ${m.online ? 'online' : 'offline'}"><span class="dot ${m.online ? 'on' : 'off'}"></span>${m.online ? '在线' : '离线'}</span></td>` +
+        `<td>${path}</td><td>${esc(since)}</td><td>${esc(last)}</td></tr>`;
+    }).join('') +
+    '</table>';
+  $('mPager').style.display = 'flex';
+  $('mPageInfo').textContent = `第 ${mPage}/${pages} 页 · 共 ${list.length} 个成员`;
+  $('mPrev').disabled = mPage <= 1;
+  $('mNext').disabled = mPage >= pages;
 }
 
 function switchTab(btn) {
@@ -275,6 +331,19 @@ async function saveForwards() {
   loadState();
 }
 function flash(id, text, ok) { $(id).textContent = text; $(id).className = 'msg ' + (ok ? 'ok' : 'bad'); }
+
+function copyText(text, el) {
+  const done = () => { if (!el) return; const old = el.style.color; el.style.color = '#2fa65a';
+    setTimeout(() => { el.style.color = old; }, 800); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => {});
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) {}
+    ta.remove();
+  }
+}
 
 function relTime(unix) {
   const diff = Math.floor(Date.now() / 1000) - unix;
