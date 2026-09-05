@@ -1,0 +1,49 @@
+# =================================================================================
+# Lanet 单节点容器编排（lanet-node：客户端=服务端一体，项目唯一组件）。
+# 典型用途：部署在一台有公网 IP 的 VPS 上，充当整个网络的引导 + 中继节点，
+# 让各自 NAT 后的成员稳定互通（直连优先，打洞失败经本节点中继转发）。
+# 镜像由 GitHub Actions 自动编译并推送（.github/workflows/docker.yml）。
+#
+#   启动：在 deploy/ 目录创建 .env 文件（参考下方示例）后
+#         docker compose up -d
+#
+# .env 示例：
+#   LANET_NAME=vps-node
+#   LANET_NETWORK_KEY=lanet-test
+#   LANET_CONSOLE_PASSWORD=请改成强密码
+#
+# 环境变量说明（pvn-node 原生读取，非 compose 插值）：
+#   LANET_NAME              节点名称（成员表中的虚拟域名）
+#   LANET_NETWORK_KEY       网络密钥；与要服务的群组保持一致（留空 = 公共网络）
+#   LANET_CONSOLE           控制台监听地址：0.0.0.0:8900 = 允许外网访问；
+#                           127.0.0.1:8900 = 仅本机（用 SSH 隧道查看，更安全）
+#   LANET_CONSOLE_PASSWORD  控制台访问密码；LANET_CONSOLE 允许外网访问时务必设置！
+#   LANET_BOOTSTRAP         引导方式（默认 public = 公共 DHT）
+#   LANET_LISTEN            P2P 监听地址（默认随机端口；这里固定 4001 便于防火墙放行）
+# =================================================================================
+
+services:
+  node:
+    image: ghcr.io/ayflying/lanet-node:latest
+    container_name: lanet-node
+    restart: unless-stopped
+    environment:
+      LANET_NAME: ${LANET_NAME:-vps-node}
+      LANET_NETWORK_KEY: ${LANET_NETWORK_KEY:-}
+      # ---- 控制台：能否外网访问 + 访问密码 ----
+      LANET_CONSOLE: ${LANET_CONSOLE:-0.0.0.0:8900}
+      LANET_CONSOLE_PASSWORD: ${LANET_CONSOLE_PASSWORD:-}
+      LANET_BOOTSTRAP: ${LANET_BOOTSTRAP:-public}
+      # ---- 固定 P2P 端口，防火墙只需放行 4001/tcp + 4001/udp ----
+      LANET_LISTEN: ${LANET_LISTEN:-/ip4/0.0.0.0/tcp/4001,/ip4/0.0.0.0/udp/4001/quic-v1}
+    ports:
+      - "8900:8900"      # Web 控制台（仅当 LANET_CONSOLE=0.0.0.0:8900 时对外有意义）
+      - "4001:4001/tcp"  # P2P 直连与中继流量
+      - "4001:4001/udp"  # QUIC / 打洞
+    volumes:
+      # 命名卷：node.key / lanet.json / state.json / lanet.log 全部落在这里，
+      # 首次挂载自动继承镜像内 /data 属主（lanet），重建容器身份不变。
+      - lanet-node-data:/data
+
+volumes:
+  lanet-node-data:
