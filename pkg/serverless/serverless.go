@@ -86,6 +86,11 @@ type Config struct {
 	// 注意：仅发现到（DHT 陈旧 provider 记录）不会续命——必须真正通讯过。
 	// 最小值 2 分钟（过小会误删 NAT 重连慢的成员）；0 = 用默认。
 	MemberTTL time.Duration
+	// Version 本节点程序版本（info 协议交换给同网络成员，
+	// 供 P2P 自更新统计全网版本分布）。空 = 不上报。
+	Version string
+	// Platform 本节点运行平台（GOOS/GOARCH，如 windows/amd64）。
+	Platform string
 	// Quiet 为 true 时不打日志。
 	Quiet bool
 }
@@ -102,6 +107,10 @@ type Member struct {
 	// Hostname 本成员的虚拟主机名（含 .lanet 后缀，如 yunloli.lanet）。
 	// 由当前成员表确定性推导，重名自动追加后缀。
 	Hostname string `json:"hostname,omitempty"`
+	// Version 成员程序版本（info 协议交换；旧节点为空）。
+	Version string `json:"version,omitempty"`
+	// Platform 成员运行平台 GOOS/GOARCH。
+	Platform string `json:"platform,omitempty"`
 }
 
 // Discovered 新成员被发现（尚未连通也会触发；连通并确认同群后 Name 有效）。
@@ -419,6 +428,8 @@ func (d *Discovery) connectAndIdentify(id peer.ID) {
 	d.mu.Lock()
 	if m, ok := d.members[id.String()]; ok {
 		m.Name = info.Name
+		m.Version = info.Version
+		m.Platform = info.Platform
 		m.LastSeen = time.Now()
 	} else {
 		d.mu.Unlock()
@@ -435,9 +446,11 @@ func (d *Discovery) connectAndIdentify(id peer.ID) {
 
 // infoPayload info 协议载荷。
 type infoPayload struct {
-	Name  string `json:"name"`
-	Group string `json:"group"`
-	OS    string `json:"os"`
+	Name     string `json:"name"`
+	Group    string `json:"group"`
+	OS       string `json:"os"`
+	Version  string `json:"version,omitempty"`  // 程序版本（P2P 自更新用）
+	Platform string `json:"platform,omitempty"` // GOOS/GOARCH
 }
 
 // handleInfo 入向信息交换。
@@ -460,12 +473,16 @@ func (d *Discovery) handleInfo(s network.Stream) {
 		if req.Name != "" {
 			m.Name = req.Name
 		}
+		m.Version = req.Version
+		m.Platform = req.Platform
 		m.LastSeen = time.Now()
 	}
 	d.mu.Unlock()
 	resp := infoPayload{
-		Name:  d.cfg.Name,
-		Group: GroupFingerprint(d.groupKey),
+		Name:     d.cfg.Name,
+		Group:    GroupFingerprint(d.groupKey),
+		Version:  d.cfg.Version,
+		Platform: d.cfg.Platform,
 	}
 	_ = json.NewEncoder(s).Encode(resp)
 }
@@ -477,7 +494,12 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 		return infoPayload{}, err
 	}
 	defer stream.Close()
-	req := infoPayload{Name: d.cfg.Name, Group: GroupFingerprint(d.groupKey)}
+	req := infoPayload{
+		Name:     d.cfg.Name,
+		Group:    GroupFingerprint(d.groupKey),
+		Version:  d.cfg.Version,
+		Platform: d.cfg.Platform,
+	}
 	if err = json.NewEncoder(stream).Encode(req); err != nil {
 		return infoPayload{}, err
 	}

@@ -83,6 +83,25 @@ jobs:
           echo "$VERSION" > "$DIR/VERSION"
           cp packaging/release-README.txt "$DIR/README.txt"
 
+      # 发布签名：对裸二进制生成带 Ed25519 签名的版本清单分片。
+      # 私钥在仓库 Secret SELFUPDATE_SIGNING_KEY（PEM PKCS#8），只在 CI 内短暂出现。
+      # P2P 自更新以此清单为信任锚：节点内置公钥验签，≥3 成员清单一致才升级。
+      # 未配置 Secret 时跳过（P2P 更新链路静默不生效，GitHub 更新路径不受影响）。
+      - name: Sign binary (P2P self-update manifest)
+        if: ${{ secrets.SELFUPDATE_SIGNING_KEY != '' }}
+        shell: bash
+        env:
+          SELFUPDATE_SIGNING_KEY: ${{ secrets.SELFUPDATE_SIGNING_KEY }}
+        run: |
+          go run ./cmd/sign-manifest \
+            -version "${VERSION}" \
+            -platform "${{ matrix.goos }}/${{ matrix.goarch }}" \
+            -file "dist/lanet-${{ matrix.goos }}-${{ matrix.goarch }}/lanet${{ matrix.ext }}" \
+            -out "dist/manifest-${{ matrix.goos }}-${{ matrix.goarch }}.json"
+          # 分片同时放进发行包：解压即有分发凭证，升级后可立即成为 P2P 种子。
+          cp "dist/manifest-${{ matrix.goos }}-${{ matrix.goarch }}.json" \
+             "dist/lanet-${{ matrix.goos }}-${{ matrix.goarch }}/manifest.json"
+
       - name: Attach wintun.dll and README (windows)
         if: matrix.goos == 'windows'
         shell: bash
@@ -111,6 +130,7 @@ jobs:
             dist/lanet-*.zip
             dist/lanet-*.tar.gz
             dist/lanet-*.sha256
+            dist/manifest-*.json
           retention-days: 30
 
   release:
@@ -160,6 +180,29 @@ jobs:
           cat *.sha256 > sha256sums.txt
           rm -f *.sha256
 
+      # 合并各平台签名分片为全网统一清单（P2P 自更新信任锚）。
+      - name: Merge update manifests
+        if: ${{ secrets.SELFUPDATE_SIGNING_KEY != '' }}
+        shell: bash
+        run: |
+          cd dist
+          if ls manifest-*.json >/dev/null 2>&1; then
+            # 分片结构为单对象 artifact 条目，直接拼装。
+            echo "{\"version\":\"${{ env.VERSION }}\",\"artifacts\":[" > manifest.json
+            first=1
+            for f in manifest-*.json; do
+              if [ $first -eq 0 ]; then echo "," >> manifest.json; fi
+              cat "$f" >> manifest.json
+              first=0
+            done
+            echo "]}" >> manifest.json
+            jq . manifest.json > /dev/null   # 语法校验，失败即终止
+            rm -f manifest-*.json
+            echo "manifest.json:"; cat manifest.json
+          else
+            echo "无签名分片（未配置 SELFUPDATE_SIGNING_KEY），跳过"
+          fi
+
       - name: Attach to GitHub Release (tag v${{ env.VERSION }})
         uses: softprops/action-gh-release@v2
         with:
@@ -168,4 +211,5 @@ jobs:
             dist/lanet-*.zip
             dist/lanet-*.tar.gz
             dist/sha256sums.txt
+            dist/manifest.json
           body_path: release-notes.md

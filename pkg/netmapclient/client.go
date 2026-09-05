@@ -28,6 +28,9 @@ type Member struct {
 	// 控制面 NetMap 无此概念，为零值。
 	FirstSeen time.Time `json:"first_seen,omitempty"`
 	LastSeen  time.Time `json:"last_seen,omitempty"`
+	// Version/Platform 成员程序版本与平台（info 协议交换；旧节点为空）。
+	Version  string `json:"version,omitempty"`
+	Platform string `json:"platform,omitempty"`
 }
 
 type Snapshot struct {

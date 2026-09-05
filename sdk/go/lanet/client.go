@@ -111,6 +111,11 @@ type Config struct {
 	// 真实通讯的成员从成员表移除，虚拟 IP 派生占用随之释放。
 	// 默认 10 分钟，最小 2 分钟；0 = 默认。DHT 陈旧记录不会续命。
 	MemberTTL time.Duration
+	// Version 本程序版本号（ldflags 注入），随 info 协议上报给同网络成员，
+	// 供 P2P 自更新统计全网版本分布。空 = 不上报。
+	Version string
+	// Platform 本程序平台，默认 runtime.GOOS+"/"+runtime.GOARCH。
+	Platform string
 	// DialTimeout 开流超时，默认 8s。
 	DialTimeout time.Duration
 	// Quiet 为 true 时不打日志。
@@ -325,11 +330,13 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 			NetworkKey:            cfg.NetworkKey,
 			Name:                  cfg.Name,
 			Bootstrap:             cfg.Bootstrap,
-		DisablePublicFallback: cfg.DisablePublicDHT,
-		EnableMDNS:            true,
-		Interval:              cfg.NetMapInterval,
-		MemberTTL:             cfg.MemberTTL,
-		Quiet:                 cfg.Quiet,
+			DisablePublicFallback: cfg.DisablePublicDHT,
+			EnableMDNS:            true,
+			Interval:              cfg.NetMapInterval,
+			MemberTTL:             cfg.MemberTTL,
+			Version:               cfg.Version,
+			Platform:              cfg.Platform,
+			Quiet:                 cfg.Quiet,
 		})
 		if err == nil {
 			err = disc.Start(ctx)
@@ -502,6 +509,7 @@ func (c *Client) NetMap() netmapclient.Snapshot {
 			members = append(members, netmapclient.Member{
 				PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, Addrs: m.Addrs,
 				Hostname: m.Hostname, FirstSeen: m.FirstSeen, LastSeen: m.LastSeen,
+				Version: m.Version, Platform: m.Platform,
 			})
 		}
 		return netmapclient.Snapshot{

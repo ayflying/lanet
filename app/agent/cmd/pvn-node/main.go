@@ -62,6 +62,8 @@ func main() {
 			"防火墙模式：deny-all / allow-list / allow-all；不传则读配置文件")
 		listen = flag.String("listen", envOr("LANET_LISTEN", ""),
 			"覆盖监听地址（逗号分隔）；默认 tcp/ws/quic 全部随机端口")
+		selfUpdate = flag.String("self-update", "@@unset@@",
+			"P2P 自动更新（≥3 成员确认 + 签名校验才升级）；true/false，缺省读配置文件（默认 true）")
 		tun = flag.String("tun", "@@unset@@",
 			"虚拟网卡 TUN（IP 层互通：ping/任意端口直达虚拟 IP）；true/false，缺省读配置文件（默认 true）")
 		noPublic = flag.Bool("no-public-dht",
@@ -124,6 +126,13 @@ func main() {
 			effProbe = 20 * time.Second
 		}
 	}
+	effSelfUpdate := nc.SelfUpdate == nil || *nc.SelfUpdate // 缺省字段视为开启
+	if *selfUpdate != "@@unset@@" {
+		effSelfUpdate = strings.EqualFold(*selfUpdate, "true") || *selfUpdate == "1"
+	}
+	if runningInContainer() {
+		effSelfUpdate = false // 容器内替换二进制会被镜像回滚
+	}
 	eff := nodeRuntime{
 		Name:        effName,
 		NetworkKey:  effKey,
@@ -132,6 +141,7 @@ func main() {
 		Firewall:    effFW,
 		NoPublicDHT: effNoPublic,
 		Tun:         effTun,
+		SelfUpdate:  effSelfUpdate,
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -173,6 +183,8 @@ func main() {
 		StateFile:        filepath.Join(filepath.Dir(*config), "state.json"),
 		ConsoleExtra:     extra,
 		Tun:              effTun,
+		Version:          version,
+		Platform:         runtime.GOOS + "/" + runtime.GOARCH,
 	}
 	switch effFW {
 	case "allow-list":
@@ -199,6 +211,15 @@ func main() {
 
 	// 每次启动后台检查一次更新（预拉发行说明，控制台弹框即点即显）。
 	StartUpdateCheck(firstNonEmpty(os.Getenv("GITHUB_TOKEN"), readConfigToken(*config)))
+
+	// P2P 自动更新（去中心化分发；默认开启，容器/显式关闭时禁用）。
+	if effSelfUpdate {
+		if reason := StartP2PUpdate(ctx, node, version, filepath.Dir(*config)); reason != "" {
+			log.Printf("[p2p-update] 已禁用：%s", reason)
+		}
+	} else {
+		log.Printf("[p2p-update] 已禁用：配置关闭")
+	}
 
 	// ---- 托盘 + 自动打开控制台（Windows 图形界面模式）----
 	if consoleURL := node.ConsoleURL(); consoleURL != "" && runtime.GOOS == "windows" {
@@ -391,6 +412,7 @@ type nodeConfig struct {
 	NoPublicDHT     bool   `json:"no_public_dht"`
 	ProbeSec        int    `json:"probe_seconds"`
 	Tun             *bool  `json:"tun,omitempty"`          // 虚拟网卡 TUN；nil = 默认开启（兼容旧配置文件）
+	SelfUpdate      *bool  `json:"self_update,omitempty"`  // P2P 自动更新；nil = 默认开启
 	GitHubToken     string `json:"github_token,omitempty"` // 私有仓库检查更新用（contents:read）
 
 	bootstrapAddrs []string `json:"-"` // 运行时由 Bootstrap 解析而来
@@ -428,6 +450,7 @@ func defaultNodeConfig(exeDir string) *nodeConfig {
 		Firewall:   "allow-all",
 		ProbeSec:   20,
 		Tun:        boolPtr(true),
+		SelfUpdate: boolPtr(true),
 	}
 }
 
@@ -457,6 +480,7 @@ type nodeRuntime struct {
 	Firewall    string
 	NoPublicDHT bool
 	Tun         bool
+	SelfUpdate  bool
 }
 
 // networkID 运行时网络标识（与 SDK/控制台页眉一致）：standalone- + 群组指纹。
@@ -491,6 +515,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				"no_public_dht": nc.NoPublicDHT,
 				"probe_seconds": nc.ProbeSec,
 				"tun":           tunOn,
+				"self_update":   nc.SelfUpdate == nil || *nc.SelfUpdate,
 				"runtime": map[string]any{
 					"name":          eff.Name,
 					"network_key":   eff.NetworkKey,
@@ -501,6 +526,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 					"firewall":      eff.Firewall,
 					"no_public_dht": eff.NoPublicDHT,
 					"tun":           eff.Tun,
+					"self_update":   eff.SelfUpdate,
 				},
 			})
 		},
@@ -536,6 +562,9 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 			prev := read()
 			if req.Tun == nil {
 				req.Tun = prev.Tun // 页面未提供（旧版控制台）时保留原值
+			}
+			if req.SelfUpdate == nil {
+				req.SelfUpdate = prev.SelfUpdate
 			}
 			req.Identity = prev.Identity // 身份文件路径只读，防止控制台误改导致身份丢失
 			// 密码语义：clear_password=true → 清除；传了非空密码 → 覆盖；否则保持不变。
