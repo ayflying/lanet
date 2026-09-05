@@ -55,7 +55,9 @@ func main() {
 		identity = flag.String("identity", envOr("LANET_IDENTITY", ""),
 			"身份密钥文件路径；不传则读配置文件，再退回默认（Windows: exe 同目录 node.key）")
 		console = flag.String("console", envOr("LANET_CONSOLE", ""),
-			"控制台监听地址；不传则读配置文件（默认 0.0.0.0:8900）")
+			"控制台监听地址；不传则读配置文件（默认 127.0.0.1:8900 仅本机，0.0.0.0:8900 = 允许远程）")
+		consolePW = flag.String("console-password", envOr("LANET_CONSOLE_PASSWORD", ""),
+			"控制台访问密码（远程访问时务必设置）；不传则读配置文件")
 		fw = flag.String("fw", envOr("LANET_FW", ""),
 			"防火墙模式：deny-all / allow-list / allow-all；不传则读配置文件")
 		listen = flag.String("listen", envOr("LANET_LISTEN", ""),
@@ -100,7 +102,8 @@ func main() {
 	}
 	effBootstrap := firstNonEmpty(*bootstrap, nc.Bootstrap, "public")
 	effIdentity := firstNonEmpty(*identity, nc.Identity, defaultIdentityPath(exeDir))
-	effConsole := firstNonEmpty(*console, nc.Console, "0.0.0.0:8900")
+	effConsole := firstNonEmpty(*console, nc.Console, "127.0.0.1:8900")
+	effConsolePW := firstNonEmpty(*consolePW, nc.ConsolePassword)
 	effFW := firstNonEmpty(*fw, nc.Firewall, "allow-all")
 	effListen := firstNonEmpty(*listen, nc.Listen)
 	effNoPublic := *noPublic || nc.NoPublicDHT
@@ -138,6 +141,7 @@ func main() {
 		DisablePublicDHT: effNoPublic,
 		IdentityFile:     effIdentity,
 		ConsoleAddr:      effConsole,
+		ConsolePassword:  effConsolePW,
 		StateFile:        filepath.Join(filepath.Dir(*config), "state.json"),
 		ConsoleExtra:     nodeConfigRoutes(*config),
 	}
@@ -338,15 +342,16 @@ func defaultIdentityPath(exeDir string) string {
 // 双击/零参数启动时全靠它；Web 控制台「节点配置」编辑的就是这个文件，
 // 保存后重启程序生效（防火墙与转发映射在控制台里是热生效的，不在此列）。
 type nodeConfig struct {
-	Name        string `json:"name"`
-	NetworkKey  string `json:"network_key"`
-	Bootstrap   string `json:"bootstrap"`
-	Identity    string `json:"identity"`
-	Console     string `json:"console"`
-	Firewall    string `json:"firewall"`
-	Listen      string `json:"listen"`
-	NoPublicDHT bool   `json:"no_public_dht"`
-	ProbeSec    int    `json:"probe_seconds"`
+	Name            string `json:"name"`
+	NetworkKey      string `json:"network_key"`
+	Bootstrap       string `json:"bootstrap"`
+	Identity        string `json:"identity"`
+	Console         string `json:"console"`
+	ConsolePassword string `json:"console_password,omitempty"`
+	Firewall        string `json:"firewall"`
+	Listen          string `json:"listen"`
+	NoPublicDHT     bool   `json:"no_public_dht"`
+	ProbeSec        int    `json:"probe_seconds"`
 
 	bootstrapAddrs []string `json:"-"` // 运行时由 Bootstrap 解析而来
 }
@@ -379,7 +384,7 @@ func defaultNodeConfig(exeDir string) *nodeConfig {
 		NetworkKey: "",
 		Bootstrap:  "public",
 		Identity:   defaultIdentityPath(exeDir),
-		Console:    "0.0.0.0:8900",
+		Console:    "127.0.0.1:8900",
 		Firewall:   "allow-all",
 		ProbeSec:   20,
 	}
@@ -417,6 +422,7 @@ func nodeConfigRoutes(path string) map[string]http.HandlerFunc {
 				"bootstrap":     nc.Bootstrap,
 				"identity":      nc.Identity,
 				"console":       nc.Console,
+				"has_password":  nc.ConsolePassword != "",
 				"firewall":      nc.Firewall,
 				"listen":        nc.Listen,
 				"no_public_dht": nc.NoPublicDHT,
@@ -424,7 +430,10 @@ func nodeConfigRoutes(path string) map[string]http.HandlerFunc {
 			})
 		},
 		"PUT /api/node-config": func(w http.ResponseWriter, r *http.Request) {
-			var req nodeConfig
+			var req struct {
+				nodeConfig
+				ClearPassword bool `json:"clear_password"`
+			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				writeJSONLocal(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
 				return
@@ -442,7 +451,16 @@ func nodeConfigRoutes(path string) map[string]http.HandlerFunc {
 			if req.ProbeSec < 0 {
 				req.ProbeSec = 20
 			}
-			req.Identity = read().Identity // 身份文件路径只读，防止控制台误改导致身份丢失
+			prev := read()
+			req.Identity = prev.Identity // 身份文件路径只读，防止控制台误改导致身份丢失
+			// 密码语义：clear_password=true → 清除；传了非空密码 → 覆盖；否则保持不变。
+			// GET 不回传密码明文，所以 req.ConsolePassword 为空时不能当作"删除"。
+			switch {
+			case req.ClearPassword:
+				req.ConsolePassword = ""
+			case req.ConsolePassword == "":
+				req.ConsolePassword = prev.ConsolePassword
+			}
 			if err := req.save(path); err != nil {
 				writeJSONLocal(w, http.StatusInternalServerError, map[string]string{"error": "保存失败: " + err.Error()})
 				return

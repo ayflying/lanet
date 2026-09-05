@@ -136,8 +136,12 @@ type Config struct {
 	// 运行中可经 Web 控制台热更新；入向转发始终受防火墙约束（默认全拒绝）。
 	LANForwards []LANForward
 	// ConsoleAddr 内置 Web 控制台监听地址，默认 127.0.0.1:8900
-	// （端口被占用时自动向后尝试到 8910）；设为 "-" 关闭控制台。
+	// （仅本机可访问；端口被占用时自动向后尝试到 8910）；设为 "-" 关闭控制台。
+	// 如需局域网/远程访问请显式设为 0.0.0.0:8900 并务必配合 ConsolePassword。
 	ConsoleAddr string
+	// ConsolePassword 控制台访问密码；非空时启用登录页 + 会话 Cookie（7 天有效），
+	// 未登录访问全部跳转登录页，API 返回 401。空 = 无密码（默认，仅本机监听时安全）。
+	ConsolePassword string
 	// StateFile 控制台状态（防火墙规则 + 转发映射）持久化文件路径；
 	// 空 = 仅内存，节点重启后回到 Config 初始值。
 	StateFile string
@@ -204,12 +208,13 @@ type Client struct {
 
 	handlers []Handler
 
-	fw         *firewall.Firewall // 入向转发防火墙（默认 deny-all）
-	fwMu       sync.RWMutex
-	forwards   []LANForward // 局域网转发映射表（热更新）
-	statePath  string       // 状态持久化文件
-	consoleSrv *http.Server // 内置 Web 控制台
-	consoleURL string       // 控制台实际访问地址（端口回退后）
+	fw           *firewall.Firewall // 入向转发防火墙（默认 deny-all）
+	fwMu         sync.RWMutex
+	forwards     []LANForward // 局域网转发映射表（热更新）
+	statePath    string       // 状态持久化文件
+	consoleSrv   *http.Server // 内置 Web 控制台
+	consoleURL   string       // 控制台实际访问地址（端口回退后）
+	sessionToken string       // 控制台会话令牌（设置 ConsolePassword 后生成）
 }
 
 // Info 节点入网后的身份信息。

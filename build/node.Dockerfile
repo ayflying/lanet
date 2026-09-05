@@ -29,4 +29,7 @@ VOLUME ["/data"]
 
 # 环境变量：LANET_NAME / LANET_NETWORK_KEY / LANET_BOOTSTRAP / LANET_FW 等，
 # 也可直接用命令行参数覆盖。
+# 容器内控制台必须监听 0.0.0.0（宿主端口映射才能到达）；本地双击运行默认仅 127.0.0.1。
+# 远程访问时务必设置 LANET_CONSOLE_PASSWORD 启用控制台登录密码。
+ENV LANET_CONSOLE=0.0.0.0:8900
 ENTRYPOINT ["pvn-node"]

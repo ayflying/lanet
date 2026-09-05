@@ -1,7 +1,10 @@
 package lanet
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -9,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ayflying/pvn/pkg/firewall"
@@ -48,6 +52,7 @@ type consoleState struct {
 }
 
 // startConsole 启动内置 Web 控制台（默认 127.0.0.1:8900，占用时向后尝试）。
+// ConsolePassword 非空时启用会话认证：未登录访问一律跳转 /login。
 func (c *Client) startConsole() error {
 	if c.cfg.ConsoleAddr == "-" {
 		return nil
@@ -71,6 +76,15 @@ func (c *Client) startConsole() error {
 		return fmt.Errorf("lanet: 控制台监听失败（%s 起 11 个端口均被占用）: %w", base, lastErr)
 	}
 
+	// 设置了访问密码：生成随机会话令牌（内存保存，重启后需重新登录）。
+	if c.cfg.ConsolePassword != "" {
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			return fmt.Errorf("lanet: 生成控制台会话令牌失败: %w", err)
+		}
+		c.sessionToken = hex.EncodeToString(buf)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", c.apiState)
 	mux.HandleFunc("PUT /api/firewall", c.apiSetFirewall)
@@ -81,6 +95,11 @@ func (c *Client) startConsole() error {
 			_, _ = w.Write(logo)
 		}
 	})
+	if c.sessionToken != "" {
+		mux.HandleFunc("GET /login", c.apiLoginPage)
+		mux.HandleFunc("POST /login", c.apiLoginSubmit)
+		mux.HandleFunc("GET /logout", c.apiLogout)
+	}
 	for pattern, handler := range c.cfg.ConsoleExtra {
 		mux.Handle(pattern, handler)
 	}
@@ -90,7 +109,11 @@ func (c *Client) startConsole() error {
 		_, _ = w.Write(page)
 	})
 
-	c.consoleSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	var handler http.Handler = mux
+	if c.sessionToken != "" {
+		handler = c.authMiddleware(mux)
+	}
+	c.consoleSrv = &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := c.consoleSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			c.logf("控制台退出: %v", err)
@@ -103,9 +126,86 @@ func (c *Client) startConsole() error {
 		host = "127.0.0.1"
 	}
 	c.consoleURL = fmt.Sprintf("http://%s", net.JoinHostPort(host, strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)))
-	c.logf("Web 控制台已启动：%s", c.consoleURL)
+	c.logf("Web 控制台已启动：%s（%s）", c.consoleURL,
+		map[bool]string{true: "已启用访问密码", false: "无密码"}[c.sessionToken != ""])
 	return nil
 }
+
+const sessionCookieName = "lanet_console_session"
+
+// authMiddleware 会话认证：除登录页/图标外全部要求有效会话 Cookie。
+func (c *Client) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login", "/logout", "/favicon.ico":
+			next.ServeHTTP(w, r)
+			return
+		}
+		ck, err := r.Cookie(sessionCookieName)
+		if err != nil || subtle.ConstantTimeCompare([]byte(ck.Value), []byte(c.sessionToken)) != 1 {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "未登录或会话已过期"})
+			} else {
+				http.Redirect(w, r, "/login", http.StatusSeeOther)
+			}
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// apiLoginPage 登录页（移动端可用的简洁表单）。
+func (c *Client) apiLoginPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(loginPageHTML))
+}
+
+// apiLoginSubmit 校验密码并签发会话 Cookie。
+func (c *Client) apiLoginSubmit(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	pw := r.FormValue("password")
+	if subtle.ConstantTimeCompare([]byte(pw), []byte(c.cfg.ConsolePassword)) != 1 {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(strings.Replace(loginPageHTML, `class="msg"`, `class="msg" style="color:#d5484a">密码错误`, 1)))
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookieName, Value: c.sessionToken, Path: "/",
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 7 * 24 * 3600,
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// apiLogout 清除会话。
+func (c *Client) apiLogout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1})
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+const loginPageHTML = `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lanet 控制台登录</title>
+<style>
+ body { font:14px/1.6 system-ui,"Segoe UI","Microsoft YaHei",sans-serif; background:#f5f6f8;
+        display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; }
+ .box { background:#fff; border:1px solid #e2e4e9; border-radius:10px; padding:28px; width:min(340px,90vw); }
+ h1 { font-size:17px; margin:0 0 4px; } .sub { color:#6b7280; font-size:12px; margin-bottom:16px; }
+ input { width:100%; box-sizing:border-box; padding:9px 10px; border:1px solid #e2e4e9;
+         border-radius:6px; font-size:14px; }
+ button { width:100%; margin-top:12px; padding:9px; border:0; border-radius:6px;
+          background:#2f6fed; color:#fff; font-size:14px; cursor:pointer; }
+ .msg { font-size:12px; min-height:16px; margin-top:10px; color:#6b7280; }
+</style></head><body><div class="box">
+<h1>Lanet 节点控制台</h1>
+<div class="sub">本控制台已启用访问密码，请登录</div>
+<form method="POST" action="/login">
+  <input type="password" name="password" placeholder="访问密码" autofocus autocomplete="current-password">
+  <button type="submit">登录</button>
+</form>
+<div class="msg"></div>
+</div></body></html>`
 
 // ConsoleURL 内置 Web 控制台的实际访问地址（含端口回退后的真实端口）；
 // 控制台关闭（ConsoleAddr="-"）时返回空串。

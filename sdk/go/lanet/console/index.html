@@ -14,16 +14,17 @@
   .sub { color:var(--muted); font-size:12px; margin-bottom:18px; }
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; max-width:1100px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
-  .tabs { display:flex; gap:4px; max-width:1100px; margin-bottom:14px; border-bottom:2px solid var(--line); }
+  .tabs { display:flex; gap:4px; margin-bottom:14px; border-bottom:2px solid var(--line);
+          overflow-x:auto; -webkit-overflow-scrolling:touch; }
   .tab { padding:9px 18px; border:0; background:none; color:var(--muted); font-size:14px; cursor:pointer;
-         border-radius:8px 8px 0 0; border-bottom:2px solid transparent; margin-bottom:-2px; }
+         border-radius:8px 8px 0 0; border-bottom:2px solid transparent; margin-bottom:-2px;
+         white-space:nowrap; flex-shrink:0; }
   .tab:hover { color:var(--txt); background:#eceef2; }
   .tab.active { color:var(--accent); font-weight:600; border-bottom-color:var(--accent); background:none; }
   .tab .badge { display:inline-block; min-width:18px; padding:0 5px; margin-left:5px; border-radius:9px;
                 background:#eef0f3; color:var(--muted); font-size:11px; font-weight:400; text-align:center; }
-  .panel { display:none; max-width:1100px; }
+  .panel { display:none; }
   .panel.active { display:block; }
-  .panel .card { max-width:1100px; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
   th { color:var(--muted); font-weight:500; }
@@ -44,6 +45,16 @@
   .msg { font-size:12px; margin-top:8px; min-height:18px; }
   .msg.ok { color:var(--ok); } .msg.bad { color:var(--bad); }
   .empty { color:var(--muted); font-size:13px; }
+  @media (max-width: 720px) {
+    body { padding:12px; }
+    h1 { font-size:16px; }
+    .tab { padding:8px 12px; font-size:13px; }
+    .row { flex-wrap:wrap; }
+    .row input, .row select { min-width:140px; }
+    .kv { flex-wrap:wrap; }
+    .kv b { min-width:100%; }
+    th,td { padding:5px 6px; }
+  }
 </style>
 </head>
 <body>
@@ -111,7 +122,7 @@
 <div class="panel" id="pConfig">
   <div class="card">
     <h2>节点配置 <span class="tag unknown">保存后重启程序生效</span></h2>
-    <div class="sub" style="margin-bottom:8px">写入程序同目录 lanet.json。防火墙与端口转发即时生效无需重启；此处的防火墙字段仅作为下次启动的初始值。</div>
+    <div class="sub" style="margin-bottom:8px">写入程序同目录 lanet.json，保存后重启程序生效。控制台默认仅本机可访问（127.0.0.1）；改为 0.0.0.0:8900 允许远程时，请务必同时设置控制台密码。</div>
     <div class="kv"><b>节点名称</b><input type="text" id="cName"></div>
     <div class="kv"><b>网络密钥</b><input type="text" id="cKey" placeholder="留空 = 公共网络；相同密钥 = 同一私有网络"></div>
     <div class="kv"><b>引导节点</b><input type="text" id="cBoot" placeholder="public = 公共 DHT / none = 仅 mDNS / 成员地址"></div>
@@ -121,7 +132,9 @@
         <option value="deny-all">默认全拒绝（deny-all）</option>
         <option value="allow-list">按规则放行（allow-list）</option>
       </select></div>
-    <div class="kv"><b>控制台</b><input type="text" id="cConsole" placeholder="0.0.0.0:8900，- = 关闭"></div>
+    <div class="kv"><b>控制台</b><input type="text" id="cConsole" placeholder="127.0.0.1:8900 = 仅本机，0.0.0.0:8900 = 允许远程，- = 关闭"></div>
+    <div class="kv"><b>控制台密码</b><input type="password" id="cPassword" placeholder="未设置；远程访问时务必设置"></div>
+    <div class="kv"><b></b><label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="cClearPW"> 清除已有密码</label></div>
     <div class="kv"><b>监听地址</b><input type="text" id="cListen" placeholder="留空 = tcp/ws/quic 随机端口"></div>
     <div class="kv"><b>身份文件</b><input type="text" id="cIdentity" disabled></div>
     <div class="row" style="margin-top:10px">
@@ -225,6 +238,9 @@ async function loadNodeConfig() {
     $('cBoot').value = c.bootstrap || 'public';
     $('cFW').value = c.firewall || 'allow-all';
     $('cConsole').value = c.console || '';
+    $('cPassword').value = '';
+    $('cPassword').placeholder = c.has_password ? '已设置（输入新值可覆盖）' : '未设置；远程访问时务必设置';
+    $('cClearPW').checked = false;
     $('cListen').value = c.listen || '';
     $('cIdentity').value = c.identity || '';
     $('cNoPublic').checked = !!c.no_public_dht;
@@ -237,6 +253,8 @@ async function saveNodeConfig() {
     bootstrap: $('cBoot').value.trim() || 'public',
     firewall: $('cFW').value,
     console: $('cConsole').value.trim(),
+    console_password: $('cPassword').value,
+    clear_password: $('cClearPW').checked,
     listen: $('cListen').value.trim(),
     no_public_dht: $('cNoPublic').checked,
   };
@@ -245,6 +263,7 @@ async function saveNodeConfig() {
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
   const res = await r.json().catch(() => ({}));
   flash('cfgMsg', r.ok ? '已保存，重启程序后生效' : ('保存失败' + (res.error ? '：' + res.error : '')), r.ok);
+  if (r.ok) loadNodeConfig();
 }
 
 loadState(); loadNodeConfig(); setInterval(loadState, 10000);
