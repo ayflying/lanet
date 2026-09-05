@@ -11,6 +11,8 @@ resource/output/
 .testbin/
 .workbuddy/
 node_modules/
+# 发布签名私钥等机密文件（严禁入库）
+secrets/
 # C# 构建产物
 sdk/csharp/**/bin/
 sdk/csharp/**/obj/
