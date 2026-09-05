@@ -3,21 +3,24 @@
   Lanet Windows 应用清单：
   - requireAdministrator：wintun 虚拟网卡需要管理员权限，双击启动时自动弹 UAC，
     免去手动"右键→以管理员身份运行"。经 go build 自动链接本 syso（仅 windows/amd64）。
-  - supportedOS：声明 Win10/11 兼容，避免旧系统兼容性垫片。
+  - supportedOS：声明 Win8.1/10/11 兼容，避免旧系统兼容性垫片。
+  ⚠️ trustInfo/security 必须是父子元素层级，写成属性会导致 SxS 解析失败
+    （启动报"应用程序的并行配置不正确"）。
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="0.3.0.0" processorArchitecture="*" name="Lanet.Node" type="win32"/>
+  <assemblyIdentity version="0.3.2.0" processorArchitecture="*" name="Lanet.Node" type="win32"/>
   <description>Lanet P2P Virtual LAN Node</description>
-  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3" security="requestedPrivileges">
-    <requestedPrivileges>
-      <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
-    </requestedPrivileges>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
   </trustInfo>
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
-      <!-- Windows 10 / Windows 11 -->
+      <!-- Windows 10 / Windows 11 / Windows Server 2016+ -->
       <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
-      <!-- Windows Server 2019/2022 与 Win10 同 GUID -->
       <!-- Windows 8.1 -->
       <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
     </application>
