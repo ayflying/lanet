@@ -5,11 +5,12 @@
 # 版本号：根目录 VERSION 文件（三段式，如 0.2.1）。改代码先改 VERSION 再提交。
 #
 # 产物（全部压缩，不直接上传 exe）：
-#   lanet-{版本}-windows-amd64.zip    含 lanet-agent/ctl/relay/node.exe + wintun.dll + README
-#   lanet-{版本}-linux-amd64.tar.gz   含 lanet-agent/ctl/relay/node
+#   lanet-{版本}-windows-amd64.zip    含 lanet.exe（单程序，客户端=服务端）+ wintun.dll + README
+#   lanet-{版本}-linux-amd64.tar.gz   含 lanet
 #   lanet-{版本}-linux-arm64.tar.gz   同上（arm64）
 #   sha256sums.txt                    全部压缩包校验和
 #
+# 发行说明 = 改 VERSION 那次提交的 commit message（直接写改动内容，不留 compare 链接）。
 # ⚠️ wintun.dll 不打入 exe（运行时从 exe 同目录或 System32 加载），
 #    Windows 包必须附带与 GOARCH 匹配的 wintun.dll。
 # =================================================================================
@@ -119,9 +120,32 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 需要完整历史定位「改 VERSION 的那次提交」
 
       - name: Read version
         run: echo "VERSION=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_ENV"
+
+      # 发行说明 = 改 VERSION 那次提交的 commit message（标题 + 详细改动列表），
+      # 不用 GitHub 自动生成的 Full Changelog 链接。
+      # 约定：版本提交的 message 必须写清本版改动，它就是发行说明。
+      - name: Build release notes from version commit
+        shell: bash
+        run: |
+          MSG=$(git log -1 --format=%B -- VERSION | tr -d '\r')
+          TITLE=$(echo "$MSG" | head -1)
+          BODY=$(echo "$MSG" | tail -n +2 | sed '/./,$!d')
+          {
+            echo "## ${TITLE}"
+            echo
+            echo "${BODY}"
+            echo
+            echo "---"
+            echo "解压即用（Windows 以管理员身份运行，wintun.dll 保持与 lanet.exe 同目录）。"
+            echo "完整性校验：\`sha256sum -c sha256sums.txt\`"
+          } > release-notes.md
+          echo "---- release-notes.md ----"
+          cat release-notes.md
 
       - name: Download all archives
         uses: actions/download-artifact@v4
@@ -144,4 +168,4 @@ jobs:
             dist/lanet-*.zip
             dist/lanet-*.tar.gz
             dist/sha256sums.txt
-          generate_release_notes: true
+          body_path: release-notes.md
