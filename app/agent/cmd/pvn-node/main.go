@@ -70,9 +70,11 @@ func main() {
 	flag.Parse()
 
 	// ---- 日志：stderr + exe 同目录 lanet.log 双写（windowsgui 无黑框时靠文件看日志）----
+	// 注意：不能用 io.MultiWriter(os.Stderr, lf)——windowsgui 下 stderr 是无效句柄，
+	// 写入报错后 MultiWriter 提前返回，文件永远写不进。这里逐个写、忽略单点错误。
 	if lf, err := os.OpenFile(filepath.Join(filepath.Dir(*config), "lanet.log"),
 		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
-		log.SetOutput(io.MultiWriter(os.Stderr, lf))
+		log.SetOutput(tolerantWriter{[]io.Writer{os.Stderr, lf}})
 	}
 
 	// ---- 配置文件：不存在则生成默认模板（双击启动的场景），存在则加载 ----
@@ -308,6 +310,17 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// tolerantWriter 逐个写出、忽略单个目标错误（io.MultiWriter 遇错即返回，
+// windowsgui 下 stderr 无效会把整个日志写挂）。
+type tolerantWriter struct{ ws []io.Writer }
+
+func (w tolerantWriter) Write(p []byte) (int, error) {
+	for _, wr := range w.ws {
+		_, _ = wr.Write(p)
+	}
+	return len(p), nil
 }
 
 // firstNonEmpty 返回第一个非空值（全部为空则返回空串）。
