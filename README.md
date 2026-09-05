@@ -342,7 +342,8 @@ Go · GoFrame v2 · go-libp2p v0.44 · wireguard/tun
 - [x] relay 支持 WebSocket 监听（tcp 与 ws 共享 4001 端口）+ ctl CORS（浏览器直连前提）
 - [x] portfwd 端口转发协议（Go SDK 节点自动启用；浏览器/C#/小程序经网关桥接组内 TCP 服务）
 - [x] ws-gateway（`app/gateway`）+ C# SDK（`sdk/csharp`）+ uniapp SDK（`sdk/uniapp`），三端帧协议同构，互通实测通过
-- [ ] 虚拟 IP 成员下线回收（长期测试场景）
+- [x] 虚拟 IP 成员下线回收：成员超过 10 分钟（可配）无真实通讯自动移出成员表，
+  虚拟 IP 派生占用随之释放；DHT 陈旧 provider 记录不会无限续命
 - [ ] 真实跨机带宽实测
 - [ ] 子网路由（未装客户端的内网设备互通）
 - [ ] Web SDK 浏览器端 webrtc-direct 直连实测（NAT 穿透场景，需公网 STUN/TURN）

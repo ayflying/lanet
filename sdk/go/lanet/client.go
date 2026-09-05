@@ -107,6 +107,10 @@ type Config struct {
 	WebRTC *bool
 	// NetMapInterval 周期任务间隔，默认 15s。
 	NetMapInterval time.Duration
+	// MemberTTL Standalone 模式成员不活跃回收时限：超过该时长无任何
+	// 真实通讯的成员从成员表移除，虚拟 IP 派生占用随之释放。
+	// 默认 10 分钟，最小 2 分钟；0 = 默认。DHT 陈旧记录不会续命。
+	MemberTTL time.Duration
 	// DialTimeout 开流超时，默认 8s。
 	DialTimeout time.Duration
 	// Quiet 为 true 时不打日志。
@@ -321,10 +325,11 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 			NetworkKey:            cfg.NetworkKey,
 			Name:                  cfg.Name,
 			Bootstrap:             cfg.Bootstrap,
-			DisablePublicFallback: cfg.DisablePublicDHT,
-			EnableMDNS:            true,
-			Interval:              cfg.NetMapInterval,
-			Quiet:                 cfg.Quiet,
+		DisablePublicFallback: cfg.DisablePublicDHT,
+		EnableMDNS:            true,
+		Interval:              cfg.NetMapInterval,
+		MemberTTL:             cfg.MemberTTL,
+		Quiet:                 cfg.Quiet,
 		})
 		if err == nil {
 			err = disc.Start(ctx)

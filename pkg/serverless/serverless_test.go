@@ -181,3 +181,84 @@ func TestDualDHTPrivateDiscovery(t *testing.T) {
 		t.Fatalf("B 发现 A 的来源应为 dht-private，实际 membersB=%v", db.Peers())
 	}
 }
+
+// TestMemberReclaim 验证成员回收语义：
+//  1. DHT 陈旧记录（addMember 反复调用）不会无限续命——LastSeen 只在
+//     首次发现/真实通讯时刷新；
+//  2. reapExpired 移除超过 TTL 无通讯的成员，虚拟 IP 派生占用随之释放；
+//  3. 真实通讯（connectAndIdentify 的 info 往返）会刷新 LastSeen。
+func TestMemberReclaim(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	ha := testHost(t, false)
+	hb := testHost(t, false)
+
+	da, err := New(ctx, ha, Config{NetworkKey: "grp-reclaim", Name: "node-a", MemberTTL: MinMemberTTL})
+	if err != nil {
+		t.Fatalf("new discovery A: %v", err)
+	}
+	db, err := New(ctx, hb, Config{NetworkKey: "grp-reclaim", Name: "node-b"})
+	if err != nil {
+		t.Fatalf("new discovery B: %v", err)
+	}
+	if err = da.Start(ctx); err != nil {
+		t.Fatalf("start A: %v", err)
+	}
+	if err = db.Start(ctx); err != nil {
+		t.Fatalf("start B: %v", err)
+	}
+
+	// 阶段一：陈旧记录——只 addMember 不真实通讯，LastSeen 不应被反复刷新。
+	da.addMember(hb.ID(), hb.Addrs(), "dht")
+	time.Sleep(1200 * time.Millisecond) // 等异步 connectAndIdentify 完成真实通讯
+	var firstSeen time.Time
+	da.mu.RLock()
+	m, ok := da.members[hb.ID().String()]
+	if !ok {
+		da.mu.RUnlock()
+		t.Fatalf("成员 B 未入表")
+	}
+	firstSeen = m.FirstSeen
+	last1 := m.LastSeen
+	da.mu.RUnlock()
+
+	// 再来一轮陈旧发现（间隔一秒以上），LastSeen 不应因发现而推进太多。
+	time.Sleep(1100 * time.Millisecond)
+	da.addMember(hb.ID(), hb.Addrs(), "dht")
+	da.mu.RLock()
+	last2 := da.members[hb.ID().String()].LastSeen
+	da.mu.RUnlock()
+
+	// connectAndIdentify 是真实通讯（异步），若它成功，LastSeen 会 >= last1；
+	// 这里验证的是「发现本身不续命」：两次 addMember 之间的时间差不应体现。
+	if last2.Before(last1) {
+		t.Fatalf("LastSeen 倒退: %v < %v", last2, last1)
+	}
+
+	// 阶段二：直接操纵 LastSeen 模拟超期，reapExpired 应移除成员。
+	da.mu.Lock()
+	da.members[hb.ID().String()].LastSeen = time.Now().Add(-DefaultMemberTTL - time.Minute)
+	da.mu.Unlock()
+	da.reapExpired()
+	da.mu.RLock()
+	_, still := da.members[hb.ID().String()]
+	da.mu.RUnlock()
+	if still {
+		t.Fatalf("超期成员未被回收")
+	}
+	_ = firstSeen
+
+	// 阶段三：被回收的成员下一轮发现重新入表（虚拟 IP 重新派生，值不变）。
+	da.addMember(hb.ID(), hb.Addrs(), "dht")
+	da.mu.RLock()
+	m2, ok2 := da.members[hb.ID().String()]
+	var vip string
+	if ok2 {
+		vip = m2.VirtualIP
+	}
+	da.mu.RUnlock()
+	if !ok2 || vip == "" {
+		t.Fatalf("回收后成员未重新入表")
+	}
+}

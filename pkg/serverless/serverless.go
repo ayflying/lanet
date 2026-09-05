@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,6 +50,12 @@ const DefaultBootstrap = "/dnsaddr/bootstrap.libp2p.io"
 // 完全隔离：只有本网络节点互相参与路由与 provider 记录。
 const PrivateDHTPrefix = "/lanet"
 
+// 默认成员回收时限与下限。过小会误删 NAT 重连慢的成员。
+const (
+	DefaultMemberTTL = 10 * time.Minute
+	MinMemberTTL     = 2 * time.Minute
+)
+
 // ProtocolInfo 节点信息交换协议（建连后校验同群 + 交换名称）。
 const ProtocolInfo = "/lanet/info/1.0.0"
 
@@ -73,6 +80,12 @@ type Config struct {
 	EnableMDNS bool
 	// Interval 广播/发现周期，默认 30s。
 	Interval time.Duration
+	// MemberTTL 成员不活跃回收时限：超过该时长无任何真实通讯
+	// （连通确认 / 信息交换 / 入向握手）的成员将从成员表移除，
+	// 其虚拟 IP 派生占用随之释放。默认 10 分钟。
+	// 注意：仅发现到（DHT 陈旧 provider 记录）不会续命——必须真正通讯过。
+	// 最小值 2 分钟（过小会误删 NAT 重连慢的成员）；0 = 用默认。
+	MemberTTL time.Duration
 	// Quiet 为 true 时不打日志。
 	Quiet bool
 }
@@ -105,6 +118,8 @@ type Discovery struct {
 	dhtPublic  *kaddht.IpfsDHT // 公共 DHT（/ipfs 前缀；兜底与公共网络）
 	mdnsSvc    mdns.Service
 
+	memberTTL time.Duration // 成员不活跃回收时限（Config.MemberTTL 归一化后）
+
 	mu      sync.RWMutex
 	members map[string]*Member // peerID -> member
 
@@ -116,11 +131,18 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 30 * time.Second
 	}
+	switch {
+	case cfg.MemberTTL <= 0:
+		cfg.MemberTTL = DefaultMemberTTL
+	case cfg.MemberTTL < MinMemberTTL:
+		cfg.MemberTTL = MinMemberTTL
+	}
 	d := &Discovery{
-		host:     h,
-		cfg:      cfg,
-		groupKey: GroupKey(cfg.NetworkKey), // 空密钥按公共网络处理
-		members:  make(map[string]*Member),
+		host:      h,
+		cfg:       cfg,
+		groupKey:  GroupKey(cfg.NetworkKey), // 空密钥按公共网络处理
+		memberTTL: cfg.MemberTTL,
+		members:   make(map[string]*Member),
 	}
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
 
@@ -241,17 +263,50 @@ func (d *Discovery) Peers() []Member {
 }
 
 // Run 阻塞运行周期广播与发现，直到 ctx 取消。
+// 每轮结束执行一次成员回收：超期无真实通讯的成员移出成员表，
+// 其虚拟 IP 派生占用随之释放（Roadmap：虚拟 IP 成员下线回收）。
 func (d *Discovery) Run(ctx context.Context) {
 	ticker := time.NewTicker(d.cfg.Interval)
 	defer ticker.Stop()
 	d.advertiseAndDiscover(ctx)
+	d.reapExpired()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			d.advertiseAndDiscover(ctx)
+			d.reapExpired()
 		}
+	}
+}
+
+// reapExpired 清理超过 memberTTL 无真实通讯的成员。
+// 被移除的成员若仍实际在线，下一轮发现会重新入表（FirstSeen 重置）。
+func (d *Discovery) reapExpired() {
+	cutoff := time.Now().Add(-d.memberTTL)
+	d.mu.Lock()
+	var removed []Member
+	for id, m := range d.members {
+		if m.LastSeen.Before(cutoff) {
+			removed = append(removed, *m)
+			delete(d.members, id)
+		}
+	}
+	d.mu.Unlock()
+	if len(removed) > 0 && !d.cfg.Quiet {
+		names := make([]string, 0, len(removed))
+		for _, m := range removed {
+			label := m.Name
+			if label == "" {
+				label = m.PeerID
+				if len(label) > 10 {
+					label = label[:10] + "…"
+				}
+			}
+			names = append(names, fmt.Sprintf("%s(%s)", label, m.VirtualIP))
+		}
+		d.logf("成员回收：%s 超过 %s 无活跃通讯，已移出成员表", strings.Join(names, ", "), d.memberTTL)
 	}
 }
 
@@ -298,6 +353,11 @@ func (d *Discovery) dhtRound(ctx context.Context, dht *kaddht.IpfsDHT, source st
 }
 
 // addMember 记录成员并异步建连（连通后经 info 协议确认同群、拿名称）。
+//
+// 活跃语义：只有真实通讯（connectAndIdentify 成功 / handleInfo 入向握手）
+// 才刷新 LastSeen。DHT 的 provider 记录带 TTL（本端 Provide 后仍能在
+// 查询结果里出现数分钟），已下线成员会以「陈旧记录」形式反复出现——
+// 这里不把发现本身当作活跃证据，否则死成员永远不过期。
 func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 	if id == d.host.ID() {
 		return
@@ -310,10 +370,10 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 			VirtualIP: DeriveVirtualIP(d.groupKey, id.String()),
 			Source:    source,
 			FirstSeen: time.Now(),
+			LastSeen:  time.Now(),
 		}
 		d.members[id.String()] = m
 	}
-	m.LastSeen = time.Now()
 	if len(addrs) > 0 {
 		m.Addrs = toStrings(addrs)
 	}
