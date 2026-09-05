@@ -27,6 +27,8 @@ func main() {
 		Name:       "node-a",
 		Standalone: true,
 		NetworkKey: networkKey,
+		// e2e 专注发现与流互通：防火墙全开（防火墙语义由 pvn-firewall-check 专测）。
+		FirewallMode: lanet.FirewallModeAllowAll,
 	})
 	if err != nil {
 		fmt.Printf("FAIL 创建节点 A: %v\n", err)
@@ -43,6 +45,8 @@ func main() {
 		Standalone: true,
 		NetworkKey: networkKey,
 		Bootstrap:  bootstraps,
+
+		FirewallMode: lanet.FirewallModeAllowAll,
 	})
 	if err != nil {
 		fmt.Printf("FAIL 创建节点 B: %v\n", err)

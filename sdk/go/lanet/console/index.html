@@ -55,9 +55,16 @@
         <option value="allow-all">端口全开（allow-all）</option>
       </select>
     </div>
+    <div class="sub" style="margin-bottom:8px">统一管控三类入向：端口转发（TCP）、TUN 虚拟网卡（TCP/UDP）、应用流（libp2p 协议）。</div>
     <div id="ruleList"></div>
     <div class="row">
       <input type="text" id="rSrc" placeholder="来源：虚拟 IP / 网段 / *（任意成员）">
+      <select id="rProto" style="flex:.8">
+        <option value="tcp">TCP 端口</option>
+        <option value="udp">UDP 端口</option>
+        <option value="/pvn/tunnel/1.0.0">应用流（Tunnel）</option>
+        <option value="*">全部协议</option>
+      </select>
       <input type="text" id="rPort" placeholder="端口：3389 / 5000-5010 / *" style="flex:.6">
       <button onclick="addRule()">添加</button>
     </div>
@@ -120,9 +127,12 @@ function renderForwards() {
       '</table>';
 }
 function addRule() {
-  const src = $('rSrc').value.trim(), port = $('rPort').value.trim();
-  if (!src || !port) { flash('fwMsg', '请填写来源与端口', false); return; }
-  S.rules.push({ source: src, port });
+  const src = $('rSrc').value.trim(), proto = $('rProto').value, port = $('rPort').value.trim();
+  if (!src) { flash('fwMsg', '请填写来源', false); return; }
+  const isStream = proto.startsWith('/') || proto === '*';
+  if (!isStream && !port) { flash('fwMsg', '请填写端口', false); return; }
+  const rule = { source: src, proto, port: isStream ? '*' : port };
+  S.rules.push(rule);
   $('rSrc').value = ''; $('rPort').value = '';
   renderRules();
 }

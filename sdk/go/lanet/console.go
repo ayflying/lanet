@@ -26,12 +26,18 @@ type (
 )
 
 const (
-	// FirewallModeDenyAll 默认：拒绝一切入向转发。
+	// FirewallModeDenyAll 默认：拒绝一切入向。
 	FirewallModeDenyAll = firewall.ModeDenyAll
 	// FirewallModeAllowList 按规则列表放行。
 	FirewallModeAllowList = firewall.ModeAllowList
-	// FirewallModeAllowAll 全开：任意来源、任意端口。
+	// FirewallModeAllowAll 全开：任意来源、任意协议、任意端口。
 	FirewallModeAllowAll = firewall.ModeAllowAll
+	// FirewallProtoTCP 传输层 TCP（PortFWD 与 TUN 入向 TCP）。
+	FirewallProtoTCP = firewall.ProtoTCP
+	// FirewallProtoUDP 传输层 UDP（TUN 入向 UDP）。
+	FirewallProtoUDP = firewall.ProtoUDP
+	// FirewallProtoAny 全部协议（含 libp2p 应用流）。
+	FirewallProtoAny = firewall.ProtoAny
 )
 
 // consoleState 控制台可热更状态的持久化结构。

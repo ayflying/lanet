@@ -36,7 +36,7 @@ func main() {
 	echoSrv2 := startEcho("127.0.0.2:9912") // loopback 别名模拟「局域网另一台设备」
 	defer echoSrv2.Close()
 
-	fmt.Println("== [1/5] 启动节点 A（开控制台 127.0.0.1:8920） ==")
+	fmt.Println("== [1/6] 启动节点 A（开控制台 127.0.0.1:8920） ==")
 	nodeA, err := lanet.New(ctx, lanet.Config{
 		Name:        "node-a",
 		Standalone:  true,
@@ -50,7 +50,7 @@ func main() {
 	defer nodeA.Close()
 	go nodeA.Run(ctx)
 
-	fmt.Println("== [2/5] 启动节点 B 并等待发现 A ==")
+	fmt.Println("== [2/6] 启动节点 B 并等待发现 A ==")
 	nodeB, err := lanet.New(ctx, lanet.Config{
 		Name:       "node-b",
 		Standalone: true,
@@ -62,19 +62,19 @@ func main() {
 	}
 	defer nodeB.Close()
 	go nodeB.Run(ctx)
-	ipA := waitDiscovery(nodeB, nodeA.Info().VirtualIP)
+	ipA := waitDiscovery(nodeB, nodeA)
 	ipB := nodeB.Info().VirtualIP
 	fmt.Printf("B 已发现 A：虚拟 IP=%s（B=%s）\n", ipA, ipB)
 
 	// 1. 默认 deny-all：9911 应被拒绝。
-	fmt.Println("== [3/5] 防火墙默认 deny-all：B 拨 A:9911 应被拒绝 ==")
+	fmt.Println("== [3/6] 防火墙默认 deny-all：B 拨 A:9911 应被拒绝 ==")
 	if err = probeRejected(nodeB, ipA, 9911); err != nil {
 		fail("%v", err)
 	}
 	fmt.Println("PASS 默认拒绝生效")
 
 	// 2. 放行 B 的 9911（本机服务）与 9912（LAN 设备映射）。
-	fmt.Println("== [4/5] 放行 B（按来源虚拟 IP）：9911 本机服务 + 9912 局域网映射 ==")
+	fmt.Println("== [4/6] 放行 B（按来源虚拟 IP）：9911 本机服务 + 9912 局域网映射 ==")
 	nodeA.SetFirewall(firewall.ModeAllowList, []firewall.Rule{
 		{Source: ipB, Port: "9911"},
 		{Source: ipB, Port: "9912"},
@@ -94,7 +94,7 @@ func main() {
 	fmt.Println("PASS 未放行端口 9999 仍被拒绝")
 
 	// 3. 控制台 API：读状态 + 热更新回 deny-all 后应再次拒绝。
-	fmt.Println("== [5/5] Web 控制台：状态接口 + 热更新回 deny-all ==")
+	fmt.Println("== [5/6] Web 控制台：状态接口 + 热更新回 deny-all ==")
 	resp, err := http.Get("http://127.0.0.1:8920/api/state")
 	if err != nil {
 		fail("控制台不可达: %v", err)
@@ -131,7 +131,49 @@ func main() {
 	}
 	fmt.Println("PASS 状态持久化文件已写入")
 
-	fmt.Println("\nPASS 防火墙 + 局域网端口转发端到端验证（拒绝/放行/映射/控制台热更新全通）")
+	// 4. 统一防火墙的应用流维度：OnStream（/pvn/tunnel/1.0.0）默认拒绝，
+	// 放行协议规则后 echo 往返连通。
+	fmt.Println("== [6/6] 应用流防火墙：OnStream 默认拒绝 → 放行协议后连通 ==")
+	nodeB.OnStream(func(stream lanet.Stream) {
+		defer stream.Close()
+		_, _ = io.Copy(stream, stream)
+	})
+	if err = probeStreamEcho(nodeA, ipB, "stream-ping"); err == nil {
+		fail("B 的应用流不应连通（默认 deny-all 未拦截 OnStream）")
+	}
+	fmt.Println("PASS OnStream 默认拒绝生效")
+	nodeB.SetFirewall(firewall.ModeAllowList, []firewall.Rule{
+		{Source: "*", Proto: "/pvn/tunnel/1.0.0"},
+	})
+	if err = probeStreamEcho(nodeA, ipB, "stream-ping-2"); err != nil {
+		fail("放行协议规则后应用流应连通: %v", err)
+	}
+	fmt.Println("PASS 放行 /pvn/tunnel/1.0.0 后 OnStream echo 往返")
+
+	fmt.Println("\nPASS 防火墙 + 局域网端口转发端到端验证（拒绝/放行/映射/控制台热更新/应用流全通）")
+}
+
+// probeStreamEcho 应用流 echo：dial → 写 payload → 断言回程。
+func probeStreamEcho(from *lanet.Client, ip string, payload string) error {
+	stream, _, err := from.Dial(context.Background(), ip)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer stream.Close()
+	if _, err = stream.Write([]byte(payload)); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	if hc, ok := stream.(interface{ CloseWrite() error }); ok {
+		_ = hc.CloseWrite()
+	}
+	reply, err := io.ReadAll(stream)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	if string(reply) != payload {
+		return fmt.Errorf("expect %q got %q", payload, reply)
+	}
+	return nil
 }
 
 // probeEcho 拨号 → 写 payload → 断言回程。
@@ -193,13 +235,25 @@ func startEcho(addr string) net.Listener {
 	return ln
 }
 
-func waitDiscovery(from *lanet.Client, targetIP string) string {
+// waitDiscovery 等待双向互见：from 与 target 的成员表都包含对方
+// （单边发现不够——对端反查来源虚拟 IP 依赖它自己的成员表同步）。
+func waitDiscovery(from, target *lanet.Client) string {
+	ipFrom, ipTarget := from.Info().VirtualIP, target.Info().VirtualIP
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
+		fSeen, tSeen := false, false
 		for _, m := range from.NetMap().Members {
-			if m.VirtualIP == targetIP {
-				return targetIP
+			if m.VirtualIP == ipTarget {
+				fSeen = true
 			}
+		}
+		for _, m := range target.NetMap().Members {
+			if m.VirtualIP == ipFrom {
+				tSeen = true
+			}
+		}
+		if fSeen && tSeen {
+			return ipTarget
 		}
 		time.Sleep(500 * time.Millisecond)
 	}

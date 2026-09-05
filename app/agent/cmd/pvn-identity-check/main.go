@@ -29,6 +29,7 @@ func main() {
 	// 1. 节点 A 第一次启动：记录虚拟 IP。
 	nodeA, err := lanet.New(ctx, lanet.Config{
 		Name: "node-a", Standalone: true, NetworkKey: networkKey, IdentityFile: keyFile,
+		FirewallMode: lanet.FirewallModeAllowAll,
 	})
 	if err != nil {
 		fail("创建节点 A（第一次）: %v", err)
@@ -39,6 +40,7 @@ func main() {
 	// 2. 节点 A 第二次启动：虚拟 IP 必须不变。
 	nodeA, err = lanet.New(ctx, lanet.Config{
 		Name: "node-a", Standalone: true, NetworkKey: networkKey, IdentityFile: keyFile,
+		FirewallMode: lanet.FirewallModeAllowAll,
 	})
 	if err != nil {
 		fail("创建节点 A（第二次）: %v", err)
@@ -66,7 +68,7 @@ func main() {
 	}
 	defer nodeB.Close()
 	go nodeB.Run(ctx)
-	waitDiscovery(nodeB, ipSecond)
+	waitDiscovery(nodeB, nodeA)
 
 	stream, _, err := nodeB.Dial(ctx, "node-a") // 虚拟域名：不用知道 IP
 	if err != nil {
@@ -98,13 +100,25 @@ func main() {
 	fmt.Println("\nPASS 身份持久化 + 虚拟域名端到端验证")
 }
 
-func waitDiscovery(from *lanet.Client, targetIP string) {
+// waitDiscovery 等待双向互见：from 与 target 的成员表都包含对方
+// （对端反查来源虚拟 IP 依赖它自己的成员表同步）。
+func waitDiscovery(from, target *lanet.Client) {
+	ipFrom, ipTarget := from.Info().VirtualIP, target.Info().VirtualIP
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
+		fSeen, tSeen := false, false
 		for _, m := range from.NetMap().Members {
-			if m.VirtualIP == targetIP {
-				return
+			if m.VirtualIP == ipTarget {
+				fSeen = true
 			}
+		}
+		for _, m := range target.NetMap().Members {
+			if m.VirtualIP == ipFrom {
+				tSeen = true
+			}
+		}
+		if fSeen && tSeen {
+			return
 		}
 		time.Sleep(500 * time.Millisecond)
 	}

@@ -22,9 +22,10 @@ import (
 	"github.com/gogf/gf/v2/os/gcmd"
 	"github.com/gogf/gf/v2/os/gctx"
 
-	"github.com/ayflying/pvn/pkg/peersource"
+	"github.com/ayflying/pvn/pkg/firewall"
 	"github.com/ayflying/pvn/pkg/netmapclient"
 	p2pkit "github.com/ayflying/pvn/pkg/p2pkit"
+	"github.com/ayflying/pvn/pkg/peersource"
 	"github.com/ayflying/pvn/pkg/protocol"
 	"github.com/ayflying/pvn/pkg/tundevice"
 	tunnelsvc "github.com/ayflying/pvn/pkg/tunnel"
@@ -46,6 +47,7 @@ func main() {
 			{Name: "tun", Short: "t", Default: "pvn0", Brief: "TUN 网卡名"},
 			{Name: "mtu", Default: "1400", Brief: "TUN MTU"},
 			{Name: "real-tun", Default: "false", Brief: "创建真实 TUN 网卡（需管理员权限）；默认内存 TUN 仅用于联调"},
+			{Name: "fw", Default: "deny-all", Brief: "入向防火墙模式：deny-all（默认，拒绝一切入向）/ allow-all（全开）"},
 		},
 		Func: func(ctx context.Context, parser *gcmd.Parser) (err error) {
 			runAgent(ctx, parser)
@@ -67,6 +69,7 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 		tunName    = parser.GetOpt("tun").String()
 		mtu        = parser.GetOpt("mtu").Int()
 		realTUN    = parser.GetOpt("real-tun").Bool()
+		fwMode     = parser.GetOpt("fw").String()
 	)
 	if name == "" {
 		log.Fatalf("必须指定 -name 节点名称")
@@ -145,7 +148,18 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 	}
 	defer device.Close()
 
-	// 4. 被叫方：接收组内隧道流，把包写进本机 TUN（交给本机协议栈）。
+	// 4.1 统一入向防火墙：管控 TUN 入向（IP 层）暴露面。
+	// 规则模式：deny-all（默认，拒绝一切入向包）/ allow-all。
+	fw := firewall.New()
+	switch fwMode {
+	case "allow-all":
+		fw.Set(firewall.ModeAllowAll, nil)
+		log.Printf("入向防火墙：allow-all（全开）")
+	default:
+		log.Printf("入向防火墙：deny-all（默认拒绝；组内成员暂时无法访问本机，如需开放用 -fw allow-all）")
+	}
+
+	// 4. 被叫方：接收组内隧道流，逐包过防火墙后写进本机 TUN（交给本机协议栈）。
 	node.SetStreamHandler(protocol.Tunnel, func(stream network.Stream) {
 		buf := make([]byte, 65535)
 		for {
@@ -153,7 +167,16 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 			if err != nil {
 				return
 			}
-			if _, err := device.Write([][]byte{buf[:n]}, 0); err != nil {
+			packet := buf[:n]
+			// 统一入向防火墙：源虚拟 IP + 协议 + 目标端口，拒绝即丢包。
+			if !tundevice.CheckPacket(fw, packet) {
+				if n >= 20 {
+					log.Printf("[firewall] TUN 入向包被拒绝：来源=%d.%d.%d.%d 协议=%d",
+						packet[12], packet[13], packet[14], packet[15], packet[9])
+				}
+				continue
+			}
+			if _, err := device.Write([][]byte{packet}, 0); err != nil {
 				return
 			}
 		}
@@ -183,6 +206,7 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 
 	tunnelSvc := tunnelsvc.New(node, netmapCli, newRelayCandidates(ctlURL))
 	router := tundevice.New(device, tunnelSvc)
+	router.SetFirewall(fw)
 	go router.Run(ctx)
 
 	// 6. 周期任务：刷新 NetMap + 重新通告地址 + 补充 relay 预约（预约会过期）。
@@ -211,7 +235,10 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 		}
 	}()
 
-	log.Printf("PVN Agent 已就绪：虚拟 IP=%s，组内成员可通过该 IP 访问本机", myIP)
+	log.Printf("PVN Agent 已就绪：虚拟 IP=%s，入向防火墙=%s", myIP, fwMode)
+	if fwMode != "allow-all" {
+		log.Printf("提示：当前 deny-all，组内成员无法访问本机；如需开放用 -fw allow-all")
+	}
 	<-ctx.Done()
 	log.Printf("收到退出信号，正在关闭")
 }

@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/ayflying/pvn/pkg/firewall"
 	"github.com/ayflying/pvn/pkg/gatewayproto"
 	"github.com/ayflying/pvn/sdk/go/lanet"
 	"github.com/gorilla/websocket"
@@ -103,6 +104,12 @@ func Run(ctx context.Context, cfg Config) (*lanet.Client, error) {
 		InviteCode: cfg.InviteCode,
 		GroupName:  cfg.GroupName,
 		Name:       cfg.Name,
+		// 网关职责是桥接 ws 客户端与群内成员：必须放行来自任意成员的
+		// Tunnel 应用流入向（service 模式依赖），其余暴露面保持默认拒绝。
+		FirewallMode: lanet.FirewallModeAllowList,
+		FirewallRules: []lanet.FirewallRule{
+			{Source: "*", Proto: firewall.ProtoAny},
+		},
 	})
 	if err != nil {
 		return nil, err

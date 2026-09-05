@@ -10,6 +10,7 @@ import (
 	"log"
 	"sync"
 
+	"github.com/ayflying/pvn/pkg/firewall"
 	tunnel "github.com/ayflying/pvn/pkg/tunnel"
 	"github.com/libp2p/go-libp2p/core/network"
 )
@@ -20,6 +21,9 @@ const maxPacketSize = 65535
 type Router struct {
 	device Device
 	tunnel *tunnel.Service
+	// fw 统一入向防火墙（nil = 不启用）：对隧道流入向的每个 IP 包
+	// 按「源虚拟 IP + 协议 + 目标端口」判定，拒绝的包直接丢弃。
+	fw *firewall.Firewall
 
 	mu      sync.Mutex
 	streams map[string]network.Stream // virtualIP -> 当前到对端的活跃流
@@ -32,6 +36,9 @@ func New(device Device, tunnelSvc *tunnel.Service) *Router {
 		streams: make(map[string]network.Stream),
 	}
 }
+
+// SetFirewall 启用统一入向防火墙（Run 之前调用）。
+func (r *Router) SetFirewall(fw *firewall.Firewall) { r.fw = fw }
 
 // Run 启动 TUN 读取循环，直到 ctx 取消或设备关闭。
 func (r *Router) Run(ctx context.Context) {
@@ -120,13 +127,34 @@ func (r *Router) pumpFromStream(virtualIP string, stream network.Stream) {
 		if n == 0 {
 			continue
 		}
-		bufs[0] = bufs[0][:n]
+		buf := bufs[0][:n]
+		// 统一入向防火墙：源虚拟 IP + 协议 + 目标端口，拒绝即丢包。
+		if !CheckPacket(r.fw, buf) {
+			if r.fw != nil && n >= 20 {
+				src := fmt.Sprintf("%d.%d.%d.%d", buf[12], buf[13], buf[14], buf[15])
+				dropLog(src, protoName(buf[9]), 0)
+			}
+			continue
+		}
+		bufs[0] = buf
 		sizes[0] = n
 		if _, err = r.device.Write(bufs, 0); err != nil {
 			log.Printf("[router] tun write: %v", err)
 			return
 		}
 		_ = sizes
+	}
+}
+
+// protoName IP 协议号转名称（日志用）。
+func protoName(n byte) string {
+	switch n {
+	case 6:
+		return "tcp"
+	case 17:
+		return "udp"
+	default:
+		return fmt.Sprintf("ip:%d", n)
 	}
 }
 

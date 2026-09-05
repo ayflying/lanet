@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ayflying/pvn/pkg/firewall"
 	"github.com/ayflying/pvn/pkg/protocol"
 	"github.com/libp2p/go-libp2p/core/network"
 )
@@ -70,8 +71,8 @@ func (c *Client) enablePortFWD() {
 		if splitErr == nil {
 			port, _ = strconv.Atoi(portStr)
 		}
-		// 2. 防火墙：默认全拒绝，需在控制台放行（或 allow-all）。
-		if !c.fw.Allow(srcIP, port) {
+		// 2. 统一防火墙：传输层 tcp 维度，默认全拒绝。
+		if !c.fw.Allow(srcIP, firewall.ProtoTCP, port) {
 			c.logf("portfwd 拒绝：来源=%s（%s） 端口=%d 不在放行规则内", srcIP, shortPeer(stream.Conn().RemotePeer().String()), port)
 			_ = stream.Reset()
 			return

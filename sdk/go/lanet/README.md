@@ -108,6 +108,8 @@ client.OnStream(func(stream lanet.Stream) {
 | `LANForwards` | []LANForward | `[]` | 局域网转发初始映射表（`{Listen, Target}`），可热更新 |
 | `ConsoleAddr` | string | `127.0.0.1:8900` | 内置 Web 控制台监听地址，`"-"` 关闭；占用时自动后移至 8910 |
 | `StateFile` | string | `""` | 控制台状态持久化文件（防火墙/转发规则），空 = 仅内存 |
+| `FirewallMode` | FirewallMode | `deny-all` | 防火墙初始模式，统一管控 PortFWD / TUN 入向 / OnStream 三类暴露面 |
+| `FirewallRules` | []FirewallRule | `[]` | 防火墙初始放行规则（`{Source, Proto, Port}`），allow-list 模式生效 |
 | `IdentityFile` | string | `""` | 节点身份密钥文件；**建议配置**，否则每次启动 PeerID/虚拟 IP 都变 |
 
 ## API 一览
@@ -234,29 +236,56 @@ client.Host().SetStreamHandler("/myapp/1.0.0", func(s network.Stream) {
 stream, viaRelay, err := client.DialProtocol(ctx, "100.64.0.2", "/myapp/1.0.0")
 ```
 
-### 入向防火墙：控制谁能访问我的服务
+### 入向防火墙：统一管控三类暴露面
 
-入向 PortFWD（本机/局域网服务暴露）默认**全拒绝（deny-all）**——
-未配置规则时，任何成员的 `DialPortFWD` 请求都会被拒绝。三种模式：
+节点有三类「入向暴露面」，全部受**同一个防火墙**管控（默认全拒绝）：
+
+| 暴露面 | 含义 | 判定维度 |
+|---|---|---|
+| 端口转发（PortFWD） | 群内成员访问本机/局域网 TCP 服务 | 来源 + TCP + 端口 |
+| TUN 虚拟网卡（IP 层） | 群内成员经虚拟网访问本机/局域网任意端口 | 来源 + TCP/UDP + 端口（包内解析） |
+| 应用流（OnStream） | 群内成员打开 `/pvn/tunnel/1.0.0` 等应用流 | 来源 + 协议 ID |
+
+三种模式：
 
 | 模式 | 行为 |
 |---|---|
-| `deny-all`（默认） | 拒绝一切入向转发 |
-| `allow-list` | 按规则放行：来源（虚拟 IP / CIDR / `*`）+ 端口（单值 / 范围 / `*`） |
-| `allow-all` | 全开：任意成员访问任意端口 |
+| `deny-all`（默认） | 拒绝一切入向（三类暴露面都拒） |
+| `allow-list` | 按规则放行（见下方规则字段） |
+| `allow-all` | 全开 |
+
+规则字段（`FirewallRule`）：
+
+| 字段 | 取值 | 说明 |
+|---|---|---|
+| `Source` | 虚拟 IP / CIDR / `*` | 来源成员 |
+| `Proto` | `"tcp"`（默认）/ `"udp"` / `"/"` 开头的协议 ID / `"*"` | 协议维度 |
+| `Port` | 单值 / 范围 / `*` | 端口维度（协议 ID 规则须留空或 `*`） |
 
 ```go
 // 编程接口（也可在 Web 控制台操作，两者热更新等价）
-client.SetFirewall(lanet.FirewallModeAllowList, []firewall.Rule{
-	{Source: "100.64.0.5", Port: "3389"},     // 指定成员访问指定端口
-	{Source: "100.64.1.0/24", Port: "80"},    // 指定网段
-	{Source: "*", Port: "5000-5010"},         // 任意成员访问端口范围
+client.SetFirewall(lanet.FirewallModeAllowList, []lanet.FirewallRule{
+	{Source: "100.64.0.5", Port: "3389"},                  // TCP：指定成员访问指定端口
+	{Source: "100.64.1.0/24", Proto: lanet.FirewallProtoUDP, Port: "53"}, // UDP：网段内可用 DNS
+	{Source: "*", Proto: "/pvn/tunnel/1.0.0"},             // 应用流：放行 Tunnel 协议
+	{Source: "*", Proto: lanet.FirewallProtoAny, Port: "*"}, // 全部协议与端口
 })
 mode, rules := client.Firewall() // 读取当前快照
 ```
 
-判定发生在向内网目标发起 TCP 连接**之前**；来源未知（不在成员表）的
-请求除 `allow-all` 外一律拒绝。
+初始配置也可直接写进 `Config`（控制台 StateFile 存在时会被覆盖）：
+
+```go
+lanet.Config{
+	FirewallMode:  lanet.FirewallModeAllowList,
+	FirewallRules: []lanet.FirewallRule{{Source: "*", Proto: lanet.FirewallProtoAny, Port: "*"}},
+}
+```
+
+判定发生在「向内网目标发起连接 / 把包写进本机协议栈 / 把流交给应用处理器」**之前**；
+来源未知（不在成员表 / 包内源地址非法）的请求除 `allow-all` 外一律拒绝。
+TUN 入向的拒绝以丢包实现，并有累计计数日志；注意 **ICMP 等非 TCP/UDP 包**
+无端口可匹配，`deny-all` / `allow-list` 下会被丢弃（ping 不通是正常现象）。
 
 ### 局域网端口转发：把内网其他设备暴露给群内
 

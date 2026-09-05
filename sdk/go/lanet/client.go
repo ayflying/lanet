@@ -135,6 +135,14 @@ type Config struct {
 	// StateFile 控制台状态（防火墙规则 + 转发映射）持久化文件路径；
 	// 空 = 仅内存，节点重启后回到 Config 初始值。
 	StateFile string
+	// FirewallMode 防火墙初始模式：deny-all（默认，拒绝一切入向）/
+	// allow-list（按 FirewallRules 放行）/ allow-all（全开）。
+	// 统一管控三类入向暴露面：PortFWD 端口转发、TUN 虚拟网卡入向（IP 层）、
+	// OnStream 应用流（协议 /pvn/tunnel/1.0.0 等）。
+	// 运行中可经 Web 控制台或 SetFirewall 热更新。
+	FirewallMode FirewallMode
+	// FirewallRules 防火墙初始放行规则（allow-list 模式生效）。
+	FirewallRules []FirewallRule
 	// IdentityFile 节点身份密钥文件（Ed25519）。强烈建议配置（如 "node.key"）：
 	// 未配置时每次启动随机生成身份，PeerID 与派生虚拟 IP 都会变化；
 	// 配置后身份跨重启稳定，虚拟 IP 恒定，其他成员可始终按本节点名称连入。
@@ -325,8 +333,10 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	} else {
 		c.tunnelSvc = tunnel.New(node, c.netmapCli, c.peerSource)
 	}
-	// 4. 端口转发入向服务：防火墙（默认 deny-all）+ 局域网映射表。
+	// 4. 统一入向防火墙（默认 deny-all）：管控 PortFWD / TUN 入向 /
+	// OnStream 应用流三类暴露面 + 局域网映射表。
 	c.fw = firewall.New()
+	c.fw.Set(cfg.FirewallMode, cfg.FirewallRules)
 	c.forwards = append([]LANForward(nil), cfg.LANForwards...)
 	c.statePath = cfg.StateFile
 	c.loadState()
@@ -480,7 +490,15 @@ func (c *Client) Close() error {
 }
 
 // handleInbound 入向流分发到已注册的 Handler。
+// 先过统一防火墙（协议维度：/pvn/tunnel/1.0.0，默认 deny-all 拒绝）。
 func (c *Client) handleInbound(stream network.Stream) {
+	srcIP := c.virtualIPByPeer(stream.Conn().RemotePeer().String())
+	if !c.fw.AllowStream(srcIP, string(protocol.Tunnel)) {
+		c.logf("onstream 拒绝：来源=%s（%s）协议=%s 不在放行规则内",
+			srcIP, shortPeer(stream.Conn().RemotePeer().String()), protocol.Tunnel)
+		_ = stream.Reset()
+		return
+	}
 	viaRelay := hasCircuit(stream.Conn().RemoteMultiaddr())
 	for _, h := range c.handlers {
 		h(streamAdapter{Stream: stream, viaRelay: viaRelay})
