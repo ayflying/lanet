@@ -25,6 +25,7 @@ type PortFWDTarget struct {
 // DialPortFWD 按虚拟 IP + 端口连接对端的 TCP 服务：
 // 先与对端建立 PortFWD 协议流，由对端 net.Dial 本地/内网目标，
 // 之后本连接等价于一条到目标端口的双向字节管道。
+// 目标也支持虚拟域名（成员名称，IP 变化不影响连入）。
 //
 // 返回的 net.Conn 用完必须 Close；发送完毕可调用 CloseWrite
 // 半关闭（ConnImpl 同时实现了 CloseWriter 接口）。
@@ -32,11 +33,15 @@ func (c *Client) DialPortFWD(ctx context.Context, target PortFWDTarget) (net.Con
 	if target.Port <= 0 || target.Port > 65535 {
 		return nil, fmt.Errorf("lanet: 无效端口 %d", target.Port)
 	}
-	raw, viaRelay, err := c.tunnelSvc.OpenStreamToVirtualIPProtocol(ctx, target.VirtualIP, protocol.PortFWD)
+	virtualIP, err := c.resolveVirtualIP(target.VirtualIP)
 	if err != nil {
 		return nil, err
 	}
-	addr := fmt.Sprintf("%s:%d", target.VirtualIP, target.Port)
+	raw, viaRelay, err := c.tunnelSvc.OpenStreamToVirtualIPProtocol(ctx, virtualIP, protocol.PortFWD)
+	if err != nil {
+		return nil, err
+	}
+	addr := fmt.Sprintf("%s:%d", virtualIP, target.Port)
 	if err = writePortFWDHeader(raw, addr); err != nil {
 		_ = raw.Close()
 		return nil, fmt.Errorf("lanet: 发送转发目标: %w", err)

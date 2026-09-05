@@ -105,6 +105,10 @@ client.OnStream(func(stream lanet.Stream) {
 | `Standalone` | bool | `false` | 无服务器模式：不依赖 ctl/relay，DHT+mDNS 自动发现组网 |
 | `NetworkKey` | string | `""` | Standalone 专用：网络密钥。留空 = 公共网络（所有留空节点互通）；相同密钥 = 私有网络 |
 | `Bootstrap` | []string | `[]` | Standalone 专用：DHT 引导节点（`lanet.DefaultBootstrap` 或已在网成员地址） |
+| `LANForwards` | []LANForward | `[]` | 局域网转发初始映射表（`{Listen, Target}`），可热更新 |
+| `ConsoleAddr` | string | `127.0.0.1:8900` | 内置 Web 控制台监听地址，`"-"` 关闭；占用时自动后移至 8910 |
+| `StateFile` | string | `""` | 控制台状态持久化文件（防火墙/转发规则），空 = 仅内存 |
+| `IdentityFile` | string | `""` | 节点身份密钥文件；**建议配置**，否则每次启动 PeerID/虚拟 IP 都变 |
 
 ## API 一览
 
@@ -288,6 +292,35 @@ client.SetLANForwards([]lanet.LANForward{{Listen: 8080, Target: "192.168.1.102:8
 - 规则变更自动持久化到 `Config.StateFile`（未配置则仅内存）。
 
 编程接口与控制台等价：`Firewall/SetFirewall/LANForwards/SetLANForwards`。
+
+### 节点身份与虚拟域名：IP 变了也能连
+
+**节点身份持久化**——不配置 `IdentityFile` 时，每次启动随机生成身份，
+PeerID 与派生虚拟 IP 都会变化。配置后身份跨重启稳定，虚拟 IP 恒定：
+
+```go
+client, _ := lanet.New(ctx, lanet.Config{
+	Name:         "home-node",
+	Standalone:   true,
+	NetworkKey:   "our-secret-net",
+	IdentityFile: "node.key", // 首次自动生成，之后复用（权限 0600）
+})
+```
+
+**虚拟域名**——`Dial / DialProtocol / DialPortFWD` 的目标参数除了虚拟 IP，
+还支持**成员名称**：成员重启后 IP 变化，其他成员仍按名字连入，无需关心 IP：
+
+```go
+stream, _, err := client.Dial(ctx, "home-node")   // 按名称，等价于拨其当前虚拟 IP
+conn, err := client.DialPortFWD(ctx, lanet.PortFWDTarget{
+	VirtualIP: "home-node", // 虚拟域名同样生效
+	Port:      5000,
+})
+```
+
+解析规则：目标是合法 IP 时按 IP 处理；否则在当前成员表按 Name 精确匹配
+（匹配到多个会报错并提示改用 IP；匹配不到报错提示未发现）。名称即节点
+启动时的 `Config.Name`，在控制台成员表中可见。
 
 ### Run / Close 生命周期
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
@@ -21,6 +22,9 @@ type HostSpec struct {
 	RelayService bool
 	RelaySource  autorelay.PeerSource
 	UserAgent    string
+	// Identity 节点私钥（可空 = 随机生成）。传入持久化密钥可使
+	// PeerID 跨重启稳定，从而无服务器模式下的派生虚拟 IP 也稳定。
+	Identity crypto.PrivKey
 	// WebRTC 是否启用 webrtc-direct 传输层（浏览器 js-libp2p 可直连）。
 	// 启用后自动在 ListenAddrs 基础上追加 /udp/<同端口+1>/webrtc-direct，
 	// 或由 WebRTCAddrs 显式指定监听地址。
@@ -50,6 +54,9 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 		libp2p.UserAgent(spec.UserAgent),
 		libp2p.EnableNATService(),
 		libp2p.EnableRelay(),
+	}
+	if spec.Identity != nil {
+		options = append(options, libp2p.Identity(spec.Identity))
 	}
 
 	if len(spec.ListenAddrs) > 0 {

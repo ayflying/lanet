@@ -31,11 +31,14 @@ package lanet
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +50,7 @@ import (
 	"github.com/ayflying/pvn/pkg/protocol"
 	"github.com/ayflying/pvn/pkg/serverless"
 	"github.com/ayflying/pvn/pkg/tunnel"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	libprotocol "github.com/libp2p/go-libp2p/core/protocol"
@@ -131,6 +135,30 @@ type Config struct {
 	// StateFile 控制台状态（防火墙规则 + 转发映射）持久化文件路径；
 	// 空 = 仅内存，节点重启后回到 Config 初始值。
 	StateFile string
+	// IdentityFile 节点身份密钥文件（Ed25519）。强烈建议配置（如 "node.key"）：
+	// 未配置时每次启动随机生成身份，PeerID 与派生虚拟 IP 都会变化；
+	// 配置后身份跨重启稳定，虚拟 IP 恒定，其他成员可始终按本节点名称连入。
+	// 文件不存在时自动生成并写回（权限 0600）。
+	IdentityFile string
+}
+
+// LoadOrCreateIdentity 加载（或首次生成）Ed25519 节点身份密钥。
+func LoadOrCreateIdentity(path string) (crypto.PrivKey, error) {
+	if data, err := os.ReadFile(path); err == nil {
+		return crypto.UnmarshalPrivateKey(data)
+	}
+	key, _, err := crypto.GenerateEd25519Key(cryptorand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("lanet: 生成节点身份: %w", err)
+	}
+	raw, err := crypto.MarshalPrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("lanet: 序列化节点身份: %w", err)
+	}
+	if err = os.WriteFile(path, raw, 0o600); err != nil {
+		return nil, fmt.Errorf("lanet: 写入身份文件 %s: %w", path, err)
+	}
+	return key, nil
 }
 
 // LANForward 一条局域网端口转发映射。
@@ -223,6 +251,13 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		UserAgent:   "lanet-sdk-go/1.1.0",
 		ListenAddrs: listenAddrs,
 		WebRTC:      cfg.WebRTC == nil || *cfg.WebRTC,
+	}
+	if cfg.IdentityFile != "" {
+		identity, idErr := LoadOrCreateIdentity(cfg.IdentityFile)
+		if idErr != nil {
+			return nil, idErr
+		}
+		spec.Identity = identity
 	}
 	var disc *serverless.Discovery
 	if cfg.Standalone {
@@ -322,9 +357,41 @@ func (c *Client) OnStream(handler Handler) {
 	}
 }
 
+// resolveVirtualIP 虚拟域名解析：目标可以是虚拟 IP（原样返回），
+// 也可以是节点名称（成员表 Name 匹配，即「虚拟域名」——成员重启后
+// 虚拟 IP 变化也不影响按名称连入）。
+func (c *Client) resolveVirtualIP(target string) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", fmt.Errorf("lanet: 目标为空")
+	}
+	if net.ParseIP(target) != nil {
+		return target, nil
+	}
+	var hit []string
+	for _, m := range c.NetMap().Members {
+		if m.Name == target {
+			hit = append(hit, m.VirtualIP)
+		}
+	}
+	switch len(hit) {
+	case 1:
+		return hit[0], nil
+	case 0:
+		return "", fmt.Errorf("lanet: 未找到节点 %q（虚拟域名支持成员名称，当前成员表 %d 人；该成员可能尚未被发现）", target, len(c.NetMap().Members))
+	default:
+		return "", fmt.Errorf("lanet: 存在 %d 个名为 %q 的节点，请改用虚拟 IP 指定", len(hit), target)
+	}
+}
+
 // Dial 按虚拟 IP 打开到对端的隧道流（直连优先，中继兜底）。
+// 目标也支持虚拟域名（成员名称，见 resolveVirtualIP）。
 // 返回流与是否经中继。用完必须 Close；发送完毕建议 CloseWrite。
 func (c *Client) Dial(ctx context.Context, virtualIP string) (Stream, bool, error) {
+	virtualIP, err := c.resolveVirtualIP(virtualIP)
+	if err != nil {
+		return nil, false, err
+	}
 	raw, viaRelay, err := c.tunnelSvc.OpenStreamToVirtualIP(ctx, virtualIP)
 	if err != nil {
 		return nil, false, err
@@ -333,8 +400,12 @@ func (c *Client) Dial(ctx context.Context, virtualIP string) (Stream, bool, erro
 }
 
 // DialProtocol 同 Dial，但指定应用层协议 ID（对端需已注册该协议处理器）。
-// 用于自定义应用协议（如网关、端口转发之外的扩展场景）。
+// 用于自定义应用协议（如网关、端口转发之外的扩展场景）。目标支持虚拟域名。
 func (c *Client) DialProtocol(ctx context.Context, virtualIP string, protoID string) (Stream, bool, error) {
+	virtualIP, err := c.resolveVirtualIP(virtualIP)
+	if err != nil {
+		return nil, false, err
+	}
 	raw, viaRelay, err := c.tunnelSvc.OpenStreamToVirtualIPProtocol(ctx, virtualIP, libprotocol.ID(protoID))
 	if err != nil {
 		return nil, false, err
