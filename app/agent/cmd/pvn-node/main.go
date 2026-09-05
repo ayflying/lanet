@@ -135,6 +135,16 @@ func main() {
 			}
 		}
 	}
+	// 更新 / 重启 / 退出 控制台接口（与节点配置同一组扩展路由）。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	extra := nodeConfigRoutes(*config)
+	for pattern, handler := range updateRoutes(cancel) {
+		extra[pattern] = handler
+	}
 	cfg := lanet.Config{
 		Name:             effName,
 		NetworkKey:       effKey,
@@ -145,7 +155,7 @@ func main() {
 		ConsoleAddr:      effConsole,
 		ConsolePassword:  effConsolePW,
 		StateFile:        filepath.Join(filepath.Dir(*config), "state.json"),
-		ConsoleExtra:     nodeConfigRoutes(*config),
+		ConsoleExtra:     extra,
 	}
 	switch effFW {
 	case "allow-list":
@@ -161,11 +171,6 @@ func main() {
 		cfg.ListenAddrs = strings.Split(effListen, ",")
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	node, err := lanet.New(ctx, cfg)
 	if err != nil {
 		log.Fatalf("[node] 入网失败: %v", err)
@@ -174,6 +179,9 @@ func main() {
 	info := node.Info()
 	log.Printf("[node] 已入网 name=%s peerID=%s virtualIP=%s network=%s",
 		effName, info.PeerID, info.VirtualIP, networkLabel(effKey))
+
+	// 每次启动后台检查一次更新（预拉发行说明，控制台弹框即点即显）。
+	StartUpdateCheck(firstNonEmpty(os.Getenv("GITHUB_TOKEN"), readConfigToken(*config)))
 
 	// ---- 托盘 + 自动打开控制台（Windows 图形界面模式）----
 	if consoleURL := node.ConsoleURL(); consoleURL != "" && runtime.GOOS == "windows" {
@@ -365,6 +373,7 @@ type nodeConfig struct {
 	Listen          string `json:"listen"`
 	NoPublicDHT     bool   `json:"no_public_dht"`
 	ProbeSec        int    `json:"probe_seconds"`
+	GitHubToken     string `json:"github_token,omitempty"` // 私有仓库检查更新用（contents:read）
 
 	bootstrapAddrs []string `json:"-"` // 运行时由 Bootstrap 解析而来
 }
@@ -452,10 +461,17 @@ func nodeConfigRoutes(path string) map[string]http.HandlerFunc {
 				return
 			}
 			switch req.Firewall {
-			case "deny-all", "allow-list", "allow-all":
+			case "deny-all", "allow-list", "allow-all", "":
+				// 空 = 页面未提供（防火墙已移入独立页签配置），保留原值
 			default:
 				writeJSONLocal(w, http.StatusBadRequest, map[string]string{"error": "firewall 必须是 deny-all / allow-list / allow-all"})
 				return
+			}
+			if req.Firewall == "" {
+				req.Firewall = read().Firewall
+			}
+			if req.Bootstrap == "" {
+				req.Bootstrap = read().Bootstrap
 			}
 			if req.Console == "" || req.Name == "" {
 				writeJSONLocal(w, http.StatusBadRequest, map[string]string{"error": "name 与 console 不能为空"})

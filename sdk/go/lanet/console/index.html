@@ -39,6 +39,20 @@
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; vertical-align:1px; }
   .dot.on { background:#1a9e6e; } .dot.off { background:#c3c8d0; }
   .mname { font-weight:600; } .mname .pid { color:var(--muted); font-weight:400; font-size:12px; }
+  .topbar { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; max-width:100%; }
+  .topbtns { display:flex; gap:8px; flex-shrink:0; padding-top:2px; }
+  .topbtns button { position:relative; }
+  button.danger { color:var(--bad); }
+  .reddot { position:absolute; top:-3px; right:-3px; width:10px; height:10px; border-radius:50%;
+            background:var(--bad); border:2px solid var(--card); }
+  .overlay { position:fixed; inset:0; background:rgba(20,22,26,.45); display:flex;
+             align-items:center; justify-content:center; z-index:50; padding:16px; }
+  .modal { background:var(--card); border-radius:12px; padding:20px; width:100%; max-width:640px;
+           max-height:82vh; display:flex; flex-direction:column; box-shadow:0 10px 40px rgba(0,0,0,.18); }
+  .modal-body { overflow-y:auto; border:1px solid var(--line); border-radius:8px; padding:12px;
+                font-size:13px; white-space:pre-wrap; word-break:break-word; background:#fafbfc;
+                max-height:46vh; margin:10px 0 12px; }
+  .modal-btns { display:flex; gap:8px; }
   select, input[type=text], input[type=number] {
     padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:13px; width:100%; }
   .row { display:flex; gap:8px; margin:8px 0; align-items:center; }
@@ -53,6 +67,9 @@
   @media (max-width: 720px) {
     body { padding:12px; }
     h1 { font-size:16px; }
+    .topbar { flex-direction:column; }
+    .topbtns { width:100%; }
+    .topbtns button { flex:1; }
     .tab { padding:8px 12px; font-size:13px; }
     .row { flex-wrap:wrap; }
     .row input, .row select { min-width:140px; }
@@ -63,13 +80,35 @@
 </style>
 </head>
 <body>
-<h1>Lanet 节点控制台</h1>
-<div class="sub" id="addrLine">加载中…</div>
+<div class="topbar">
+  <div>
+    <h1 id="nodeTitle">Lanet 节点控制台</h1>
+    <div class="sub" id="addrLine">加载中…</div>
+  </div>
+  <div class="topbtns" id="topBtns" style="display:none">
+    <button class="ghost" id="btnUpdate" onclick="onUpdateClick()">更新<span class="reddot" id="updDot" style="display:none"></span></button>
+    <button class="ghost" onclick="onRestartClick()">重启</button>
+    <button class="ghost danger" onclick="onQuitClick()">关闭</button>
+  </div>
+</div>
 <div class="tabs">
   <button class="tab active" data-panel="pMembers" onclick="switchTab(this)">成员与链路 <span class="badge" id="bMembers">0</span></button>
   <button class="tab" data-panel="pFirewall" onclick="switchTab(this)">入向防火墙 <span class="badge" id="bRules">0</span></button>
   <button class="tab" data-panel="pForwards" onclick="switchTab(this)">端口转发 <span class="badge" id="bForwards">0</span></button>
   <button class="tab" data-panel="pConfig" id="tabConfig" onclick="switchTab(this)" style="display:none">节点配置</button>
+</div>
+
+<!-- 更新弹框（发行说明已预取，打开即显示） -->
+<div class="overlay" id="updOverlay" style="display:none">
+  <div class="modal">
+    <h2 id="updTitle">发现新版本</h2>
+    <div class="modal-body" id="updNotes">加载中…</div>
+    <div class="modal-btns">
+      <button id="updApply" onclick="applyUpdate()">立即更新并重启</button>
+      <button class="ghost" onclick="closeUpdateModal()">关闭</button>
+    </div>
+    <div class="msg" id="updMsg"></div>
+  </div>
 </div>
 
 <div class="panel active" id="pMembers">
@@ -130,13 +169,6 @@
     <div class="sub" style="margin-bottom:8px">写入程序同目录 lanet.json，保存后重启程序生效。控制台默认仅本机可访问（127.0.0.1）；改为 0.0.0.0:8900 允许远程时，请务必同时设置控制台密码。</div>
     <div class="kv"><b>节点名称</b><input type="text" id="cName"></div>
     <div class="kv"><b>网络密钥</b><input type="text" id="cKey" placeholder="留空 = 公共网络；相同密钥 = 同一私有网络"></div>
-    <div class="kv"><b>引导节点</b><input type="text" id="cBoot" placeholder="public = 公共 DHT / none = 仅 mDNS / 成员地址"></div>
-    <div class="kv"><b>防火墙</b>
-      <select id="cFW" style="flex:1">
-        <option value="allow-all">端口全开（allow-all）</option>
-        <option value="deny-all">默认全拒绝（deny-all）</option>
-        <option value="allow-list">按规则放行（allow-list）</option>
-      </select></div>
     <div class="kv"><b>控制台</b><input type="text" id="cConsole" placeholder="127.0.0.1:8900 = 仅本机，0.0.0.0:8900 = 允许远程，- = 关闭"></div>
     <div class="kv"><b>控制台密码</b><input type="password" id="cPassword" placeholder="未设置；远程访问时务必设置"></div>
     <div class="kv"><b></b><label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="cClearPW"> 清除已有密码</label></div>
@@ -161,6 +193,8 @@ async function loadState() {
   const r = await fetch('/api/state');
   S = await r.json();
   const i = S.info;
+  const nodeName = i.name || (i.peer_id ? i.peer_id.slice(0, 16) + '…' : '节点');
+  $('nodeTitle').textContent = nodeName;
   $('addrLine').textContent = `虚拟 IP ${i.virtual_ip} · 节点 ${i.peer_id.slice(0,16)}… · 网络 ${i.group || i.group_id}`;
   $('members').innerHTML = S.members.length === 0
     ? '<span class="empty">暂未发现其他成员（等待 DHT / mDNS 发现）</span>'
@@ -260,8 +294,6 @@ async function loadNodeConfig() {
     $('tabConfig').style.display = '';
     $('cName').value = c.name || '';
     $('cKey').value = c.network_key || '';
-    $('cBoot').value = c.bootstrap || 'public';
-    $('cFW').value = c.firewall || 'allow-all';
     $('cConsole').value = c.console || '';
     $('cPassword').value = '';
     $('cPassword').placeholder = c.has_password ? '已设置（输入新值可覆盖）' : '未设置；远程访问时务必设置';
@@ -275,8 +307,6 @@ async function saveNodeConfig() {
   const body = {
     name: $('cName').value.trim(),
     network_key: $('cKey').value,
-    bootstrap: $('cBoot').value.trim() || 'public',
-    firewall: $('cFW').value,
     console: $('cConsole').value.trim(),
     console_password: $('cPassword').value,
     clear_password: $('cClearPW').checked,
@@ -291,7 +321,81 @@ async function saveNodeConfig() {
   if (r.ok) loadNodeConfig();
 }
 
-loadState(); loadNodeConfig(); setInterval(loadState, 10000);
+// ---- 更新 / 重启 / 关闭（宿主注册 /api/update 时才显示按钮组） ----
+let updInfo = null;
+async function initTopActions() {
+  try {
+    const r = await fetch('/api/update');
+    if (!r.ok) return; // 纯 SDK 场景无此接口：隐藏按钮组
+    updInfo = await r.json();
+    $('topBtns').style.display = '';
+    $('updDot').style.display = updInfo.has_update ? '' : 'none';
+  } catch (e) { /* 无接口：隐藏 */ }
+}
+function mdLite(md) {
+  return esc(md || '')
+    .replace(/^#{1,4}\s+(.*)$/gm, '<b>$1</b>')
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/^- (.*)$/gm, '• $1');
+}
+function onUpdateClick() {
+  if (!updInfo) return;
+  const has = updInfo.has_update;
+  $('updTitle').textContent = has
+    ? `发现新版本 v${updInfo.latest}（当前 v${updInfo.current}）`
+    : `已是最新版本 v${updInfo.current}`;
+  $('updNotes').innerHTML = has
+    ? (mdLite(updInfo.notes) || '（无发行说明）')
+    : '当前已是最新版本，无需更新。';
+  $('updApply').style.display = has ? '' : 'none';
+  $('updMsg').textContent = '';
+  $('updOverlay').style.display = '';
+}
+function closeUpdateModal() { $('updOverlay').style.display = 'none'; }
+async function applyUpdate() {
+  $('updApply').disabled = true;
+  flash('updMsg', '正在下载更新并校验（完成后程序自动重启）…', true);
+  try {
+    const r = await fetch('/api/update/apply', { method: 'POST' });
+    const res = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      flash('updMsg', '更新失败' + (res.error ? '：' + res.error : ''), false);
+      $('updApply').disabled = false;
+      return;
+    }
+    flash('updMsg', '下载完成，程序重启中，页面将自动重连…', true);
+    pollAndReload();
+  } catch (e) {
+    flash('updMsg', '更新请求失败：' + e, false);
+    $('updApply').disabled = false;
+  }
+}
+function onRestartClick() {
+  if (!confirm('确定要重启节点程序吗？重启期间本节点会短暂离线。')) return;
+  fetch('/api/restart', { method: 'POST' });
+  $('addrLine').textContent = '程序重启中，页面将自动重连…';
+  pollAndReload();
+}
+function onQuitClick() {
+  if (!confirm('确定要关闭节点程序吗？\n关闭后本节点离线，其他成员将无法连接，直到再次手动启动。')) return;
+  if (!confirm('第二次确认：真的要现在关闭节点程序吗？')) return;
+  fetch('/api/quit', { method: 'POST' });
+  $('addrLine').textContent = '节点程序已退出，可关闭此页面。';
+  document.body.style.opacity = .6;
+}
+function pollAndReload() {
+  let n = 0;
+  const t = setInterval(() => {
+    n++;
+    fetch('/api/state', { cache: 'no-store' })
+      .then(r => { if (r.ok) { clearInterval(t); location.reload(); } })
+      .catch(() => {});
+    if (n > 90) { clearInterval(t); location.reload(); }
+  }, 2000);
+}
+
+loadState(); loadNodeConfig(); initTopActions(); setInterval(loadState, 10000);
 </script>
 </body>
 </html>

@@ -223,6 +223,8 @@ type Info struct {
 	GroupID   string `json:"group_id"`
 	Group     string `json:"group"`
 	VirtualIP string `json:"virtual_ip"`
+	// Name 节点名称（Standalone 即配置名；常规模式为创建/加入时登记的名）。
+	Name string `json:"name,omitempty"`
 	// Created 仅创建模式为 true（同时携带 InviteCode）。
 	Created    bool   `json:"created,omitempty"`
 	InviteCode string `json:"invite_code,omitempty"`
@@ -371,6 +373,7 @@ func (c *Client) Info() Info {
 	return Info{
 		PeerID: c.peerID, GroupID: c.groupID, Group: c.group,
 		VirtualIP:  c.myIP,
+		Name:       c.cfg.Name,
 		Created:    c.created,
 		InviteCode: c.cfg.InviteCode,
 	}
