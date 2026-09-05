@@ -104,6 +104,7 @@ client.OnStream(func(stream lanet.Stream) {
 | `Quiet` | bool | `false` | 为 true 时不打日志 |
 | `Standalone` | bool | `false` | 无服务器模式：不依赖 ctl/relay，DHT+mDNS 自动发现组网 |
 | `NetworkKey` | string | `""` | Standalone 专用：网络密钥。留空 = 公共网络（所有留空节点互通）；相同密钥 = 私有网络 |
+| `Channel` | string | `lanet.ChannelSDK` | Standalone 专用：分发渠道，参与群组身份派生。SDK 构建默认与官方发行版网络互相隔离（相同 NetworkKey 也不互通）；确需互通显式设为 `"official"` |
 | `Bootstrap` | []string | `[]` | Standalone 专用：引导节点 multiaddr（已在网成员地址作为私有 DHT 种子；`lanet.DefaultBootstrap` 为公共引导） |
 | `DisablePublicDHT` | bool | `false` | Standalone 私有网络专用：关闭公共 DHT 兜底，只用私有 DHT + mDNS 发现 |
 | `LANForwards` | []LANForward | `[]` | 局域网转发初始映射表（`{Listen, Target}`），可热更新 |
@@ -172,6 +173,12 @@ log.Printf("虚拟 IP=%s（自动派生）", info.VirtualIP)
 
 密钥经 `SHA256` 派生网络标识，不可反推明文；两套密钥之间完全隔离
 （DHT rendezvous、mDNS tag、建连后群指纹校验三层都是独立的）。
+
+**渠道隔离**：网络身份实际由（分发渠道, NetworkKey）共同派生。SDK 构建
+的程序默认渠道为 `lanet.ChannelSDK`，与官方发行版程序（官方渠道）即使
+使用完全相同的 NetworkKey 也互不相通——DHT 发现、mDNS、虚拟 IP 派生、
+info 协议同群校验四层全部隔离。这是软边界：显式设置 `Config.Channel`
+为相同值（如 `"official"`）即可与对应渠道互通。
 
 工作方式：
 

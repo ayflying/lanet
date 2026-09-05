@@ -24,13 +24,29 @@ import (
 // 想私有组网请各自约定相同的 NetworkKey。
 const PublicNetworkKey = "lanet/public"
 
-// GroupKey 由网络密钥派生群组密钥（32 字节）。
-// 网络密钥留空时按公共网络密钥处理。
-func GroupKey(networkKey string) []byte {
+// 分发渠道（Channel）：参与群组密钥派生，用于把不同分发途径的程序
+// 隔离在不同的网络里——即使双方使用完全相同的 NetworkKey 也不互通
+// （DHT rendezvous、mDNS 标签、虚拟 IP 派生全部随群组密钥隔离）。
+const (
+	// ChannelOfficial 官方发行渠道：官方打包发布的程序（pvn-node 等）。
+	// 派生时使用空渠道前缀，与历史版本派生结果完全一致（老网络零迁移）。
+	ChannelOfficial = ""
+	// ChannelSDK 第三方 SDK 渠道：通过 sdk/go/lanet（及各语言 SDK 封装）
+	// 构建的程序默认归属此渠道，与官方渠道网络互相隔离。
+	ChannelSDK = "sdk"
+)
+
+// GroupKey 由（渠道, 网络密钥）派生群组密钥（32 字节）。
+// 网络密钥留空时按公共网络密钥处理；渠道留空时与历史版本派生一致。
+func GroupKey(channel, networkKey string) []byte {
 	if networkKey == "" {
 		networkKey = PublicNetworkKey
 	}
-	h := sha256.Sum256([]byte("lanet-group-v1:" + networkKey))
+	msg := "lanet-group-v1:" + channel
+	if channel != "" {
+		msg += ":"
+	}
+	h := sha256.Sum256([]byte(msg + networkKey))
 	return h[:]
 }
 

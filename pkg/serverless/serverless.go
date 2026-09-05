@@ -65,6 +65,10 @@ type Config struct {
 	// 留空 = 加入公共网络（所有留空节点互通，见 PublicNetworkKey）；
 	// 填写任意非空字符串 = 私有网络，只有持相同密钥的节点能互相发现与连接。
 	NetworkKey string
+	// Channel 分发渠道：参与群组密钥派生，用于把不同分发途径的程序隔离在
+	// 不同网络（即使 NetworkKey 相同也不互通）。官方程序用 ChannelOfficial，
+	// SDK 构建默认 ChannelSDK。留空 = ChannelOfficial（历史派生）。
+	Channel string
 	// Name 本节点名称（随 info 协议交换给同网络成员）。
 	Name string
 	// Bootstrap DHT 引导节点 multiaddr 列表。
@@ -149,7 +153,7 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	d := &Discovery{
 		host:      h,
 		cfg:       cfg,
-		groupKey:  GroupKey(cfg.NetworkKey), // 空密钥按公共网络处理
+		groupKey:  GroupKey(cfg.Channel, cfg.NetworkKey), // 空密钥按公共网络处理
 		memberTTL: cfg.MemberTTL,
 		members:   make(map[string]*Member),
 	}

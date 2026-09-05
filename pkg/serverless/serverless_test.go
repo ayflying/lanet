@@ -2,6 +2,7 @@ package serverless
 
 import (
 	"context"
+	"crypto/sha256"
 	"testing"
 	"time"
 
@@ -95,19 +96,58 @@ func TestRelayServiceHopReservation(t *testing.T) {
 // TestNetworkKeySemantics 网络密钥语义：留空 = 公共网络（同 key），
 // 不同密钥 = 互相隔离。
 func TestNetworkKeySemantics(t *testing.T) {
-	empty := GroupKey("")
-	if string(empty) != string(GroupKey(PublicNetworkKey)) {
-		t.Fatalf("GroupKey(\"\") should equal GroupKey(PublicNetworkKey)")
+	empty := GroupKey(ChannelOfficial, "")
+	if string(empty) != string(GroupKey(ChannelOfficial, PublicNetworkKey)) {
+		t.Fatalf(`GroupKey(official, "") should equal GroupKey(official, PublicNetworkKey)`)
 	}
-	if string(GroupKey("alpha")) == string(GroupKey("beta")) {
+	if string(GroupKey(ChannelOfficial, "alpha")) == string(GroupKey(ChannelOfficial, "beta")) {
 		t.Fatalf("different keys must derive different group keys")
 	}
 	// 不同密钥的 rendezvous / mDNS 标识必须不同（网络隔离的基础）。
-	if RendezvousKey(GroupKey("alpha")) == RendezvousKey(GroupKey("beta")) {
+	if RendezvousKey(GroupKey(ChannelOfficial, "alpha")) == RendezvousKey(GroupKey(ChannelOfficial, "beta")) {
 		t.Fatalf("rendezvous keys of different networks must differ")
 	}
-	if MdnsTag(GroupKey("alpha")) == MdnsTag(GroupKey("beta")) {
+	if MdnsTag(GroupKey(ChannelOfficial, "alpha")) == MdnsTag(GroupKey(ChannelOfficial, "beta")) {
 		t.Fatalf("mdns tags of different networks must differ")
+	}
+}
+
+// TestChannelIsolation 渠道隔离语义：官方发行版与第三方 SDK 构建即使在
+// 完全相同的 NetworkKey（含公共网络）下也必须派生不同的群组密钥；
+// 官方渠道（空渠道前缀）派生必须与历史版本一致。
+func TestChannelIsolation(t *testing.T) {
+	for _, key := range []string{"", "lanet/public", "my-secret-key"} {
+		official := GroupKey(ChannelOfficial, key)
+		sdk := GroupKey(ChannelSDK, key)
+		if string(official) == string(sdk) {
+			t.Fatalf("official and sdk channels must not share a network (key=%q)", key)
+		}
+		// 渠道不同 → rendezvous / mDNS / 虚拟 IP 派生全部隔离。
+		if RendezvousKey(official) == RendezvousKey(sdk) {
+			t.Fatalf("rendezvous keys must differ across channels (key=%q)", key)
+		}
+		if MdnsTag(official) == MdnsTag(sdk) {
+			t.Fatalf("mdns tags must differ across channels (key=%q)", key)
+		}
+		if DeriveVirtualIP(official, "peerA") == DeriveVirtualIP(sdk, "peerA") {
+			t.Fatalf("virtual IPs must be derived in isolated spaces (key=%q)", key)
+		}
+	}
+	// 兼容性：官方渠道 + 任意密钥 = 历史「lanet-group-v1:<key>」派生，
+	// 升级到渠道隔离版本后官方既有网络不变（零迁移）。
+	for _, key := range []string{"", PublicNetworkKey, "my-secret-key"} {
+		input := key
+		if input == "" {
+			input = PublicNetworkKey
+		}
+		sum := sha256.Sum256([]byte("lanet-group-v1:" + input))
+		if string(GroupKey(ChannelOfficial, key)) != string(sum[:]) {
+			t.Fatalf("official channel derivation must stay backward compatible (key=%q)", key)
+		}
+	}
+	// 空渠道 = 官方渠道（历史派生），与显式 sdk 渠道区分。
+	if string(GroupKey("", "k")) != string(GroupKey(ChannelOfficial, "k")) {
+		t.Fatalf("empty channel must behave as official channel")
 	}
 }
 
@@ -179,6 +219,57 @@ func TestDualDHTPrivateDiscovery(t *testing.T) {
 	}
 	if !viaPrivate {
 		t.Fatalf("B 发现 A 的来源应为 dht-private，实际 membersB=%v", db.Peers())
+	}
+}
+
+// TestChannelIsolationNoDiscovery 渠道隔离端到端验证：两节点使用完全相同的
+// NetworkKey，但渠道不同（official vs sdk）——即使 B 把 A 配置为私有 DHT
+// 种子并互相拨号，也必须在观察窗口内互相发现不到（成员表为空）。
+func TestChannelIsolationNoDiscovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ha := testHost(t, false)
+	hb := testHost(t, false)
+
+	seeds := make([]string, 0, len(ha.Addrs()))
+	for _, a := range ha.Addrs() {
+		seeds = append(seeds, a.String()+"/p2p/"+ha.ID().String())
+	}
+	da, err := New(ctx, ha, Config{
+		NetworkKey: "same-key", Channel: ChannelOfficial, Name: "official-a",
+		Interval:              500 * time.Millisecond,
+		DisablePublicFallback: true,
+	})
+	if err != nil {
+		t.Fatalf("new discovery A: %v", err)
+	}
+	db, err := New(ctx, hb, Config{
+		NetworkKey: "same-key", Channel: ChannelSDK, Name: "sdk-b",
+		Bootstrap:             seeds,
+		Interval:              500 * time.Millisecond,
+		DisablePublicFallback: true,
+	})
+	if err != nil {
+		t.Fatalf("new discovery B: %v", err)
+	}
+	if err = da.Start(ctx); err != nil {
+		t.Fatalf("start A: %v", err)
+	}
+	if err = db.Start(ctx); err != nil {
+		t.Fatalf("start B: %v", err)
+	}
+	go da.Run(ctx)
+	go db.Run(ctx)
+
+	// 观察窗口：与 TestDualDHTPrivateDiscovery 相同环境下正常同渠道
+	// 数秒内即可互相发现，这里给足 8 秒仍互不相见才算隔离成立。
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+		if len(da.Peers()) > 0 || len(db.Peers()) > 0 {
+			t.Fatalf("跨渠道节点互相同网络：membersA=%v membersB=%v", da.Peers(), db.Peers())
+		}
 	}
 }
 

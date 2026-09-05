@@ -88,6 +88,13 @@ func (s streamAdapter) RemotePeer() string { return s.Stream.Conn().RemotePeer()
 // Handler 收到入向流时的回调。
 type Handler func(stream Stream)
 
+// 分发渠道常量（见 Config.Channel）：SDK 构建默认 ChannelSDK，
+// 与官方发行版（ChannelOfficial）的网络互相隔离。
+const (
+	ChannelOfficial = serverless.ChannelOfficial
+	ChannelSDK      = serverless.ChannelSDK
+)
+
 // Config SDK 配置。
 type Config struct {
 	// CTLURL 控制面地址（必填），如 http://127.0.0.1:8600。
@@ -129,7 +136,16 @@ type Config struct {
 	//   - 留空：加入公共网络——所有未设置密钥的节点在同一张大网内互相可见可连；
 	//   - 填写非空值（任意约定字符串）：加入私有网络，只有持相同密钥的节点
 	//     能互相发现与连接（密钥经 SHA256 派生，不可反推）。
+	// 注意：SDK 构建的程序与官方发行版程序默认互相隔离（渠道隔离），
+	// 即使使用完全相同的 NetworkKey 也不在同一张网络内；如确需互通，
+	// 将 Channel 显式设为与对方一致的渠道值（见 Channel 字段说明）。
 	NetworkKey string
+	// Channel 分发渠道（仅 Standalone 模式生效）：参与群组密钥派生，
+	// 用于把不同分发途径的程序隔离在不同网络。留空默认 ChannelSDK
+	// （第三方 SDK 构建与官方发行版互不相通）；官方发行版程序
+	// 使用 ChannelOfficial。这是防止官方公共网络被 SDK 程序混入的
+	// 软隔离边界：显式设置相同 Channel 值即可互通。
+	Channel string
 	// Bootstrap 仅 Standalone 模式生效：DHT 引导节点 multiaddr 列表。
 	// 私有网络下作为「私有 DHT 种子」——填任意已在网成员的 multiaddr 可
 	// 加速入网（每台节点都是种子）；填 DefaultBootstrap 会被识别为公共引导。
@@ -280,6 +296,11 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		if cfg.NetworkKey == "" {
 			cfg.NetworkKey = cfg.InviteCode
 		}
+		// 渠道隔离：SDK 构建默认归属 sdk 渠道，与官方发行版网络互相隔离
+		//（即使 NetworkKey 相同也不互通）。
+		if cfg.Channel == "" {
+			cfg.Channel = serverless.ChannelSDK
+		}
 	}
 
 	c := &Client{cfg: cfg}
@@ -328,6 +349,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Standalone {
 		disc, err = serverless.New(ctx, node, serverless.Config{
 			NetworkKey:            cfg.NetworkKey,
+			Channel:               cfg.Channel,
 			Name:                  cfg.Name,
 			Bootstrap:             cfg.Bootstrap,
 			DisablePublicFallback: cfg.DisablePublicDHT,

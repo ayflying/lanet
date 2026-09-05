@@ -27,6 +27,7 @@ Lanet 是一个自研的群组制 P2P 虚拟局域网系统：客户端创建群
 ## 核心特性
 
 - **群组隔离**：每群从 `10.7.0.0/16` 池分配独立 /24 子网；NetMap 仅返回同群成员，跨群天然不可见。
+- **渠道隔离**：官方发行版程序与第三方 SDK 构建的程序默认归属不同「分发渠道」，DHT 发现、mDNS、虚拟 IP 派生全链条隔离——即使双方使用完全相同的网络密钥也不在同一张网络内（见 [SDK](#sdk) 一节）。
 - **三段隧道策略**：直连优先 → 复用已有连接开流 → Circuit Relay v2 中继保底，全程自动降级。
 - **虚拟网卡**：基于 `wireguard/tun` 的真实 TUN 设备，支持 Windows / Linux / macOS，本地测试可用内存回环设备。
 - **打洞能力**：AutoNAT + DCUtR 打洞 + AutoRelay，典型 NAT 环境下即可直连。
@@ -191,6 +192,15 @@ client.Run(ctx)
 ```
 
 完整 API 与示例见 [sdk/go/lanet/README.md](sdk/go/lanet/README.md)。
+
+**渠道隔离（官方 vs SDK）**：Standalone 模式下，群组身份由（分发渠道, 网络密钥）
+共同派生。官方发行版程序（Releases 下载 / 官方镜像）固定为官方渠道；
+通过 Go SDK 构建的程序默认为 SDK 渠道（`Config.Channel` 留空自动取
+`lanet.ChannelSDK`）。两个渠道即使使用完全相同的 `NetworkKey`（包括都
+留空加入公共网络），也互相发现不到、连不进对方成员表——DHT rendezvous、
+mDNS 标签、虚拟 IP 派生、info 协议同群校验四层全部随渠道隔离。这是
+防止官方网络被任意 SDK 程序混入的软隔离边界：确需与官方网络互通时，
+显式把 `Config.Channel` 设为 `"official"` 即可。
 
 ### Web SDK（`sdk/web`，npm 包名 `@lanet/sdk-web`）
 

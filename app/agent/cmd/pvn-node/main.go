@@ -175,6 +175,7 @@ func main() {
 		Name:             effName,
 		NetworkKey:       effKey,
 		Standalone:       true,
+		Channel:          lanet.ChannelOfficial, // 官方发行渠道：与第三方 SDK 构建网络隔离
 		Bootstrap:        nc.bootstrapAddrs,
 		DisablePublicDHT: effNoPublic,
 		IdentityFile:     effIdentity,
@@ -484,8 +485,9 @@ type nodeRuntime struct {
 }
 
 // networkID 运行时网络标识（与 SDK/控制台页眉一致）：standalone- + 群组指纹。
+// 官方程序固定使用官方渠道派生（与 GroupKey 历史结果一致，老网络不变）。
 func networkID(networkKey string) string {
-	return "standalone-" + serverless.GroupFingerprint(serverless.GroupKey(networkKey))
+	return "standalone-" + serverless.GroupFingerprint(serverless.GroupKey(serverless.ChannelOfficial, networkKey))
 }
 
 // nodeConfigRoutes 节点配置 API：GET 读取 / PUT 保存（写回 lanet.json，重启生效）。
