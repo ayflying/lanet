@@ -168,16 +168,39 @@ func (s *Service) markRelay(peerID string, viaRelay bool) {
 }
 
 // LastPathUsed 返回对端最近一次链路类型：direct / relay / unknown。
+// LastPathUsed 返回到对端最近一次链路类型：direct / relay / offline / unknown。
+// 有本端拨号记录时返回记录值；否则按当前实际连接状态实时判定
+// （未连接 = offline，经 /p2p-circuit = relay，否则 direct）。
 func (s *Service) LastPathUsed(peerID string) string {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if used, ok := s.relayUsed[peerID]; ok {
+		s.mu.Unlock()
 		if used {
 			return "relay"
 		}
 		return "direct"
 	}
-	return "unknown"
+	s.mu.Unlock()
+	return s.connPath(peerID)
+}
+
+// connPath 按当前连接实时判定链路类型（不依赖历史拨号记录，
+// 被动入向连接、从未主动拨号过的成员也能正确显示）。
+func (s *Service) connPath(peerID string) string {
+	id, err := peer.Decode(peerID)
+	if err != nil {
+		return "unknown"
+	}
+	conns := s.self.Network().ConnsToPeer(id)
+	if len(conns) == 0 {
+		return "offline"
+	}
+	for _, c := range conns {
+		if hasCircuit(c.RemoteMultiaddr()) {
+			return "relay"
+		}
+	}
+	return "direct"
 }
 
 func hasCircuit(address ma.Multiaddr) bool {

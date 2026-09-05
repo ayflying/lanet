@@ -34,6 +34,11 @@
   .tag.direct { background:#e2f4ec; color:#127a55; }
   .tag.relay { background:#fdeeee; color:#b03a3c; }
   .tag.unknown { background:#eef0f3; color:#6b7280; }
+  .tag.online { background:#e2f4ec; color:#127a55; font-weight:600; }
+  .tag.offline { background:#eef0f3; color:#9aa1ab; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; vertical-align:1px; }
+  .dot.on { background:#1a9e6e; } .dot.off { background:#c3c8d0; }
+  .mname { font-weight:600; } .mname .pid { color:var(--muted); font-weight:400; font-size:12px; }
   select, input[type=text], input[type=number] {
     padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:13px; width:100%; }
   .row { display:flex; gap:8px; margin:8px 0; align-items:center; }
@@ -159,10 +164,20 @@ async function loadState() {
   $('addrLine').textContent = `虚拟 IP ${i.virtual_ip} · 节点 ${i.peer_id.slice(0,16)}… · 网络 ${i.group || i.group_id}`;
   $('members').innerHTML = S.members.length === 0
     ? '<span class="empty">暂未发现其他成员（等待 DHT / mDNS 发现）</span>'
-    : '<table><tr><th>名称</th><th>虚拟 IP</th><th>链路</th></tr>' +
-      S.members.map(m =>
-        `<tr><td>${esc(m.name)}</td><td>${esc(m.virtual_ip)}</td>` +
-        `<td><span class="tag ${esc(m.path)}">${esc(m.path)}</span></td></tr>`).join('') +
+    : '<table><tr><th>设备</th><th>虚拟 IP</th><th>状态</th><th>链路</th><th>上线时间</th></tr>' +
+      S.members.map(m => {
+        const label = m.name || (m.peer_id ? m.peer_id.slice(0, 10) + '…' : '未知设备');
+        const pid = m.name ? '<span class="pid"> (' + esc(m.peer_id.slice(0, 8)) + '…)</span>' : '';
+        const path = m.online
+          ? (m.path === 'relay' ? '<span class="tag relay">中继</span>'
+            : m.path === 'direct' ? '<span class="tag direct">直连</span>'
+            : '<span class="tag unknown">已连接</span>')
+          : '<span class="tag unknown">—</span>';
+        const since = m.first_seen ? relTime(m.first_seen) : '—';
+        return `<tr><td class="mname">${esc(label)}${pid}</td><td>${esc(m.virtual_ip)}</td>` +
+          `<td><span class="tag ${m.online ? 'online' : 'offline'}"><span class="dot ${m.online ? 'on' : 'off'}"></span>${m.online ? '在线' : '离线'}</span></td>` +
+          `<td>${path}</td><td>${esc(since)}</td></tr>`;
+      }).join('') +
       '</table>';
   $('fwMode').value = S.mode;
   $('bMembers').textContent = S.members.length;
@@ -225,6 +240,16 @@ async function saveForwards() {
   loadState();
 }
 function flash(id, text, ok) { $(id).textContent = text; $(id).className = 'msg ' + (ok ? 'ok' : 'bad'); }
+
+function relTime(unix) {
+  const diff = Math.floor(Date.now() / 1000) - unix;
+  if (diff < 0) return '刚刚';
+  if (diff < 60) return diff + ' 秒前';
+  if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+  if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
+  const d = new Date(unix * 1000);
+  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
 
 // ---- 节点配置（仅宿主程序注册了 /api/node-config 时显示页签，SDK 库内使用自动隐藏） ----
 async function loadNodeConfig() {

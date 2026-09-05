@@ -443,7 +443,7 @@ func (c *Client) DialProtocol(ctx context.Context, virtualIP string, protoID str
 	return streamAdapter{Stream: raw, viaRelay: viaRelay}, viaRelay, nil
 }
 
-// LastPathUsed 返回到对端最近一次链路类型：direct / relay / unknown。
+// LastPathUsed 返回到对端最近一次链路类型：direct / relay / offline / unknown。
 func (c *Client) LastPathUsed(peerID string) string { return c.tunnelSvc.LastPathUsed(peerID) }
 
 // NetMap 当前群组成员目录快照。Standalone 模式返回本地发现的成员表。
@@ -453,6 +453,7 @@ func (c *Client) NetMap() netmapclient.Snapshot {
 		for _, m := range c.disc.Peers() {
 			members = append(members, netmapclient.Member{
 				PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, Addrs: m.Addrs,
+				FirstSeen: m.FirstSeen, LastSeen: m.LastSeen,
 			})
 		}
 		return netmapclient.Snapshot{

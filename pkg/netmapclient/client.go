@@ -21,6 +21,10 @@ type Member struct {
 	OS        string   `json:"os"`
 	VirtualIP string   `json:"virtual_ip"`
 	Addrs     []string `json:"addrs"`
+	// FirstSeen/LastSeen 仅 Standalone（本地发现）模式有值；
+	// 控制面 NetMap 无此概念，为零值。
+	FirstSeen time.Time `json:"first_seen,omitempty"`
+	LastSeen  time.Time `json:"last_seen,omitempty"`
 }
 
 type Snapshot struct {

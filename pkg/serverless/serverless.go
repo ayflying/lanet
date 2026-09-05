@@ -79,11 +79,13 @@ type Config struct {
 
 // Member 成员表中的一项。
 type Member struct {
-	PeerID    string   `json:"peer_id"`
-	Name      string   `json:"name"`
-	VirtualIP string   `json:"virtual_ip"`
-	Addrs     []string `json:"addrs"`
-	Source    string   `json:"source"` // dht / dht-private / mdns
+	PeerID    string    `json:"peer_id"`
+	Name      string    `json:"name"`
+	VirtualIP string    `json:"virtual_ip"`
+	Addrs     []string  `json:"addrs"`
+	Source    string    `json:"source"`     // dht / dht-private / mdns
+	FirstSeen time.Time `json:"first_seen"` // 首次发现时间（即上线时间）
+	LastSeen  time.Time `json:"last_seen"`  // 最近一次出现（发现/握手/入向信息）时间
 }
 
 // Discovered 新成员被发现（尚未连通也会触发；连通并确认同群后 Name 有效）。
@@ -296,9 +298,11 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 			PeerID:    id.String(),
 			VirtualIP: DeriveVirtualIP(d.groupKey, id.String()),
 			Source:    source,
+			FirstSeen: time.Now(),
 		}
 		d.members[id.String()] = m
 	}
+	m.LastSeen = time.Now()
 	if len(addrs) > 0 {
 		m.Addrs = toStrings(addrs)
 	}
@@ -344,6 +348,7 @@ func (d *Discovery) connectAndIdentify(id peer.ID) {
 	d.mu.Lock()
 	if m, ok := d.members[id.String()]; ok {
 		m.Name = info.Name
+		m.LastSeen = time.Now()
 	} else {
 		d.mu.Unlock()
 		return
@@ -376,6 +381,17 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	if req.Group != GroupFingerprint(d.groupKey) {
 		return
 	}
+	// 对端主动来握手：同样视为活跃成员，顺带补齐名称与活跃时间
+	// （本端出向 connectAndIdentify 失败时也能从这里拿到名称）。
+	remote := s.Conn().RemotePeer()
+	d.mu.Lock()
+	if m, ok := d.members[remote.String()]; ok {
+		if req.Name != "" {
+			m.Name = req.Name
+		}
+		m.LastSeen = time.Now()
+	}
+	d.mu.Unlock()
 	resp := infoPayload{
 		Name:  d.cfg.Name,
 		Group: GroupFingerprint(d.groupKey),

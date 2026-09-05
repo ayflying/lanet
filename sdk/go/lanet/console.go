@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/ayflying/pvn/pkg/firewall"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 //go:embed console/index.html console/logo.png
@@ -221,14 +223,29 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		PeerID    string `json:"peer_id"`
 		Name      string `json:"name"`
 		VirtualIP string `json:"virtual_ip"`
+		Online    bool   `json:"online"`
 		Path      string `json:"path"`
+		FirstSeen int64  `json:"first_seen"` // Unix 秒，0 = 未知
+		LastSeen  int64  `json:"last_seen"`
 	}
 	members := []memberView{}
 	for _, m := range c.NetMap().Members {
-		members = append(members, memberView{
+		online := false
+		if pid, err := peer.Decode(m.PeerID); err == nil {
+			online = c.node.Network().Connectedness(pid) == network.Connected
+		}
+		mv := memberView{
 			PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP,
-			Path: c.LastPathUsed(m.PeerID),
-		})
+			Online: online,
+			Path:   c.LastPathUsed(m.PeerID),
+		}
+		if !m.FirstSeen.IsZero() {
+			mv.FirstSeen = m.FirstSeen.Unix()
+		}
+		if !m.LastSeen.IsZero() {
+			mv.LastSeen = m.LastSeen.Unix()
+		}
+		members = append(members, mv)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"info":     c.Info(),
