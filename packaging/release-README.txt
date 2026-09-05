@@ -55,7 +55,7 @@ Lanet —— 单一程序，客户端与服务端一体（无服务器 P2P 虚�
                已在网成员的 multiaddr（私有 DHT 种子，入网更快）
   -no-public-dht  关闭公共 DHT 兜底（纯私有种子 + mDNS）
   -fw          防火墙：allow-all（默认）/ deny-all / allow-list
-  -console     控制台监听地址，默认 0.0.0.0:8900，传 - 关闭
+  -console     控制台监听地址，默认 127.0.0.1:8900（仅本机），传 - 关闭
 
 【提示】
   1. 首次运行 Wintun 会创建虚拟网卡，可能弹出驱动安装确认。

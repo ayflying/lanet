@@ -141,7 +141,7 @@ jobs:
             echo "${BODY}"
             echo
             echo "---"
-            echo "解压即用（Windows 以管理员身份运行，wintun.dll 保持与 lanet.exe 同目录）。"
+            echo "解压即用（Windows 双击运行，UAC 弹窗点「是」即可；wintun.dll 保持与 lanet.exe 同目录）。"
             echo "完整性校验：\`sha256sum -c sha256sums.txt\`"
           } > release-notes.md
           echo "---- release-notes.md ----"
