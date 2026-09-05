@@ -40,6 +40,19 @@ services:
       # 命名卷：node.key / lanet.json / state.json / lanet.log 全部落在这里，
       # 首次挂载自动继承镜像内 /data 属主（lanet），重建容器身份不变。
       - lanet-node-data:/data
+    # ---- TUN 虚拟网卡（0.4.0+，按需二选一）----
+    # 0.4.0 起节点默认尝试创建 TUN（IP 层互通：ping / 任意端口直达虚拟 IP）。
+    # 容器默认非 root 且无 /dev/net/tun，创建会失败并自动降级为纯应用层
+    # （Dial / 端口转发不受影响），每次启动日志记一条降级原因。
+    # ① 引导/中继节点不需要 TUN，建议显式关闭保持日志干净（取消下行注释）：
+    # command: ["-tun", "false"]
+    # ② 要让容器节点真正启用 TUN（其他成员需 ping 通它的虚拟 IP）时，
+    #    改为 root 运行并授予网卡权限（同时要求宿主机已加载 tun 模块）：
+    # user: "0:0"
+    # cap_add:
+    #   - NET_ADMIN
+    # devices:
+    #   - /dev/net/tun
 
 volumes:
   lanet-node-data:
