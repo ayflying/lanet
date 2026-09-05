@@ -42,7 +42,9 @@ type updateState struct {
 	current   string
 	latest    string
 	notes     string
-	assetURL  string // 发行包下载地址（当前平台）
+	assetURL  string // 浏览器下载地址（仅展示）
+	assetAPI  string // API 资产端点（实际下载）
+	sumsAPI   string // sha256sums.txt API 资产端点
 	assetName string
 	checkedAt time.Time
 	token     string
@@ -153,6 +155,7 @@ func checkUpdate(ctx context.Context) error {
 		Body    string `json:"body"`
 		Assets  []struct {
 			Name               string `json:"name"`
+			URL                string `json:"url"` // API 资产端点（私有仓库下载必须走这里）
 			BrowserDownloadURL string `json:"browser_download_url"`
 		} `json:"assets"`
 	}
@@ -166,11 +169,14 @@ func checkUpdate(ctx context.Context) error {
 		want := fmt.Sprintf("lanet-%s-%s-%s", latest, runtime.GOOS, runtime.GOARCH)
 		for _, a := range rel.Assets {
 			if a.Name == want+".zip" || a.Name == want+".tar.gz" {
-				res.assetURL, res.assetName = a.BrowserDownloadURL, a.Name
-				break
+				res.assetURL, res.assetAPIURL = a.BrowserDownloadURL, a.URL
+				res.assetName = a.Name
+			}
+			if a.Name == "sha256sums.txt" {
+				res.sumsAPIURL = a.URL
 			}
 		}
-		if res.assetURL == "" {
+		if res.assetAPIURL == "" {
 			res.errMsg = fmt.Sprintf("最新版 %s 未提供 %s/%s 的发行包", latest, runtime.GOOS, runtime.GOARCH)
 			res.hasUpdate = false
 		}
@@ -180,13 +186,15 @@ func checkUpdate(ctx context.Context) error {
 }
 
 type updateResult struct {
-	hasUpdate bool
-	needToken bool
-	latest    string
-	notes     string
-	assetURL  string
-	assetName string
-	errMsg    string
+	hasUpdate   bool
+	needToken   bool
+	latest      string
+	notes       string
+	assetURL    string // 浏览器下载地址（仅展示用，私有仓库不能用它下载）
+	assetAPIURL string // API 资产端点（实际下载走这里，带 Token + octet-stream）
+	sumsAPIURL  string // sha256sums.txt 的 API 资产端点
+	assetName   string
+	errMsg      string
 }
 
 func (u *updateState) finish(res updateResult, errMsg string) {
@@ -197,7 +205,15 @@ func (u *updateState) finish(res updateResult, errMsg string) {
 	u.hasUpdate, u.needToken = res.hasUpdate, res.needToken
 	u.latest, u.notes = res.latest, res.notes
 	u.assetURL, u.assetName = res.assetURL, res.assetName
+	u.assetAPI, u.sumsAPI = res.assetAPIURL, res.sumsAPIURL
 	u.errMsg = errMsg
+}
+
+// downloadTargets 返回应用更新所需的真实下载地址（API 资产端点）。
+func (u *updateState) downloadTargets() (assetAPI, sumsAPI, assetName string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.assetAPI, u.sumsAPI, u.assetName
 }
 
 // versionLess 三段式版本比较：a < b 返回 true。非法段按 0 处理。
@@ -238,9 +254,13 @@ func (u *updateState) snapshot() (checked, hasUpdate, needToken bool, latest, no
 
 // applyUpdate 下载发行包并校验，替换自身后重启。失败返回错误信息给页面。
 func applyUpdate() error {
-	_, hasUpdate, _, _, _, assetURL, assetName, _ := upd.snapshot()
-	if !hasUpdate || assetURL == "" {
+	_, hasUpdate, _, _, _, _, _, _ := upd.snapshot()
+	if !hasUpdate {
 		return fmt.Errorf("没有可应用的更新")
+	}
+	assetAPI, sumsAPI, assetName := upd.downloadTargets()
+	if assetAPI == "" {
+		return fmt.Errorf("没有可下载的更新资产（请重新检查更新）")
 	}
 	exePath := selfExe()
 	exeDir := filepath.Dir(exePath)
@@ -252,13 +272,13 @@ func applyUpdate() error {
 
 	log.Printf("[update] 开始下载 %s", assetName)
 	archivePath := filepath.Join(workDir, assetName)
-	sum, err := downloadToFile(assetURL, archivePath, upd.token)
+	sum, err := downloadToFile(assetAPI, archivePath, upd.token)
 	if err != nil {
 		return fmt.Errorf("下载失败: %w", err)
 	}
 	// sha256 校验（对比发行包内 sha256sums.txt）。
-	if sumsURL := sha256sumsURL(assetURL, assetName); sumsURL != "" {
-		if err = verifySHA256(sumsURL, assetName, sum, upd.token); err != nil {
+	if sumsAPI != "" {
+		if err = verifySHA256(sumsAPI, assetName, sum, upd.token); err != nil {
 			return fmt.Errorf("校验失败: %w", err)
 		}
 		log.Printf("[update] sha256 校验通过 %s", hex.EncodeToString(sum)[:16]+"…")
@@ -284,13 +304,8 @@ func applyUpdate() error {
 	return nil
 }
 
-// sha256sumsURL 由发行包地址推出 sha256sums.txt 地址（同一 Release 目录）。
-func sha256sumsURL(assetURL, assetName string) string {
-	if !strings.Contains(assetURL, "/releases/download/") {
-		return ""
-	}
-	return strings.TrimSuffix(assetURL, assetName) + "sha256sums.txt"
-}
+// sha256sumsURL 已废弃：私有仓库的 browser_download_url 无法带 Token 下载，
+// 现一律走 checkUpdate 时缓存的 API 资产端点（sumsAPIURL）。
 
 func verifySHA256(sumsURL, assetName string, sum []byte, token string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -299,6 +314,7 @@ func verifySHA256(sumsURL, assetName string, sum []byte, token string) error {
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Accept", "application/octet-stream") // API 资产端点：拿文件内容而非 JSON 元数据
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -331,11 +347,12 @@ func downloadToFile(url, path, token string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 私有仓库的发行包必须带 Token（browser_download_url 302 到签名对象存储，
+	// 私有仓库发行包必须带 Token（API 资产端点 302 到签名对象存储，
 	// 跳转后不再需要鉴权，多余的头无副作用）。
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	req.Header.Set("Accept", "application/octet-stream") // API 资产端点：拿文件内容而非 JSON 元数据
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
