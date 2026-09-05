@@ -110,3 +110,74 @@ func TestNetworkKeySemantics(t *testing.T) {
 		t.Fatalf("mdns tags of different networks must differ")
 	}
 }
+
+// TestDualDHTPrivateDiscovery 双 DHT 快路径：B 以 A 为私有种子（关闭公共
+// 兜底），仅凭私有 /lanet/kad DHT 互相发现，来源标记 dht-private。
+// 无任何公共网络依赖（离线可跑）。
+func TestDualDHTPrivateDiscovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	ha := testHost(t, false)
+	hb := testHost(t, false)
+
+	da, err := New(ctx, ha, Config{
+		NetworkKey: "dual-dht", Name: "node-a",
+		Interval:              500 * time.Millisecond,
+		DisablePublicFallback: true,
+	})
+	if err != nil {
+		t.Fatalf("new discovery A: %v", err)
+	}
+	seeds := make([]string, 0, len(ha.Addrs()))
+	for _, a := range ha.Addrs() {
+		seeds = append(seeds, a.String()+"/p2p/"+ha.ID().String())
+	}
+	db, err := New(ctx, hb, Config{
+		NetworkKey: "dual-dht", Name: "node-b",
+		Bootstrap:             seeds,
+		Interval:              500 * time.Millisecond,
+		DisablePublicFallback: true,
+	})
+	if err != nil {
+		t.Fatalf("new discovery B: %v", err)
+	}
+	if err = da.Start(ctx); err != nil {
+		t.Fatalf("start A: %v", err)
+	}
+	if err = db.Start(ctx); err != nil {
+		t.Fatalf("start B: %v", err)
+	}
+	go da.Run(ctx)
+	go db.Run(ctx)
+
+	// 双向均经私有 DHT 发现：B 侧来源必须标记 dht-private。
+	bSeesA, aSeesB, viaPrivate := false, false, false
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, m := range db.Peers() {
+			if m.PeerID == ha.ID().String() {
+				bSeesA = true
+				if m.Source == "dht-private" {
+					viaPrivate = true
+				}
+			}
+		}
+		for _, m := range da.Peers() {
+			if m.PeerID == hb.ID().String() {
+				aSeesB = true
+			}
+		}
+		if bSeesA && aSeesB && viaPrivate {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !bSeesA || !aSeesB {
+		t.Fatalf("私有 DHT 发现失败：aSeesB=%v bSeesA=%v membersA=%v membersB=%v",
+			aSeesB, bSeesA, da.Peers(), db.Peers())
+	}
+	if !viaPrivate {
+		t.Fatalf("B 发现 A 的来源应为 dht-private，实际 membersB=%v", db.Peers())
+	}
+}

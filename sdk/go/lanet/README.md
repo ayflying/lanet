@@ -104,7 +104,8 @@ client.OnStream(func(stream lanet.Stream) {
 | `Quiet` | bool | `false` | 为 true 时不打日志 |
 | `Standalone` | bool | `false` | 无服务器模式：不依赖 ctl/relay，DHT+mDNS 自动发现组网 |
 | `NetworkKey` | string | `""` | Standalone 专用：网络密钥。留空 = 公共网络（所有留空节点互通）；相同密钥 = 私有网络 |
-| `Bootstrap` | []string | `[]` | Standalone 专用：DHT 引导节点（`lanet.DefaultBootstrap` 或已在网成员地址） |
+| `Bootstrap` | []string | `[]` | Standalone 专用：引导节点 multiaddr（已在网成员地址作为私有 DHT 种子；`lanet.DefaultBootstrap` 为公共引导） |
+| `DisablePublicDHT` | bool | `false` | Standalone 私有网络专用：关闭公共 DHT 兜底，只用私有 DHT + mDNS 发现 |
 | `LANForwards` | []LANForward | `[]` | 局域网转发初始映射表（`{Listen, Target}`），可热更新 |
 | `ConsoleAddr` | string | `127.0.0.1:8900` | 内置 Web 控制台监听地址，`"-"` 关闭；占用时自动后移至 8910 |
 | `StateFile` | string | `""` | 控制台状态持久化文件（防火墙/转发规则），空 = 仅内存 |
@@ -147,7 +148,7 @@ type Stream interface {
 
 `Standalone: true` 开启后**不需要部署任何自己的服务器**：
 节点同时运行 DHT server 与 relay service（客户端即服务端），
-通过 **mDNS（局域网自动发现）+ DHT（跨网发现）** 找到同网络成员并自动建连。
+通过 **mDNS（局域网自动发现）+ 双 DHT（私有优先 + 公共兜底）** 找到同网络成员并自动建连。
 `Dial / OnStream / DialPortFWD` 等 API 与常规模式完全一致：
 
 ```go
@@ -155,8 +156,8 @@ client, err := lanet.New(ctx, lanet.Config{
 	Name:       "my-node",
 	Standalone: true,
 	NetworkKey: "our-secret-net", // 网络密钥：相同密钥的节点组成同一张私有网络
-	// 可选：DHT 引导节点；不填则局域网内仅靠 mDNS 发现
-	Bootstrap: []string{lanet.DefaultBootstrap}, // 加入公共 DHT 网络
+	// 可选：私有 DHT 种子（任意已在网成员地址）；不填则靠 mDNS + 公共 DHT 兜底入网
+	Bootstrap: []string{"192.168.1.10:4001/p2p/12D3KooW..."},
 })
 info := client.Info()
 log.Printf("虚拟 IP=%s（自动派生）", info.VirtualIP)
@@ -182,12 +183,16 @@ log.Printf("虚拟 IP=%s（自动派生）", info.VirtualIP)
 - **节点即服务端**：每个节点无条件运行 Circuit Relay v2 hop 中继（默认资源配额）
   与 kad-dht server 模式；公网可达的成员自然成为网络内的引导与中继节点，
   NAT 后成员经 DCUtR 打洞直连，打洞失败经可达成员中继兜底；
-- **引导（Bootstrap）**：跨网发现的冷启动入口，三选一——
-  1. 填 `lanet.DefaultBootstrap`（libp2p 官方公共 DHT 引导节点），
-     **国内可达性已实测通过**（2026-09-05，武汉电信/联通出口均能连上
-     4 个官方引导节点）；
-  2. 填任意已在网成员的 multiaddr（`<addr>/p2p/<peerID>`，每台节点都是种子）；
-  3. 不填：纯局域网（mDNS 自动发现）或通过 portfwd/其他渠道带外交换地址。
+- **双 DHT（私有优先 + 公共兜底）**：私有网络在每台节点上同时运行两张
+  完全隔离的 DHT——私有 DHT（`/lanet/kad/1.0.0` 协议前缀）只有本网络节点参与，
+  路由表小、发现快；公共 DHT（`/ipfs/kad/1.0.0`）仅负责跨网冷启动时找到
+  第一个「自己人」（鸡生蛋的钥匙）与兜底。同群成员一经确认即注入私有 DHT
+  路由表（互为种子），之后每轮发现全部走私有快路径。
+  纯隐私场景可设 `DisablePublicDHT: true` 关闭公共兜底（需保证首次经种子或局域网入网）；
+- **引导（Bootstrap）**：填任意已在网成员的 multiaddr（`<addr>/p2p/<peerID>`，
+  每台节点都是私有种子）可加速入网；不填则跨网场景依赖公共 DHT 兜底
+  （国内可达性已实测通过，2026-09-05，武汉电信/联通出口均能连上
+  4 个官方引导节点）；纯局域网靠 mDNS 自动发现。
 
 **跨网络实测结论（2026-09-05，三节点 Docker 部署）**：两个处于不同物理局域网、
 公网入向均不可达的节点（A：192.168.50.x 家宽 + 运营商 NAT；B：另一局域网），
@@ -199,10 +204,11 @@ log.Printf("虚拟 IP=%s（自动派生）", info.VirtualIP)
 - 第三个双宿节点（同属两个局域网）作为成员/中继加入后双向 direct 可达，
   印证「可达成员自动成为网络内服务端」的设计。
 
-已验证（2026-09-05，本机 e2e `pvn-serverless-check`，libp2p v0.49 + kad-dht v0.42）：
-相同 NetworkKey 双节点无 ctl/relay，mDNS 秒级互发现 + info 交换，
-按派生虚拟 IP 双向 echo 直连往返 PASS；
-`go test ./pkg/serverless/` 覆盖 info 往返、hop 中继预约与网络密钥隔离语义。
+已验证（2026-09-05，本机 e2e `pvn-serverless-check` + `go test ./pkg/serverless/`，
+libp2p v0.49 + kad-dht v0.42）：相同 NetworkKey 双节点无 ctl/relay，
+双 DHT 模式互发现（私有来源标记 `dht-private`）+ info 交换，
+按派生虚拟 IP 双向 echo 直连往返 PASS；单测覆盖 info 往返、hop 中继预约、
+网络密钥隔离语义与「关闭公共兜底的纯私有 DHT 发现」。
 
 实测注意事项：
 
@@ -215,7 +221,8 @@ log.Printf("虚拟 IP=%s（自动派生）", info.VirtualIP)
   但不建议依赖。
 
 当前限制：NAT 后节点在打洞成功前无法被直连（成员表中的中继候选打洞后可用）；
-跨机/跨网场景（公共 DHT 引导）待真机实测；虚拟 IP 冲突未仲裁（群规模大时注意）。
+公共 DHT 兜底仅在私有网络首次牵线时使用，若关闭兜底且无种子则跨网无法冷启动；
+虚拟 IP 冲突未仲裁（群规模大时注意）。
 
 ### PortFWD：访问对端节点的 TCP 服务
 

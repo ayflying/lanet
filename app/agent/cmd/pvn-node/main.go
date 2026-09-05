@@ -37,24 +37,29 @@ func main() {
 		name      = flag.String("name", envOr("LANET_NAME", "node"), "节点名称（成员表中的虚拟域名）")
 		key       = flag.String("key", envOr("LANET_NETWORK_KEY", ""), "网络密钥（留空 = 公共网络）")
 		bootstrap = flag.String("bootstrap", envOr("LANET_BOOTSTRAP", "public"),
-			"逗号分隔的引导节点 multiaddr；public = 公共 DHT，none = 仅 mDNS")
+			"逗号分隔的引导节点 multiaddr（私有网络下作为私有 DHT 种子）；public = 公共 DHT，none = 仅 mDNS")
 		identity = flag.String("identity", envOr("LANET_IDENTITY", "/data/node.key"), "身份密钥文件路径")
 		console  = flag.String("console", envOr("LANET_CONSOLE", "0.0.0.0:8900"), "控制台监听地址，- 关闭")
 		fw       = flag.String("fw", envOr("LANET_FW", "allow-all"), "防火墙模式：deny-all / allow-list / allow-all")
 		probe    = flag.Duration("probe", 20*time.Second, "成员探测间隔")
 		listen   = flag.String("listen", envOr("LANET_LISTEN", ""),
 			"覆盖监听地址（逗号分隔）；默认 tcp/ws/quic 全部随机端口")
+		noPublic = flag.Bool("no-public-dht",
+			envOr("LANET_NO_PUBLIC_DHT", "") == "1" || strings.EqualFold(envOr("LANET_NO_PUBLIC_DHT", ""), "true"),
+			"私有网络下关闭公共 DHT 兜底（纯私有种子 + mDNS）")
 	)
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s", *name, *key, *fw, *console)
+	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s noPublicDHT=%v", *name, *key, *fw, *console, *noPublic)
 
 	// 引导节点列表。
 	var bootstraps []string
+	noPublicDHT := *noPublic
 	switch strings.TrimSpace(*bootstrap) {
 	case "", "none":
-		// 仅 mDNS 局域网发现。
+		// 仅 mDNS 局域网发现（完全不接入公共 DHT）。
+		noPublicDHT = true
 	case "public":
 		bootstraps = []string{serverless.DefaultBootstrap}
 	default:
@@ -65,12 +70,13 @@ func main() {
 		}
 	}
 	cfg := lanet.Config{
-		Name:         *name,
-		NetworkKey:   *key,
-		Standalone:   true,
-		Bootstrap:    bootstraps,
-		IdentityFile: *identity,
-		ConsoleAddr:  *console,
+		Name:             *name,
+		NetworkKey:       *key,
+		Standalone:       true,
+		Bootstrap:        bootstraps,
+		DisablePublicDHT: noPublicDHT,
+		IdentityFile:     *identity,
+		ConsoleAddr:      *console,
 	}
 	switch *fw {
 	case "allow-list":

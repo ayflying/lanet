@@ -122,9 +122,15 @@ type Config struct {
 	//     能互相发现与连接（密钥经 SHA256 派生，不可反推）。
 	NetworkKey string
 	// Bootstrap 仅 Standalone 模式生效：DHT 引导节点 multiaddr 列表。
-	// 空且未启用 mDNS 时无法跨网发现；可填 serverless.DefaultBootstrap
-	// 加入公共 DHT 网络，或直接填任意已在网成员的 multiaddr（每台节点都是种子）。
+	// 私有网络下作为「私有 DHT 种子」——填任意已在网成员的 multiaddr 可
+	// 加速入网（每台节点都是种子）；填 DefaultBootstrap 会被识别为公共引导。
+	// 私有网络默认同时挂公共 DHT 兜底：私有种子全不可达时仍能经公共 DHT
+	// 找到第一个同群成员（跨网冷启动零配置）。
 	Bootstrap []string
+	// DisablePublicDHT 仅 Standalone 私有网络生效：关闭公共 DHT 兜底，
+	// 只用私有 DHT + mDNS 发现。适用于不想接入公共网络、且能保证首次
+	// 通过种子节点或局域网入网的场景。
+	DisablePublicDHT bool
 	// LANForwards 局域网端口转发初始映射表：入向请求端口命中 Listen 时，
 	// 转发到 Target（本机所在真实局域网内的设备地址，如 192.168.1.100:5000）。
 	// 运行中可经 Web 控制台热更新；入向转发始终受防火墙约束（默认全拒绝）。
@@ -288,12 +294,13 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	// 2. 入网。
 	if cfg.Standalone {
 		disc, err = serverless.New(ctx, node, serverless.Config{
-			NetworkKey: cfg.NetworkKey,
-			Name:       cfg.Name,
-			Bootstrap:  cfg.Bootstrap,
-			EnableMDNS: true,
-			Interval:   cfg.NetMapInterval,
-			Quiet:      cfg.Quiet,
+			NetworkKey:            cfg.NetworkKey,
+			Name:                  cfg.Name,
+			Bootstrap:             cfg.Bootstrap,
+			DisablePublicFallback: cfg.DisablePublicDHT,
+			EnableMDNS:            true,
+			Interval:              cfg.NetMapInterval,
+			Quiet:                 cfg.Quiet,
 		})
 		if err == nil {
 			err = disc.Start(ctx)

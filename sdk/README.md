@@ -24,9 +24,10 @@ Lanet（群组制 P2P 虚拟局域网）对外提供四套 SDK，按运行环境
 - ctl 只负责目录（NetMap / 邀请码 / 中继候选），**不在数据路径上**。
 
 Go SDK 另支持**无服务器模式（Standalone）**：不部署 ctl/relay，节点同时充当
-DHT server 与中继（客户端即服务端），经 mDNS + DHT 自动发现同网络成员组网。
-网络归属由**网络密钥（NetworkKey）**决定：留空 = 加入公共网络（所有留空节点互通），
-相同密钥 = 私有网络。详见 [Go SDK → 无服务器模式](./go/lanet/README.md)。
+DHT server 与中继（客户端即服务端），经 mDNS + 双 DHT（私有优先 + 公共兜底）
+自动发现同网络成员组网。网络归属由**网络密钥（NetworkKey）**决定：
+留空 = 加入公共网络（所有留空节点互通），相同密钥 = 私有网络。
+详见 [Go SDK → 无服务器模式](./go/lanet/README.md)。
 
 ### 2. ws-gateway 网关中转（C# / uniapp SDK）
 

@@ -1,3 +1,21 @@
+// Package serverless 提供无控制面的群组成员发现：
+//
+//   - DHT（kad-dht，ModeAutoServer）：跨网段发现。每个节点把
+//     「本网络 rendezvous key」作为 provider 记录发布到 DHT 网络，
+//     同网络成员通过 FindProviders 互相找到。
+//     key 由网络密钥（NetworkKey）派生，不知道密钥就无法定位网络（弱隐私边界）。
+//   - 双 DHT（私有优先 + 公共兜底）：私有网络（NetworkKey 非空）在同一张
+//     Host 上同时运行两张 DHT——私有 DHT 使用独立协议前缀（/lanet/kad/1.0.0）
+//     与公共 /ipfs DHT 完全隔离，只有本网络节点参与，路由表小、发现快；
+//     公共 DHT 作为兜底（私有引导节点全不可达时仍能经公共网络找到成员）。
+//     发现顺序私有优先；同群成员一经确认即注入私有 DHT 路由表（互为种子）。
+//   - mDNS：局域网零配置发现（service tag 派生自网络密钥，同网络才互见）。
+//   - 节点即服务端：每个节点默认运行 relay service 与 DHT server 模式，
+//     公网可达的成员自然成为网络内的引导与中继节点。
+//
+// 发现到同网络成员后主动建连并交换信息（/lanet/info/1.0.0），
+// 本地维护成员表；对外实现 tunnel.GroupNetMap（按虚拟 IP 解析）
+// 与 tunnel.RelaySource（中继候选），SDK 的 Dial/OnStream 语义不变。
 package serverless
 
 import (
@@ -26,6 +44,11 @@ import (
 // 已在网成员的 multiaddr（每台节点都是潜在种子）。
 const DefaultBootstrap = "/dnsaddr/bootstrap.libp2p.io"
 
+// PrivateDHTPrefix 私有 DHT 的协议前缀。私有 DHT 的协议为
+// /lanet/kad/1.0.0（ProtocolPrefix 补全），与公共 /ipfs/kad/1.0.0
+// 完全隔离：只有本网络节点互相参与路由与 provider 记录。
+const PrivateDHTPrefix = "/lanet"
+
 // ProtocolInfo 节点信息交换协议（建连后校验同群 + 交换名称）。
 const ProtocolInfo = "/lanet/info/1.0.0"
 
@@ -37,9 +60,15 @@ type Config struct {
 	NetworkKey string
 	// Name 本节点名称（随 info 协议交换给同网络成员）。
 	Name string
-	// Bootstrap DHT 引导节点 multiaddr 列表；为空时仅 mDNS（纯局域网）。
-	// 传入 DefaultBootstrap 可加入公共 DHT 网络。
+	// Bootstrap DHT 引导节点 multiaddr 列表。
+	// 私有网络（NetworkKey 非空）下作为「私有 DHT 种子」：填任意已在网
+	// 成员的 multiaddr 即可加速入网；填 DefaultBootstrap 会被识别为公共
+	// 引导（不作为私有种子）。公共网络下即公共 DHT 引导列表。
 	Bootstrap []string
+	// DisablePublicFallback 私有网络下关闭公共 DHT 兜底（纯私有发现：
+	// 私有引导节点 + mDNS）。默认开启兜底：私有种子不可达时仍可经公共
+	// DHT 找到同群成员。仅对 NetworkKey 非空时生效。
+	DisablePublicFallback bool
 	// EnableMDNS 启用局域网 mDNS 自动发现。
 	EnableMDNS bool
 	// Interval 广播/发现周期，默认 30s。
@@ -54,7 +83,7 @@ type Member struct {
 	Name      string   `json:"name"`
 	VirtualIP string   `json:"virtual_ip"`
 	Addrs     []string `json:"addrs"`
-	Source    string   `json:"source"` // dht / mdns
+	Source    string   `json:"source"` // dht / dht-private / mdns
 }
 
 // Discovered 新成员被发现（尚未连通也会触发；连通并确认同群后 Name 有效）。
@@ -67,8 +96,9 @@ type Discovery struct {
 	groupKey []byte
 	selfIP   string
 
-	dht     *kaddht.IpfsDHT
-	mdnsSvc mdns.Service
+	dhtPrivate *kaddht.IpfsDHT // 私有 DHT（/lanet 前缀；仅私有网络非 nil）
+	dhtPublic  *kaddht.IpfsDHT // 公共 DHT（/ipfs 前缀；兜底与公共网络）
+	mdnsSvc    mdns.Service
 
 	mu      sync.RWMutex
 	members map[string]*Member // peerID -> member
@@ -89,18 +119,56 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	}
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
 
-	// 1. DHT：默认每台节点都是 server（客户端即服务端）。
-	bootstraps, err := parseBootstrap(ctx, cfg.Bootstrap)
-	if err != nil {
-		return nil, err
-	}
-	dhtOpts := []kaddht.Option{
-		kaddht.Mode(kaddht.ModeAutoServer),
-		kaddht.BootstrapPeers(bootstraps...),
-	}
-	d.dht, err = kaddht.New(h, dhtOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("serverless: init dht: %w", err)
+	// 1. DHT：每台节点都是 server（客户端即服务端）。
+	//    私有网络跑双 DHT：私有（/lanet 前缀，只有本网络节点）优先发现，
+	//    公共（/ipfs 前缀）兜底——负责跨网冷启动时找到第一个「自己人」。
+	//    公共网络（密钥留空）只跑公共 DHT，语义与此前一致。
+	if cfg.NetworkKey != "" {
+		privSeeds := make([]string, 0, len(cfg.Bootstrap))
+		for _, b := range cfg.Bootstrap {
+			if b != DefaultBootstrap { // 公共引导地址不作为私有种子
+				privSeeds = append(privSeeds, b)
+			}
+		}
+		privParsed, err := parseBootstrap(ctx, privSeeds)
+		if err != nil {
+			return nil, err
+		}
+		d.dhtPrivate, err = kaddht.New(h,
+			kaddht.Mode(kaddht.ModeAutoServer),
+			kaddht.BootstrapPeers(privParsed...),
+			kaddht.ProtocolPrefix(PrivateDHTPrefix),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("serverless: init private dht: %w", err)
+		}
+		if !cfg.DisablePublicFallback {
+			pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			pubParsed, perr := parseBootstrap(pubCtx, []string{DefaultBootstrap})
+			cancel()
+			if perr != nil {
+				d.logf("公共引导解析失败，公共兜底暂不可用（下轮重试广播）: %v", perr)
+			}
+			d.dhtPublic, err = kaddht.New(h,
+				kaddht.Mode(kaddht.ModeAutoServer),
+				kaddht.BootstrapPeers(pubParsed...),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("serverless: init public dht: %w", err)
+			}
+		}
+	} else {
+		bootstraps, err := parseBootstrap(ctx, cfg.Bootstrap)
+		if err != nil {
+			return nil, err
+		}
+		d.dhtPublic, err = kaddht.New(h,
+			kaddht.Mode(kaddht.ModeAutoServer),
+			kaddht.BootstrapPeers(bootstraps...),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("serverless: init dht: %w", err)
+		}
 	}
 
 	// 2. mDNS（可选）：NewMdnsService 创建即启动。
@@ -122,8 +190,18 @@ func (d *Discovery) Start(ctx context.Context) error {
 		}
 		cancel()
 	}
-	if err := d.dht.Bootstrap(ctx); err != nil {
-		d.logf("DHT 自举未完成（周期重试）: %v", err)
+	if d.dhtPrivate != nil {
+		if err := d.dhtPrivate.Bootstrap(ctx); err != nil {
+			d.logf("私有 DHT 自举未完成（周期重试）: %v", err)
+		}
+	}
+	if d.dhtPublic != nil {
+		if err := d.dhtPublic.Bootstrap(ctx); err != nil {
+			d.logf("公共 DHT 自举未完成（周期重试）: %v", err)
+		}
+	}
+	if d.dhtPrivate != nil && d.dhtPublic != nil {
+		d.logf("双 DHT 模式：私有发现优先，公共 DHT 兜底")
 	}
 	d.host.SetStreamHandler(ProtocolInfo, d.handleInfo)
 	return nil
@@ -165,25 +243,45 @@ func (d *Discovery) Run(ctx context.Context) {
 }
 
 // advertiseAndDiscover 一轮：广播自身 + 查找同群成员 + 尝试建连。
+// 私有 DHT 与公共 DHT 并行工作：私有命中快，公共兜底（跨网冷启动）。
 func (d *Discovery) advertiseAndDiscover(ctx context.Context) {
+	var wg sync.WaitGroup
+	if d.dhtPrivate != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.dhtRound(ctx, d.dhtPrivate, "dht-private", 15*time.Second, 8*time.Second)
+		}()
+	}
+	if d.dhtPublic != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.dhtRound(ctx, d.dhtPublic, "dht", 20*time.Second, 25*time.Second)
+		}()
+	}
+	wg.Wait()
+}
+
+// dhtRound 单张 DHT 的一轮：把自身发布为群的 provider（TTL 由 DHT 管理，
+// 周期刷新），再查找同群 provider 列表并逐个建连确认。
+func (d *Discovery) dhtRound(ctx context.Context, dht *kaddht.IpfsDHT, source string, advTimeout, findTimeout time.Duration) {
 	key := d.providerKey()
 
-	// 广播：把自身发布为群的 provider（TTL 由 DHT 管理，周期刷新）。
-	advCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	if err := d.dht.Provide(advCtx, key, true); err != nil {
-		d.logf("DHT 广播失败（下轮重试）: %v", err)
+	advCtx, cancel := context.WithTimeout(ctx, advTimeout)
+	if err := dht.Provide(advCtx, key, true); err != nil {
+		d.logf("DHT 广播失败（%s，下轮重试）: %v", source, err)
 	}
 	cancel()
 
-	// 查找：同群 provider 列表。
-	findCtx, cancel2 := context.WithTimeout(ctx, 25*time.Second)
-	for pi := range d.dht.FindProvidersAsync(findCtx, key, 64) {
+	findCtx, cancel := context.WithTimeout(ctx, findTimeout)
+	defer cancel()
+	for pi := range dht.FindProvidersAsync(findCtx, key, 64) {
 		if pi.ID == d.host.ID() {
 			continue
 		}
-		d.addMember(pi.ID, pi.Addrs, "dht")
+		d.addMember(pi.ID, pi.Addrs, source)
 	}
-	cancel2()
 }
 
 // addMember 记录成员并异步建连（连通后经 info 协议确认同群、拿名称）。
@@ -237,6 +335,11 @@ func (d *Discovery) connectAndIdentify(id peer.ID) {
 		delete(d.members, id.String())
 		d.mu.Unlock()
 		return
+	}
+	// 同群成员互为私有 DHT 种子：确认后立即进路由表，
+	// 后续发现不再依赖公共 DHT（快路径生效）。
+	if d.dhtPrivate != nil {
+		_, _ = d.dhtPrivate.RoutingTable().TryAddPeer(id, false, false)
 	}
 	d.mu.Lock()
 	if m, ok := d.members[id.String()]; ok {
