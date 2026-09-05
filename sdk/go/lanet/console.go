@@ -14,7 +14,7 @@ import (
 	"github.com/ayflying/pvn/pkg/firewall"
 )
 
-//go:embed console/index.html
+//go:embed console/index.html console/logo.png
 var consoleFS embed.FS
 
 // 防火墙类型别名：SDK 用户无需直接 import pkg/firewall。
@@ -75,6 +75,15 @@ func (c *Client) startConsole() error {
 	mux.HandleFunc("GET /api/state", c.apiState)
 	mux.HandleFunc("PUT /api/firewall", c.apiSetFirewall)
 	mux.HandleFunc("PUT /api/forwards", c.apiSetForwards)
+	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		if logo, err := consoleFS.ReadFile("console/logo.png"); err == nil {
+			_, _ = w.Write(logo)
+		}
+	})
+	for pattern, handler := range c.cfg.ConsoleExtra {
+		mux.Handle(pattern, handler)
+	}
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		page, _ := consoleFS.ReadFile("console/index.html")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -87,9 +96,20 @@ func (c *Client) startConsole() error {
 			c.logf("控制台退出: %v", err)
 		}
 	}()
-	c.logf("Web 控制台已启动：http://%s", ln.Addr())
+
+	// 记录实际访问地址（端口被占用时 listener 会向后回退）。
+	host := hostPart
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	c.consoleURL = fmt.Sprintf("http://%s", net.JoinHostPort(host, strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)))
+	c.logf("Web 控制台已启动：%s", c.consoleURL)
 	return nil
 }
+
+// ConsoleURL 内置 Web 控制台的实际访问地址（含端口回退后的真实端口）；
+// 控制台关闭（ConsoleAddr="-"）时返回空串。
+func (c *Client) ConsoleURL() string { return c.consoleURL }
 
 // apiState 全量状态：节点信息 + 成员表 + 防火墙 + 转发映射。
 func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {

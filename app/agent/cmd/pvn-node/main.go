@@ -1,23 +1,29 @@
-// pvn-node 长驻的 Standalone（无服务器）节点，用于部署与跨网络联调：
+// pvn-node（发行名 lanet）长驻的 Standalone（无服务器）节点：
 //
-//   - 以 lanet SDK standalone 模式入网（DHT + mDNS 自动发现，节点即服务端）；
-//   - 对外提供 /lanet/echo/1.0.0 回显应用流；
-//   - 周期探测成员表内所有成员：按虚拟 IP 开 echo 流往返一次并记录结果
-//     （direct/relay、耗时），便于在容器日志里直接确认跨网连通性；
-//   - 内置 Web 控制台（防火墙 / 转发映射 / 成员状态）。
+//   - 客户端与服务端一体：DHT + mDNS 自动发现，节点即服务端，无需部署任何东西；
+//   - 双击/零参数即可启动：读取 exe 同目录 lanet.json 配置文件（不存在则自动生成），
+//     之后全部在 Web 控制台（默认 http://127.0.0.1:8900）配置，保存后重启生效；
+//   - 对外提供 /lanet/echo/1.0.0 回显应用流，并周期探测成员连通性；
+//   - 内置 Web 控制台（成员 / 防火墙 / 端口转发 / 节点配置）。
 //
-// 用法示例（详见 build/node.Dockerfile 与 docker compose）：
+// 用法示例：
 //
-//	pvn-node -name edge-a -key net-xnet-test -bootstrap public -console :8900
+//	lanet                            # 双击或直接运行：按 lanet.json 配置入网
+//	lanet -name edge-a -key net-x -bootstrap public -console :8900
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -36,52 +42,106 @@ const echoProto = libprotocol.ID("/lanet/echo/1.0.0")
 var version = "dev"
 
 func main() {
+	exeDir := exeDir()
 	var (
-		name      = flag.String("name", envOr("LANET_NAME", "node"), "节点名称（成员表中的虚拟域名）")
-		key       = flag.String("key", envOr("LANET_NETWORK_KEY", ""), "网络密钥（留空 = 公共网络）")
-		bootstrap = flag.String("bootstrap", envOr("LANET_BOOTSTRAP", "public"),
-			"逗号分隔的引导节点 multiaddr（私有网络下作为私有 DHT 种子）；public = 公共 DHT，none = 仅 mDNS")
-		identity = flag.String("identity", envOr("LANET_IDENTITY", "/data/node.key"), "身份密钥文件路径")
-		console  = flag.String("console", envOr("LANET_CONSOLE", "0.0.0.0:8900"), "控制台监听地址，- 关闭")
-		fw       = flag.String("fw", envOr("LANET_FW", "allow-all"), "防火墙模式：deny-all / allow-list / allow-all")
-		probe    = flag.Duration("probe", 20*time.Second, "成员探测间隔")
-		listen   = flag.String("listen", envOr("LANET_LISTEN", ""),
+		config = flag.String("config", envOr("LANET_CONFIG", filepath.Join(exeDir, "lanet.json")),
+			"配置文件路径（默认 exe 同目录 lanet.json，双击启动即靠它）")
+		name = flag.String("name", envOr("LANET_NAME", ""),
+			"节点名称（成员表中的虚拟域名）；不传则读配置文件，再退回主机名")
+		key = flag.String("key", envOr("LANET_NETWORK_KEY", "@@unset@@"),
+			"网络密钥（留空 = 公共网络）；不传则读配置文件")
+		bootstrap = flag.String("bootstrap", envOr("LANET_BOOTSTRAP", ""),
+			"引导节点：public = 公共 DHT / none = 仅 mDNS / 成员 multiaddr；不传则读配置文件")
+		identity = flag.String("identity", envOr("LANET_IDENTITY", ""),
+			"身份密钥文件路径；不传则读配置文件，再退回默认（Windows: exe 同目录 node.key）")
+		console = flag.String("console", envOr("LANET_CONSOLE", ""),
+			"控制台监听地址；不传则读配置文件（默认 0.0.0.0:8900）")
+		fw = flag.String("fw", envOr("LANET_FW", ""),
+			"防火墙模式：deny-all / allow-list / allow-all；不传则读配置文件")
+		listen = flag.String("listen", envOr("LANET_LISTEN", ""),
 			"覆盖监听地址（逗号分隔）；默认 tcp/ws/quic 全部随机端口")
 		noPublic = flag.Bool("no-public-dht",
 			envOr("LANET_NO_PUBLIC_DHT", "") == "1" || strings.EqualFold(envOr("LANET_NO_PUBLIC_DHT", ""), "true"),
 			"私有网络下关闭公共 DHT 兜底（纯私有种子 + mDNS）")
+		probe = flag.Duration("probe", 0, "成员探测间隔；不传则读配置文件（默认 20s）")
 	)
 	flag.Parse()
 
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s noPublicDHT=%v version=%s", *name, *key, *fw, *console, *noPublic, version)
+	// ---- 日志：stderr + exe 同目录 lanet.log 双写（windowsgui 无黑框时靠文件看日志）----
+	if lf, err := os.OpenFile(filepath.Join(filepath.Dir(*config), "lanet.log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+		log.SetOutput(io.MultiWriter(os.Stderr, lf))
+	}
 
-	// 引导节点列表。
-	var bootstraps []string
-	noPublicDHT := *noPublic
-	switch strings.TrimSpace(*bootstrap) {
+	// ---- 配置文件：不存在则生成默认模板（双击启动的场景），存在则加载 ----
+	nc, cfgCreated := loadNodeConfig(*config, exeDir)
+	if cfgCreated {
+		log.Printf("[node] 已生成默认配置文件 %s（可在 Web 控制台修改，重启生效）", *config)
+	}
+
+	// ---- 参数解析优先级：显式命令行 > 环境变量 > 配置文件 > 内置默认 ----
+	flagSet := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { flagSet[f.Name] = true })
+
+	effName := nc.Name
+	if *name != "" {
+		effName = *name
+	}
+	if effName == "" {
+		if h, err := os.Hostname(); err == nil && h != "" {
+			effName = h
+		} else {
+			effName = "node"
+		}
+	}
+	effKey := nc.NetworkKey // 注意：空串是合法值（公共网络），不能用 "非空才覆盖" 逻辑
+	if *key != "@@unset@@" {
+		effKey = *key
+	}
+	effBootstrap := firstNonEmpty(*bootstrap, nc.Bootstrap, "public")
+	effIdentity := firstNonEmpty(*identity, nc.Identity, defaultIdentityPath(exeDir))
+	effConsole := firstNonEmpty(*console, nc.Console, "0.0.0.0:8900")
+	effFW := firstNonEmpty(*fw, nc.Firewall, "allow-all")
+	effListen := firstNonEmpty(*listen, nc.Listen)
+	effNoPublic := *noPublic || nc.NoPublicDHT
+	effProbe := *probe
+	if effProbe <= 0 {
+		if nc.ProbeSec > 0 {
+			effProbe = time.Duration(nc.ProbeSec) * time.Second
+		} else {
+			effProbe = 20 * time.Second
+		}
+	}
+
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s noPublicDHT=%v version=%s config=%s",
+		effName, effKey, effFW, effConsole, effNoPublic, version, *config)
+
+	switch strings.TrimSpace(effBootstrap) {
 	case "", "none":
 		// 仅 mDNS 局域网发现（完全不接入公共 DHT）。
-		noPublicDHT = true
+		effNoPublic = true
 	case "public":
-		bootstraps = []string{serverless.DefaultBootstrap}
+		nc.bootstrapAddrs = []string{serverless.DefaultBootstrap}
 	default:
-		for _, a := range strings.Split(*bootstrap, ",") {
+		for _, a := range strings.Split(effBootstrap, ",") {
 			if a = strings.TrimSpace(a); a != "" {
-				bootstraps = append(bootstraps, a)
+				nc.bootstrapAddrs = append(nc.bootstrapAddrs, a)
 			}
 		}
 	}
 	cfg := lanet.Config{
-		Name:             *name,
-		NetworkKey:       *key,
+		Name:             effName,
+		NetworkKey:       effKey,
 		Standalone:       true,
-		Bootstrap:        bootstraps,
-		DisablePublicDHT: noPublicDHT,
-		IdentityFile:     *identity,
-		ConsoleAddr:      *console,
+		Bootstrap:        nc.bootstrapAddrs,
+		DisablePublicDHT: effNoPublic,
+		IdentityFile:     effIdentity,
+		ConsoleAddr:      effConsole,
+		StateFile:        filepath.Join(filepath.Dir(*config), "state.json"),
+		ConsoleExtra:     nodeConfigRoutes(*config),
 	}
-	switch *fw {
+	switch effFW {
 	case "allow-list":
 		cfg.FirewallMode = lanet.FirewallModeAllowList
 		// 探测与 echo 依赖应用流入向：放行全部来源的全部协议（测试语义）。
@@ -91,12 +151,14 @@ func main() {
 	default:
 		cfg.FirewallMode = lanet.FirewallModeAllowAll
 	}
-	if *listen != "" {
-		cfg.ListenAddrs = strings.Split(*listen, ",")
+	if effListen != "" {
+		cfg.ListenAddrs = strings.Split(effListen, ",")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	node, err := lanet.New(ctx, cfg)
 	if err != nil {
@@ -105,7 +167,13 @@ func main() {
 	defer node.Close()
 	info := node.Info()
 	log.Printf("[node] 已入网 name=%s peerID=%s virtualIP=%s network=%s",
-		*name, info.PeerID, info.VirtualIP, networkLabel(*key))
+		effName, info.PeerID, info.VirtualIP, networkLabel(effKey))
+
+	// ---- 托盘 + 自动打开控制台（Windows 图形界面模式）----
+	if consoleURL := node.ConsoleURL(); consoleURL != "" && runtime.GOOS == "windows" {
+		startTray(func() string { return consoleURL }, cancel)
+		openBrowser(consoleURL)
+	}
 
 	// 回显服务：收到什么回什么（供其他节点探测）。
 	node.Host().SetStreamHandler(echoProto, func(s network.Stream) {
@@ -133,7 +201,7 @@ func main() {
 
 	// 周期探测：向成员表内所有其他成员发起 echo 往返。
 	lastMembers := ""
-	ticker := time.NewTicker(*probe)
+	ticker := time.NewTicker(effProbe)
 	defer ticker.Stop()
 	first := time.After(5 * time.Second)
 	for {
@@ -236,4 +304,158 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// firstNonEmpty 返回第一个非空值（全部为空则返回空串）。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// exeDir 可执行文件所在目录（双击启动时配置/身份/状态文件都落在这里）。
+func exeDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	return filepath.Dir(exe)
+}
+
+// defaultIdentityPath 身份密钥默认路径：Windows 放 exe 同目录（好找好备份），
+// 其他平台维持容器约定 /data/node.key。
+func defaultIdentityPath(exeDir string) string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(exeDir, "node.key")
+	}
+	return "/data/node.key"
+}
+
+// nodeConfig lanet.json 配置文件结构（字段与命令行参数一一对应）。
+// 双击/零参数启动时全靠它；Web 控制台「节点配置」编辑的就是这个文件，
+// 保存后重启程序生效（防火墙与转发映射在控制台里是热生效的，不在此列）。
+type nodeConfig struct {
+	Name        string `json:"name"`
+	NetworkKey  string `json:"network_key"`
+	Bootstrap   string `json:"bootstrap"`
+	Identity    string `json:"identity"`
+	Console     string `json:"console"`
+	Firewall    string `json:"firewall"`
+	Listen      string `json:"listen"`
+	NoPublicDHT bool   `json:"no_public_dht"`
+	ProbeSec    int    `json:"probe_seconds"`
+
+	bootstrapAddrs []string `json:"-"` // 运行时由 Bootstrap 解析而来
+}
+
+// loadNodeConfig 读取配置文件；不存在或损坏时返回默认配置并尽力生成模板文件。
+// 返回值 created 表示本次是否新生成了模板。
+func loadNodeConfig(path, exeDir string) (*nodeConfig, bool) {
+	if data, err := os.ReadFile(path); err == nil {
+		var nc nodeConfig
+		if json.Unmarshal(data, &nc) == nil {
+			return &nc, false
+		}
+		log.Printf("[node] 配置文件解析失败（按默认值运行，可删除该文件重新生成）: %s", path)
+	}
+	nc := defaultNodeConfig(exeDir)
+	if err := nc.save(path); err != nil {
+		log.Printf("[node] 默认配置文件生成失败（不影响启动）: %v", err)
+	}
+	return nc, true
+}
+
+// defaultNodeConfig 开箱即用默认值：主机名作为节点名、公共 DHT 引导、控制台全开。
+func defaultNodeConfig(exeDir string) *nodeConfig {
+	name, err := os.Hostname()
+	if err != nil || name == "" {
+		name = "node"
+	}
+	return &nodeConfig{
+		Name:       name,
+		NetworkKey: "",
+		Bootstrap:  "public",
+		Identity:   defaultIdentityPath(exeDir),
+		Console:    "0.0.0.0:8900",
+		Firewall:   "allow-all",
+		ProbeSec:   20,
+	}
+}
+
+// save 原子写入配置文件。
+func (nc *nodeConfig) save(path string) error {
+	data, err := json.MarshalIndent(nc, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err = os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// nodeConfigRoutes 节点配置 API：GET 读取 / PUT 保存（写回 lanet.json，重启生效）。
+func nodeConfigRoutes(path string) map[string]http.HandlerFunc {
+	read := func() nodeConfig {
+		var nc nodeConfig
+		if data, err := os.ReadFile(path); err == nil {
+			_ = json.Unmarshal(data, &nc)
+		}
+		return nc
+	}
+	return map[string]http.HandlerFunc{
+		"GET /api/node-config": func(w http.ResponseWriter, r *http.Request) {
+			nc := read()
+			writeJSONLocal(w, http.StatusOK, map[string]any{
+				"config_path":   path,
+				"name":          nc.Name,
+				"network_key":   nc.NetworkKey,
+				"bootstrap":     nc.Bootstrap,
+				"identity":      nc.Identity,
+				"console":       nc.Console,
+				"firewall":      nc.Firewall,
+				"listen":        nc.Listen,
+				"no_public_dht": nc.NoPublicDHT,
+				"probe_seconds": nc.ProbeSec,
+			})
+		},
+		"PUT /api/node-config": func(w http.ResponseWriter, r *http.Request) {
+			var req nodeConfig
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSONLocal(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
+				return
+			}
+			switch req.Firewall {
+			case "deny-all", "allow-list", "allow-all":
+			default:
+				writeJSONLocal(w, http.StatusBadRequest, map[string]string{"error": "firewall 必须是 deny-all / allow-list / allow-all"})
+				return
+			}
+			if req.Console == "" || req.Name == "" {
+				writeJSONLocal(w, http.StatusBadRequest, map[string]string{"error": "name 与 console 不能为空"})
+				return
+			}
+			if req.ProbeSec < 0 {
+				req.ProbeSec = 20
+			}
+			req.Identity = read().Identity // 身份文件路径只读，防止控制台误改导致身份丢失
+			if err := req.save(path); err != nil {
+				writeJSONLocal(w, http.StatusInternalServerError, map[string]string{"error": "保存失败: " + err.Error()})
+				return
+			}
+			log.Printf("[node] 节点配置已保存到 %s（重启程序后生效）", path)
+			writeJSONLocal(w, http.StatusOK, map[string]any{"saved": true, "restart_required": true})
+		},
+	}
+}
+
+// writeJSONLocal 统一 JSON 响应（节点配置 API 用）。
+func writeJSONLocal(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
 }

@@ -59,17 +59,25 @@ docker compose -f deploy/docker-compose.agent.yml up -d
 
 需要 `NET_ADMIN` 权限与 `/dev/net/tun`（编排文件已声明）。
 
-### 方式三：Windows 客户端（发行包）
+### 方式三：Windows / Linux 单程序（发行包，推荐）
 
-从 [Releases](https://github.com/ayflying/lanet/releases) 下载 `lanet-agent-windows-amd64.zip`，解压后**以管理员身份**运行（`wintun.dll` 必须与 exe 同目录）：
+从 [Releases](https://github.com/ayflying/lanet/releases) 下载对应平台压缩包并解压。
+**只有一个程序 `lanet`**——客户端与服务端一体，无需部署任何服务器。
+
+**Windows 双击即用**：右键以管理员身份运行 `lanet.exe`（无黑框窗口），
+桌面托盘出现图标、浏览器自动打开 Web 控制台；在「节点配置」里填好
+节点名称与网络密钥，保存后重启程序即完成入网。托盘右键可打开控制台或退出。
+`wintun.dll` 必须与 `lanet.exe` 同目录。
 
 ```powershell
-# 创建群组（第一个节点）
-.\lanet-agent-windows-amd64.exe -ctl http://<服务端IP>:8000 -mode create -name my-pc -group "我的局域网"
-
-# 凭邀请码加入
-.\lanet-agent-windows-amd64.exe -ctl http://<服务端IP>:8000 -mode join -invite <邀请码> -name pc2
+# 命令行方式（可选，参数会覆盖 lanet.json 配置文件）
+.\lanet.exe -name pc1 -key "我们的网络密钥"
+.\lanet.exe -name pc2 -key "我们的网络密钥"   # 相同密钥自动互相发现并组网
 ```
+
+零参数启动时自动在 exe 同目录生成 `lanet.json`（配置）、`node.key`（身份）、
+`lanet.log`（日志）。控制台默认 `http://127.0.0.1:8900`：
+查看成员、配置防火墙与端口转发（即时生效）、修改节点配置（重启生效）。
 
 ### 方式四：源码运行（开发调试）
 
@@ -295,8 +303,8 @@ pkg/                          跨应用共享库
   tundevice/     TUN 设备与路由器
 build/                        容器镜像 Dockerfile（ctl/relay/agent）
 deploy/                       容器编排（服务端 / 客户端）
-packaging/                    发行包附带文件（如 Windows README）
-.github/workflows/            CI：docker（容器镜像）、release-windows（Windows 发行包）
+packaging/                    发行包附带文件（README、logo 图标）
+.github/workflows/            CI：docker（容器镜像）、release（全平台压缩发行包）
 ```
 
 接口走 gf 标准链路：`api`（声明 Req/Res 与路由）→ `controller`（实现）→ `service`（接口）→ `logic`（实现），

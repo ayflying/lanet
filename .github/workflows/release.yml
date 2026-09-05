@@ -74,17 +74,13 @@ jobs:
           DIR="dist/lanet-${{ matrix.goos }}-${{ matrix.goarch }}"
           mkdir -p "$DIR"
           LDFLAGS="-s -w -X main.version=${VERSION}"
-          for target in \
-            "lanet-agent ./app/agent/cmd/pvn-agent" \
-            "lanet-ctl ./app/ctl" \
-            "lanet-relay ./app/relay" \
-            "lanet-node ./app/agent/cmd/pvn-node"; do
-            name=${target%% *}
-            path=${target#* }
-            GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
-              go build -trimpath -ldflags "$LDFLAGS" -o "$DIR/$name${{ matrix.ext }}" "$path"
-          done
+          # Windows 用 GUI 子系统：双击启动无黑色控制台窗口（托盘常驻，日志在 lanet.log）。
+          if [ "${{ matrix.goos }}" = "windows" ]; then LDFLAGS="$LDFLAGS -H=windowsgui"; fi
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+            go build -trimpath -ldflags "$LDFLAGS" \
+            -o "$DIR/lanet${{ matrix.ext }}" ./app/agent/cmd/pvn-node
           echo "$VERSION" > "$DIR/VERSION"
+          cp packaging/release-README.txt "$DIR/README.txt"
 
       - name: Attach wintun.dll and README (windows)
         if: matrix.goos == 'windows'

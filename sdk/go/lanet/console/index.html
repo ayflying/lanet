@@ -87,6 +87,30 @@
     <div class="msg" id="fwdMsg"></div>
   </div>
 
+  <div class="card" id="cfgCard" style="display:none">
+    <h2>节点配置 <span class="tag unknown">保存后重启程序生效</span></h2>
+    <div class="sub" style="margin-bottom:8px">写入程序同目录 lanet.json。防火墙与端口转发即时生效无需重启；此处的防火墙字段仅作为下次启动的初始值。</div>
+    <div class="kv"><b>节点名称</b><input type="text" id="cName"></div>
+    <div class="kv"><b>网络密钥</b><input type="text" id="cKey" placeholder="留空 = 公共网络；相同密钥 = 同一私有网络"></div>
+    <div class="kv"><b>引导节点</b><input type="text" id="cBoot" placeholder="public = 公共 DHT / none = 仅 mDNS / 成员地址"></div>
+    <div class="kv"><b>防火墙</b>
+      <select id="cFW" style="flex:1">
+        <option value="allow-all">端口全开（allow-all）</option>
+        <option value="deny-all">默认全拒绝（deny-all）</option>
+        <option value="allow-list">按规则放行（allow-list）</option>
+      </select></div>
+    <div class="kv"><b>控制台</b><input type="text" id="cConsole" placeholder="0.0.0.0:8900，- = 关闭"></div>
+    <div class="kv"><b>监听地址</b><input type="text" id="cListen" placeholder="留空 = tcp/ws/quic 随机端口"></div>
+    <div class="kv"><b>身份文件</b><input type="text" id="cIdentity" disabled></div>
+    <div class="row" style="margin-top:10px">
+      <label style="display:flex;gap:6px;align-items:center">
+        <input type="checkbox" id="cNoPublic"> 关闭公共 DHT 兜底（纯私有种子 + mDNS）
+      </label>
+    </div>
+    <button onclick="saveNodeConfig()">保存节点配置</button>
+    <div class="msg" id="cfgMsg"></div>
+  </div>
+
 </div>
 <script>
 let S = null;

@@ -141,6 +141,10 @@ type Config struct {
 	// StateFile 控制台状态（防火墙规则 + 转发映射）持久化文件路径；
 	// 空 = 仅内存，节点重启后回到 Config 初始值。
 	StateFile string
+	// ConsoleExtra 宿主程序向内置 Web 控制台追加的自定义路由。
+	// key 为 Go 1.22 http.ServeMux 路由模式（如 "GET /api/node-config"），
+	// value 为处理函数；与内置路由共存，路径冲突时启动报错。
+	ConsoleExtra map[string]http.HandlerFunc
 	// FirewallMode 防火墙初始模式：deny-all（默认，拒绝一切入向）/
 	// allow-list（按 FirewallRules 放行）/ allow-all（全开）。
 	// 统一管控三类入向暴露面：PortFWD 端口转发、TUN 虚拟网卡入向（IP 层）、
@@ -205,6 +209,7 @@ type Client struct {
 	forwards   []LANForward // 局域网转发映射表（热更新）
 	statePath  string       // 状态持久化文件
 	consoleSrv *http.Server // 内置 Web 控制台
+	consoleURL string       // 控制台实际访问地址（端口回退后）
 }
 
 // Info 节点入网后的身份信息。
