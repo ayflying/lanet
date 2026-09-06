@@ -256,7 +256,8 @@ type Client struct {
 	sessionToken string       // 控制台会话令牌（设置 ConsolePassword 后生成）
 
 	tunMu     sync.Mutex
-	tunDevice tundevice.Device // TUN 虚拟网卡（cfg.Tun 且创建成功时非 nil）
+	tunDevice tundevice.Device  // TUN 虚拟网卡（cfg.Tun 且创建成功时非 nil）
+	tunRouter *tundevice.Router // TUN 数据面路由器（非 nil 时 Tunnel 协议已由 TUN 接管）
 }
 
 // Info 节点入网后的身份信息。
@@ -462,11 +463,29 @@ func (c *Client) selfHostname() string {
 }
 
 // OnStream 注册入向流处理器（协议 Tunnel）。可注册多个，按序调用。
+//
+// 注意：TUN 虚拟网卡创建成功时，/pvn/tunnel/1.0.0 协议已被 SDK 接管为
+// IP 层数据面（入向流写回 TUN 网卡，承载 ping / TCP / UDP 等全部流量），
+// 本方法注册的处理器在该协议上不再被调用——否则会与 TUN 数据面互相抢流
+// （历史上 pvn-node 的 echo handler 曾因此吞掉全部入向 IP 包导致
+// ping 双向 100% 丢包）。应用层入向流请用 DialProtocol 配自定义协议。
+// TUN 未启用或创建失败（如 Windows 非管理员）时，行为与从前一致。
 func (c *Client) OnStream(handler Handler) {
 	c.handlers = append(c.handlers, handler)
+	if c.tunActive() {
+		c.logf("OnStream 已忽略：TUN 虚拟网卡已接管 /pvn/tunnel/1.0.0（IP 数据面），应用流处理器不再作用于该协议")
+		return
+	}
 	if len(c.handlers) == 1 {
 		c.node.SetStreamHandler(protocol.Tunnel, c.handleInbound)
 	}
+}
+
+// tunActive TUN 数据面是否已激活（创建成功且已接管 Tunnel 协议）。
+func (c *Client) tunActive() bool {
+	c.tunMu.Lock()
+	defer c.tunMu.Unlock()
+	return c.tunRouter != nil
 }
 
 // resolveVirtualIP 虚拟地址解析：目标可以是虚拟 IP、
@@ -572,15 +591,24 @@ func (c *Client) startTUN(ctx context.Context) {
 	}
 	c.tunMu.Lock()
 	c.tunDevice = device
-	c.tunMu.Unlock()
 	router := tundevice.New(device, c.tunnelSvc)
 	router.SetFirewall(c.fw)
+	c.tunRouter = router
+	c.tunMu.Unlock()
 	// 设备生命周期与 ctx 绑定：退出时关闭设备，Router.Run 随 Read 错误退出。
 	go func() {
 		<-ctx.Done()
 		_ = device.Close()
 	}()
 	go router.Run(ctx)
+	// 关键接线：TUN 已就绪时，/pvn/tunnel/1.0.0 入向流必须写回 TUN 网卡
+	// （对端主动发来的 IP 包）。没有这行，本节点永远收不到对端的包
+	// ——ping 双向 100% 丢包的核心根因（此前该协议被宿主的 echo handler
+	// 吞掉，IP 包从未进入本机协议栈）。此时宿主的 OnStream 不再作用于
+	// Tunnel 协议（见 OnStream 注释），应用流场景请改用 DialProtocol+自定义协议。
+	c.node.SetStreamHandler(protocol.Tunnel, func(stream network.Stream) {
+		router.ServeInboundStream(stream)
+	})
 	c.logf("TUN 网卡 %s 已就绪（虚拟 IP=%s）：组内成员可通过虚拟 IP 直接访问本机（ping/任意端口，入向受防火墙约束）", name, c.myIP)
 }
 

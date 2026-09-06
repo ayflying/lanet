@@ -223,6 +223,9 @@ func main() {
 	}
 
 	// 回显服务：收到什么回什么（供其他节点探测）。
+	// 注意：不再向 OnStream 注册 Tunnel 协议 echo——TUN 开启时该协议是
+	// IP 数据面（ping/任意端口直达虚拟 IP 的承载），应用层 echo 会与之
+	// 抢流、吞掉入向 IP 包导致 ping 不通。探测统一走独立 echoProto。
 	node.Host().SetStreamHandler(echoProto, func(s network.Stream) {
 		defer s.Close()
 		buf := make([]byte, 4096)
@@ -238,11 +241,7 @@ func main() {
 			}
 		}
 	})
-	// 同时保留 SDK Tunnel 协议 echo（兼容既有验证工具）。
-	node.OnStream(func(stream lanet.Stream) {
-		defer stream.Close()
-		_, _ = stream.Write([]byte("echo:" + stream.Protocol()))
-	})
+	// （原 Tunnel 协议 OnStream echo 已删除：与 TUN 数据面冲突，见上）
 
 	go node.Run(ctx)
 
