@@ -91,5 +91,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 注入版本号：P2P 自更新与成员表版本列都依赖它（dev 版本号不可比）。
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,scope=${{ matrix.name }},mode=max

@@ -13,18 +13,27 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" \
+
+# VERSION 由 CI 传入（docker.yml build-args），本地构建退回 dev。
+# 版本号经 -ldflags 注入 main.version：P2P 自更新的版本比较、
+# 成员表版本列、控制台版本显示全部依赖它，缺失会导致节点互不识别版本。
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/pvn-node ./app/agent/cmd/pvn-node
 
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache ca-certificates tzdata iproute2 \
     && addgroup -S lanet && adduser -S lanet -G lanet \
     && mkdir -p /data && chown lanet:lanet /data
 
 COPY --from=builder /out/pvn-node /usr/local/bin/pvn-node
 
-USER lanet
+# 保持 root 运行：TUN 虚拟网卡需要 CAP_NET_ADMIN。注意 Docker 的
+# --cap-add NET_ADMIN 只对 root 用户生效——若以 USER lanet（非 root）
+# 运行，cap 被清空，TUN 创建必报 operation not permitted（实测踩坑）。
+# 隔离边界由容器命名卷 /data + 显式 --cap-add 控制，不在镜像内降权。
 VOLUME ["/data"]
 
 # 环境变量：LANET_NAME / LANET_NETWORK_KEY / LANET_CONSOLE / LANET_CONSOLE_PASSWORD 等，
