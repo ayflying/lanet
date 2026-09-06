@@ -201,10 +201,8 @@
         <input type="checkbox" id="cTun"> 虚拟网卡 TUN（IP 层互通：ping / 任意端口直达虚拟 IP，需管理员权限运行）
       </label>
     </div>
-    <div class="row">
-      <label style="display:flex;gap:6px;align-items:center">
-        <input type="checkbox" id="cSelfUpdate"> P2P 自动更新（≥3 成员运行更新版本且签名校验通过时，从成员间分发下载并错峰重启）
-      </label>
+    <div class="row" style="color:var(--muted,#888);font-size:12px">
+      P2P 自动更新已内置开启：发现更高版本成员即验签下载、错峰重启（无需配置）
     </div>
     <button onclick="saveNodeConfig()">保存节点配置</button>
     <div class="msg" id="cfgMsg"></div>
@@ -384,7 +382,6 @@ async function loadNodeConfig() {
     $('cIdentity').value = c.identity || '';
     $('cNoPublic').checked = !!c.no_public_dht;
     $('cTun').checked = c.tun === undefined ? true : !!c.tun;
-    $('cSelfUpdate').checked = c.self_update === undefined ? true : !!c.self_update;
     renderRuntimeBanner(c);
   } catch (e) { /* 无此接口（纯 SDK 场景）：保持页签隐藏 */ }
 }
@@ -411,7 +408,6 @@ async function saveNodeConfig() {
     listen: $('cListen').value.trim(),
     no_public_dht: $('cNoPublic').checked,
     tun: $('cTun').checked,
-    self_update: $('cSelfUpdate').checked,
   };
   if (!body.name || !body.console) { flash('cfgMsg', '节点名称与控制台地址不能为空', false); return; }
   const r = await fetch('/api/node-config', { method: 'PUT',

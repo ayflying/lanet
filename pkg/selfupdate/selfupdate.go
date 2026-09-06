@@ -162,8 +162,9 @@ type Config struct {
 	PublicKey string
 	// CheckInterval 版本巡检周期，默认 30 分钟。
 	CheckInterval time.Duration
-	// MinNewPeers 触发征询所需的更高版本同平台成员数，默认 3。
-	// 同时是清单共识票数（3 份一致才可信）。
+	// MinNewPeers 触发征询所需的更高版本同平台成员数，默认 1。
+	// 发现 1 个更高版本成员即征询其清单；验签通过即可信（签名信任锚
+	// 保证清单出自发布私钥，无需多票灰度），多份时要求完全一致。
 	MinNewPeers int
 	// Quiet 关闭日志。
 	Quiet bool
@@ -180,7 +181,7 @@ func (c *Config) fillDefaults() {
 		c.CheckInterval = 30 * time.Minute
 	}
 	if c.MinNewPeers <= 0 {
-		c.MinNewPeers = 3
+		c.MinNewPeers = 1
 	}
 	if c.ManifestPath == "" {
 		c.ManifestPath = filepath.Join(filepath.Dir(c.ExePath), "update-manifest.json")
@@ -271,11 +272,16 @@ func (c *Coordinator) round(ctx context.Context) {
 	if len(newer) < c.cfg.MinNewPeers {
 		return
 	}
-	// 随机抽样征询（灰度：要下载的版本必须已在至少 N 个成员上运行）。
+	// 随机抽样征询：MinNewPeers=1 时向所有更高版本成员征询（谁在线问谁，
+	// 提高响应率）；多成员时抽样上限设为 3 份用于交叉比对。
 	rand.Shuffle(len(newer), func(i, j int) { newer[i], newer[j] = newer[j], newer[i] })
 	sample := newer
-	if len(sample) > c.cfg.MinNewPeers {
-		sample = sample[:c.cfg.MinNewPeers]
+	maxSample := c.cfg.MinNewPeers
+	if maxSample < 3 {
+		maxSample = 3
+	}
+	if len(sample) > maxSample {
+		sample = sample[:maxSample]
 	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -295,7 +301,8 @@ func (c *Coordinator) round(ctx context.Context) {
 	}
 	wg.Wait()
 
-	// 共识 + 逐份验签：全部一致才可信（少数派可能是被篡改或陈旧记录）。
+	// 共识 + 逐份验签：验签通过（出自发布私钥）即满足票数门槛；多份一致
+	// 更佳，不一致时取验签通过的最高版本由 CompareVersions 二次把关。
 	target, ok := consensus(heads, c.cfg.PublicKey, c.cfg.MinNewPeers)
 	if !ok {
 		c.logf("征询到 %d/%d 份清单但未形成可信共识，放弃本轮", len(heads), len(sample))
@@ -312,8 +319,8 @@ func (c *Coordinator) round(ctx context.Context) {
 	c.attempts[target.SHA256] = true
 	c.mu.Unlock()
 
-	c.logf("发现新版本 v%s（sha256=%s…，%d 成员确认 + 验签通过），开始下载",
-		target.Version, target.SHA256[:12], len(sample))
+	c.logf("发现新版本 v%s（sha256=%s…，验签通过），开始下载",
+		target.Version, target.SHA256[:12])
 	path, err := c.download(ctx, target, sample)
 	if err != nil {
 		c.logf("P2P 更新下载失败（下轮巡检重试）: %v", err)
@@ -329,8 +336,9 @@ func (c *Coordinator) round(ctx context.Context) {
 	}
 }
 
-// consensus 要求 heads 中验签通过的份数 >= need，且 sha256 完全一致。
-// 一致才返回该 head（验签保证它出自发布私钥，一致保证多数在跑）。
+// consensus 要求 heads 中验签通过的份数 >= need。份数达标时返回验签通过
+// 清单中「版本最高」的一份（need=1 时单份验签通过即可信——签名信任锚保证
+// 清单出自发布私钥；多份且同版本必须 sha256 一致，同版本不一致视为异常放弃）。
 func consensus(heads []Manifest, pubB64 string, need int) (Manifest, bool) {
 	var valid []Manifest
 	for _, m := range heads {
@@ -340,6 +348,23 @@ func consensus(heads []Manifest, pubB64 string, need int) (Manifest, bool) {
 	}
 	if len(valid) < need {
 		return Manifest{}, false
+	}
+	if need == 1 {
+		// 同版本多份但 sha256 不一致 = 分发被污染，宁可放弃。
+		byVersion := make(map[string]string)
+		for _, m := range valid {
+			if prev, ok := byVersion[m.Version]; ok && prev != m.SHA256 {
+				return Manifest{}, false
+			}
+			byVersion[m.Version] = m.SHA256
+		}
+		best := valid[0]
+		for _, m := range valid[1:] {
+			if CompareVersions(best.Version, m.Version) < 0 {
+				best = m
+			}
+		}
+		return best, true
 	}
 	for _, m := range valid[1:] {
 		if m.SHA256 != valid[0].SHA256 || m.Version != valid[0].Version {

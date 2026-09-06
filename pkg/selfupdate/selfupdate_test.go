@@ -75,7 +75,7 @@ func TestCompareVersions(t *testing.T) {
 	}
 }
 
-// TestConsensus 共识决策：验签通过 + 全员一致才可信。
+// TestConsensus 共识决策：验签通过 + 票数达标才可信（need=1 单票制）。
 func TestConsensus(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	pubB64 := base64.StdEncoding.EncodeToString(pub)
@@ -84,13 +84,34 @@ func TestConsensus(t *testing.T) {
 	if err := SignManifest(priv, &good); err != nil {
 		t.Fatal(err)
 	}
-	// 3 份一致 → 通过。
+	// need=1：单份验签通过即可信（签名信任锚）。
+	if m, ok := consensus([]Manifest{good}, pubB64, 1); !ok || m.SHA256 != "aa" {
+		t.Fatalf("单份验签通过未通过 need=1: %v %v", m, ok)
+	}
+	// 3 份一致 → 通过（兼容多票制）。
 	if m, ok := consensus([]Manifest{good, good, good}, pubB64, 3); !ok || m.SHA256 != "aa" {
 		t.Fatalf("3 份一致未通过: %v %v", m, ok)
 	}
-	// 2 份 → 票数不足。
+	// 2 份 → 票数不足（多票制下）。
 	if _, ok := consensus([]Manifest{good, good}, pubB64, 3); ok {
 		t.Fatal("2 份不应通过 need=3 的共识")
+	}
+	// 单票制下同版本 sha256 冲突 → 拒绝（分发被污染，宁可不动）。
+	conflict := good
+	conflict.SHA256 = "bb"
+	if err := SignManifest(priv, &conflict); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := consensus([]Manifest{good, conflict}, pubB64, 1); ok {
+		t.Fatal("同版本 sha256 冲突不应通过 need=1")
+	}
+	// 单票制下取验签通过的最高版本。
+	better := Manifest{Version: "0.6.0", Platform: "windows/amd64", Size: 1, SHA256: "cc"}
+	if err := SignManifest(priv, &better); err != nil {
+		t.Fatal(err)
+	}
+	if m, ok := consensus([]Manifest{good, better}, pubB64, 1); !ok || m.Version != "0.6.0" {
+		t.Fatalf("应取最高版本 0.6.0: %v %v", m, ok)
 	}
 	// 混入假签名 → 拒绝。
 	fake := good

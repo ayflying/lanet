@@ -2,11 +2,11 @@ package main
 
 // p2pupdate.go P2P 自更新接线：
 //   - 容器环境自动禁用（容器内替换二进制会被镜像回滚，更新走编排层）；
-//   - Coordinator 巡检成员版本 → 达票征询 → 验签 → P2P 下载；
+//   - Coordinator 巡检成员版本 → 发现更高版本即征询 → 验签 → P2P 下载；
 //   - 下载成功后由本文件完成自替换与随机抖动重启（与 GitHub 更新互斥）。
 //
-// 信任链：CI 私钥签名（GitHub Secrets）→ 节点内置公钥验签 → 3 成员清单
-// 一致（灰度门槛）→ sha256 下载校验。GitHub 仅是发版与首种子来源。
+// 信任链：CI 私钥签名（GitHub Secrets）→ 节点内置公钥验签 → sha256 下载
+// 校验。验签通过即可信（1 票制），GitHub 仅是发版与首种子来源。
 
 import (
 	"context"
@@ -48,6 +48,8 @@ func (n netmapPeers) Peers() []selfupdate.PeerInfo {
 var updateBusy sync.Mutex
 
 // StartP2PUpdate 启动 P2P 自更新巡检。返回禁用原因（空 = 已启动）。
+// 信任锚（Ed25519 签名）保证清单不可伪造，因此发现 1 个更高版本成员
+// 即征询下载，验签通过就可信；错峰重启避免全网同时重启。
 func StartP2PUpdate(ctx context.Context, c *lanet.Client, version string, exeDir string) string {
 	if version == "" || version == "dev" {
 		return "dev 构建（版本号不可比）"
@@ -73,7 +75,7 @@ func StartP2PUpdate(ctx context.Context, c *lanet.Client, version string, exeDir
 		applyP2PUpdate(newPath, m, exePath)
 	})
 	coord.Start(ctx)
-	log.Printf("[p2p-update] 已启动：巡检 30 分钟/轮，≥3 成员确认 + 验签通过才升级")
+	log.Printf("[p2p-update] 已启动：巡检 30 分钟/轮，发现更高版本即征询下载（验签通过才升级）")
 	return ""
 }
 
