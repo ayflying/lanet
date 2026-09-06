@@ -8,3 +8,7 @@ func startTray(consoleURL func() string, onExit func()) {}
 
 // openBrowser 非 Windows 平台不自动打开浏览器（容器/无头环境）。
 func openBrowser(url string) {}
+
+// shouldOpenConsole 非 Windows 平台不自动开浏览器，恒返回 false
+// （与 openBrowser 空实现语义一致；与 Windows 版保持相同签名）。
+func shouldOpenConsole(url string) bool { return false }
