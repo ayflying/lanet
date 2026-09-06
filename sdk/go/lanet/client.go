@@ -38,6 +38,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -208,6 +209,12 @@ func LoadOrCreateIdentity(path string) (crypto.PrivKey, error) {
 	raw, err := crypto.MarshalPrivateKey(key)
 	if err != nil {
 		return nil, fmt.Errorf("lanet: 序列化节点身份: %w", err)
+	}
+	// 父目录不存在时自动创建（自定义路径/文件夹移动后的新位置都覆盖）。
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err = os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("lanet: 创建身份文件目录 %s: %w", dir, err)
+		}
 	}
 	if err = os.WriteFile(path, raw, 0o600); err != nil {
 		return nil, fmt.Errorf("lanet: 写入身份文件 %s: %w", path, err)

@@ -107,7 +107,20 @@ func main() {
 		effKey = *key
 	}
 	effBootstrap := firstNonEmpty(*bootstrap, nc.Bootstrap, "public")
+	// 身份路径解析：裸文件名相对配置目录；旧版写的绝对路径若因文件夹移动而
+	// 失效，自动回退到 exe 同目录的同名文件并回写配置（身份不丢，无需手改）。
 	effIdentity := firstNonEmpty(*identity, nc.Identity, defaultIdentityPath(exeDir))
+	if *identity == "" { // 命令行显式指定时不做解析/回写，完全尊重使用者
+		configDir := filepath.Dir(*config)
+		resolved, healed := resolveIdentityPath(nc.Identity, configDir, exeDir)
+		effIdentity = resolved
+		if healed {
+			nc.Identity = resolved
+			if err := nc.save(*config); err == nil {
+				log.Printf("[node] 身份文件原路径不存在，已自动切换为 %s 并回写配置", resolved)
+			}
+		}
+	}
 	effConsole := firstNonEmpty(*console, nc.Console, "127.0.0.1:8900")
 	effConsolePW := firstNonEmpty(*consolePW, nc.ConsolePassword)
 	effFW := firstNonEmpty(*fw, nc.Firewall, "allow-all")
@@ -389,13 +402,42 @@ func exeDir() string {
 	return filepath.Dir(exe)
 }
 
-// defaultIdentityPath 身份密钥默认路径：Windows 放 exe 同目录（好找好备份），
+// defaultIdentityPath 身份密钥默认路径：Windows 存裸文件名 node.key
+// （按配置文件所在目录解析，整个文件夹移动/改名都不断链），
 // 其他平台维持容器约定 /data/node.key。
 func defaultIdentityPath(exeDir string) string {
 	if runtime.GOOS == "windows" {
-		return filepath.Join(exeDir, "node.key")
+		return "node.key"
 	}
 	return "/data/node.key"
+}
+
+// resolveIdentityPath 把配置里的 identity 解析为实际使用的绝对路径，并处理
+// 历史遗留的失效绝对路径（文件夹被移动/改名后旧路径不存在）：
+//   - 裸文件名/相对路径 → 相对配置文件所在目录解析（可移植，推荐写法）；
+//   - 绝对路径且文件存在 → 原样使用（容器/自定义位置）；
+//   - 绝对路径但文件不存在 → 自愈：在 exe 同目录找同名文件，找到则改用并
+//     回写配置（身份不丢）；找不到则沿用该路径（首次启动会在那里生成）。
+//
+// 返回解析后的路径与是否发生了自愈回写。
+func resolveIdentityPath(idPath, configDir, exeDir string) (string, bool) {
+	if idPath == "" {
+		return defaultIdentityPath(exeDir), false
+	}
+	if !filepath.IsAbs(idPath) {
+		return filepath.Join(configDir, idPath), false
+	}
+	if _, err := os.Stat(idPath); err == nil {
+		return idPath, false
+	}
+	// 失效的绝对路径：尝试 exe 同目录下的同名文件（最常见 = 整个文件夹被移动）。
+	candidate := filepath.Join(exeDir, filepath.Base(idPath))
+	if candidate != idPath {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, true
+		}
+	}
+	return idPath, false
 }
 
 // nodeConfig lanet.json 配置文件结构（字段与命令行参数一一对应）。
@@ -446,7 +488,7 @@ func defaultNodeConfig(exeDir string) *nodeConfig {
 		Name:       name,
 		NetworkKey: "",
 		Bootstrap:  "public",
-		Identity:   defaultIdentityPath(exeDir),
+		Identity:   defaultIdentityPath(exeDir), // Windows = 裸文件名 node.key，随文件夹移动
 		Console:    "127.0.0.1:8900",
 		Firewall:   "allow-all",
 		ProbeSec:   20,
