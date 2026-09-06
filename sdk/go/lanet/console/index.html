@@ -188,9 +188,7 @@
     <div class="kv"><b>网络密钥</b><input type="text" id="cKey" placeholder="留空 = 公共网络；相同密钥 = 同一私有网络"></div>
     <div class="kv"><b>控制台</b><input type="text" id="cConsole" placeholder="127.0.0.1:8900 = 仅本机，0.0.0.0:8900 = 允许远程，- = 关闭"></div>
     <div class="kv"><b>控制台密码</b><input type="password" id="cPassword" placeholder="未设置；远程访问时务必设置"></div>
-    <div class="kv"><b></b><label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="cClearPW"> 清除已有密码</label></div>
     <div class="kv"><b>监听地址</b><input type="text" id="cListen" placeholder="留空 = tcp/ws/quic 随机端口"></div>
-    <div class="kv"><b>身份文件</b><input type="text" id="cIdentity" disabled></div>
     <div class="row" style="margin-top:10px">
       <label style="display:flex;gap:6px;align-items:center">
         <input type="checkbox" id="cNoPublic"> 关闭公共 DHT 兜底（纯私有种子 + mDNS）
@@ -200,9 +198,6 @@
       <label style="display:flex;gap:6px;align-items:center">
         <input type="checkbox" id="cTun"> 虚拟网卡 TUN（IP 层互通：ping / 任意端口直达虚拟 IP，需管理员权限运行）
       </label>
-    </div>
-    <div class="row" style="color:var(--muted,#888);font-size:12px">
-      P2P 自动更新已内置开启：发现更高版本成员即验签下载、错峰重启（无需配置）
     </div>
     <button onclick="saveNodeConfig()">保存节点配置</button>
     <div class="msg" id="cfgMsg"></div>
@@ -262,7 +257,7 @@ function renderMembers() {
   }
   const page = list.slice((mPage - 1) * M_PAGE_SIZE, mPage * M_PAGE_SIZE);
   $('members').innerHTML =
-    '<table><tr><th>设备</th><th>虚拟地址</th><th>虚拟 IP</th><th>状态</th><th>链路</th><th>上线时间</th><th>最后活跃</th></tr>' +
+    '<table><tr><th>设备</th><th>虚拟地址</th><th>虚拟 IP</th><th>状态</th><th>链路</th><th>版本</th><th>最后活跃</th></tr>' +
     page.map(m => {
       const label = m.name || (m.peer_id ? m.peer_id.slice(0, 10) + '…' : '未知设备');
       const pid = m.name ? '<span class="pid"> (' + esc(m.peer_id.slice(0, 8)) + '…)</span>' : '';
@@ -274,11 +269,13 @@ function renderMembers() {
           : m.path === 'direct' ? '<span class="tag direct">直连</span>'
           : '<span class="tag unknown">已连接</span>')
         : '<span class="tag unknown">—</span>';
-      const since = m.first_seen ? relTime(m.first_seen) : '—';
+      const ver = m.version
+        ? '<span class="tag unknown" title="' + esc(m.platform || '') + '">' + esc(m.version) + '</span>'
+        : '<span class="tag unknown" title="旧版本节点，未上报版本号">—</span>';
       const last = m.last_seen ? relTime(m.last_seen) : '—';
       return `<tr><td class="mname">${esc(label)}${pid}</td><td>${host}</td><td>${esc(m.virtual_ip)}</td>` +
         `<td><span class="tag ${m.online ? 'online' : 'offline'}"><span class="dot ${m.online ? 'on' : 'off'}"></span>${m.online ? '在线' : '离线'}</span></td>` +
-        `<td>${path}</td><td>${esc(since)}</td><td>${esc(last)}</td></tr>`;
+        `<td>${path}</td><td>${ver}</td><td>${esc(last)}</td></tr>`;
     }).join('') +
     '</table>';
   $('mPager').style.display = 'flex';
@@ -377,9 +374,7 @@ async function loadNodeConfig() {
     $('cConsole').value = c.console || '';
     $('cPassword').value = '';
     $('cPassword').placeholder = c.has_password ? '已设置（输入新值可覆盖）' : '未设置；远程访问时务必设置';
-    $('cClearPW').checked = false;
     $('cListen').value = c.listen || '';
-    $('cIdentity').value = c.identity || '';
     $('cNoPublic').checked = !!c.no_public_dht;
     $('cTun').checked = c.tun === undefined ? true : !!c.tun;
     renderRuntimeBanner(c);
@@ -404,7 +399,6 @@ async function saveNodeConfig() {
     network_key: $('cKey').value,
     console: $('cConsole').value.trim(),
     console_password: $('cPassword').value,
-    clear_password: $('cClearPW').checked,
     listen: $('cListen').value.trim(),
     no_public_dht: $('cNoPublic').checked,
     tun: $('cTun').checked,

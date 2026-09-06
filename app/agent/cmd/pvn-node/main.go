@@ -52,8 +52,6 @@ func main() {
 			"网络密钥（留空 = 公共网络）；不传则读配置文件")
 		bootstrap = flag.String("bootstrap", envOr("LANET_BOOTSTRAP", ""),
 			"引导节点：public = 公共 DHT / none = 仅 mDNS / 成员 multiaddr；不传则读配置文件")
-		identity = flag.String("identity", envOr("LANET_IDENTITY", ""),
-			"身份密钥文件路径；不传则读配置文件，再退回默认（Windows: exe 同目录 node.key）")
 		console = flag.String("console", envOr("LANET_CONSOLE", ""),
 			"控制台监听地址；不传则读配置文件（默认 127.0.0.1:8900 仅本机，0.0.0.0:8900 = 允许远程）")
 		consolePW = flag.String("console-password", envOr("LANET_CONSOLE_PASSWORD", ""),
@@ -80,7 +78,7 @@ func main() {
 	}
 
 	// ---- 配置文件：不存在则生成默认模板（双击启动的场景），存在则加载 ----
-	nc, cfgCreated := loadNodeConfig(*config, exeDir)
+	nc, cfgCreated := loadNodeConfig(*config)
 	if cfgCreated {
 		log.Printf("[node] 已生成默认配置文件 %s（可在 Web 控制台修改，重启生效）", *config)
 	}
@@ -105,20 +103,9 @@ func main() {
 		effKey = *key
 	}
 	effBootstrap := firstNonEmpty(*bootstrap, nc.Bootstrap, "public")
-	// 身份路径解析：裸文件名相对配置目录；旧版写的绝对路径若因文件夹移动而
-	// 失效，自动回退到 exe 同目录的同名文件并回写配置（身份不丢，无需手改）。
-	effIdentity := firstNonEmpty(*identity, nc.Identity, defaultIdentityPath(exeDir))
-	if *identity == "" { // 命令行显式指定时不做解析/回写，完全尊重使用者
-		configDir := filepath.Dir(*config)
-		resolved, healed := resolveIdentityPath(nc.Identity, configDir, exeDir)
-		effIdentity = resolved
-		if healed {
-			nc.Identity = resolved
-			if err := nc.save(*config); err == nil {
-				log.Printf("[node] 身份文件原路径不存在，已自动切换为 %s 并回写配置", resolved)
-			}
-		}
-	}
+	// 身份文件路径固定：exe 同目录 node.key（Windows）/ /data/node.key（其他平台），
+	// 不读配置、不暴露到控制台；文件不存在即新用户，SDK 自动创建新身份。
+	effIdentity := defaultIdentityPath(exeDir)
 	effConsole := firstNonEmpty(*console, nc.Console, "127.0.0.1:8900")
 	effConsolePW := firstNonEmpty(*consolePW, nc.ConsolePassword)
 	effFW := firstNonEmpty(*fw, nc.Firewall, "allow-all")
@@ -396,42 +383,15 @@ func exeDir() string {
 	return filepath.Dir(exe)
 }
 
-// defaultIdentityPath 身份密钥默认路径：Windows 存裸文件名 node.key
+// defaultIdentityPath 身份密钥固定路径：Windows 存裸文件名 node.key
 // （按配置文件所在目录解析，整个文件夹移动/改名都不断链），
-// 其他平台维持容器约定 /data/node.key。
+// 其他平台维持容器约定 /data/node.key。路径不写入配置、不对外展示，
+// 文件不存在即视为新用户，由 SDK 自动创建新身份。
 func defaultIdentityPath(exeDir string) string {
 	if runtime.GOOS == "windows" {
 		return "node.key"
 	}
 	return "/data/node.key"
-}
-
-// resolveIdentityPath 把配置里的 identity 解析为实际使用的绝对路径，并处理
-// 历史遗留的失效绝对路径（文件夹被移动/改名后旧路径不存在）：
-//   - 裸文件名/相对路径 → 相对配置文件所在目录解析（可移植，推荐写法）；
-//   - 绝对路径且文件存在 → 原样使用（容器/自定义位置）；
-//   - 绝对路径但文件不存在 → 自愈：在 exe 同目录找同名文件，找到则改用并
-//     回写配置（身份不丢）；找不到则沿用该路径（首次启动会在那里生成）。
-//
-// 返回解析后的路径与是否发生了自愈回写。
-func resolveIdentityPath(idPath, configDir, exeDir string) (string, bool) {
-	if idPath == "" {
-		return defaultIdentityPath(exeDir), false
-	}
-	if !filepath.IsAbs(idPath) {
-		return filepath.Join(configDir, idPath), false
-	}
-	if _, err := os.Stat(idPath); err == nil {
-		return idPath, false
-	}
-	// 失效的绝对路径：尝试 exe 同目录下的同名文件（最常见 = 整个文件夹被移动）。
-	candidate := filepath.Join(exeDir, filepath.Base(idPath))
-	if candidate != idPath {
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate, true
-		}
-	}
-	return idPath, false
 }
 
 // nodeConfig lanet.json 配置文件结构（字段与命令行参数一一对应）。
@@ -441,24 +401,23 @@ type nodeConfig struct {
 	Name            string `json:"name"`
 	NetworkKey      string `json:"network_key"`
 	Bootstrap       string `json:"bootstrap"`
-	Identity        string `json:"identity"`
 	Console         string `json:"console"`
 	ConsolePassword string `json:"console_password,omitempty"`
 	Firewall        string `json:"firewall"`
 	Listen          string `json:"listen"`
 	NoPublicDHT     bool   `json:"no_public_dht"`
 	ProbeSec        int    `json:"probe_seconds"`
-	Tun *bool `json:"tun,omitempty"` // 虚拟网卡 TUN；nil = 默认开启（兼容旧配置文件）
+	Tun             *bool  `json:"tun,omitempty"` // 虚拟网卡 TUN；nil = 默认开启（兼容旧配置文件）
 	// self_update 字段已移除：P2P 自动更新强制开启（签名信任锚保证安全）。
 	// 旧配置文件里遗留的 self_update 键会被 json 忽略，无副作用。
-	GitHubToken     string `json:"github_token,omitempty"` // 私有仓库检查更新用（contents:read）
+	GitHubToken string `json:"github_token,omitempty"` // 私有仓库检查更新用（contents:read）
 
 	bootstrapAddrs []string `json:"-"` // 运行时由 Bootstrap 解析而来
 }
 
 // loadNodeConfig 读取配置文件；不存在或损坏时返回默认配置并尽力生成模板文件。
 // 返回值 created 表示本次是否新生成了模板。
-func loadNodeConfig(path, exeDir string) (*nodeConfig, bool) {
+func loadNodeConfig(path string) (*nodeConfig, bool) {
 	if data, err := os.ReadFile(path); err == nil {
 		var nc nodeConfig
 		if json.Unmarshal(data, &nc) == nil {
@@ -466,7 +425,7 @@ func loadNodeConfig(path, exeDir string) (*nodeConfig, bool) {
 		}
 		log.Printf("[node] 配置文件解析失败（按默认值运行，可删除该文件重新生成）: %s", path)
 	}
-	nc := defaultNodeConfig(exeDir)
+	nc := defaultNodeConfig()
 	if err := nc.save(path); err != nil {
 		log.Printf("[node] 默认配置文件生成失败（不影响启动）: %v", err)
 	}
@@ -474,7 +433,7 @@ func loadNodeConfig(path, exeDir string) (*nodeConfig, bool) {
 }
 
 // defaultNodeConfig 开箱即用默认值：主机名作为节点名、公共 DHT 引导、控制台全开。
-func defaultNodeConfig(exeDir string) *nodeConfig {
+func defaultNodeConfig() *nodeConfig {
 	name, err := os.Hostname()
 	if err != nil || name == "" {
 		name = "node"
@@ -483,7 +442,6 @@ func defaultNodeConfig(exeDir string) *nodeConfig {
 		Name:       name,
 		NetworkKey: "",
 		Bootstrap:  "public",
-		Identity:   defaultIdentityPath(exeDir), // Windows = 裸文件名 node.key，随文件夹移动
 		Console:    "127.0.0.1:8900",
 		Firewall:   "allow-all",
 		ProbeSec:   20,
@@ -544,7 +502,6 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				"name":          nc.Name,
 				"network_key":   nc.NetworkKey,
 				"bootstrap":     nc.Bootstrap,
-				"identity":      nc.Identity,
 				"console":       nc.Console,
 				"has_password":  nc.ConsolePassword != "",
 				"firewall":      nc.Firewall,
@@ -568,7 +525,6 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 		"PUT /api/node-config": func(w http.ResponseWriter, r *http.Request) {
 			var req struct {
 				nodeConfig
-				ClearPassword bool `json:"clear_password"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				writeJSONLocal(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
@@ -598,13 +554,9 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 			if req.Tun == nil {
 				req.Tun = prev.Tun // 页面未提供（旧版控制台）时保留原值
 			}
-			req.Identity = prev.Identity // 身份文件路径只读，防止控制台误改导致身份丢失
-			// 密码语义：clear_password=true → 清除；传了非空密码 → 覆盖；否则保持不变。
+			// 密码语义：传了非空密码 → 覆盖；留空 → 保持不变（空密码 = 未设置）。
 			// GET 不回传密码明文，所以 req.ConsolePassword 为空时不能当作"删除"。
-			switch {
-			case req.ClearPassword:
-				req.ConsolePassword = ""
-			case req.ConsolePassword == "":
+			if req.ConsolePassword == "" {
 				req.ConsolePassword = prev.ConsolePassword
 			}
 			if err := req.save(path); err != nil {

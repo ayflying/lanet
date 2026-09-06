@@ -227,8 +227,9 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		Hostname  string `json:"hostname"` // 虚拟地址（如 yunloli.lanet），可能为空
 		Online    bool   `json:"online"`
 		Path      string `json:"path"`
-		FirstSeen int64  `json:"first_seen"` // Unix 秒，0 = 未知
 		LastSeen  int64  `json:"last_seen"`
+		Version   string `json:"version,omitempty"`  // 程序版本号（info 协议交换；旧节点为空）
+		Platform  string `json:"platform,omitempty"` // 运行平台（如 windows/amd64）
 	}
 	members := []memberView{}
 	for _, m := range c.NetMap().Members {
@@ -241,9 +242,7 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 			Hostname: m.Hostname,
 			Online:   online,
 			Path:     c.LastPathUsed(m.PeerID),
-		}
-		if !m.FirstSeen.IsZero() {
-			mv.FirstSeen = m.FirstSeen.Unix()
+			Version:  m.Version, Platform: m.Platform,
 		}
 		if !m.LastSeen.IsZero() {
 			mv.LastSeen = m.LastSeen.Unix()
