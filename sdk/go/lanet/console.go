@@ -227,6 +227,7 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		Hostname  string `json:"hostname"` // 虚拟地址（如 yunloli.lanet），可能为空
 		Online    bool   `json:"online"`
 		Path      string `json:"path"`
+		FirstSeen int64  `json:"first_seen,omitempty"` // Unix 秒，0 = 未知（仅排序用，页面不展示）
 		LastSeen  int64  `json:"last_seen"`
 		Version   string `json:"version,omitempty"`  // 程序版本号（info 协议交换；旧节点为空）
 		Platform  string `json:"platform,omitempty"` // 运行平台（如 windows/amd64）
@@ -244,19 +245,20 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 			Path:     c.LastPathUsed(m.PeerID),
 			Version:  m.Version, Platform: m.Platform,
 		}
+		if !m.FirstSeen.IsZero() {
+			mv.FirstSeen = m.FirstSeen.Unix()
+		}
 		if !m.LastSeen.IsZero() {
 			mv.LastSeen = m.LastSeen.Unix()
 		}
 		members = append(members, mv)
 	}
-	// 稳定排序：在线成员在前（按最后活跃时间倒序），离线成员沉底（同样按最后活跃倒序）；
-	// 相同时间按虚拟 IP 兜底，保证刷新轮询时列表不跳动。
+	// 固定排序：按发现时间倒序（最后发现的成员固定在最上面），与在线状态、
+	// 活跃时间无关——列表顺序在成员增减之外永不跳动。
+	// FirstSeen 为零（控制面 NetMap 无此概念）时按虚拟 IP 兜底，保证稳定。
 	sort.Slice(members, func(i, j int) bool {
-		if members[i].Online != members[j].Online {
-			return members[i].Online
-		}
-		if members[i].LastSeen != members[j].LastSeen {
-			return members[i].LastSeen > members[j].LastSeen
+		if members[i].FirstSeen != members[j].FirstSeen && members[i].FirstSeen != 0 && members[j].FirstSeen != 0 {
+			return members[i].FirstSeen > members[j].FirstSeen
 		}
 		return members[i].VirtualIP < members[j].VirtualIP
 	})
