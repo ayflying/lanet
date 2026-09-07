@@ -20,7 +20,13 @@ func ConfigureTUN(name, ip string, prefixBits int) error {
 		return runCmd("netsh", "interface", "ip", "set", "address",
 			"name="+name, "source=static", "addr="+ip, "mask=255.255.0.0")
 	case "linux":
-		return runCmd("ip", "addr", "add", fmt.Sprintf("%s/%d", ip, 16), "dev", name)
+		// 注意顺序：先配地址再 UP。Linux 下 `ip addr add` 不会自动拉起接口，
+		// 缺少 ip link set up 会导致接口保持 DOWN——内核把发往 10.7/16 的
+		// 出向包直接丢在接口上（表现为 ping 100% 丢包且进程零日志）。
+		if err := runCmd("ip", "addr", "add", fmt.Sprintf("%s/%d", ip, 16), "dev", name); err != nil {
+			return err
+		}
+		return runCmd("ip", "link", "set", name, "up")
 	case "darwin":
 		return runCmd("ifconfig", name, ip, ip, "up")
 	default:

@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"runtime"
 	"sync"
 
 	"github.com/ayflying/pvn/pkg/firewall"
@@ -15,7 +16,24 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 )
 
-const maxPacketSize = 65535
+// virtioNetHdrLen Linux 端 wireguard/tun 以 IFF_VNET_HDR 打开 TUN 时的
+// virtio 网络头长度（库源码 offload_linux.go: unsafe.Sizeof(virtioNetHdr{})）。
+const (
+	maxPacketSize   = 65535
+	virtioNetHdrLen = 10
+)
+
+// packetWriteOffset 返回向 TUN 写包时数据在缓冲区中的起始偏移。
+// Linux 端 vnetHdr 模式下库要求 offset >= virtioNetHdrLen（否则 Write 返回
+// "invalid offset"，包永远写不进网卡——表现为 Linux 节点 TUN 只发不收，
+// 双向 ping 全丢）；调用方须把包放在 [offset:] 并把切片长度截为 offset+包长，
+// 库会在 [offset-10:offset] 编码 virtio 头后整体写入。Windows/macOS 无此要求。
+func packetWriteOffset() int {
+	if runtime.GOOS == "linux" {
+		return virtioNetHdrLen
+	}
+	return 0
+}
 
 // Router 负责双向转发。每个对端并发流数量受限，避免单一对端占满。
 type Router struct {
@@ -122,11 +140,15 @@ func (r *Router) streamTo(ctx context.Context, virtualIP string) (network.Stream
 // 入向（对端拨入本节点）必须由此接线，否则本机永远收不到对端发的包。
 // 每条入向流一个 goroutine，流结束或设备关闭即退出。
 func (r *Router) ServeInboundStream(stream network.Stream) {
+	if p := stream.Conn().RemotePeer(); len(p) > 12 {
+		log.Printf("[router] inbound tunnel stream peer=%s…", p[:12])
+	}
+	writeOffset := packetWriteOffset()
 	bufs := make([][]byte, 1)
 	sizes := make([]int, 1)
 	for {
 		bufs[0] = make([]byte, maxPacketSize)
-		n, err := stream.Read(bufs[0])
+		n, err := stream.Read(bufs[0][writeOffset:])
 		if err != nil {
 			_ = stream.Close()
 			return
@@ -134,18 +156,20 @@ func (r *Router) ServeInboundStream(stream network.Stream) {
 		if n == 0 {
 			continue
 		}
-		buf := bufs[0][:n]
+		// 包数据位于 [writeOffset:]，切片长度截为 writeOffset+n，
+		// 供库在 [writeOffset-10:writeOffset] 编码 virtio 头（Linux）。
+		buf := bufs[0][:writeOffset+n]
 		// 统一入向防火墙：源虚拟 IP + 协议 + 目标端口，拒绝即丢包。
-		if !CheckPacket(r.fw, buf) {
+		if !CheckPacket(r.fw, buf[writeOffset:]) {
 			if r.fw != nil && n >= 20 {
-				src := fmt.Sprintf("%d.%d.%d.%d", buf[12], buf[13], buf[14], buf[15])
-				dropLog(src, protoName(buf[9]), 0)
+				src := fmt.Sprintf("%d.%d.%d.%d", buf[writeOffset+12], buf[writeOffset+13], buf[writeOffset+14], buf[writeOffset+15])
+				dropLog(src, protoName(buf[writeOffset+9]), 0)
 			}
 			continue
 		}
 		bufs[0] = buf
 		sizes[0] = n
-		if _, err = r.device.Write(bufs, 0); err != nil {
+		if _, err = r.device.Write(bufs, writeOffset); err != nil {
 			log.Printf("[router] tun write: %v", err)
 			_ = stream.Close()
 			return
@@ -155,29 +179,32 @@ func (r *Router) ServeInboundStream(stream network.Stream) {
 
 func (r *Router) pumpFromStream(virtualIP string, stream network.Stream) {
 	defer r.dropStream(virtualIP)
+	writeOffset := packetWriteOffset()
 	bufs := make([][]byte, 1)
 	sizes := make([]int, 1)
 	for {
 		bufs[0] = make([]byte, maxPacketSize)
-		n, err := stream.Read(bufs[0])
+		n, err := stream.Read(bufs[0][writeOffset:])
 		if err != nil {
 			return
 		}
 		if n == 0 {
 			continue
 		}
-		buf := bufs[0][:n]
+		// 包数据位于 [writeOffset:]，切片长度截为 writeOffset+n，
+		// 供库在 [writeOffset-10:writeOffset] 编码 virtio 头（Linux）。
+		buf := bufs[0][:writeOffset+n]
 		// 统一入向防火墙：源虚拟 IP + 协议 + 目标端口，拒绝即丢包。
-		if !CheckPacket(r.fw, buf) {
+		if !CheckPacket(r.fw, buf[writeOffset:]) {
 			if r.fw != nil && n >= 20 {
-				src := fmt.Sprintf("%d.%d.%d.%d", buf[12], buf[13], buf[14], buf[15])
-				dropLog(src, protoName(buf[9]), 0)
+				src := fmt.Sprintf("%d.%d.%d.%d", buf[writeOffset+12], buf[writeOffset+13], buf[writeOffset+14], buf[writeOffset+15])
+				dropLog(src, protoName(buf[writeOffset+9]), 0)
 			}
 			continue
 		}
 		bufs[0] = buf
 		sizes[0] = n
-		if _, err = r.device.Write(bufs, 0); err != nil {
+		if _, err = r.device.Write(bufs, writeOffset); err != nil {
 			log.Printf("[router] tun write: %v", err)
 			return
 		}
