@@ -426,7 +426,11 @@ conn, err := client.DialPortFWD(ctx, lanet.PortFWDTarget{
 ## 实测记录
 
 - 2026-09-04：三机真机联测（2×Linux + Windows），6 方向直连 + relay 兜底 + 边界场景 + 重启恢复全过；
-- `go test ./...` + `go run ./app/agent/cmd/pvn-e2e-check`（端到端本地验证）持续绿。
+- 2026-09-08：Windows/Linux 0.5.8 真机覆盖回归：双向 ping 各 100/100、Linux 高频
+  500/500，1200/1360 字节 DF ICMP 双向通过，TCP/UDP 双向 echo、离线成员隔离、重启
+  恢复和控制台生命周期入口通过；重启后约 10 秒链路收敛完成。
+- `go test ./...`、`go test -race ./...`、`go vet ./...`、托管模式/Standalone/
+  防火墙/身份四个 E2E 检查均通过。
 
 ## 能力边界
 
@@ -436,3 +440,6 @@ conn, err := client.DialPortFWD(ctx, lanet.PortFWDTarget{
   （长度前缀 / 分隔符）；PortFWD 桥接的 TCP 连接无此限制；
 - 浏览器接入用 [Web SDK](../../web/README.md)，小程序/Unity 用网关 SDK
   （见 [SDK 总览](../../README.md)）。
+- 虚拟域名（如 `home-node.lanet`）由 SDK 根据成员表解析，不会自动成为操作系统 DNS
+  记录；若要让系统自带 `ping`、浏览器或其他非 SDK 程序按域名访问，需要额外配置 DNS
+  或 hosts。系统级 ICMP/TCP/UDP 访问仍应直接使用成员的 `10.7.x.x` 虚拟 IP。

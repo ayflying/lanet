@@ -231,9 +231,42 @@ go run ./app/ctl repair
 
 ```bash
 go test ./...
+go test -race ./...
+go vet ./...
 go run ./app/agent/cmd/pvn-e2e-check
 go run ./app/agent/cmd/pvn-serverless-check
+go run ./app/agent/cmd/pvn-firewall-check
+go run ./app/agent/cmd/pvn-identity-check
 ```
+
+远程构建发布前还应验证发行架构：
+
+```bash
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./app/agent/cmd/pvn-node
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./app/agent/cmd/pvn-node
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./app/agent/cmd/pvn-node
+```
+
+### 0.5.8 覆盖性实测
+
+2026-09-08 在 Windows amd64 与 Linux amd64 节点上完成了当前版本的运行时回归，节点
+虚拟 IP 为 `10.7.243.173` 和 `10.7.9.215`：
+
+- Windows → Linux、Linux → Windows 各 `100/100`，丢包率 `0%`；Linux 高频 `500/500`，丢包率 `0%`；
+- DF 模式下双向发送 1200/1360 字节 ICMP 均 `10/10` 成功，确认 TUN MTU 与分片边界；
+- TCP、UDP 双向主动连接和原文回显均成功；同时访问离线成员时，在线成员仍保持 `30/30`，离线目标不会阻塞数据面；
+- 控制面建群/邀请码入群/Relay、中继回退、Standalone DHT+mDNS、身份持久化、虚拟域名、
+  防火墙、端口转发、控制台热更新、密码认证、更新检查、重启和退出入口均完成回归；
+- `go test ./...`、`go test -race ./...`、`go vet ./...` 以及 Windows amd64、Linux amd64、
+  Linux arm64 交叉编译均通过。
+
+重启属于进程级重建：API 通常约 2 秒恢复，P2P 路由和邻居表还需要短暂收敛。重启后等待
+约 10 秒，双向 ping 恢复 `20/20`、`0%` 丢包；这不是热重启承诺，业务侧应为重启窗口准备重试。
+
+Windows 首次生成 `lanet.json` 时自动打开控制台页签；升级、重启或普通再次启动只记录
+“跳过自动打开控制台页签”，不会重复打开浏览器。`<节点名>.lanet`、短名等名称只由
+Lanet SDK 在成员表内解析，当前不会自动注册到 Windows/Linux 系统 DNS，因此系统自带的
+`ping <节点名>.lanet` 仍需要额外的 DNS 或 hosts 配置。
 
 历史真机验证：
 

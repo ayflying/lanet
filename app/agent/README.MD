@@ -94,4 +94,30 @@ go run ./app/agent/cmd/pvn-agent \
 ```bash
 go run ./app/agent/cmd/pvn-e2e-check
 go run ./app/agent/cmd/pvn-serverless-check
+go run ./app/agent/cmd/pvn-firewall-check
+go run ./app/agent/cmd/pvn-identity-check
 ```
+
+### 发行前覆盖性回归
+
+当前官方节点版本的完整回归建议在 Linux 构建机上执行：
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./app/agent/cmd/pvn-node
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./app/agent/cmd/pvn-node
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./app/agent/cmd/pvn-node
+```
+
+`pvn-e2e-check` 覆盖托管模式的控制面建群、邀请码入组、NetMap、Relay 中继和双向
+流回显；`pvn-serverless-check` 覆盖 Standalone 的私有 DHT/mDNS 发现和双向直连；
+`pvn-firewall-check` 覆盖 deny/allow-list/allow-all、TUN/PortFWD/应用流统一防火墙、
+局域网转发和控制台热更新；`pvn-identity-check` 覆盖身份文件、稳定虚拟 IP、名称拨号
+和未知名称错误。
+
+2026-09-08 的 Windows/Linux 真机回归还验证了双向虚拟 IP ping、TCP/UDP、1200/1360
+字节 DF ICMP、500 次高频 ping、离线成员隔离和重启恢复。重启后 API 约 2 秒恢复，P2P
+链路需要短暂收敛；等待约 10 秒后双向 ping 恢复 0% 丢包。升级、重启和再次启动不会
+自动打开新的控制台页签，只有首次生成配置文件时会打开。
