@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/ayflying/pvn/pkg/firewall"
 	tunnel "github.com/ayflying/pvn/pkg/tunnel"
@@ -20,8 +21,11 @@ import (
 // virtioNetHdrLen Linux 端 wireguard/tun 以 IFF_VNET_HDR 打开 TUN 时的
 // virtio 网络头长度（库源码 offload_linux.go: unsafe.Sizeof(virtioNetHdr{})）。
 const (
-	maxPacketSize   = 65535
-	virtioNetHdrLen = 10
+	maxPacketSize      = 65535
+	virtioNetHdrLen    = 10
+	outboundQueueSize  = 256
+	maxOutboundWorkers = 1024
+	outboundWorkerIdle = time.Minute
 )
 
 // packetWriteOffset 返回向 TUN 写包时数据在缓冲区中的起始偏移。
@@ -48,6 +52,17 @@ type Router struct {
 
 	mu      sync.Mutex
 	streams map[string]*streamState // virtualIP -> 当前到对端的活跃双工流
+	// outbound 按目标 IP 隔离拨号和发送。离线成员的慢拨号不能阻塞唯一的
+	// TUN 读取循环，否则其他成员的回程包也会滞留在网卡里并表现为随机丢包。
+	outbound map[string]*outboundWorker
+	// 限制并回收按目标创建的 worker，避免无效地址扫描持续占用 goroutine
+	// 和队列内存。字段保留在实例上，便于对边界行为做快速单元测试。
+	outboundLimit int
+	outboundIdle  time.Duration
+	limitDrops    uint64
+	// Wintun 的 NativeTun.Read/Write 要求每个方向由单一调用方串行访问。
+	// 多条入向隧道流可能同时写 TUN，不加锁会在环形缓冲上产生间歇性丢包。
+	writeMu sync.Mutex
 	// dialing single-flight：同一虚拟 IP 只允许一个 goroutine 拨号，
 	// 其余调用等待复用结果。没有它，TUN 读循环里每个丢包的 ping 都会
 	// 各自触发一次拨号，几十个并发拨号会打爆 libp2p 资源限制
@@ -61,6 +76,11 @@ type dialCall struct {
 	err  error
 }
 
+type outboundWorker struct {
+	packets chan []byte
+	dropped uint64
+}
+
 // streamState 串行化同一字节流上的包写入。network.Stream 是字节流，若多个
 // goroutine 并发 Write，IP 包字节可能交错，接收端将无法按 IPv4 total_length 分帧。
 type streamState struct {
@@ -70,10 +90,13 @@ type streamState struct {
 
 func New(device Device, tunnelSvc *tunnel.Service) *Router {
 	return &Router{
-		device:  device,
-		tunnel:  tunnelSvc,
-		streams: make(map[string]*streamState),
-		dialing: make(map[string]*dialCall),
+		device:        device,
+		tunnel:        tunnelSvc,
+		streams:       make(map[string]*streamState),
+		outbound:      make(map[string]*outboundWorker),
+		outboundLimit: maxOutboundWorkers,
+		outboundIdle:  outboundWorkerIdle,
+		dialing:       make(map[string]*dialCall),
 	}
 }
 
@@ -85,13 +108,14 @@ func (r *Router) SetLocalIP(fn func() netip.Addr) { r.onIP = fn }
 
 // Run 启动 TUN 读取循环，直到 ctx 取消或设备关闭。
 func (r *Router) Run(ctx context.Context) {
-	bufs := make([][]byte, 1)
+	workerCtx, cancelWorkers := context.WithCancel(ctx)
+	defer cancelWorkers()
+	bufs := [][]byte{make([]byte, maxPacketSize)}
 	sizes := make([]int, 1)
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		bufs[0] = make([]byte, maxPacketSize)
 		n, err := r.device.Read(bufs, sizes, 0)
 		if err != nil {
 			select {
@@ -137,16 +161,112 @@ func (r *Router) Run(ctx context.Context) {
 					wOff := packetWriteOffset()
 					out := make([]byte, wOff+len(reply))
 					copy(out[wOff:], reply)
-					if _, err := r.device.Write([][]byte{out}, wOff); err != nil {
+					if err := r.writeDevice([][]byte{out}, wOff); err != nil {
 						log.Printf("[router] arp reply write: %v", err)
 					}
 				}
 			}
 			continue
 		}
-		if err = r.forwardPacket(ctx, packet); err != nil {
+		if err = r.enqueuePacket(workerCtx, packet); err != nil {
 			log.Printf("[router] forward: %v", err)
 		}
+	}
+}
+
+// enqueuePacket 把包交给目标 IP 专属的串行 worker。不同目标可并行拨号和发送，
+// 同一目标仍保持内核交付顺序，避免 TCP 包乱序。队列满时丢弃新包，由上层协议重传。
+func (r *Router) enqueuePacket(ctx context.Context, packet []byte) error {
+	if len(packet) < 20 {
+		return fmt.Errorf("packet too short: %d", len(packet))
+	}
+	if packet[0]>>4 != 4 {
+		return nil
+	}
+	destinationAddr := netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]})
+	if !destinationAddr.IsGlobalUnicast() {
+		return nil
+	}
+	destination := destinationAddr.String()
+
+	r.mu.Lock()
+	worker, ok := r.outbound[destination]
+	if !ok {
+		if len(r.outbound) >= r.outboundLimit {
+			r.limitDrops++
+			dropped := r.limitDrops
+			r.mu.Unlock()
+			if dropped == 1 || dropped%100 == 0 {
+				return fmt.Errorf("outbound worker limit %d reached (dropped=%d)", r.outboundLimit, dropped)
+			}
+			return nil
+		}
+		worker = &outboundWorker{packets: make(chan []byte, outboundQueueSize)}
+		r.outbound[destination] = worker
+		go r.runOutbound(ctx, destination, worker)
+	}
+	// Run 复用 TUN 读取缓冲。队列和 worker 异步消费，因此入队前必须复制，
+	// 与 Nebula 握手缓存、WireGuard staged queue 的数据所有权语义一致。
+	ownedPacket := append([]byte(nil), packet...)
+	select {
+	case worker.packets <- ownedPacket:
+		r.mu.Unlock()
+		return nil
+	default:
+		worker.dropped++
+		dropped := worker.dropped
+		r.mu.Unlock()
+		if dropped == 1 || dropped%100 == 0 {
+			return fmt.Errorf("outbound queue to %s is full (dropped=%d)", destination, dropped)
+		}
+		return nil
+	}
+}
+
+func (r *Router) runOutbound(ctx context.Context, destination string, worker *outboundWorker) {
+	timer := time.NewTimer(r.outboundIdle)
+	defer timer.Stop()
+	defer r.removeOutboundWorker(destination, worker)
+	var failures uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case packet := <-worker.packets:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if err := r.forwardPacket(ctx, packet); err != nil {
+				failures++
+				if failures == 1 || failures%100 == 0 {
+					log.Printf("[router] forward to %s failed (count=%d): %v", destination, failures, err)
+				}
+			} else {
+				failures = 0
+			}
+			timer.Reset(r.outboundIdle)
+		case <-timer.C:
+			r.mu.Lock()
+			current := r.outbound[destination]
+			if current == worker && len(worker.packets) == 0 {
+				delete(r.outbound, destination)
+				r.mu.Unlock()
+				return
+			}
+			r.mu.Unlock()
+			timer.Reset(r.outboundIdle)
+		}
+	}
+}
+
+func (r *Router) removeOutboundWorker(destination string, worker *outboundWorker) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.outbound[destination] == worker {
+		delete(r.outbound, destination)
 	}
 }
 
@@ -219,7 +339,6 @@ func (r *Router) dialStream(ctx context.Context, virtualIP string) (*streamState
 		// 失败时摘除可能残留的死流，让下一次拨号真正重建，
 		// 而不是继续向已断开的流写包（静默丢包）。
 		r.dropStream(virtualIP, nil)
-		log.Printf("[router] open stream to %s failed: %v", virtualIP, err)
 		return nil, err
 	}
 	state := &streamState{stream: stream}
@@ -280,10 +399,19 @@ func (r *Router) writeInbound(bufs [][]byte, sizes []int, pkt []byte, writeOffse
 	copy(buf[writeOffset:], pkt)
 	bufs[0] = buf
 	sizes[0] = n
-	if _, err := r.device.Write(bufs, writeOffset); err != nil {
+	if err := r.writeDevice(bufs, writeOffset); err != nil {
 		log.Printf("[router] tun write: %v", err)
 		return
 	}
+}
+
+// writeDevice 串行化所有 TUN 写入。wireguard/tun 的 NativeTun 实现明确要求
+// 同一设备的 Write 不被多个 goroutine 并发调用；Router 的多个入向流则天然并发。
+func (r *Router) writeDevice(bufs [][]byte, offset int) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	_, err := r.device.Write(bufs, offset)
+	return err
 }
 
 func (r *Router) pumpFromStream(virtualIP string, state *streamState) {

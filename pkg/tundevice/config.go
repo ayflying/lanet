@@ -2,7 +2,7 @@ package tundevice
 
 import (
 	"fmt"
-	"os"
+	"log"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -26,18 +26,29 @@ func ConfigureTUN(name, ip string, prefixBits int) error {
 		// （route add ... <网关IP>）会让内核对网关做 ARP 解析，同样卡死
 		// （实测 netsh route 指向自身 IP 时邻居 10.7.x 永远 Probe/Unreachable）。
 		// on-link 路由由 wintun 直收直发，不经过邻居子系统。
-		// 先清掉旧地址（上次运行残留或"对象已存在"会让 set address 直接失败），
-		// 失败不阻断——首次启动本来就没有旧地址。
-		_ = runCmd("netsh", "interface", "ip", "delete", "address", "name="+name, "addr="+ip)
-		if err := runCmd("netsh", "interface", "ip", "set", "address",
-			"name="+name, "source=static", "addr="+ip, "mask=255.255.255.255"); err != nil {
-			return err
+		// 原生 IP Helper API 会同时设置系统接口 MTU；wireguard/tun 的 Windows
+		// mtu 参数只保存在进程内，不会更新内核接口（默认会显示 65535）。
+		// 原生调用失败时回退 netsh，兼容精简版 Windows 环境。
+		if nativeErr := configureAddressNative(name, ip, 32); nativeErr != nil {
+			log.Printf("[tun] native Windows address config failed, using netsh: %v", nativeErr)
+			_ = runCmd("netsh", "interface", "ip", "delete", "address", "name="+name, "addr="+ip)
+			if netshErr := runCmd("netsh", "interface", "ip", "set", "address",
+				"name="+name, "source=static", "addr="+ip, "mask=255.255.255.255"); netshErr != nil {
+				return fmt.Errorf("ip helper: %v; netsh fallback: %w", nativeErr, netshErr)
+			}
+		}
+		if interfaceErr := configureInterfaceNative(name); interfaceErr != nil {
+			log.Printf("[tun] native Windows interface config failed, using netsh: %v", interfaceErr)
+			_ = runCmd("netsh", "interface", "ipv4", "set", "subinterface",
+				name, "mtu=1400", "store=active")
+			_ = runCmd("netsh", "interface", "ipv4", "set", "interface",
+				name, "metric=50")
 		}
 		// Wintun 是点对点 L3 接口。Windows 上聚合 /16 on-link 路由仍会触发邻居
 		// 解析，目标最终变成 Unreachable；工作正常的 WireGuard 配置使用每目标
 		// /32 on-link 路由。这里只清理历史聚合路由和错误邻居，成员 /32 路由由
 		// EnsureRoute 随成员表增量写入。
-		_ = runCmd("netsh", "interface", "ipv4", "delete", "neighbors", "interface="+name)
+		_ = runCmd("netsh", "interface", "ipv4", "delete", "neighbors", "name="+name)
 		_ = runCmd("netsh", "interface", "ipv4", "delete", "route",
 			"prefix=10.7.0.0/16", "interface="+name)
 		return nil
@@ -76,6 +87,9 @@ func EnsureRoute(name, ip string) error {
 	if runtime.GOOS != "windows" {
 		return nil
 	}
+	if err := ensureRouteNative(name, ip); err == nil {
+		return nil
+	}
 	add := exec.Command("netsh", "interface", "ipv4", "add", "route",
 		"prefix="+ip+"/32", "interface="+name, "store=active", "metric=1")
 	hideWindow(add)
@@ -104,25 +118,5 @@ func EnsureNeighbor(name, ip string) error {
 	if runtime.GOOS != "windows" {
 		return nil
 	}
-	// 排障开关：LANET_SKIP_NEIGHBOR=1 时完全不写邻居表，用于验证
-	// 「不写邻居 vs 写邻居」两种情况下内核是否放行单播包。
-	if os.Getenv("LANET_SKIP_NEIGHBOR") != "" {
-		return nil
-	}
-	// netsh 对 L3 设备（Wintun）会静默丢弃链路层地址，留下"永久但无 MAC"的
-	// 无效条目（包照样卡死在邻居层）。必须走原生 IP Helper API 写真实 MAC。
-	if err := ensureNeighborNative(name, ip); err == nil {
-		return nil
-	} else {
-		// 某些精简 Windows 环境没有完整的 IP Helper 行为，保留 netsh
-		// 作为兼容回退。先删后加，避免把已有的 Unreachable 条目误判为成功。
-		_ = runCmd("netsh", "interface", "ipv4", "delete", "neighbors",
-			"interface="+name, "address="+ip)
-		netshErr := runCmd("netsh", "interface", "ipv4", "add", "neighbors",
-			"interface="+name, "address="+ip, "neighbor=aa-bb-cc-dd-ee-01", "store=active")
-		if netshErr == nil {
-			return nil
-		}
-		return fmt.Errorf("ip helper: %v; netsh fallback: %w", err, netshErr)
-	}
+	return ensureNeighborNative(name, ip)
 }

@@ -3,7 +3,9 @@ package tundevice
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +44,22 @@ type stubRelay struct{}
 
 func (stubRelay) Candidates(ctx context.Context, number int) ([]peer.AddrInfo, error) {
 	return nil, fmt.Errorf("no relay in unit test")
+}
+
+type blockingRelay struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingRelay) Candidates(ctx context.Context, _ int) ([]peer.AddrInfo, error) {
+	r.once.Do(func() { close(r.entered) })
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-r.release:
+		return nil, fmt.Errorf("released blocked relay lookup")
+	}
 }
 
 // buildIPv4 构造最小 IPv4 包（协议 UDP，载荷长度 len(payload)）。
@@ -171,4 +189,134 @@ func TestRouterForwardsBothWays(t *testing.T) {
 	}
 	_ = injectA
 	_ = protocolOf
+}
+
+// TestRouterOfflineDestinationDoesNotBlockOthers 回归验证：一个离线目标的慢拨号
+// 不能占住唯一的 TUN 读取循环，发往在线目标的包应由独立 worker 立即转发。
+func TestRouterOfflineDestinationDoesNotBlockOthers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	hostA, hostB := newPair(t)
+	offlineHost, err := libp2p.New(libp2p.NoListenAddrs, libp2p.NoSecurity)
+	if err != nil {
+		t.Fatalf("offline host: %v", err)
+	}
+	offlineID := offlineHost.ID()
+	_ = offlineHost.Close()
+
+	if err = hostA.Connect(ctx, peer.AddrInfo{ID: hostB.ID(), Addrs: hostB.Addrs()}); err != nil {
+		t.Fatalf("connect a->b: %v", err)
+	}
+
+	received := make(chan []byte, 1)
+	onlinePacket := buildIPv4(
+		[4]byte{10, 7, 0, 2},
+		[4]byte{10, 7, 0, 3},
+		[]byte("online-must-not-wait"),
+	)
+	hostB.SetStreamHandler(protocol.Tunnel, func(stream network.Stream) {
+		defer stream.Close()
+		packet := make([]byte, len(onlinePacket))
+		if _, readErr := io.ReadFull(stream, packet); readErr == nil {
+			received <- packet
+		}
+	})
+
+	device, inject, err := NewMemory(1400)
+	if err != nil {
+		t.Fatalf("mem tun: %v", err)
+	}
+	defer device.Close()
+	relay := &blockingRelay{entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(relay.release)
+	routes := &stubNetmap{routes: map[string]peer.ID{
+		"10.7.0.3":   hostB.ID(),
+		"10.7.0.250": offlineID,
+	}}
+	router := New(device, tunnel.New(hostA, routes, relay))
+	go router.Run(ctx)
+
+	offlinePacket := buildIPv4(
+		[4]byte{10, 7, 0, 2},
+		[4]byte{10, 7, 0, 250},
+		[]byte("blocks-its-own-worker"),
+	)
+	if err = inject(offlinePacket); err != nil {
+		t.Fatalf("inject offline packet: %v", err)
+	}
+	select {
+	case <-relay.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("offline route did not enter blocked relay lookup")
+	}
+
+	if err = inject(onlinePacket); err != nil {
+		t.Fatalf("inject online packet: %v", err)
+	}
+	select {
+	case got := <-received:
+		if string(got) != string(onlinePacket) {
+			t.Fatalf("online packet mismatch: got %d bytes, want %d", len(got), len(onlinePacket))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("online packet was blocked by offline destination dial")
+	}
+}
+
+func TestEnqueuePacketOwnsPacketData(t *testing.T) {
+	worker := &outboundWorker{packets: make(chan []byte, 1)}
+	router := &Router{
+		outbound:      map[string]*outboundWorker{"10.7.0.3": worker},
+		outboundLimit: 1,
+		outboundIdle:  time.Minute,
+	}
+	packet := buildIPv4([4]byte{10, 7, 0, 2}, [4]byte{10, 7, 0, 3}, []byte("original"))
+	if err := router.enqueuePacket(context.Background(), packet); err != nil {
+		t.Fatalf("enqueue packet: %v", err)
+	}
+	packet[20] = 'X'
+	queued := <-worker.packets
+	if got := string(queued[20:]); got != "original" {
+		t.Fatalf("queued payload changed with read buffer: %q", got)
+	}
+}
+
+func TestEnqueuePacketLimitsDestinationWorkers(t *testing.T) {
+	router := &Router{
+		outbound: map[string]*outboundWorker{
+			"10.7.0.3": {packets: make(chan []byte, 1)},
+		},
+		outboundLimit: 1,
+		outboundIdle:  time.Minute,
+	}
+	packet := buildIPv4([4]byte{10, 7, 0, 2}, [4]byte{10, 7, 0, 4}, nil)
+	if err := router.enqueuePacket(context.Background(), packet); err == nil {
+		t.Fatal("expected destination worker limit error")
+	}
+}
+
+func TestOutboundWorkerIsReapedWhenIdle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	router := &Router{
+		outbound:      make(map[string]*outboundWorker),
+		outboundLimit: 1,
+		outboundIdle:  20 * time.Millisecond,
+	}
+	worker := &outboundWorker{packets: make(chan []byte, 1)}
+	router.outbound["10.7.0.3"] = worker
+	go router.runOutbound(ctx, "10.7.0.3", worker)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		router.mu.Lock()
+		remaining := len(router.outbound)
+		router.mu.Unlock()
+		if remaining == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("idle outbound worker was not removed")
 }

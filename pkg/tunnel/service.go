@@ -101,8 +101,8 @@ func (s *Service) OpenStreamToVirtualIPProtocol(ctx context.Context, virtualIP s
 	// 3) 中继保底：逐个候选 Relay 预约，成功即经中继转发。
 	stream, relayErr := s.openViaRelay(ctx, target, proto)
 	if relayErr != nil {
-		return nil, false, fmt.Errorf("direct and relay dial both failed: direct=%v relay=%v",
-			describeDirect(route, directErr), relayErr)
+		return nil, false, fmt.Errorf("direct and relay dial both failed: direct=%s relay=%s",
+			describeDirect(route, directErr), compactError(relayErr))
 	}
 	s.markRelay(route.PeerID, true)
 	return stream, true, nil
@@ -208,7 +208,19 @@ func hasCircuit(address ma.Multiaddr) bool {
 
 func describeDirect(route netmapclient.Route, err error) string {
 	if err != nil {
-		return fmt.Sprintf("peer=%s addrs=%v err=%v", route.PeerID, route.Addrs, err)
+		return fmt.Sprintf("peer=%s addrs=%d err=%s", route.PeerID, len(route.Addrs), compactError(err))
 	}
-	return fmt.Sprintf("peer=%s addrs=%v (no address or already connected)", route.PeerID, route.Addrs)
+	return fmt.Sprintf("peer=%s addrs=%d (no address or already connected)", route.PeerID, len(route.Addrs))
+}
+
+func compactError(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+	const maxLength = 512
+	message := err.Error()
+	if len(message) <= maxLength {
+		return message
+	}
+	return message[:maxLength] + "..."
 }

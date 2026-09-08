@@ -32,8 +32,8 @@ const (
 
 	// ERROR_OBJECT_ALREADY_EXISTS：内核已存在该邻居条目（通常是 ARP 失败
 	// 留下的 Unreachable/Probe），Create 会失败，必须 Delete 重建或 Set 改写。
-	errObjectAlreadyExists = 0x490
-	errNotFound            = 1168 // ERROR_NOT_FOUND
+	errObjectAlreadyExists = 5010 // ERROR_OBJECT_ALREADY_EXISTS (0x1392)
+	errNotFound            = 1168 // ERROR_NOT_FOUND (0x490)
 )
 
 type sockaddrInet struct {

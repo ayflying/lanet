@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/ayflying/pvn/pkg/netmapclient"
+	"github.com/ayflying/pvn/pkg/p2pkit"
 	"github.com/ipfs/go-cid"
 	kaddht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -374,6 +375,15 @@ func (d *Discovery) dhtRound(ctx context.Context, dht *kaddht.IpfsDHT, source st
 func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 	if id == d.host.ID() {
 		return
+	}
+	// TUN 地址只能承载 overlay 流量，不能作为承载 libp2p 的 underlay 地址。
+	// 旧节点可能已把 10.7/16 通告进 DHT；接收侧也必须过滤并清理 peerstore，
+	// 否则拨号隧道时会再次进入同一隧道，形成递归拨号和队列堆积。
+	addrs = p2pkit.FilterUnderlayAddrs(addrs)
+	for _, addr := range d.host.Peerstore().Addrs(id) {
+		if p2pkit.IsLanetOverlayAddr(addr) {
+			d.host.Peerstore().SetAddr(id, addr, 0)
+		}
 	}
 	d.mu.Lock()
 	m, ok := d.members[id.String()]

@@ -3,19 +3,25 @@ package p2pkit
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/connmgr"
+	"github.com/libp2p/go-libp2p/core/control"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	ma "github.com/multiformats/go-multiaddr"
 )
+
+var lanetOverlayPrefix = netip.MustParsePrefix("10.7.0.0/16")
 
 type HostSpec struct {
 	ListenAddrs  []string
@@ -54,6 +60,8 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 		libp2p.UserAgent(spec.UserAgent),
 		libp2p.EnableNATService(),
 		libp2p.EnableRelay(),
+		libp2p.AddrsFactory(FilterUnderlayAddrs),
+		libp2p.ConnectionGater(lanetOverlayGater{}),
 	}
 	if spec.Identity != nil {
 		options = append(options, libp2p.Identity(spec.Identity))
@@ -104,6 +112,54 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 		}
 	}
 	return h, nil
+}
+
+// IsLanetOverlayAddr reports whether addr points into Lanet's virtual IP range.
+// Such an address can carry application traffic, but must never be advertised as
+// a libp2p transport endpoint: dialing the tunnel through itself creates a loop.
+func IsLanetOverlayAddr(addr ma.Multiaddr) bool {
+	ipText, err := addr.ValueForProtocol(ma.P_IP4)
+	if err != nil {
+		return false
+	}
+	ip, err := netip.ParseAddr(ipText)
+	return err == nil && lanetOverlayPrefix.Contains(ip)
+}
+
+// FilterUnderlayAddrs removes Lanet overlay addresses while preserving order.
+func FilterUnderlayAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
+	filtered := make([]ma.Multiaddr, 0, len(addrs))
+	for _, addr := range addrs {
+		if !IsLanetOverlayAddr(addr) {
+			filtered = append(filtered, addr)
+		}
+	}
+	return filtered
+}
+
+// lanetOverlayGater is the final guard against old peers reintroducing overlay
+// addresses through DHT or Identify after discovery-time filtering. It blocks
+// nested libp2p connections over the TUN in both directions.
+type lanetOverlayGater struct{}
+
+var _ connmgr.ConnectionGater = lanetOverlayGater{}
+
+func (lanetOverlayGater) InterceptPeerDial(peer.ID) bool { return true }
+
+func (lanetOverlayGater) InterceptAddrDial(_ peer.ID, addr ma.Multiaddr) bool {
+	return !IsLanetOverlayAddr(addr)
+}
+
+func (lanetOverlayGater) InterceptAccept(addrs network.ConnMultiaddrs) bool {
+	return !IsLanetOverlayAddr(addrs.RemoteMultiaddr())
+}
+
+func (lanetOverlayGater) InterceptSecured(_ network.Direction, _ peer.ID, addrs network.ConnMultiaddrs) bool {
+	return !IsLanetOverlayAddr(addrs.RemoteMultiaddr())
+}
+
+func (lanetOverlayGater) InterceptUpgraded(network.Conn) (bool, control.DisconnectReason) {
+	return true, 0
 }
 
 // defaultWebRTCAddrs 依据 TCP/QUIC 监听地址推导 webrtc-direct 监听地址：
