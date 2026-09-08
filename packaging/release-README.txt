@@ -1,64 +1,52 @@
-Lanet —— 单一程序，客户端与服务端一体（无服务器 P2P 虚拟局域网）
+Lanet
+=====
 
-【文件说明】
-  lanet.exe（Linux 为 lanet）  主程序（客户端 = 服务端，无需部署任何服务器）
-  wintun.dll                   虚拟网卡驱动（仅 Windows 包附带，必须与 exe 同目录）
-  README.txt                   本文件
+Lanet 是无中心服务器的 P2P 虚拟局域网。使用相同网络密钥的设备经 mDNS 与
+DHT 自动发现，优先打洞直连，失败时经网络内可达成员的 Circuit Relay v2 中继。
 
-【运行要求】
-  1. Windows 10 1809+ / Windows Server 2019+（x64）；Linux 需 root 与 /dev/net/tun
-  2. Windows 必须以管理员身份运行（创建虚拟网卡需要）
-  3. Windows：wintun.dll 必须与 lanet.exe 放在同一目录
+【发行包内容】
+  lanet / lanet.exe  单一主程序
+  VERSION            当前版本
+  manifest.json      P2P 更新签名清单（签名版发行包提供）
+  README.txt         本文件
+  wintun.dll         仅 Windows 包附带，必须与 lanet.exe 同目录
 
-【使用方法（Windows 双击即用）】
-  1. 直接双击 lanet.exe（首次建议右键"以管理员身份运行"）——没有黑框，
-     桌面右下角出现托盘图标，首次启动时浏览器自动打开 Web 控制台；
-  2. 在控制台「节点配置」里填写：节点名称、网络密钥（相同密钥的机器
-     组成同一张私有网络），点「保存节点配置」；
-  3. 重启程序（托盘右键 → 退出，再双击 lanet.exe）即完成入网。
-
-  托盘图标右键菜单：
-    打开控制台 —— 在浏览器打开 Web 控制台（默认 http://127.0.0.1:8900）
-    退出       —— 停止节点并退出程序
-
-  程序同目录文件（均可随 exe 一起拷贝迁移）：
-    lanet.json  节点配置（名称/网络密钥/引导节点/防火墙初始值等）
-    lanet.log   运行日志（没有黑框窗口，看日志看这个文件）
-    node.key    节点身份密钥（决定 PeerID，务必保留，删除会换身份）
-    state.json  控制台状态（防火墙规则 / 端口转发映射）
+【Windows】
+  1. 支持 Windows 10 1809+ / Windows Server 2019+ x64。
+  2. 双击 lanet.exe 并接受 UAC 提示。程序内置管理员清单，不需要右键提权。
+  3. 首次启动自动打开 http://127.0.0.1:8900，在“节点配置”填写名称和网络
+     密钥，保存后重启。
+  4. 以后通过系统托盘打开控制台或退出。只有首次生成配置时自动打开浏览器。
 
 【Linux】
-  ./lanet   （root 运行；默认读工作目录 lanet.json，不存在则自动生成）
-  建议用 systemd 常驻；Linux 无托盘与自动开浏览器，配置方式相同。
+  1. TUN 需要 root，或 /dev/net/tun + CAP_NET_ADMIN：
+       sudo ./lanet -name server-1 -key 'our-network-key'
+  2. 默认在可执行文件目录读写 lanet.json、state.json 和 lanet.log；身份文件
+     默认是 /data/node.key。请保证路径可写并持久化。
+  3. Linux 没有托盘和自动打开浏览器，控制台默认仍为 127.0.0.1:8900。
 
-【控制台安全（重要）】
-  - 控制台默认只监听 127.0.0.1:8900，**网络里其他设备无法访问**，只能本机打开；
-  - 如需从其他设备（如手机）访问：在「节点配置」页签把控制台地址改为
-    0.0.0.0:8900，并务必同时设置控制台密码，保存后重启程序；
-  - 设置密码后打开控制台需要登录（会话 7 天有效），忘记密码可在
-    节点配置里清除（同样需重启生效），或直接编辑 lanet.json 删除
-    console_password 字段。
+【网络与安全】
+  - 相同非空网络密钥组成私有网络；密钥留空会加入官方公共网络。
+  - 默认启用 TUN 和 allow-all，组内成员可按 10.7.x.x 访问本机。生产使用请
+    根据边界在 Web 控制台配置 deny-all 或 allow-list。
+  - 控制台远程开放为 0.0.0.0:8900 时，必须同时设置强密码并限制防火墙来源。
+  - node.key 决定 PeerID 与稳定虚拟 IP，应备份，但不能由多个在线节点共用。
+  - TUN 创建失败时自动降级，应用流和端口转发仍能继续工作；查看 lanet.log。
 
-【Web 控制台能做什么】
-  - 成员与链路：查看同网络成员、虚拟 IP（10.7.x.x）、直连/中继状态；
-  - 入向防火墙：默认全拒绝 / 按规则放行 / 端口全开（即时生效）；
-  - 局域网端口转发：把本机所在局域网内其他设备的服务端口暴露给群内成员
-    （如 192.168.1.100:5000 的 NAS 服务），即时生效；
-  - 节点配置：名称 / 网络密钥 / 引导节点 / 控制台监听与密码等
-    （保存后重启生效）。页面适配手机浏览器，全屏宽度布局。
+【常用参数】
+  -config            配置文件路径
+  -name              节点名称
+  -key               网络密钥
+  -bootstrap         public / none / 成员 multiaddr
+  -no-public-dht     关闭公共 DHT 兜底
+  -listen            逗号分隔的 libp2p 监听地址
+  -console           控制台地址，传 - 关闭
+  -console-password  控制台密码
+  -fw                deny-all / allow-list / allow-all
+  -tun               true / false
 
-【常用命令行参数（高级，全部可选）】
-  -config      配置文件路径（默认 exe 同目录 lanet.json）
-  -name        节点名称（虚拟域名）
-  -key         网络密钥：留空 = 公共网络；相同密钥 = 同一私有网络
-  -bootstrap   public = 公共 DHT（默认，跨网零配置）/ none = 仅 mDNS /
-               已在网成员的 multiaddr（私有 DHT 种子，入网更快）
-  -no-public-dht  关闭公共 DHT 兜底（纯私有种子 + mDNS）
-  -fw          防火墙：allow-all（默认）/ deny-all / allow-list
-  -console     控制台监听地址，默认 127.0.0.1:8900（仅本机），传 - 关闭
+【更新】
+  官方裸机程序会从同网络、同平台成员获取 Ed25519 签名的新版本清单，验签并
+  校验 SHA-256 后更新。容器和 dev 构建自动禁用，容器请通过镜像编排升级。
 
-【提示】
-  1. 首次运行 Wintun 会创建虚拟网卡，可能弹出驱动安装确认。
-  2. node.key 决定节点身份：拷贝它可以让重装系统后身份不变；
-     不带身份文件启动会在同目录重新生成。
-  3. 加入私有网络的最快方式：在 -bootstrap 里填一台已在网成员的地址。
+完整文档：https://github.com/ayflying/lanet

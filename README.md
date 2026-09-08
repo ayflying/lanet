@@ -1,371 +1,307 @@
 # Lanet
 
-**Lanet** = **Lan** + **net** —— 把散落各地的人拉进同一张局域网。
+**Lanet** = **Lan** + **net**：把不同网络中的设备接入同一张加密的 P2P 虚拟局域网。
 
-Lanet 是一个自研的群组制 P2P 虚拟局域网系统：客户端创建群组并邀请他人加入，**只有同群成员才处于同一个虚拟局域网**。组内流量优先 P2P 直连（打洞成功即可跑满带宽），直连失败自动降级到中继转发，保证不断连。
+官方发行版是一个无需中心服务器的单程序节点。使用相同网络密钥的设备会通过
+mDNS 与 DHT 自动发现，优先打洞直连；直连失败时，可经网络内可达成员的
+Circuit Relay v2 中继。Windows 和 Linux 节点默认启用 TUN，可直接使用
+`10.7.x.x` 虚拟 IP 进行 `ping` 及 TCP/UDP 通信。
 
-## 架构
+当前版本号以仓库根目录 [`VERSION`](./VERSION) 为准。
 
+## 运行模式
+
+| 模式 | 适用场景 | 成员发现与地址分配 | 数据路径 |
+|---|---|---|---|
+| **Standalone（推荐）** | 官方 `lanet` 单程序、Go SDK 自组网 | mDNS + 私有 DHT，公共 DHT 可用于跨网冷启动；虚拟 IP 由网络身份与 PeerID 确定性派生 | 直连优先，网络内可达成员中继兜底 |
+| **托管模式** | 需要邀请码、群主权限、中心成员目录的 SDK/旧 agent 场景 | `ctl` 管理群组、邀请码、NetMap 和 `/24` 子网；独立 `relay` 提供兜底 | 直连优先，指定 relay 兜底 |
+
+官方桌面程序固定使用 Standalone 模式，不需要部署 `ctl` 或独立 `relay`。
+托管模式仍保留，主要供 Web、C#、uniapp SDK 及需要中心化群组管理的系统使用。
+
+## Standalone 架构
+
+```text
+                       mDNS / DHT 发现
+              +-----------------------------+
+              |                             |
+        +-----v------+     P2P 直连    +-----v------+
+        |  lanet A   |<--------------->|  lanet B   |
+        | TUN/控制台 |                 | TUN/控制台 |
+        +-----+------+                 +-----+------+
+              |                             |
+              +-----> 可达成员 relay <------+
+                     （直连失败时）
 ```
-                ┌─────────────┐
-                │  ctl 控制面  │   建群 / 邀请码 / NetMap / 中继目录
-                └──────┬──────┘
-                       │  HTTP
-        ┌──────────────┼──────────────┐
-        │              │              │
-  ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐
-  │  agent A   │◄─┼──P2P 直连──┼─►│  agent B   │   同群成员互连
-  └─────┬─────┘  └───────────┘  └─────┬─────┘
-        │                             │
-        └──────► relay 中继 ◄─────────┘   直连失败时兜底转发
-```
 
-- **ctl（控制面）**：GoFrame v2 编写的 HTTP 服务。负责群组创建、邀请码、成员加入、子网分配（每群独立 /24）、NetMap 查询与中继目录。
-- **relay（中继）**：基于 libp2p Circuit Relay v2 的转发节点，注册到 ctl 供客户端发现，`WithInfiniteLimits` 不限时长与流量。
-- **agent（客户端）**：用户终端程序。创建 libp2p Host（AutoNAT / 打洞 / AutoRelay），拉取所在群的 NetMap，通过 TUN 虚拟网卡收发包。
+每个节点同时具备客户端、DHT server 和 relay service 能力。网络身份由
+`(分发渠道, 网络密钥)` 共同决定，同网络成员只在本地维护成员表，控制面不在
+发现链路或数据链路中。
 
-## 核心特性
+## 核心能力
 
-- **群组隔离**：每群从 `10.7.0.0/16` 池分配独立 /24 子网；NetMap 仅返回同群成员，跨群天然不可见。
-- **渠道隔离**：官方发行版程序与第三方 SDK 构建的程序默认归属不同「分发渠道」，DHT 发现、mDNS、虚拟 IP 派生全链条隔离——即使双方使用完全相同的网络密钥也不在同一张网络内（见 [SDK](#sdk) 一节）。
-- **三段隧道策略**：直连优先 → 复用已有连接开流 → Circuit Relay v2 中继保底，全程自动降级。
-- **虚拟网卡**：基于 `wireguard/tun` 的真实 TUN 设备，支持 Windows / Linux / macOS，本地测试可用内存回环设备。
-- **打洞能力**：AutoNAT + DCUtR 打洞 + AutoRelay，典型 NAT 环境下即可直连。
+- **零中心组网**：相同网络密钥自动成网；局域网走 mDNS，跨网络走双 DHT。
+- **直连优先**：TCP、QUIC、WebSocket、webrtc-direct、DCUtR 打洞与
+  Circuit Relay v2 组合使用，链路自动降级。
+- **真实虚拟网卡**：Windows 使用 Wintun，Linux/macOS 使用系统 TUN；
+  `10.7.0.0/16` 全网段均路由到虚拟网卡。
+- **稳定身份与地址**：`node.key` 固定 PeerID；虚拟 IP 随身份稳定，成员还可用
+  `<节点名>.lanet`、短名或原始成员名连接。
+- **统一入向防火墙**：同一套规则覆盖 TUN TCP/UDP、PortFWD 与应用协议流。
+- **局域网端口转发**：把节点所在真实局域网中的 NAS、数据库、远程桌面等服务
+  暴露给同网络成员。
+- **内置 Web 控制台**：成员与链路、节点配置、防火墙、转发映射和更新操作集中管理。
+- **签名 P2P 更新**：官方裸机程序通过成员间分发签名清单和二进制；容器更新交给编排层。
+- **渠道隔离**：官方发行版与第三方 SDK 构建默认不在同一网络，避免 SDK 程序
+  意外混入官方网络。
 
 ## 快速开始
 
-### 方式一：Docker Compose 部署公网节点（仅 Linux）
+### Windows
 
-镜像由 CI 自动编译发布到 GHCR（`linux/amd64` + `linux/arm64`）。典型用法：
-把根目录 `docker-compose.yml` 放到一台**有公网 IP 的 VPS** 上，充当整个网络的
-引导 + 中继节点，让各自 NAT 后的成员稳定互通：
+1. 从 [Releases](https://github.com/ayflying/lanet/releases) 下载
+   `lanet-<版本>-windows-amd64.zip` 并完整解压。
+2. 保持 `lanet.exe` 与 `wintun.dll` 在同一目录，双击 `lanet.exe`，在 UAC
+   提示中选择“是”。程序已内置管理员清单，不需要右键提权。
+3. 首次启动会创建配置并打开 `http://127.0.0.1:8900`。在“节点配置”填写
+   节点名称和网络密钥，保存后重启。
+4. 其他设备使用相同网络密钥启动，成员出现后即可互相 `ping 10.7.x.x` 或访问服务。
 
-```bash
-git clone https://github.com/ayflying/lanet.git && cd lanet
-vim docker-compose.yml   # 直接在 environment 段改：节点名 / 网络密钥 / 控制台密码
-docker compose up -d
-```
+只有首次生成配置时会自动打开浏览器。后续可从托盘菜单打开控制台或退出节点。
 
-| 配置项 | 说明 |
-|---|---|
-| `LANET_NAME` | 节点名称（成员表中的虚拟域名） |
-| `LANET_NETWORK_KEY` | 网络密钥，与要服务的群组一致（留空 = 公共网络） |
-| `LANET_CONSOLE` | `0.0.0.0:8900` = 允许外网访问控制台；`127.0.0.1:8900` = 仅本机 |
-| `LANET_CONSOLE_PASSWORD` | 控制台密码（外网开放时务必设置） |
-
-数据（`node.key` / `lanet.json` / 日志）持久化在 `lanet-node-data` 命名卷。
-防火墙放行 `8900/tcp` + `4001/tcp` + `4001/udp`。
-
-### 方式二：Windows / Linux 单程序（发行包，推荐）
-
-从 [Releases](https://github.com/ayflying/lanet/releases) 下载对应平台压缩包并解压。
-**只有一个程序 `lanet`**——客户端与服务端一体，无需部署任何服务器。
-
-**Windows 双击即用**：双击 `lanet.exe`，在 UAC 弹窗点「是」即可（程序内置
-管理员清单，无需右键提权）。无黑框窗口，桌面托盘出现图标、浏览器自动打开
-Web 控制台（仅首次启动自动打开，之后可从托盘手动打开）；在「节点配置」里填好节点名称与网络密钥，保存后重启程序即完成
-入网。托盘右键可打开控制台或退出。`wintun.dll` 必须与 `lanet.exe` 同目录。
+命令行参数会覆盖 `lanet.json`：
 
 ```powershell
-# 命令行方式（可选，参数会覆盖 lanet.json 配置文件）
-.\lanet.exe -name pc1 -key "我们的网络密钥"
-.\lanet.exe -name pc2 -key "我们的网络密钥"   # 相同密钥自动互相发现并组网
+./lanet.exe -name pc1 -key "our-network-key"
+./lanet.exe -name pc2 -key "our-network-key"
+
+# 纯局域网发现，不接入公共 DHT
+./lanet.exe -name pc3 -key "our-network-key" -bootstrap none -no-public-dht
+
+# 临时关闭 TUN，仅使用 SDK 流/端口转发能力
+./lanet.exe -tun false
 ```
 
-零参数启动时自动在 exe 同目录生成 `lanet.json`（配置）、`node.key`（身份）、
-`lanet.log`（日志）。控制台默认 `http://127.0.0.1:8900`（**仅本机可访问**）：
-查看成员、配置防火墙与端口转发（即时生效）、修改节点配置（重启生效）。
-页面为全屏宽度布局，适配手机浏览器。
+### Linux
 
-**虚拟网卡 TUN（默认开启）**：程序启动时自动创建 `lanet` TUN 网卡并配置
-本节点虚拟 IP，组内成员可直接 `ping` 对方虚拟 IP、按 `IP:端口` 访问任意
-TCP/UDP 服务（入向仍受防火墙约束，`allow-all` 全通）。Windows 双击运行
-（内置管理员清单）即满足权限；命令行/服务方式需管理员权限。创建失败时
-自动降级为仅应用层（`Dial` / 端口转发不受影响），日志给出原因。
-可用 `lanet.json` 的 `tun` 字段、控制台「节点配置」开关或 `-tun false`
-关闭；SDK 对应 `Config.Tun` / `Config.TunName`（网卡名默认 `lanet`）。
-
-**控制台安全**：如需从其他设备访问控制台，在「节点配置」把控制台地址改为
-`0.0.0.0:8900` 并设置控制台密码（登录会话 7 天有效），重启生效；
-SDK 侧对应 `Config.ConsolePassword`。容器镜像默认已监听 `0.0.0.0`（环境变量
-`LANET_CONSOLE`），远程暴露时同样务必设置 `LANET_CONSOLE_PASSWORD`。
-
-**P2P 自动更新（强制开启，裸机二进制形态）**：节点经 info 协议上报版本与
-平台；发现「更新版本 + 同平台」成员即向其征询版本清单（版本/大小/sha256/
-Ed25519 签名），内置公钥验签通过即可信（签名无法伪造，无需多票灰度），
-随机选一个成员流式下载新程序，sha256 校验通过即替换自身并随机延迟 1~8
-分钟错峰重启——升级分发完全在成员间进行，不依赖任何单一下载渠道。信任锚
-是发布签名：CI 私钥（GitHub Secrets `SELFUPDATE_SIGNING_KEY`，PEM 格式）
-对每个平台二进制签名，签名随清单在节点间自由传播但无法伪造；发行包内置
-`manifest.json` 首种子。无签名版本不参与分发；容器内自动禁用（重启即回滚，
-容器更新走编排层）。dev 构建版本号不可比，同样不参与。
-
-### 方式三：源码运行（开发调试）
+Linux 发行包需要 root，或至少具备 `/dev/net/tun` 和 `CAP_NET_ADMIN`：
 
 ```bash
-go run ./app/ctl                                  # 控制面（默认 :8000）
-go run ./app/relay                                # 中继（默认监听 4001）
-go run ./app/agent/cmd/pvn-agent -mode create -name alpha -ctl http://<ctl地址>:8000
-go run ./app/agent/cmd/pvn-agent -mode join -name beta -invite <邀请码> -ctl http://<ctl地址>:8000
+sudo ./lanet -name server-1 -key 'our-network-key'
 ```
 
-成员入组后获得群内虚拟 IP（如 `10.7.0.2`），直接 `ping` 组内成员的虚拟 IP 即可互通。
+`lanet.json`、`state.json` 和 `lanet.log` 位于配置文件目录；Linux 身份文件默认是
+`/data/node.key`。长期运行建议使用 systemd，并持久化这些文件。
 
-**虚拟地址（域名式连接）**：每个成员还拥有一个稳定好记的虚拟地址
-`<节点名>.lanet`（如 `yunloli.lanet`，节点名自动规范化为 DNS 标签；
-组内重名自动追加后缀，控制台成员表可直接查看/复制）。SDK 的
-`Dial` / `DialPortFWD` 目标支持虚拟 IP、完整虚拟地址、短名与原始
-成员名四种写法，成员重启换 IP 后按名字连接依然有效。
+### 公网节点容器
 
-### 群主管理
-
-创建者即群主（`role=owner`），拥有以下专属能力：
+把根目录 [`docker-compose.yml`](./docker-compose.yml) 放到有公网 IP 的 Linux
+主机，修改 `environment` 后启动：
 
 ```bash
-# 重置邀请码（旧码立即作废；valid_seconds 缺省为永久有效）
-curl -X POST http://<ctl>/v1/groups/invite/reset \
-  -d '{"operator_peer_id":"<群主peer>","group_id":"g0","valid_seconds":86400}'
-
-# 踢出成员（回收虚拟 IP、清除通告地址，被踢者立即离开局域网）
-curl -X POST http://<ctl>/v1/groups/kick \
-  -d '{"operator_peer_id":"<群主peer>","group_id":"g0","target_peer_id":"<被踢peer>"}'
+git clone https://github.com/ayflying/lanet.git
+cd lanet
+docker compose up -d
+docker compose logs -f node
 ```
 
-群组数据（群组/成员/角色/邀请码及有效期/通告地址）存储于 SQLite（WAL 模式），服务重启后自动恢复。通过环境变量控制：
+至少设置：
 
-- `PVN_CTL_DB`：SQLite 数据库路径；未设置时退化为内存模式（重启丢数据）
-- `PVN_CTL_ADDR`：监听地址覆盖（如 `127.0.0.1:18090`），优先于 config.yaml
+| 配置 | 说明 |
+|---|---|
+| `LANET_NAME` | 节点名称 |
+| `LANET_NETWORK_KEY` | 网络密钥；与其他官方节点一致 |
+| `LANET_CONSOLE` | `127.0.0.1:8900` 仅本机，`0.0.0.0:8900` 允许远程访问 |
+| `LANET_CONSOLE_PASSWORD` | 控制台远程开放时必须设置强密码 |
+| `LANET_LISTEN` | 固定 P2P 监听地址，Compose 默认使用 4001/TCP+UDP |
+
+放行 `4001/tcp`、`4001/udp`；只有确实远程开放控制台时才放行 `8900/tcp`。
+身份、配置、状态和日志保存在 `lanet-node-data` 命名卷中。
+
+Compose 默认没有授予 TUN 权限，因此该公网节点作为引导/中继运行并自动降级为
+应用层模式。若还要让容器本身响应虚拟 IP，请按文件内注释启用
+`NET_ADMIN` 与 `/dev/net/tun`。
+
+### 源码运行
+
+编译和测试需要 Go 1.25。官方单程序入口：
+
+```bash
+go run ./app/agent/cmd/pvn-node -name dev-node -key dev-network
+```
+
+托管模式组件：
+
+```bash
+PVN_CTL_DB=./lanet.db go run ./app/ctl
+PVN_RELAY_CTL=http://127.0.0.1:8000 go run ./app/relay
+
+go run ./app/agent/cmd/pvn-agent \
+  -ctl http://127.0.0.1:8000 -mode create -name alpha -group demo -real-tun
+```
+
+详细说明见：
+
+- [`app/agent/README.MD`](./app/agent/README.MD)：官方节点、托管 agent 与联调工具
+- [`app/ctl/README.MD`](./app/ctl/README.MD)：控制面 API、持久化与运维命令
+- [`app/relay/README.MD`](./app/relay/README.MD)：独立 relay 的部署与通告
+
+## 配置与安全
+
+### 节点文件
+
+| 文件 | 作用 | 变更生效方式 |
+|---|---|---|
+| `lanet.json` | 名称、网络密钥、引导方式、控制台、监听地址、TUN 等节点配置 | 保存后重启 |
+| `node.key` | Ed25519 节点身份，决定 PeerID 和稳定虚拟 IP | 不应删除或在多个在线节点间共用 |
+| `state.json` | 防火墙规则与局域网端口转发映射 | 控制台保存后立即生效 |
+| `lanet.log` | 运行日志和链路探测结果 | 实时写入 |
+| `manifest.json` | 官方签名更新清单种子 | 随发行包提供 |
+
+Windows 上这些文件位于 `lanet.exe`/配置文件目录；`node.key` 也随整个目录迁移。
+控制台 GET 接口不会返回密码明文。
+
+### 网络密钥与发现
+
+- 网络密钥留空会加入官方公共网络，不适合传输敏感数据。
+- 非空且相同的密钥组成私有网络；密钥经 SHA-256 派生网络标识，不直接广播明文。
+- `bootstrap=public` 使用公共 DHT 完成跨网冷启动；`bootstrap=none` 仅使用 mDNS。
+- 指定任意已在网成员的完整 multiaddr 可加快私有网络冷启动。
+- `no_public_dht=true` 或 `-no-public-dht` 会关闭公共 DHT 兜底，此时跨网必须有
+  可达种子。
+
+官方发行版固定为 `official` 渠道，Go SDK 默认是 `sdk` 渠道。即使网络密钥相同，
+两个渠道也不会互相发现；Go SDK 只有显式设置 `Channel: lanet.ChannelOfficial`
+才会加入官方发行版网络。
+
+### TUN 与防火墙
+
+官方程序默认 `tun=true`、`firewall=allow-all`，便于直接使用虚拟 IP。SDK 默认
+不开 TUN，防火墙默认 `deny-all`。请按部署边界收紧入向规则。
+
+Windows 为每个已发现成员维护 `/32` on-link 路由及邻居项；Linux 把整个
+`10.7.0.0/16` 路由到 TUN。TUN 创建或配置失败时节点仍会继续运行，`Dial`、
+自定义协议和 PortFWD 不受影响，具体原因写入日志。
+
+ICMP 没有端口：`deny-all` 或没有匹配协议规则的 `allow-list` 会使 `ping` 被丢弃。
+远程开放控制台时，应同时设置密码并在主机防火墙限制来源。
+
+### P2P 自动更新
+
+官方裸机二进制强制启用签名 P2P 更新。节点发现同平台新版本后，从一个已持有该
+版本的成员获取 Ed25519 签名清单，验签并校验 SHA-256 后替换程序，随后随机延迟
+1 到 8 分钟重启。签名私钥只存在于发布流水线，成员只能转发、不能伪造清单。
+
+`dev` 构建和容器环境自动禁用该机制。私有 GitHub 仓库的主动检查更新可通过
+`github_token` 或 `GITHUB_TOKEN` 提供只读令牌。
+
+## SDK
+
+Lanet 提供四套 SDK：
+
+| SDK | 接入方式 | TUN | 典型场景 |
+|---|---|:---:|---|
+| [Go SDK](./sdk/go/lanet/README.md) | libp2p 直连；支持 Standalone 或托管模式 | 可选 | Go 服务、原生节点、端口转发 |
+| [Web SDK](./sdk/web/README.md) | 浏览器/Node 直接运行 js-libp2p | 否 | 网页与 Go 节点互开流 |
+| [C# SDK](./sdk/csharp/README.md) | 经 ws-gateway 接入 | 否 | Unity、.NET、MAUI |
+| [uniapp SDK](./sdk/uniapp/README.md) | 经 ws-gateway 接入 | 否 | 小程序、H5、跨端应用 |
+
+选择指南和两种接入链路见 [`sdk/README.md`](./sdk/README.md)。浏览器、C# 和
+uniapp 当前使用托管模式；Go SDK 可直接创建与官方节点同能力的 Standalone 节点。
+
+## 托管模式运维
+
+托管模式由 `ctl + relay + agent/SDK` 组成。`ctl` 负责群组、邀请码、角色、
+NetMap 和 relay 目录，不承载数据流量；`relay` 每 30 秒向 `ctl` 心跳，超过
+150 秒未续期的候选会被移除。
+
+控制面持久化和维护示例：
+
+```bash
+export PVN_CTL_DB=./lanet.db
+go run ./app/ctl migrate
+go run ./app/ctl dbversion
+go run ./app/ctl backup ./lanet-backup.db
+go run ./app/ctl repair
+```
+
+`PVN_CTL_DB` 未设置时，控制面使用内存存储，重启后群组数据丢失。
 
 ## 验证
 
 ```bash
-# 全部单元测试
 go test ./...
-
-# 端到端链路验证（本地起 ctl + relay + 双 agent，实测建群→入组→直连→回包）
 go run ./app/agent/cmd/pvn-e2e-check
+go run ./app/agent/cmd/pvn-serverless-check
 ```
 
-### 真机联测记录（2026-09-04）
+历史真机验证：
 
-三机环境：217（Linux，跑 ctl+relay 服务端）、243（Linux）、Windows 开发机（后两台各跑 agent/探针）。实测覆盖：
+| 日期 | 环境 | 已验证内容 |
+|---|---|---|
+| 2026-09-04 | 2 台 Linux + 1 台 Windows | 托管模式建群/入组/NetMap、6 个方向直连、relay 兜底、权限边界、SQLite 重启恢复 |
+| 2026-09-05 | 不同物理网络的 Standalone 节点 | 公共 DHT 冷启动、私有 DHT 发现、DCUtR/QUIC 打洞，双向 direct RTT 7-13ms |
+| 2026-09-08 | Windows + Linux | TUN 双向回包、跨 `/24` 虚拟 IP、Windows 单播路由与邻居处理 |
 
-| 验证项 | 结果 |
-|---|---|
-| 建群 → 入组 → NetMap（独立 /24 分配、通告地址） | ✅ |
-| 6/6 方向跨机隧道回包（Win↔243、Win↔217、217↔243 双向，`path=direct`） | ✅ |
-| relay 中继转发（双端预约 Reservation 后经中继回包） | ✅ |
-| 边界场景：错误邀请码 / 重复加入 / 非群主操作 / 邀请码过期 / 踢人即时生效 | ✅ |
-| ctl 容器重启后数据完整恢复（SQLite WAL）；四个运维子命令容器内实跑 | ✅ |
-
-注意事项（实测经验）：
-
-- 探针/测试客户端每次 join 都会占用一个虚拟 IP（10.7.x.x 池），频繁重启会持续消耗；正式使用无需关心，长期自动化测试建议建独立群组或实现成员回收。
-- Windows 端回显类自测程序需注意 libp2p 流的半关闭语义：发送完成后 `CloseWrite()` 半关闭写端，对端才能用 `ReadAll` 判定 EOF，否则双方互等死锁。
-
-## SDK
-
-Lanet 对外提供两套 SDK，让其他项目以编程方式接入群组网格：
-
-### Go SDK（`sdk/go/lanet`）
-
-把任意 Go 程序变成网格中的一个节点：入网、开流、接流，十几行代码完成。
-
-```go
-client, err := lanet.New(ctx, lanet.Config{
-	CTLURL: "http://ctl.example.com:8000",
-	Name:   "my-service",
-	GroupName: "my-group", // 或填 InviteCode 凭邀请码加入
-})
-defer client.Close()
-
-// 按虚拟 IP 开流（直连优先、中继兜底，与 agent 一致）
-stream, viaRelay, _ := client.Dial(ctx, "10.7.0.2")
-defer stream.Close()
-
-// 接收入向流
-client.OnStream(func(stream lanet.Stream) { /* ... */ })
-
-// 周期维护（NetMap 刷新 / 地址通告 / 中继预约），阻塞直到 ctx 取消
-client.Run(ctx)
-```
-
-完整 API 与示例见 [sdk/go/lanet/README.md](sdk/go/lanet/README.md)。
-
-**渠道隔离（官方 vs SDK）**：Standalone 模式下，群组身份由（分发渠道, 网络密钥）
-共同派生。官方发行版程序（Releases 下载 / 官方镜像）固定为官方渠道；
-通过 Go SDK 构建的程序默认为 SDK 渠道（`Config.Channel` 留空自动取
-`lanet.ChannelSDK`）。两个渠道即使使用完全相同的 `NetworkKey`（包括都
-留空加入公共网络），也互相发现不到、连不进对方成员表——DHT rendezvous、
-mDNS 标签、虚拟 IP 派生、info 协议同群校验四层全部随渠道隔离。这是
-防止官方网络被任意 SDK 程序混入的软隔离边界：确需与官方网络互通时，
-显式把 `Config.Channel` 设为 `"official"` 即可。
-
-### Web SDK（`sdk/web`，npm 包名 `@lanet/sdk-web`）
-
-网页作为一个**真正的 P2P 节点**加入群组：js-libp2p（WebSocket + WebRTC +
-Circuit Relay v2），与 Go 节点互开隧道流（`/pvn/tunnel/1.0.0`）。
-直连优先（ws / webrtc-direct）、relay 电路兜底，无需独立信令服务器。
-
-```js
-import { createNode } from '@lanet/sdk-web'
-const node = await createNode({ ctlURL, inviteCode, name: 'web-demo' })
-const stream = await node.dial('10.7.0.2')  // 按虚拟 IP 开流
-```
-
-联调工具：`go run ./app/agent/cmd/pvn-web-echo`（Go echo 节点，打印邀请码）+
-`node sdk/web/test/interop.mjs`（Node 互通验证）。浏览器与 Go 互通已本机实测
-（直连 echo 往返 ~100ms），详见 [sdk/web/README.md](sdk/web/README.md)。
-受浏览器沙箱限制无 TUN/虚拟 IP 路由能力；组内 TCP 服务桥接（portfwd）见 Roadmap。
-
-### ws-gateway + C# / uniapp SDK（网关接入模式）
-
-无法运行 libp2p 的运行时（C#/Unity、微信小程序等）经 **ws-gateway** 接入：
-网关以 Go SDK 节点身份入群，客户端用一条 WebSocket 走统一的二进制帧协议
-（auth / dial / data / close，见 `pkg/gatewayproto`）。
-
-```bash
-# 网关服务（加入指定群组；-invite 省略则创建新群组并打印邀请码）
-go run ./app/gateway/cmd/pvn-gateway -ctl http://ctl:8000 -invite XXXXXXXXXX
-```
-
-- **C# SDK**（`sdk/csharp`，NuGet 包 `Lanet.Sdk`，netstandard2.1 + net8.0）：
-  `DialAsync(ip, port)` / `DialProtocolAsync` / `OnStream`，Unity 2021+ 可用；
-- **uniapp SDK**（`sdk/uniapp`，npm 包 `@lanet/sdk-uniapp`）：
-  自动适配 uni / wx / H5，小程序要求网关走 wss + 备案域名；
-- Go SDK 节点自动获得 **PortFWD 端口转发**能力（`/pvn/portfwd/1.0.0`）：
-  网关客户端 dial 的 `ip:port` 由目标节点 net.Dial 到本机/内网服务，
-  远程桌面、数据库等 TCP 应用由此桥接。
-
-三端互通已本机实测 PASS：js 客户端（自定义协议 echo 1ms、PortFWD 3ms）、
-.NET 客户端（echo 15ms、PortFWD 25ms）。详见各 SDK 目录 README。
-
-## 中继兜底与数据库运维
-
-### relay 链路说明
-
-- relay 启动时通过 `-ctl http://<ctl>:8000` 向控制面**自注册**，之后每 30s 心跳保活；心跳失联会自动重新注册。
-- 容器 NAT 环境下 relay 通告的默认是容器内网地址，外部 agent 不可达——用 `PVN_RELAY_ADVERTISE` 显式指定宿主可达地址（逗号分隔 multiaddr，如 `/ip4/1.2.3.4/tcp/4001,/ip4/1.2.3.4/udp/4001/quic-v1`）。
-- agent 入网后会**主动向 relay 预约**（`EnsureRelayReservation`，周期补充）：Circuit Relay v2 要求目标 peer 必须有 Reservation，否则对端经中继拨号会报 `NO_RESERVATION(204)`。AutoRelay 只在节点自认不可达时才预约，公网可达节点必须靠主动预约兜底。
-- ctl 对超过 150s 无心跳的候选做惰性清理，agent 不会拿到失效 relay。
-
-### 数据库运维子命令（ctl 二进制）
-
-通过 `PVN_CTL_DB` 指定库路径（缺省 `./lanet.db`），容器内可直接 `docker exec`：
-
-```bash
-lanet-ctl migrate              # 显式跑 schema 版本化迁移并打印版本
-lanet-ctl dbversion            # 查看当前迁移版本
-lanet-ctl backup [dest]        # VACUUM INTO 一致性备份（缺省自动带纳秒时间戳）
-lanet-ctl repair               # 损坏库自动修复：先备份→直迁→失败则导出可读数据→重建灌回
-```
-
-schema 迁移采用账本表 `schema_migrations` 记录版本，迁移以有序切片内嵌在代码中；**禁止修改已发布的迁移，只允许追加新版本**。
+以上是对应日期的验证记录，不替代当前提交的自动化测试结果。
 
 ## CI/CD
 
-| 流水线 | 触发 | 产物 |
-|---|---|---|
-| `docker` | push main / `v*` tag | 4 个容器镜像推 GHCR（amd64+arm64）：`lanet-ctl` / `lanet-relay` / `lanet-agent` / `lanet-node`，含 VERSION 文件版本号 tag + latest |
-| `release` | push main / `v*` tag / 手动 | 全平台发行压缩包附加到 GitHub Release（见下） |
+版本号唯一来源是 [`VERSION`](./VERSION)。
 
-### 版本号与发行流程
-
-版本号唯一来源是根目录 **`VERSION` 文件**（三段式，如 `0.2.1`）：
-
-1. **每次代码修改先改 VERSION 再提交**（版本号 +1）；
-2. `docker` 流水线读取 VERSION，镜像获得 `0.2.1` 版本 tag（外加 latest / main / sha）；
-3. `release` 流水线自动交叉编译并打包发行文件（**全部压缩，不直接上传 exe**）：
-
-| 发行包 | 内容 |
+| 流水线 | 产物 |
 |---|---|
-| `lanet-{版本}-windows-amd64.zip` | lanet.exe（单程序）+ wintun.dll + README + VERSION |
-| `lanet-{版本}-linux-amd64.tar.gz` | lanet（单程序）+ VERSION |
-| `lanet-{版本}-linux-arm64.tar.gz` | 同上（arm64） |
-| `sha256sums.txt` | 全部压缩包校验和 |
-
-- 发行包同时创建/更新 GitHub Release（tag `v{VERSION}`）；
-- 各二进制由 `-ldflags "-X main.version={VERSION}"` 注入版本，启动日志可见（如 `[node] 启动 ... version=0.2.1`），可用于部署核验。
+| `docker` | `lanet-ctl`、`lanet-relay`、`lanet-agent`、`lanet-node` 的 amd64/arm64 GHCR 镜像 |
+| `release` | Windows amd64、Linux amd64/arm64 压缩包、`sha256sums.txt` 和签名 `manifest.json` |
 
 镜像地址：
 
-```
+```text
 ghcr.io/ayflying/lanet-ctl:latest
 ghcr.io/ayflying/lanet-relay:latest
 ghcr.io/ayflying/lanet-agent:latest
 ghcr.io/ayflying/lanet-node:latest
 ```
 
-> 容器镜像均为私有，拉取前需 `docker login ghcr.io`。
-> Windows 发行包中的 `wintun.dll` 来自 [wintun.net 官方 0.14.1](https://www.wintun.net/)，不打入 exe（运行时从 exe 同目录加载），因此必须随包分发。
+发布包中的 `wintun.dll` 来自 Wintun 0.14.1，必须与 Windows 可执行文件一起分发。
 
 ## 目录结构
 
-工程由 `gf init -m` 脚手架生成，遵循 GoFrame 官方工程规范：
-
-```
-app/                          gf mono-repo 应用目录
-  ctl/                        控制面（HTTP 服务，gf 规范分层）
-    api/                      接口定义层：Req/Res + 路由声明（group/health/relay）
-    internal/
-      cmd/                    入口：服务注册 + 路由绑定
-      controller/             控制器：实现 api 接口，委托 service
-      logic/                  业务实现：group（SQLite 持久化）、node（IPAM）、relaydir
-      model/                  api/logic 共享视图结构
-      service/                接口定义层（logic 实现后注册）
-      consts/ hack/ manifest/ gf 脚手架标准目录
-  agent/                      客户端
-    cmd/pvn-agent/            客户端入口（gcmd 声明式参数）
-    cmd/pvn-e2e-check/        端到端验证
-    cmd/pvn-web-echo/         Web SDK 联调 echo 节点
-    internal/service/         tunnel 接收端
-  relay/                      中继（libp2p Circuit Relay v2，gcmd 子命令：relay/check）
-    internal/cmd/             中继入口
-  gateway/                    ws-gateway（C#/uniapp 等运行时的网关接入）
-    cmd/pvn-gateway/          网关入口
-    internal/gateway/         WS 帧协议服务（auth/dial/data/close）
-sdk/                          对外 SDK
-  go/lanet/                   Go SDK（入网 / Dial / DialPortFWD / OnStream / Run）
-  web/                        Web SDK（js-libp2p：浏览器/Node 节点入网互开流）
-  csharp/                     C# SDK（Unity/.NET/MAUI，经 ws-gateway 接入）
-  uniapp/                     uniapp SDK（小程序/H5/Node，经 ws-gateway 接入）
-pkg/                          跨应用共享库
-  p2pkit/        libp2p Host 封装（含 webrtc-direct 传输层）
-  peersource/    中继候选客户端（控制面 /v1/relays/candidates）
-  protocol/      协议定义（/pvn/tunnel/1.0.0、/pvn/portfwd/1.0.0）
-  gatewayproto/  ws-gateway 帧协议（Go/C#/JS 三端同构）
-  tunnel/        隧道服务（直连→中继三段降级）
-  netmapclient/  NetMap 客户端
-  tundevice/     TUN 设备与路由器
-build/                        容器镜像 Dockerfile（ctl/relay/agent/node）
-docker-compose.yml           公网节点容器编排（仅 Linux，配置直接写在文件里）
-packaging/                    发行包附带文件（README、logo 图标、Windows 提权清单）
-.github/workflows/            CI：docker（容器镜像）、release（全平台压缩发行包）
+```text
+app/
+  agent/cmd/pvn-node/       官方 Standalone 单程序
+  agent/cmd/pvn-agent/      托管模式客户端
+  agent/cmd/*-check/        端到端与专项联调工具
+  ctl/                      GoFrame v2 控制面
+  relay/                    独立 Circuit Relay v2 服务
+  gateway/                  C#/uniapp 的 WebSocket 网关
+sdk/
+  go/lanet/                 Go SDK
+  web/                      浏览器/Node SDK
+  csharp/                   Unity/.NET/MAUI SDK
+  uniapp/                   uniapp/小程序 SDK
+pkg/
+  serverless/               Standalone 发现、网络身份、虚拟地址
+  p2pkit/                   libp2p Host、打洞与 relay 封装
+  tunnel/                   隧道拨号与链路降级
+  tundevice/                TUN 配置、路由与 IP 包转发
+  firewall/                 统一入向防火墙
+  selfupdate/               签名清单校验与更新分发
+  gatewayproto/             ws-gateway 二进制帧协议
+build/                      容器镜像 Dockerfile
+packaging/                  发行包说明、图标与 Windows 清单
 ```
 
-接口走 gf 标准链路：`api`（声明 Req/Res 与路由）→ `controller`（实现）→ `service`（接口）→ `logic`（实现），
-响应统一为 `MiddlewareHandlerResponse` 包装（`{code, message, data}`），入参校验用 gf `v:` 规则。
-
-## 技术栈
-
-Go · GoFrame v2 · go-libp2p v0.44 · wireguard/tun
+主要依赖：Go 1.25、GoFrame v2、go-libp2p v0.49、kad-dht v0.42、wireguard/tun。
 
 ## Roadmap
 
-- [x] 群组/成员/邀请码落库 SQLite（重启不丢）
-- [x] 邀请码过期、成员踢出、群主权限
-- [x] 容器镜像 CI（GHCR，amd64+arm64）与服务端/客户端编排
-- [x] Windows 发行包 CI（交叉编译 + wintun.dll 打包 → Release）
-- [x] 真实跨机联测（217/243/Windows 三机，6 方向隧道 + relay 兜底 + 边界场景，见「真机联测记录」）
-- [x] Go SDK（`sdk/go/lanet`：New / Dial / OnStream / Run，宿主程序十几行代码入网）
-- [x] Web SDK（`sdk/web`：js-libp2p 浏览器/Node 入网、Dial、OnStream；与 Go 节点互通实测通过）
-- [x] relay 支持 WebSocket 监听（tcp 与 ws 共享 4001 端口）+ ctl CORS（浏览器直连前提）
-- [x] portfwd 端口转发协议（Go SDK 节点自动启用；浏览器/C#/小程序经网关桥接组内 TCP 服务）
-- [x] ws-gateway（`app/gateway`）+ C# SDK（`sdk/csharp`）+ uniapp SDK（`sdk/uniapp`），三端帧协议同构，互通实测通过
-- [x] 虚拟 IP 成员下线回收：成员超过 10 分钟（可配）无真实通讯自动移出成员表，
-  虚拟 IP 派生占用随之释放；DHT 陈旧 provider 记录不会无限续命
-- [ ] 真实跨机带宽实测
-- [ ] 子网路由（未装客户端的内网设备互通）
-- [ ] Web SDK 浏览器端 webrtc-direct 直连实测（NAT 穿透场景，需公网 STUN/TURN）
-- [ ] ctl API key 鉴权（网关/SDK 场景下管理操作的权限控制）
-- [ ] ctl API key 鉴权（SDK 场景下管理操作的权限控制）
+- [x] Standalone 零中心组网、双 DHT、mDNS、打洞与成员中继
+- [x] Windows/Linux TUN 虚拟 IP 双向通信与跨 `/24` 路由
+- [x] 稳定身份、`<节点名>.lanet`、控制台、防火墙与局域网端口转发
+- [x] 签名 P2P 自动更新与多平台发行流水线
+- [x] Go、Web、C#、uniapp SDK 与 ws-gateway
+- [ ] 真实跨机吞吐与长时间稳定性基准
+- [ ] 未安装客户端设备的三层子网路由
+- [ ] 浏览器 webrtc-direct 在复杂 NAT 下的跨网实测
+- [ ] 托管模式 ctl API key 鉴权

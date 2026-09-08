@@ -4,7 +4,7 @@ Lanet（群组制 P2P 虚拟局域网）对外提供四套 SDK，按运行环境
 
 | SDK | 运行环境 | 接入方式 | 是否真 P2P | 典型场景 |
 |---|---|---|---|---|
-| [Go SDK](./go/lanet/README.md) | Go 程序 / 服务器 | **libp2p 直接入群**（直连优先、中继兜底） | ✅ 端到端 | 后端服务互联、端口转发节点、自建服务 |
+| [Go SDK](./go/lanet/README.md) | Go 程序 / 服务器 | **libp2p 直接入群**（Standalone 或托管模式） | ✅ 端到端 | 后端服务互联、可选 TUN、端口转发节点 |
 | [Web SDK](./web/README.md) | 浏览器 / Node ≥20 | **libp2p 直接入群**（js-libp2p） | ✅ 端到端 | 网页与后端服务直接互开流 |
 | [C# SDK](./csharp/README.md) | Unity / .NET 8 / MAUI | **经 ws-gateway 接入**（WebSocket 帧协议） | ⚠️ 网关中转 | 游戏客户端、桌面应用 |
 | [uniapp SDK](./uniapp/README.md) | uniapp / 微信小程序 / H5 / App | **经 ws-gateway 接入**（WebSocket 帧协议） | ⚠️ 网关中转 | 小程序、跨端移动应用 |
@@ -27,6 +27,8 @@ Go SDK 另支持**无服务器模式（Standalone）**：不部署 ctl/relay，�
 DHT server 与中继（客户端即服务端），经 mDNS + 双 DHT（私有优先 + 公共兜底）
 自动发现同网络成员组网。网络归属由**网络密钥（NetworkKey）**决定：
 留空 = 加入公共网络（所有留空节点互通），相同密钥 = 私有网络。
+网络身份还包含分发渠道：Go SDK 默认 `sdk`，官方发行版固定 `official`；只有
+显式设置相同 `Channel` 时二者才互通。
 详见 [Go SDK → 无服务器模式](./go/lanet/README.md)。
 
 ### 2. ws-gateway 网关中转（C# / uniapp SDK）
@@ -45,9 +47,11 @@ DHT server 与中继（客户端即服务端），经 mDNS + 双 DHT（私有优
 
 | 组件 | 作用 | Go SDK | Web SDK | C# SDK | uniapp SDK |
 |---|---|:---:|:---:|:---:|:---:|
-| ctl（控制面） | 群组/邀请码/NetMap/中继目录 | ✅ 必需 | ✅ 必需 | ✅ 必需 | ✅ 必需 |
-| relay（中继） | 打洞失败兜底 | ✅ 必需 | ✅ 必需 | —（网关持有） | —（网关持有） |
+| ctl（控制面） | 群组/邀请码/NetMap/中继目录 | 仅托管模式 | ✅ 必需 | ✅ 必需 | ✅ 必需 |
+| relay（中继） | 打洞失败兜底 | 仅托管模式 | ✅ 必需 | —（网关持有） | —（网关持有） |
 | ws-gateway | 帧协议网关 | — | — | ✅ 必需 | ✅ 必需 |
+
+Go SDK 的 Standalone 模式三项都不需要；节点自身提供 DHT 和 relay service。
 
 - 组件启动示例见仓库根 `app/*/cmd`；网关入口 `go run ./app/gateway/cmd/pvn-gateway`。
 - 小程序场景网关必须走 **wss + 备案域名**（微信平台要求），并在小程序后台配置 socket 合法域名。
@@ -55,17 +59,22 @@ DHT server 与中继（客户端即服务端），经 mDNS + 双 DHT（私有优
 
 ## 通用概念（四个 SDK 一致）
 
-- **群组（Group）**：一个群组独占一个 /24 子网（`10.7.0.0/16` 池分配），只有同群成员互可见。
+- **群组（Group）**：托管模式中一个群组独占一个 `/24` 子网；Standalone
+  不创建中心群组，成员在 `10.7.0.0/16` 内确定性派生虚拟 IP。
 - **邀请码（InviteCode）**：入群凭证（常规模式）。Go SDK 可创建群组（成为群主），Web SDK / 网关客户端均凭码加入。
 - **网络密钥（NetworkKey）**：无服务器模式的网络归属凭证，留空 = 公共网络，相同密钥 = 私有网络。
 - **虚拟 IP（VirtualIP）**：入群时分配，如 `10.7.0.2`。所有 SDK 的开流目标都是对端虚拟 IP。
-- **流（Stream）**：一切访问的基本单元。SDK 之间开的是 libp2p 流（消息边界不保证，需应用层分帧）；
+- **虚拟地址（VirtualHost）**：Go/Standalone 节点可按 `<节点名>.lanet`、短名或
+  原始成员名解析目标，避免成员地址变化后修改业务配置。
+- **流（Stream）**：一切访问的基本单元。SDK 之间开的是双向字节流（没有消息边界，需应用层分帧）；
   网关客户端 `dial(ip, port)` 额外支持 PortFWD——把对端节点的 TCP 服务桥接为一条双向字节管道。
 - **入向防火墙**：Go SDK 节点统一管控三类入向暴露面——端口转发（TCP）、
   TUN 虚拟网卡入向（IP 层 TCP/UDP）、OnStream 应用流（协议 ID），默认**全拒绝**，
   可在内置 Web 控制台（`127.0.0.1:8900`）按「来源虚拟 IP + 协议 + 端口」放行，或设置全开。
 - **局域网端口转发**：Go SDK 节点可配置映射表，把本机所在真实局域网的其他设备
   （NAS/内网服务等）暴露给群内成员访问，同样受防火墙约束。
+- **TUN**：Go SDK 可设置 `Config.Tun=true` 创建系统虚拟网卡；默认关闭，开启后
+  需要 Windows 管理员权限或 Linux `/dev/net/tun` + `CAP_NET_ADMIN`。
 - **半关闭（CloseWrite）**：发送完毕必须半关闭写端，对端才能读到 EOF。
   这是所有 SDK 的核心语义，示例代码里都有对应调用。
 

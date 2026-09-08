@@ -1,7 +1,7 @@
 # Lanet Go SDK
 
 把任意 Go 程序变成 Lanet 群组网格中的一个节点：十几行代码完成入网、开流、接流。
-与内置 agent 使用同一套 libp2p 协议栈（v0.44），隧道策略一致：
+与官方节点使用同一套 libp2p 协议栈（v0.49），隧道策略一致：
 **直连优先 → 已有连接开流 → Circuit Relay v2 中继兜底**。
 
 ## 安装
@@ -10,8 +10,10 @@
 go get github.com/ayflying/pvn/sdk/go/lanet
 ```
 
-前置条件：已部署控制面（ctl）与中继（relay）。SDK 只需能访问 ctl（`CTLURL`），
-relay 地址由 ctl 目录自动下发。无需 root/管理员权限（不创建 TUN 网卡）。
+SDK 支持两种模式：`Standalone: true` 时不需要 `ctl`/独立 `relay`，节点经
+DHT + mDNS 自组网；托管模式则需要已部署的 `ctl` 和 `relay`，SDK 只需访问
+`CTLURL`，relay 地址由控制面目录下发。`Tun` 默认关闭，因此常规使用无需
+root/管理员权限；显式开启 TUN 后需要相应系统权限。
 
 ## 五分钟上手
 
@@ -32,7 +34,7 @@ func main() {
 	defer cancel()
 
 	client, err := lanet.New(ctx, lanet.Config{
-		CTLURL:    "http://ctl.example.com:8600", // 控制面地址（必填）
+		CTLURL:    "http://ctl.example.com:8000", // 托管模式控制面地址（必填）
 		Name:      "my-service",                  // 节点名称（必填）
 		GroupName: "my-group",                    // 群组名称
 	})
@@ -54,7 +56,7 @@ func main() {
 
 ```go
 client, err := lanet.New(ctx, lanet.Config{
-	CTLURL:     "http://ctl.example.com:8600",
+	CTLURL:     "http://ctl.example.com:8000",
 	Name:       "another-node",
 	InviteCode: "grp-xxxxxxxx", // 群主分享的邀请码；留空则创建新群组
 })
@@ -88,11 +90,15 @@ client.OnStream(func(stream lanet.Stream) {
 })
 ```
 
+`OnStream` 使用 `/pvn/tunnel/1.0.0`。如果 `Config.Tun=true` 且 TUN 创建成功，
+该协议由 IP 数据面独占，`OnStream` 会被忽略；应用层服务应改用自定义协议并通过
+`Host().SetStreamHandler` 注册，再由对端 `DialProtocol` 连接。
+
 ## Config 配置项
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `CTLURL` | string | —（必填） | 控制面地址，如 `http://127.0.0.1:8600` |
+| `CTLURL` | string | — | 托管模式必填；Standalone 必须留空，如 `http://127.0.0.1:8000` |
 | `Name` | string | —（必填） | 节点名称，显示在 NetMap 中 |
 | `OS` | string | `runtime.GOOS` | OS 标识 |
 | `InviteCode` | string | `""` | 凭码加入群组；**留空则创建新群组** |
@@ -100,6 +106,9 @@ client.OnStream(func(stream lanet.Stream) {
 | `ListenAddrs` | []string | tcp + ws + quic 全部随机端口 | 覆盖默认监听地址 |
 | `WebRTC` | *bool | `true` | 启用 webrtc-direct 传输（浏览器节点可直连本节点） |
 | `NetMapInterval` | time.Duration | `15s` | 周期任务（NetMap 刷新/通告/中继预约）间隔 |
+| `MemberTTL` | time.Duration | `10m` | Standalone 成员无真实通讯后的回收时限；最小 `2m` |
+| `Version` | string | `""` | 随 info 协议上报的程序版本；空值不报告 |
+| `Platform` | string | 当前 OS/架构 | 随 info 协议上报的平台，如 `windows/amd64` |
 | `DialTimeout` | time.Duration | `8s` | 开流超时 |
 | `Quiet` | bool | `false` | 为 true 时不打日志 |
 | `Standalone` | bool | `false` | 无服务器模式：不依赖 ctl/relay，DHT+mDNS 自动发现组网 |
@@ -109,10 +118,14 @@ client.OnStream(func(stream lanet.Stream) {
 | `DisablePublicDHT` | bool | `false` | Standalone 私有网络专用：关闭公共 DHT 兜底，只用私有 DHT + mDNS 发现 |
 | `LANForwards` | []LANForward | `[]` | 局域网转发初始映射表（`{Listen, Target}`），可热更新 |
 | `ConsoleAddr` | string | `127.0.0.1:8900` | 内置 Web 控制台监听地址，`"-"` 关闭；占用时自动后移至 8910 |
+| `ConsolePassword` | string | `""` | 控制台密码；非空时启用登录与 7 天会话 Cookie |
 | `StateFile` | string | `""` | 控制台状态持久化文件（防火墙/转发规则），空 = 仅内存 |
+| `ConsoleExtra` | map[string]http.HandlerFunc | `nil` | 向控制台追加 Go 1.22 `ServeMux` 路由 |
 | `FirewallMode` | FirewallMode | `deny-all` | 防火墙初始模式，统一管控 PortFWD / TUN 入向 / OnStream 三类暴露面 |
 | `FirewallRules` | []FirewallRule | `[]` | 防火墙初始放行规则（`{Source, Proto, Port}`），allow-list 模式生效 |
 | `IdentityFile` | string | `""` | 节点身份密钥文件；**建议配置**，否则每次启动 PeerID/虚拟 IP 都变 |
+| `Tun` | bool | `false` | 创建 TUN，启用虚拟 IP 的系统层 ping/TCP/UDP；失败自动降级 |
+| `TunName` | string | `lanet` | TUN 网卡名称 |
 
 ## API 一览
 
@@ -120,11 +133,11 @@ client.OnStream(func(stream lanet.Stream) {
 |---|---|
 | `New(ctx, Config)` | 创建节点并入网（创建或加入群组）；失败即返回错误 |
 | `Info()` | 节点身份：PeerID / GroupID / Group / VirtualIP / InviteCode / Created |
-| `OnStream(Handler)` | 注册入向流回调（协议 `/pvn/tunnel/1.0.0`，可注册多个，按序调用） |
+| `OnStream(Handler)` | 注册 `/pvn/tunnel/1.0.0` 入向回调；TUN 激活后该协议由 IP 数据面接管 |
 | `Dial(ctx, virtualIP)` | 按虚拟 IP 开流，返回 `(Stream, viaRelay, error)` |
 | `DialProtocol(ctx, virtualIP, protoID)` | 指定协议 ID 开流（自定义应用协议） |
 | `DialPortFWD(ctx, PortFWDTarget)` | 桥接对端节点侧 TCP 服务，返回标准 `net.Conn` |
-| `LastPathUsed(peerID)` | 到对端最近一次链路：`direct` / `relay` / `unknown` |
+| `LastPathUsed(peerID)` | 到对端最近一次链路：`direct` / `relay` / `offline` / `unknown` |
 | `NetMap()` | 当前群组成员目录快照 |
 | `Host()` | 底层 libp2p Host（进阶：注册自定义协议处理器） |
 | `Run(ctx)` | 阻塞运行周期维护任务，直到 ctx 取消 |
@@ -250,11 +263,12 @@ defer conn.Close()
 
 工作方式：本节点与目标节点建立 `/pvn/portfwd/1.0.0` 协议流，
 目标节点收到后向 `ip:port` 发起 TCP 连接并双向搬运。
-**目标为本节点虚拟 IP 时自动映射到 127.0.0.1**（SDK 节点无 TUN，
-虚拟 IP 在本机 OS 上不可路由）；目标为其他地址时由目标节点代为拨出（可触达其内网）。
+**目标为本节点虚拟 IP 时自动映射到 127.0.0.1**，因此 PortFWD 不依赖 TUN
+回环；目标为其他地址时由目标节点代为拨出（可触达其内网）。
 
 > PortFWD 入向处理器默认开启（`enablePortFWD`）。若要对外提供转发能力，
-> 直接用 Go SDK 即可；完整 TUN 组网（ping 虚拟 IP、子网路由）请用内置 agent。
+> 直接用 Go SDK 即可；需要 `ping`/系统 TCP/UDP 时可设置 `Config.Tun: true`，
+> 并授予 Windows 管理员权限或 Linux `/dev/net/tun` + `CAP_NET_ADMIN`。
 
 ### 自定义协议
 
@@ -382,9 +396,8 @@ conn, err := client.DialPortFWD(ctx, lanet.PortFWDTarget{
 })
 ```
 
-解析规则：目标是合法 IP 时按 IP 处理；否则在当前成员表按 Name 精确匹配
-（匹配到多个会报错并提示改用 IP；匹配不到报错提示未发现）。名称即节点
-启动时的 `Config.Name`，在控制台成员表中可见。
+解析规则：目标可以是虚拟 IP、完整 `<名称>.lanet`、短名或原始成员名。
+组内规范化名称重名时会自动追加稳定后缀；仍有歧义会报错并提示改用虚拟 IP。
 
 ### Run / Close 生命周期
 
@@ -417,7 +430,9 @@ conn, err := client.DialPortFWD(ctx, lanet.PortFWDTarget{
 
 ## 能力边界
 
-- SDK 节点无 TUN：不能 ping 虚拟 IP、不能当子网路由器（这些用内置 agent）；
-- 流是消息流不是字节流：libp2p 不保证消息边界，跨流传协议请自行分帧
+- SDK 默认不开 TUN；设置 `Config.Tun` 后可直接使用虚拟 IP，但调用进程需有系统
+  网卡管理权限。当前只提供节点自身的虚拟 IP 路由，不是完整的物理子网路由器；
+- 流是没有消息边界的双向字节流；应用协议请自行分帧
   （长度前缀 / 分隔符）；PortFWD 桥接的 TCP 连接无此限制；
-- 浏览器接入用 [Web SDK](../web/README.md)，小程序/Unity 用网关 SDK（见 [总览](../README.md)）。
+- 浏览器接入用 [Web SDK](../../web/README.md)，小程序/Unity 用网关 SDK
+  （见 [SDK 总览](../../README.md)）。
