@@ -145,6 +145,7 @@ go run ./app/agent/cmd/pvn-agent \
 - [`app/agent/README.MD`](./app/agent/README.MD)：官方节点、托管 agent 与联调工具
 - [`app/ctl/README.MD`](./app/ctl/README.MD)：控制面 API、持久化与运维命令
 - [`app/relay/README.MD`](./app/relay/README.MD)：独立 relay 的部署与通告
+- [`docs/virtual-network-connectivity-fix.md`](./docs/virtual-network-connectivity-fix.md)：虚拟局域网互通问题排障复盘、修复步骤与验证证据
 
 ## 配置与安全
 
