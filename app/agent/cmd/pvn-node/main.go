@@ -214,14 +214,13 @@ func main() {
 	}
 
 	// ---- 托盘 + 自动打开控制台（Windows 图形界面模式）----
-	// shouldOpenConsole 防重复：本进程已自动打开过同一控制台 URL 就不再弹
-	// （更新/重启场景页签还开着，避免堆积多个相同页签）。
+	// 配置文件仅在首次启动时创建；升级或重启时文件已存在，不再自动开新页签。
 	if consoleURL := node.ConsoleURL(); consoleURL != "" && runtime.GOOS == "windows" {
 		startTray(func() string { return consoleURL }, cancel)
-		if shouldOpenConsole(consoleURL) {
+		if shouldAutoOpenConsole(cfgCreated) && shouldOpenConsole(consoleURL) {
 			openBrowser(consoleURL)
 		} else {
-			log.Printf("[node] 控制台页签已打开，跳过重复打开: %s", consoleURL)
+			log.Printf("[node] 跳过自动打开控制台页签: %s", consoleURL)
 		}
 	}
 
