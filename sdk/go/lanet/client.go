@@ -37,8 +37,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -593,6 +595,10 @@ func (c *Client) startTUN(ctx context.Context) {
 	c.tunDevice = device
 	router := tundevice.New(device, c.tunnelSvc)
 	router.SetFirewall(c.fw)
+	router.SetLocalIP(func() netip.Addr {
+		ip, _ := netip.ParseAddr(c.myIP)
+		return ip
+	})
 	c.tunRouter = router
 	c.tunMu.Unlock()
 	// 设备生命周期与 ctx 绑定：退出时关闭设备，Router.Run 随 Read 错误退出。
@@ -607,8 +613,50 @@ func (c *Client) startTUN(ctx context.Context) {
 	// 吞掉，IP 包从未进入本机协议栈）。此时宿主的 OnStream 不再作用于
 	// Tunnel 协议（见 OnStream 注释），应用流场景请改用 DialProtocol+自定义协议。
 	c.node.SetStreamHandler(protocol.Tunnel, func(stream network.Stream) {
-		router.ServeInboundStream(stream)
+		virtualIP := c.virtualIPByPeer(stream.Conn().RemotePeer().String())
+		router.ServeInboundStream(virtualIP, stream)
 	})
+	// Windows Wintun 按成员维护 /32 on-link 路由，与 WireGuard 的 AllowedIPs
+	// 路由形态一致。L3 Wintun 没有二层 ARP，应同时写入永久邻居占位项；否则
+	// Windows 会把对端项变成 Unreachable，IP 包根本不会进入 TUN。只增量添加，
+	// 避免路由窗口，也避免每次刷新都重建邻居项。
+	if runtime.GOOS == "windows" {
+		go func() {
+			knownRoutes := make(map[string]struct{})
+			knownNeighbors := make(map[string]struct{})
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				for _, m := range c.NetMap().Members {
+					if m.VirtualIP == "" || m.VirtualIP == c.myIP {
+						continue
+					}
+					if _, ok := knownRoutes[m.VirtualIP]; !ok {
+						if err := tundevice.EnsureRoute(name, m.VirtualIP); err != nil {
+							c.logf("成员路由写入失败 %s: %v", m.VirtualIP, err)
+							continue
+						}
+						knownRoutes[m.VirtualIP] = struct{}{}
+					}
+					if _, ok := knownNeighbors[m.VirtualIP]; !ok {
+						if err := tundevice.EnsureNeighbor(name, m.VirtualIP); err != nil {
+							c.logf("成员邻居项写入失败 %s: %v", m.VirtualIP, err)
+							continue
+						}
+						knownNeighbors[m.VirtualIP] = struct{}{}
+					} else if err := tundevice.EnsureNeighbor(name, m.VirtualIP); err != nil {
+						delete(knownNeighbors, m.VirtualIP)
+						c.logf("成员邻居项刷新失败 %s: %v", m.VirtualIP, err)
+					}
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
 	c.logf("TUN 网卡 %s 已就绪（虚拟 IP=%s）：组内成员可通过虚拟 IP 直接访问本机（ping/任意端口，入向受防火墙约束）", name, c.myIP)
 }
 

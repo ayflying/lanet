@@ -71,29 +71,10 @@ func (s *Service) OpenStreamToVirtualIPProtocol(ctx context.Context, virtualIP s
 	dialCtx, cancel := context.WithTimeout(ctx, s.dialTimeout)
 	defer cancel()
 
-	// 1) 直连尝试：用通告地址主动建连。
-	var directErr error
-	if len(route.Addrs) > 0 {
-		addrs := make([]ma.Multiaddr, 0, len(route.Addrs))
-		for _, raw := range route.Addrs {
-			if addr, addrErr := ma.NewMultiaddr(raw); addrErr == nil {
-				addrs = append(addrs, addr)
-			}
-		}
-		if len(addrs) > 0 {
-			directErr = s.self.Connect(dialCtx, peer.AddrInfo{ID: target, Addrs: addrs})
-			if directErr == nil {
-				stream, streamErr := s.openStream(dialCtx, target, proto)
-				if streamErr == nil {
-					s.markRelay(route.PeerID, false)
-					return stream, false, nil
-				}
-				directErr = streamErr
-			}
-		}
-	}
-
-	// 2) 已有连接（可能由打洞/AutoRelay 建立）直接开流。
+	// 1) 已有连接直接开流（可能由打洞/AutoRelay/此前 probe 建立）。
+	//    必须最先尝试：对同一 peer 反复 Connect 会触发 libp2p dial
+	//    backoff，且 addrs 里常混有 127.0.0.1/169.254 等不可达地址，
+	//    逐个试会耗尽 dialTimeout——而此时连接明明是健康的。
 	if s.self.Network().Connectedness(target) == network.Connected {
 		stream, streamErr := s.openStream(dialCtx, target, proto)
 		if streamErr == nil {
@@ -101,6 +82,20 @@ func (s *Service) OpenStreamToVirtualIPProtocol(ctx context.Context, virtualIP s
 			s.markRelay(route.PeerID, viaRelay)
 			return stream, viaRelay, nil
 		}
+	}
+
+	// 2) 主动建连：不带 Addrs，让 libp2p 用 peerstore 中的全部已知地址
+	//    （含此前 probe/identify 学到的内网直连地址）。带 Addrs 强制拨号
+	//    会踩通告地址里的脏数据（观测到的 NAT 公网地址 hairpin 不通等），
+	//    反而错过物理可达的内网路径。
+	directErr := s.self.Connect(dialCtx, peer.AddrInfo{ID: target})
+	if directErr == nil {
+		stream, streamErr := s.openStream(dialCtx, target, proto)
+		if streamErr == nil {
+			s.markRelay(route.PeerID, false)
+			return stream, false, nil
+		}
+		directErr = streamErr
 	}
 
 	// 3) 中继保底：逐个候选 Relay 预约，成功即经中继转发。

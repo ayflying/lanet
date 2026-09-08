@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"log"
+	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
@@ -163,30 +164,7 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 		log.Printf("入向防火墙：deny-all（默认拒绝；组内成员暂时无法访问本机，如需开放用 -fw allow-all）")
 	}
 
-	// 4. 被叫方：接收组内隧道流，逐包过防火墙后写进本机 TUN（交给本机协议栈）。
-	node.SetStreamHandler(protocol.Tunnel, func(stream network.Stream) {
-		buf := make([]byte, 65535)
-		for {
-			n, err := stream.Read(buf)
-			if err != nil {
-				return
-			}
-			packet := buf[:n]
-			// 统一入向防火墙：源虚拟 IP + 协议 + 目标端口，拒绝即丢包。
-			if !tundevice.CheckPacket(fw, packet) {
-				if n >= 20 {
-					log.Printf("[firewall] TUN 入向包被拒绝：来源=%d.%d.%d.%d 协议=%d",
-						packet[12], packet[13], packet[14], packet[15], packet[9])
-				}
-				continue
-			}
-			if _, err := device.Write([][]byte{packet}, 0); err != nil {
-				return
-			}
-		}
-	})
-
-	// 5. 首次拉取 NetMap 并通告可达地址；隧道与路由器启动。
+	// 4. 首次拉取 NetMap 并通告可达地址；隧道与路由器启动。
 	if _, err = netmapCli.Refresh(ctx); err != nil {
 		log.Fatalf("拉取 NetMap: %v", err)
 	}
@@ -211,7 +189,60 @@ func runAgent(ctx context.Context, parser *gcmd.Parser) {
 	tunnelSvc := tunnelsvc.New(node, netmapCli, newRelayCandidates(ctlURL))
 	router := tundevice.New(device, tunnelSvc)
 	router.SetFirewall(fw)
+	router.SetLocalIP(func() netip.Addr {
+		ip, _ := netip.ParseAddr(myIP)
+		return ip
+	})
+	// TUN 接管 Tunnel 协议的入向流。必须按对端 PeerID 找到虚拟 IP，
+	// 这样对端发来的请求包写入本机协议栈后，Reply 才能沿同一条双工流返回。
+	node.SetStreamHandler(protocol.Tunnel, func(stream network.Stream) {
+		virtualIP := ""
+		for _, member := range netmapCli.Current().Members {
+			if member.PeerID == stream.Conn().RemotePeer().String() {
+				virtualIP = member.VirtualIP
+				break
+			}
+		}
+		router.ServeInboundStream(virtualIP, stream)
+	})
 	go router.Run(ctx)
+	// Windows Wintun 使用 /32 on-link 路由；同时写入永久邻居占位项，
+	// 否则 Windows 会把对端邻居标为 Unreachable，包不会进入 TUN。
+	go func() {
+		knownRoutes := make(map[string]struct{})
+		knownNeighbors := make(map[string]struct{})
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			for _, member := range netmapCli.Current().Members {
+				if member.VirtualIP == "" || member.VirtualIP == myIP {
+					continue
+				}
+				if _, ok := knownRoutes[member.VirtualIP]; !ok {
+					if err := tundevice.EnsureRoute(tunName, member.VirtualIP); err != nil {
+						log.Printf("成员路由写入失败 %s: %v", member.VirtualIP, err)
+						continue
+					}
+					knownRoutes[member.VirtualIP] = struct{}{}
+				}
+				if _, ok := knownNeighbors[member.VirtualIP]; !ok {
+					if err := tundevice.EnsureNeighbor(tunName, member.VirtualIP); err != nil {
+						log.Printf("成员邻居项写入失败 %s: %v", member.VirtualIP, err)
+						continue
+					}
+					knownNeighbors[member.VirtualIP] = struct{}{}
+				} else if err := tundevice.EnsureNeighbor(tunName, member.VirtualIP); err != nil {
+					delete(knownNeighbors, member.VirtualIP)
+					log.Printf("成员邻居项刷新失败 %s: %v", member.VirtualIP, err)
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
 
 	// 6. 周期任务：刷新 NetMap + 重新通告地址 + 补充 relay 预约（预约会过期）。
 	go func() {

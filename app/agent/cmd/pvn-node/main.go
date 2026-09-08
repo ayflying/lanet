@@ -121,7 +121,10 @@ func main() {
 		if nc.ProbeSec > 0 {
 			effProbe = time.Duration(nc.ProbeSec) * time.Second
 		} else {
-			effProbe = 20 * time.Second
+			// 20s -> 5s：探测是 P2P 连接的保温机制，间隔过长时 libp2p 连接
+			// 进入空闲回收，TUN 数据面 streamTo 每包都要重拨（经历 backoff
+			// 长达数秒），表现为 ping 偶发全丢或超高延迟。
+			effProbe = 5 * time.Second
 		}
 	}
 	// P2P 自动更新强制开启：签名信任锚保证安全，无需用户决策。
