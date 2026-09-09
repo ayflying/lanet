@@ -180,7 +180,7 @@
 <div class="panel" id="pForwards">
   <div class="card">
     <h2>局域网端口转发</h2>
-    <div class="sub" style="margin-bottom:8px">群内成员访问「本节点虚拟 IP : Listen」时，转发到局域网设备 Target。</div>
+    <div class="sub" style="margin-bottom:8px">群内成员访问「本节点虚拟 IP : Listen」时，转发到局域网设备 Target。本节点同时在 Listen 端口开监听并代理到 Target——容器节点没有真实服务监听时（如转发宿主上其他容器的服务），这样 <b>http://虚拟IP:端口</b> 才能直接访问。</div>
     <div id="fwdList"></div>
     <div class="row">
       <input type="number" id="fListen" placeholder="Listen 端口" style="flex:.5">

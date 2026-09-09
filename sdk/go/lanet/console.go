@@ -309,6 +309,8 @@ func (c *Client) apiSetForwards(w http.ResponseWriter, r *http.Request) {
 	c.forwards = req.Forwards
 	c.fwMu.Unlock()
 	c.saveState()
+	// 用节点根 context（不是请求作用域 ctx）：监听 goroutine 要与节点同生命周期。
+	c.syncListenForwards(c.rootCtx)
 	c.logf("转发映射已更新：%d 条", len(req.Forwards))
 	writeJSON(w, http.StatusOK, map[string]any{"forwards": req.Forwards})
 }
@@ -439,6 +441,7 @@ func (c *Client) SetLANForwards(fs []LANForward) {
 	c.forwards = append([]LANForward(nil), fs...)
 	c.fwMu.Unlock()
 	c.saveState()
+	c.syncListenForwards(c.rootCtx)
 }
 
 // LANForwards 当前转发映射表。

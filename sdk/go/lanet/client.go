@@ -265,6 +265,10 @@ type Client struct {
 	consoleURL   string       // 控制台实际访问地址（端口回退后）
 	sessionToken string       // 控制台会话令牌（设置 ConsolePassword 后生成）
 
+	lfMu        sync.Mutex
+	lfListeners map[int]*fwdListener // 端口转发本地监听表（listen 端口 → 监听器）
+	rootCtx     context.Context      // 节点生命周期 context（监听 goroutine 用）
+
 	tunMu     sync.Mutex
 	tunDevice tundevice.Device  // TUN 虚拟网卡（cfg.Tun 且创建成功时非 nil）
 	tunRouter *tundevice.Router // TUN 数据面路由器（非 nil 时 Tunnel 协议已由 TUN 接管）
@@ -424,8 +428,14 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	c.fw.Set(cfg.FirewallMode, cfg.FirewallRules)
 	c.forwards = append([]LANForward(nil), cfg.LANForwards...)
 	c.statePath = cfg.StateFile
+	c.lfListeners = make(map[int]*fwdListener)
+	c.rootCtx = ctx
 	c.loadState()
 	c.enablePortFWD()
+	// 4.4 端口转发本地监听：转发表里的端口在虚拟 IP 上真实监听并代理到
+	// 目标——容器节点只有虚拟 IP 可达时（TUN 数据面），没有监听的端口
+	// 会被内核 RST，表现为「ping 得通但服务连不上」。
+	c.startListenForwards(ctx)
 	// 4.5 TUN 虚拟网卡（IP 层互通，可选）：放在防火墙初始化之后，
 	// Router 的入向 IP 包判定复用同一套防火墙规则。
 	if cfg.Tun {
@@ -756,6 +766,12 @@ func (c *Client) Close() error {
 	if c.dns != nil {
 		c.dns.Close()
 	}
+	c.lfMu.Lock()
+	for _, fl := range c.lfListeners {
+		_ = fl.ln.Close()
+	}
+	c.lfListeners = make(map[int]*fwdListener)
+	c.lfMu.Unlock()
 	return c.node.Close()
 }
 
