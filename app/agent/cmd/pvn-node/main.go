@@ -66,6 +66,8 @@ func main() {
 			envOr("LANET_NO_PUBLIC_DHT", "") == "1" || strings.EqualFold(envOr("LANET_NO_PUBLIC_DHT", ""), "true"),
 			"私有网络下关闭公共 DHT 兜底（纯私有种子 + mDNS）")
 		probe = flag.Duration("probe", 0, "成员探测间隔；不传则读配置文件（默认 20s）")
+		dns = flag.String("dns", "@@unset@@",
+			".lanet 域名 DNS 服务（ping <成员名>.lanet 直达虚拟 IP）；true/false，缺省读配置文件（默认 true）")
 	)
 	// ---- 开机自启路径识别：注册表 Run 键带 -autorun 参数拉起 ----
 	// 必须在 flag.Parse 之前剔除 -autorun（flag 包对未定义 flag 会报错退出），
@@ -130,6 +132,11 @@ func main() {
 		effTun = strings.EqualFold(*tun, "true") || *tun == "1"
 	}
 	effNoPublic := *noPublic || nc.NoPublicDHT
+	// .lanet DNS 默认开启：配置缺省字段（nil）视为 true。
+	effDNS := nc.DNS == nil || *nc.DNS
+	if *dns != "@@unset@@" {
+		effDNS = strings.EqualFold(*dns, "true") || *dns == "1"
+	}
 	effProbe := *probe
 	if effProbe <= 0 {
 		if nc.ProbeSec > 0 {
@@ -154,8 +161,8 @@ func main() {
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s noPublicDHT=%v tun=%v version=%s config=%s",
-		effName, effKey, effFW, effConsole, effNoPublic, effTun, version, *config)
+	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s noPublicDHT=%v tun=%v dns=%v version=%s config=%s",
+		effName, effKey, effFW, effConsole, effNoPublic, effTun, effDNS, version, *config)
 
 	switch strings.TrimSpace(effBootstrap) {
 	case "", "none":
@@ -193,6 +200,7 @@ func main() {
 		StateFile:        filepath.Join(filepath.Dir(*config), "state.json"),
 		ConsoleExtra:     extra,
 		Tun:              effTun,
+		LanetDNS:         effDNS,
 		Version:          version,
 		Platform:         runtime.GOOS + "/" + runtime.GOARCH,
 	}
@@ -218,6 +226,22 @@ func main() {
 	info := node.Info()
 	log.Printf("[node] 已入网 name=%s peerID=%s virtualIP=%s network=%s",
 		effName, info.PeerID, info.VirtualIP, networkLabel(effKey))
+
+	// ---- .lanet DNS 的系统路由（Windows NRPT 规则）----
+	// 节点以管理员运行，把 *.lanet 查询定向到内置 DNS（127.0.0.1:53）。
+	// 退出时移除规则，不留系统残留；注册失败仅降级（虚拟 IP 直连不受影响）。
+	if effDNS {
+		if err := ensureNRPTRule("127.0.0.1"); err != nil {
+			log.Printf("[node] NRPT 规则注册失败（ping <成员名>.lanet 不可用，虚拟 IP 直连不受影响）: %v", err)
+		} else {
+			log.Printf("[node] NRPT 规则已就绪：*.lanet → 127.0.0.1（ping <成员名>.lanet 直达虚拟 IP）")
+		}
+		defer func() {
+			if err := removeNRPTRule(); err != nil {
+				log.Printf("[node] NRPT 规则移除失败（可用 PowerShell Get-DnsClientNrptRule 查看）: %v", err)
+			}
+		}()
+	}
 
 	// 每次启动后台检查一次更新（预拉发行说明，控制台弹框即点即显）。
 	StartUpdateCheck(firstNonEmpty(os.Getenv("GITHUB_TOKEN"), readConfigToken(*config)))
@@ -443,6 +467,9 @@ type nodeConfig struct {
 	NoPublicDHT     bool   `json:"no_public_dht"`
 	ProbeSec        int    `json:"probe_seconds"`
 	Tun             *bool  `json:"tun,omitempty"` // 虚拟网卡 TUN；nil = 默认开启（兼容旧配置文件）
+	// DNS 开关：.lanet 域名解析服务（内置 DNS + Windows NRPT 规则）。
+	// nil = 默认开启（兼容旧配置文件）。
+	DNS *bool `json:"dns,omitempty"`
 	// self_update 字段已移除：P2P 自动更新强制开启（签名信任锚保证安全）。
 	// 旧配置文件里遗留的 self_update 键会被 json 忽略，无副作用。
 	GitHubToken string `json:"github_token,omitempty"` // 私有仓库检查更新用（contents:read）
@@ -535,6 +562,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 		"GET /api/node-config": func(w http.ResponseWriter, r *http.Request) {
 			nc := read()
 			tunOn := nc.Tun == nil || *nc.Tun
+			dnsOn := nc.DNS == nil || *nc.DNS
 			writeJSONLocal(w, http.StatusOK, map[string]any{
 				"config_path":   path,
 				"name":          nc.Name,
@@ -547,6 +575,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				"no_public_dht": nc.NoPublicDHT,
 				"probe_seconds": nc.ProbeSec,
 				"tun":           tunOn,
+				"dns":           dnsOn,
 				"autorun":       isAutorunEnabled(),
 				"autorun_supported": autorunSupported(),
 				"runtime": map[string]any{
@@ -593,6 +622,9 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 			prev := read()
 			if req.Tun == nil {
 				req.Tun = prev.Tun // 页面未提供（旧版控制台）时保留原值
+			}
+			if req.DNS == nil {
+				req.DNS = prev.DNS // 同上
 			}
 			// 开机自启：平台支持时按请求值切换（立即生效，无需重启）。
 			if req.Autorun != nil && autorunSupported() {

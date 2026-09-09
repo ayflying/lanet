@@ -69,6 +69,13 @@ Circuit Relay v2 中继。Windows 和 Linux 节点默认启用 TUN，可直接�
 
 只有首次生成配置时会自动打开浏览器。后续可从托盘菜单打开控制台或退出节点。
 
+**虚拟域名解析（.lanet DNS）**：节点内置 DNS 应答器（127.0.0.1:53），把
+`<成员名>.lanet` 的查询按成员表实时应答成虚拟 IP（TTL=0 不缓存，成员换 IP 自动跟随）。
+Windows 上启动时自动注册 NRPT 规则（`*.lanet → 127.0.0.1`），退出时移除，因此
+`ping xa.lanet`、`ping yunloli.lanet` 直接可用；非 Windows 平台仅启动 DNS 服务，
+需手动把 `.lanet` 后缀指向本机（如 /etc/resolv.conf 或 /etc/resolver/lanet）。
+开关：控制台「节点配置」页「.lanet 域名解析」复选框，或 `-dns=false` 参数。0.5.10 起。
+
 **开机自启（Windows）**：在 Web 控制台“节点配置”勾选“开机自启”即可。开启后写入
 当前用户注册表 Run 键（`HKCU\...\Run`，值名 `Lanet`），登录 Windows 后自动在后台
 拉起 lanet，**不会打开控制台网页**，可从系统托盘打开。关闭勾选即撤销自启；在任务

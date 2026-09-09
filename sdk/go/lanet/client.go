@@ -197,6 +197,14 @@ type Config struct {
 	Tun bool
 	// TunName TUN 网卡名，默认 "lanet"。
 	TunName string
+	// LanetDNS 启动内置 DNS 应答器（127.0.0.1:53）：把 <成员名>.lanet 的
+	// A 查询按成员表实时解析为虚拟 IP。成员重启换 IP 时名字解析自动跟随。
+	// 绑定 53 端口需要特权；启动失败仅记日志（不影响组网，虚拟 IP 直连不受影响）。
+	// 操作系统把 .lanet 查询路由到本服务的配置（Windows NRPT / macOS
+	// /etc/resolver）由宿主程序负责；Windows 官方程序已自动注册 NRPT 规则。
+	LanetDNS bool
+	// LanetDNSAddr 覆盖 DNS 监听地址，默认 127.0.0.1:53。
+	LanetDNSAddr string
 }
 
 // LoadOrCreateIdentity 加载（或首次生成）Ed25519 节点身份密钥。
@@ -260,6 +268,8 @@ type Client struct {
 	tunMu     sync.Mutex
 	tunDevice tundevice.Device  // TUN 虚拟网卡（cfg.Tun 且创建成功时非 nil）
 	tunRouter *tundevice.Router // TUN 数据面路由器（非 nil 时 Tunnel 协议已由 TUN 接管）
+
+	dns *serverless.DNSServer // .lanet DNS 应答器（cfg.LanetDNS 且启动成功时非 nil）
 }
 
 // Info 节点入网后的身份信息。
@@ -421,12 +431,50 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Tun {
 		c.startTUN(ctx)
 	}
+	// 4.6 .lanet DNS 应答器（可选）：把成员名域名解析交给操作系统，
+	// `ping <成员名>.lanet` 可直接用。成员表实时读取，IP 变化自动跟随。
+	if cfg.LanetDNS {
+		c.startDNS(ctx, cfg.LanetDNSAddr)
+	}
 	// 5. 内置 Web 控制台。
 	if err = c.startConsole(); err != nil {
 		_ = node.Close()
 		return nil, err
 	}
 	return c, nil
+}
+
+// startDNS 启动 .lanet DNS 应答器（默认 127.0.0.1:53）。失败仅记日志降级——
+// DNS 不可用不影响组网，虚拟 IP 直连始终可用。
+func (c *Client) startDNS(ctx context.Context, addr string) {
+	d := serverless.NewDNSServer(c.memberRefs)
+	listen := addr
+	if listen == "" {
+		listen = "127.0.0.1:53"
+	}
+	go func() {
+		if err := d.ListenAndServeAddr(ctx, listen); err != nil {
+			c.logf(".lanet DNS 服务启动失败（虚拟 IP 直连不受影响；ping <成员名>.lanet 不可用）: %v", err)
+			return
+		}
+		c.logf(".lanet DNS 服务已退出")
+	}()
+	c.dns = d
+}
+
+// memberRefs 当前成员表快照（DNS 解析与 selfHostname 同源同规则）。
+func (c *Client) memberRefs() []serverless.MemberRef {
+	var members []serverless.MemberRef
+	if c.disc != nil {
+		for _, m := range c.disc.Peers() {
+			members = append(members, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+		}
+	} else if c.netmapCli != nil {
+		for _, m := range c.netmapCli.Current().Members {
+			members = append(members, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+		}
+	}
+	return members
 }
 
 // Info 返回节点身份信息。
@@ -705,6 +753,9 @@ func (c *Client) Close() error {
 	c.tunMu.Unlock()
 	if c.consoleSrv != nil {
 		_ = c.consoleSrv.Close()
+	}
+	if c.dns != nil {
+		c.dns.Close()
 	}
 	return c.node.Close()
 }
