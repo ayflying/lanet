@@ -137,6 +137,8 @@ type Discovery struct {
 	mu      sync.RWMutex
 	members map[string]*Member // peerID -> member
 
+	publicRetired bool // 公共 DHT 已退出（私有 DHT 就绪后省流量）
+
 	onDiscovered []Discovered
 }
 
@@ -366,6 +368,68 @@ func (d *Discovery) dhtRound(ctx context.Context, dht *kaddht.IpfsDHT, source st
 	}
 }
 
+// publicRetireThreshold 私有 DHT 路由表达到该数量的同群节点后，
+// 公共 DHT 视为「已完成冷启动使命」并退出（省流量）。
+// 1 = 只要有一个同群种子就退（同群成员互为种子，后续发现可持续）。
+const publicRetireThreshold = 1
+
+// maybeRetirePublicDHT 每确认一个同群成员就检查一次：私有 DHT 路由表
+// 攒够足够多的「自己人」后，主动退出公共 DHT（停止广告、清空路由表、
+// 关闭流处理），不再承担公共 DHT server 的应答流量（实测上行 ~4MB/分钟）。
+// 退出后不自动回归公共——mDNS 与成员表里的地址仍可重连；彻底失联时
+// 重启节点即可重新冷启动。
+func (d *Discovery) maybeRetirePublicDHT() {
+	d.mu.Lock()
+	if d.dhtPublic == nil || d.dhtPrivate == nil || d.publicRetired {
+		d.mu.Unlock()
+		return
+	}
+	n := len(d.dhtPrivate.RoutingTable().ListPeers())
+	if n < publicRetireThreshold {
+		d.mu.Unlock()
+		return
+	}
+	d.publicRetired = true // 先置位，防并发重复触发
+	d.mu.Unlock()
+	d.logf("私有 DHT 已就绪（路由表 %d 个同群节点），退出公共 DHT 省流量", n)
+	go d.retirePublicDHT()
+}
+
+// retirePublicDHT 退出公共 DHT：
+//  1. Close 停掉 kad 协议流处理与周期刷新（不再应答公网随机查询）；
+//  2. 断开全部公网 DHT 连接（识别哪些连接来自公共 DHT 不可行，直接
+//     按「非同群成员」过滤——同群成员有成员表背书）；
+//  3. 置 nil，后续 advertiseAndDiscover 不再跑公共轮。
+//
+// 私有 DHT / mDNS / 成员表直连不受影响。
+func (d *Discovery) retirePublicDHT() {
+	pub := d.dhtPublic
+	if pub == nil {
+		return
+	}
+	if err := pub.Close(); err != nil {
+		d.logf("公共 DHT 关闭失败（忽略）: %v", err)
+	}
+	d.mu.Lock()
+	d.dhtPublic = nil
+	// 同群成员快照（保留这些连接）。
+	keep := make(map[string]struct{}, len(d.members))
+	for id := range d.members {
+		keep[id] = struct{}{}
+	}
+	d.mu.Unlock()
+
+	self := d.host.ID()
+	for _, c := range d.host.Network().Conns() {
+		remote := c.RemotePeer()
+		if _, ok := keep[remote.String()]; ok || remote == self {
+			continue
+		}
+		_ = c.Close()
+	}
+	d.logf("已退出公共 DHT（发现继续：私有 DHT + mDNS + 成员表）")
+}
+
 // addMember 记录成员并异步建连（连通后经 info 协议确认同群、拿名称）。
 //
 // 活跃语义：只有真实通讯（connectAndIdentify 成功 / handleInfo 入向握手）
@@ -438,6 +502,7 @@ func (d *Discovery) connectAndIdentify(id peer.ID) {
 	// 后续发现不再依赖公共 DHT（快路径生效）。
 	if d.dhtPrivate != nil {
 		_, _ = d.dhtPrivate.RoutingTable().TryAddPeer(id, false, false)
+		d.maybeRetirePublicDHT()
 	}
 	d.mu.Lock()
 	if m, ok := d.members[id.String()]; ok {
@@ -492,6 +557,10 @@ func (d *Discovery) handleInfo(s network.Stream) {
 		m.LastSeen = time.Now()
 	}
 	d.mu.Unlock()
+	if d.dhtPrivate != nil {
+		_, _ = d.dhtPrivate.RoutingTable().TryAddPeer(remote, false, false)
+		d.maybeRetirePublicDHT()
+	}
 	resp := infoPayload{
 		Name:     d.cfg.Name,
 		Group:    GroupFingerprint(d.groupKey),
