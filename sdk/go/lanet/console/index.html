@@ -64,6 +64,7 @@
   button.ghost { background:#eef0f3; color:var(--txt); }
   button.ghost:disabled { opacity:.45; cursor:default; }
   button.del { background:none; color:var(--bad); padding:2px 6px; }
+  button.mdetail { padding:3px 10px; font-size:12px; }
   .msg { font-size:12px; margin-top:8px; min-height:18px; }
   .msg.ok { color:var(--ok); } .msg.bad { color:var(--bad); }
   .empty { color:var(--muted); font-size:13px; }
@@ -111,6 +112,19 @@
       <button class="ghost" onclick="closeUpdateModal()">关闭</button>
     </div>
     <div class="msg" id="updMsg"></div>
+  </div>
+</div>
+
+<!-- 本机详情弹框（识别当前设备用） -->
+<div class="overlay" id="infoOverlay" style="display:none" onclick="if(event.target===this)closeInfoModal()">
+  <div class="modal" style="max-width:520px">
+    <h2>本机设备详情</h2>
+    <div class="modal-body" id="infoBody" style="white-space:normal;max-height:60vh">加载中…</div>
+    <div class="modal-btns">
+      <button class="ghost" onclick="copyInfoSummary()">复制信息</button>
+      <button class="ghost" onclick="closeInfoModal()">关闭</button>
+    </div>
+    <div class="msg" id="infoMsg"></div>
   </div>
 </div>
 
@@ -262,7 +276,7 @@ function renderMembers() {
   }
   const page = list.slice((mPage - 1) * M_PAGE_SIZE, mPage * M_PAGE_SIZE);
   $('members').innerHTML =
-    '<table><tr><th>设备</th><th>虚拟地址</th><th>虚拟 IP</th><th>状态</th><th>链路</th><th>版本</th><th>最后活跃</th></tr>' +
+    '<table><tr><th>设备</th><th>虚拟地址</th><th>虚拟 IP</th><th>状态</th><th>链路</th><th>版本</th><th>最后活跃</th><th style="width:52px">操作</th></tr>' +
     page.map(m => {
       const label = m.name || (m.peer_id ? m.peer_id.slice(0, 10) + '…' : '未知设备');
       const pid = m.name ? '<span class="pid"> (' + esc(m.peer_id.slice(0, 8)) + '…)</span>' : '';
@@ -280,7 +294,8 @@ function renderMembers() {
       const last = m.last_seen ? relTime(m.last_seen) : '—';
       return `<tr><td class="mname">${esc(label)}${pid}</td><td>${host}</td><td>${esc(m.virtual_ip)}</td>` +
         `<td><span class="tag ${m.online ? 'online' : 'offline'}"><span class="dot ${m.online ? 'on' : 'off'}"></span>${m.online ? '在线' : '离线'}</span></td>` +
-        `<td>${path}</td><td>${ver}</td><td>${esc(last)}</td></tr>`;
+        `<td>${path}</td><td>${ver}</td><td>${esc(last)}</td>` +
+        `<td><button class="ghost mdetail" onclick="openInfoModal()">详情</button></td></tr>`;
     }).join('') +
     '</table>';
   $('mPager').style.display = 'flex';
@@ -469,6 +484,58 @@ function onUpdateClick() {
   $('updOverlay').style.display = '';
 }
 function closeUpdateModal() { $('updOverlay').style.display = 'none'; }
+
+// ---- 本机设备详情弹框（识别当前控制台所在设备） ----
+let localInfo = null;
+async function openInfoModal() {
+  $('infoMsg').textContent = '';
+  $('infoBody').textContent = '加载中…';
+  $('infoOverlay').style.display = '';
+  localInfo = null;
+  try {
+    const r = await fetch('/api/local-info');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    localInfo = await r.json();
+    renderInfoModal();
+  } catch (e) {
+    $('infoBody').textContent = '获取本机信息失败：' + e;
+  }
+}
+function renderInfoModal() {
+  const i = localInfo;
+  if (!i) return;
+  const ipRows = (i.ips || []).map(x =>
+    `<tr><td>${esc(x.iface)}</td><td><span class="vhost" title="点击复制" onclick="copyText('${esc(x.ip)}', this)">${esc(x.ip)}</span></td><td>${esc(x.type)}</td></tr>`
+  ).join('') || '<tr><td colspan="3" class="empty">未获取到网卡地址</td></tr>';
+  $('infoBody').innerHTML = `
+    <div class="kv"><b>主机名</b>${esc(i.hostname || '—')}</div>
+    <div class="kv"><b>节点名</b>${esc(i.node_name || '—')}</div>
+    <div class="kv"><b>虚拟 IP</b><span class="vhost" title="点击复制" onclick="copyText('${esc(i.virtual_ip || '')}', this)">${esc(i.virtual_ip || '—')}</span></div>
+    <div class="kv"><b>虚拟地址</b>${i.virtual_host ? `<span class="vhost" title="点击复制" onclick="copyText('${esc(i.virtual_host)}', this)">${esc(i.virtual_host)}</span>` : '—'}</div>
+    <div class="kv"><b>节点 ID</b><span style="word-break:break-all">${esc(i.peer_id || '—')}</span></div>
+    <div class="kv"><b>系统</b>${esc(i.os || '—')} · ${esc(i.platform || '—')}</div>
+    <div class="kv"><b>程序版本</b>${esc(i.version ? 'v' + i.version : 'dev')}</div>
+    <div class="kv"><b>Go 版本</b>${esc(i.go_version || '—')}</div>
+    <div style="margin:10px 0 4px;font-weight:600">本机所有 IP 地址</div>
+    <table><tr><th>网卡</th><th>地址</th><th>类型</th></tr>${ipRows}</table>`;
+}
+function copyInfoSummary() {
+  if (!localInfo) return;
+  const i = localInfo;
+  const lines = [
+    '主机名: ' + (i.hostname || '—'),
+    '节点名: ' + (i.node_name || '—'),
+    '虚拟 IP: ' + (i.virtual_ip || '—'),
+    '虚拟地址: ' + (i.virtual_host || '—'),
+    '系统: ' + (i.os || '—') + ' · ' + (i.platform || '—'),
+    '程序版本: ' + (i.version ? 'v' + i.version : 'dev'),
+    '本机 IP:',
+    ...(i.ips || []).map(x => '  [' + x.iface + '] ' + x.ip + ' (' + x.type + ')'),
+  ];
+  copyText(lines.join('\n'), $('infoMsg'));
+  flash('infoMsg', '已复制到剪贴板', true);
+}
+function closeInfoModal() { $('infoOverlay').style.display = 'none'; }
 async function applyUpdate() {
   $('updApply').disabled = true;
   flash('updMsg', '正在下载更新并校验（完成后程序自动重启）…', true);

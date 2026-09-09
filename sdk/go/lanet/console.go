@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -90,6 +91,7 @@ func (c *Client) startConsole() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", c.apiState)
+	mux.HandleFunc("GET /api/local-info", c.apiLocalInfo)
 	mux.HandleFunc("PUT /api/firewall", c.apiSetFirewall)
 	mux.HandleFunc("PUT /api/forwards", c.apiSetForwards)
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
@@ -349,6 +351,70 @@ func (c *Client) saveState() {
 		return
 	}
 	_ = os.Rename(tmp, c.statePath)
+}
+
+// localIPView 本机网卡 IP 信息（详情弹框用）。
+type localIPView struct {
+	Iface string `json:"iface"` // 网卡名
+	IP    string `json:"ip"`    // IP 地址（含掩码位数）
+	Type  string `json:"type"`  // v4 / v6
+	MAC   string `json:"mac,omitempty"` // 物理网卡附带的 MAC
+}
+
+// apiLocalInfo 本机基础信息：主机名、系统/平台、版本、虚拟身份、全部网卡 IP。
+// 用于在控制台「详情」弹框里识别当前设备是哪台机器。
+func (c *Client) apiLocalInfo(w http.ResponseWriter, r *http.Request) {
+	hostname, _ := os.Hostname()
+
+	// 枚举所有网卡的活动 IP（排除回环与链路本地单播的 v6 冗余项保留决策：
+	// fe80:: 链路本地地址对识别设备无用，跳过；v6 全局地址保留）。
+	ips := []localIPView{}
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, ifc := range ifaces {
+			if ifc.Flags&net.FlagLoopback != 0 {
+				continue // 回环网卡整块跳过
+			}
+			addrs, err := ifc.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, a := range addrs {
+				ipn, ok := a.(*net.IPNet)
+				if !ok {
+					continue
+				}
+				ip4 := ipn.IP.To4()
+				if ip4 == nil {
+					// v6：跳过链路本地（fe80::/10）
+					if ipn.IP.IsLinkLocalUnicast() {
+						continue
+					}
+				} else if ip4.IsLinkLocalUnicast() {
+					continue // 169.254.x.x 自动专用地址同样无识别价值
+				}
+				mask, _ := ipn.Mask.Size()
+				ips = append(ips, localIPView{
+					Iface: ifc.Name,
+					IP:    fmt.Sprintf("%s/%d", ipn.IP, mask),
+					Type:  map[bool]string{true: "v4", false: "v6"}[ip4 != nil],
+					MAC:   ifc.HardwareAddr.String(),
+				})
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"hostname":    hostname,
+		"os":          c.cfg.OS,
+		"platform":    c.platform(),
+		"go_version":  runtime.Version(),
+		"version":     c.cfg.Version,
+		"node_name":   c.cfg.Name,
+		"virtual_ip":  c.myIP,
+		"virtual_host": c.selfHostname(),
+		"peer_id":     c.peerID,
+		"ips":         ips,
+	})
 }
 
 // writeJSON 统一 JSON 响应。
