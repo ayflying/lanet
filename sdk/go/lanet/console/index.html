@@ -199,11 +199,6 @@
         <input type="checkbox" id="cTun"> 虚拟网卡 TUN（IP 层互通：ping / 任意端口直达虚拟 IP，需管理员权限运行）
       </label>
     </div>
-    <div class="row">
-      <label style="display:flex;gap:6px;align-items:center">
-        <input type="checkbox" id="cDNS"> .lanet 域名解析（内置 DNS + 系统路由，<b>ping 成员名.lanet</b> 直达虚拟 IP，IP 变化自动跟随）
-      </label>
-    </div>
     <div class="row" id="cAutorunRow" style="display:none">
       <label style="display:flex;gap:6px;align-items:center">
         <input type="checkbox" id="cAutorun" onchange="saveAutorun()"> 开机自启（登录 Windows 后自动在后台启动，<b>不打开控制台网页</b>，可从系统托盘打开）
@@ -387,7 +382,6 @@ async function loadNodeConfig() {
     $('cListen').value = c.listen || '';
     $('cNoPublic').checked = !!c.no_public_dht;
     $('cTun').checked = c.tun === undefined ? true : !!c.tun;
-    $('cDNS').checked = c.dns === undefined ? true : !!c.dns;
     if (c.autorun_supported) {
       $('cAutorunRow').style.display = '';
       $('cAutorun').checked = !!c.autorun;
@@ -417,7 +411,6 @@ async function saveNodeConfig() {
     listen: $('cListen').value.trim(),
     no_public_dht: $('cNoPublic').checked,
     tun: $('cTun').checked,
-    dns: $('cDNS').checked,
     autorun: $('cAutorunRow').style.display !== 'none' ? $('cAutorun').checked : undefined,
   };
   if (!body.name || !body.console) { flash('cfgMsg', '节点名称与控制台地址不能为空', false); return; }

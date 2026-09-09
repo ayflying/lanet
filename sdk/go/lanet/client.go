@@ -197,12 +197,12 @@ type Config struct {
 	Tun bool
 	// TunName TUN 网卡名，默认 "lanet"。
 	TunName string
-	// LanetDNS 启动内置 DNS 应答器（127.0.0.1:53）：把 <成员名>.lanet 的
-	// A 查询按成员表实时解析为虚拟 IP。成员重启换 IP 时名字解析自动跟随。
-	// 绑定 53 端口需要特权；启动失败仅记日志（不影响组网，虚拟 IP 直连不受影响）。
-	// 操作系统把 .lanet 查询路由到本服务的配置（Windows NRPT / macOS
-	// /etc/resolver）由宿主程序负责；Windows 官方程序已自动注册 NRPT 规则。
-	LanetDNS bool
+	// .lanet DNS 强制开启（无开关）：入网即启动内置 DNS 应答器，把
+	// <成员名>.lanet 的 A 查询按成员表实时解析为虚拟 IP，成员重启换 IP
+	// 时名字解析自动跟随。绑定 53 端口需要特权；启动失败仅记日志
+	// （不影响组网，虚拟 IP 直连不受影响）。操作系统把 .lanet 查询路由到
+	// 本服务的配置（Windows NRPT / macOS /etc/resolver）由宿主程序负责；
+	// Windows 官方程序已自动注册 NRPT 规则。
 	// LanetDNSAddr 覆盖 DNS 监听地址，默认 127.0.0.1:53。
 	LanetDNSAddr string
 }
@@ -269,7 +269,7 @@ type Client struct {
 	tunDevice tundevice.Device  // TUN 虚拟网卡（cfg.Tun 且创建成功时非 nil）
 	tunRouter *tundevice.Router // TUN 数据面路由器（非 nil 时 Tunnel 协议已由 TUN 接管）
 
-	dns *serverless.DNSServer // .lanet DNS 应答器（cfg.LanetDNS 且启动成功时非 nil）
+	dns *serverless.DNSServer // .lanet DNS 应答器（启动成功时非 nil）
 }
 
 // Info 节点入网后的身份信息。
@@ -433,9 +433,8 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	// 4.6 .lanet DNS 应答器（可选）：把成员名域名解析交给操作系统，
 	// `ping <成员名>.lanet` 可直接用。成员表实时读取，IP 变化自动跟随。
-	if cfg.LanetDNS {
-		c.startDNS(ctx, cfg.LanetDNSAddr)
-	}
+	// .lanet DNS 强制开启：入网即启动内置应答器（默认 127.0.0.1:53）。
+	c.startDNS(ctx, cfg.LanetDNSAddr)
 	// 5. 内置 Web 控制台。
 	if err = c.startConsole(); err != nil {
 		_ = node.Close()
