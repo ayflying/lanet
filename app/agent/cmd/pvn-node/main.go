@@ -67,6 +67,20 @@ func main() {
 			"私有网络下关闭公共 DHT 兜底（纯私有种子 + mDNS）")
 		probe = flag.Duration("probe", 0, "成员探测间隔；不传则读配置文件（默认 20s）")
 	)
+	// ---- 开机自启路径识别：注册表 Run 键带 -autorun 参数拉起 ----
+	// 必须在 flag.Parse 之前剔除 -autorun（flag 包对未定义 flag 会报错退出），
+	// 再用环境变量向后续逻辑传递「本次是自启」。环境变量会被子进程继承，
+	// 控制台重启（spawnSelf）后标记保留，语义正确。
+	args := make([]string, 0, len(os.Args))
+	for _, a := range os.Args {
+		if a == "-autorun" || a == "--autorun" {
+			_ = os.Setenv(autorunEnv, "1")
+			continue
+		}
+		args = append(args, a)
+	}
+	os.Args = args
+
 	flag.Parse()
 
 	// ---- 日志：stderr + exe 同目录 lanet.log 双写（windowsgui 无黑框时靠文件看日志）----
@@ -215,13 +229,19 @@ func main() {
 
 	// ---- 托盘 + 自动打开控制台（Windows 图形界面模式）----
 	// 配置文件仅在首次启动时创建；升级或重启时文件已存在，不再自动开新页签。
+	// 开机自启（-autorun / 注册表 Run 键拉起）永远不自动开页签——开机场景
+	// 用户没有交互预期，弹浏览器只会打扰；托盘照常启动，随时可手动打开。
+	autorunLaunch := isAutorunLaunch()
 	if consoleURL := node.ConsoleURL(); consoleURL != "" && runtime.GOOS == "windows" {
 		startTray(func() string { return consoleURL }, cancel)
-		if shouldAutoOpenConsole(cfgCreated) && shouldOpenConsole(consoleURL) {
+		if !autorunLaunch && shouldAutoOpenConsole(cfgCreated) && shouldOpenConsole(consoleURL) {
 			openBrowser(consoleURL)
 		} else {
-			log.Printf("[node] 跳过自动打开控制台页签: %s", consoleURL)
+			log.Printf("[node] 跳过自动打开控制台页签 (autorun=%v): %s", autorunLaunch, consoleURL)
 		}
+	}
+	if autorunLaunch {
+		log.Printf("[node] 本次为开机自启启动")
 	}
 
 	// 回显服务：收到什么回什么（供其他节点探测）。
@@ -375,6 +395,20 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// hasFlag 判断命令行是否包含指定 flag（不解析值，仅检测 -flag / --flag 形式）。
+// osArgs 为可注入变量，便于单元测试。
+var osArgs = os.Args
+
+func hasFlag(name string) bool {
+	prefix := "-" + name
+	for _, arg := range osArgs[1:] {
+		if arg == prefix || arg == "-"+prefix {
+			return true
+		}
+	}
+	return false
+}
+
 // exeDir 可执行文件所在目录（双击启动时配置/身份/状态文件都落在这里）。
 func exeDir() string {
 	exe, err := os.Executable()
@@ -412,6 +446,9 @@ type nodeConfig struct {
 	// self_update 字段已移除：P2P 自动更新强制开启（签名信任锚保证安全）。
 	// 旧配置文件里遗留的 self_update 键会被 json 忽略，无副作用。
 	GitHubToken string `json:"github_token,omitempty"` // 私有仓库检查更新用（contents:read）
+	// Autorun 开机自启（仅控制台 PUT 请求体使用，GET 走注册表实时查询）。
+	// 不落 lanet.json：真实状态在注册表 Run 键，避免两处状态不一致。
+	Autorun *bool `json:"autorun,omitempty"`
 
 	bootstrapAddrs []string `json:"-"` // 运行时由 Bootstrap 解析而来
 }
@@ -510,6 +547,8 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				"no_public_dht": nc.NoPublicDHT,
 				"probe_seconds": nc.ProbeSec,
 				"tun":           tunOn,
+				"autorun":       isAutorunEnabled(),
+				"autorun_supported": autorunSupported(),
 				"runtime": map[string]any{
 					"name":          eff.Name,
 					"network_key":   eff.NetworkKey,
@@ -554,6 +593,13 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 			prev := read()
 			if req.Tun == nil {
 				req.Tun = prev.Tun // 页面未提供（旧版控制台）时保留原值
+			}
+			// 开机自启：平台支持时按请求值切换（立即生效，无需重启）。
+			if req.Autorun != nil && autorunSupported() {
+				if err := setAutorunEnabled(*req.Autorun); err != nil {
+					writeJSONLocal(w, http.StatusInternalServerError, map[string]string{"error": "开机自启设置失败: " + err.Error()})
+					return
+				}
 			}
 			// 密码语义：传了非空密码 → 覆盖；留空 → 保持不变（空密码 = 未设置）。
 			// GET 不回传密码明文，所以 req.ConsolePassword 为空时不能当作"删除"。
