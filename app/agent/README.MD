@@ -68,6 +68,11 @@ ID 互连 + 连接审批**模型：把对方节点 ID 填进控制台并点连�
 Windows 的 `node.key` 与程序目录一起迁移；其他平台身份路径固定为
 `/data/node.key`。`lanet.db`（地址簿）、`state.json` 和 `lanet.log` 位于配置文件目录。
 
+Windows 裸机版可在 Web 控制台“节点配置”开启“Windows 服务自启”。启用后注册
+LocalSystem 自动启动服务，机器启动后无需登录账号即可运行；服务模式不创建托盘、
+不打开浏览器，控制台仍按 `console` 配置监听。关闭开关会卸载服务，启用时会自动清理
+v0.5.23 及以前使用的当前用户 Run 注册表项，避免登录后重复启动。
+
 ## pvn-agent
 
 先启动 [`../ctl`](../ctl/README.MD) 和 [`../relay`](../relay/README.MD)，再创建群组：

@@ -15,6 +15,8 @@ func isAutorunEnabled() bool { return false }
 
 func autorunSupported() bool { return false }
 
+func autorunKind() string { return "unsupported" }
+
 func setAutorunEnabled(enable bool) error {
 	return errors.New("当前平台不支持程序内开机自启（Linux 请使用 systemd unit）")
 }

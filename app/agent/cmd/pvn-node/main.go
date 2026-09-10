@@ -43,6 +43,29 @@ const echoProto = libprotocol.ID("/lanet/echo/1.0.0")
 var version = "dev"
 
 func main() {
+	// 服务重启辅助进程必须先于 SCM 入口处理。它由正在运行的服务派生，等待
+	// HTTP 响应送达后通过服务管理器执行 stop/start，避免绕过 SCM 拉起孤儿进程。
+	if handled, err := handleWindowsServiceCommand(); handled {
+		if err != nil {
+			log.Printf("[service] Windows 服务控制失败: %v", err)
+		}
+		return
+	}
+	// Windows 服务模式必须在解析普通命令行参数之前接管进程：SCM 启动
+	// lanet.exe -service 后，由服务控制管理器负责 Start/Stop 生命周期。
+	// 普通双击/命令行启动则直接进入交互模式。
+	if handled, err := runAsSystemService(func(ctx context.Context) {
+		runNode(ctx, true)
+	}); handled {
+		if err != nil {
+			log.Printf("[service] Windows 服务运行失败: %v", err)
+		}
+		return
+	}
+	runNode(context.Background(), false)
+}
+
+func runNode(parent context.Context, serviceMode bool) {
 	exeDir := exeDir()
 	var (
 		config = flag.String("config", envOr("LANET_CONFIG", filepath.Join(exeDir, "lanet.json")),
@@ -209,7 +232,7 @@ func main() {
 		}
 	}
 	// 更新 / 重启 / 退出 控制台接口（与节点配置同一组扩展路由）。
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -291,7 +314,7 @@ func main() {
 	// 开机自启（-autorun / 注册表 Run 键拉起）永远不自动开页签——开机场景
 	// 用户没有交互预期，弹浏览器只会打扰；托盘照常启动，随时可手动打开。
 	autorunLaunch := isAutorunLaunch()
-	if consoleURL := node.ConsoleURL(); consoleURL != "" && runtime.GOOS == "windows" {
+	if consoleURL := node.ConsoleURL(); consoleURL != "" && runtime.GOOS == "windows" && !serviceMode {
 		startTray(func() string { return consoleURL }, cancel)
 		if !autorunLaunch && shouldAutoOpenConsole(cfgCreated) && shouldOpenConsole(consoleURL) {
 			openBrowser(consoleURL)
@@ -299,8 +322,10 @@ func main() {
 			log.Printf("[node] 跳过自动打开控制台页签 (autorun=%v): %s", autorunLaunch, consoleURL)
 		}
 	}
-	if autorunLaunch {
-		log.Printf("[node] 本次为开机自启启动")
+	if serviceMode {
+		log.Printf("[service] 正以 Windows 系统服务运行（LocalSystem，无需用户登录；不启动托盘和浏览器）")
+	} else if autorunLaunch {
+		log.Printf("[node] 本次为用户登录后自启启动")
 	}
 
 	// 回显服务：收到什么回什么（供其他节点探测）。
@@ -744,6 +769,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				"tun":                tunOn,
 				"autorun":            isAutorunEnabled(),
 				"autorun_supported":  autorunSupported(),
+				"autorun_kind":       autorunKind(),
 				"require_approval":   requireApprovalOn,
 				"auto_accept":        autoAcceptOn,
 				"db_path":            nc.DBPath,
@@ -808,8 +834,8 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				writeJSONLocal(w, http.StatusOK, map[string]any{"saved": true, "restart_required": false})
 				return
 			}
-			// autorun-only 请求（自启复选框即时切换）：只带 autorun 字段，
-			// 不走完整表单校验，改完即返回（不触发重启提示）。
+			// autorun-only 请求（Windows 服务自启复选框即时切换）：只带
+			// autorun 字段，不走完整表单校验，改完即返回。
 			if req.Autorun != nil && req.Name == "" && req.Console == "" {
 				if !autorunSupported() {
 					writeJSONLocal(w, http.StatusBadRequest, map[string]string{"error": "当前平台不支持开机自启"})

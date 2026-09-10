@@ -550,6 +550,13 @@ func spawnSelf() error {
 func restartSelf(delay time.Duration) {
 	go func() {
 		time.Sleep(delay)
+		if isServiceProcess() {
+			log.Printf("[service] 请求 Windows 服务管理器重启 Lanet")
+			if err := restartWindowsService(); err != nil {
+				log.Printf("[service] 重启服务失败: %v", err)
+			}
+			return
+		}
 		exe := selfExe()
 		log.Printf("[node] 重启程序: %s %v", exe, os.Args[1:])
 		if err := spawnSelf(); err != nil {

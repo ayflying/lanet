@@ -293,7 +293,7 @@
     <div class="sub" style="margin:2px 0 0">供<b>无人值守的中央服务器 / 种子节点</b>使用：开启后陌生节点无需人工审批即可互连。普通客户端不建议开启（等于放弃审批这道安全边界）。</div>
     <div class="row" id="cAutorunRow" style="display:none">
       <label style="display:flex;gap:6px;align-items:center">
-        <input type="checkbox" id="cAutorun" onchange="saveAutorun()"> 开机自启（登录 Windows 后自动在后台启动，<b>不打开控制台网页</b>，可从系统托盘打开）
+        <input type="checkbox" id="cAutorun" onchange="saveAutorun()"> Windows 服务自启（<b>无需登录账号</b>，机器开机后即以 LocalSystem 后台运行；服务模式不显示托盘、不打开浏览器）
       </label>
     </div>
     <button onclick="saveNodeConfig()">保存节点配置</button>
@@ -773,7 +773,7 @@ async function saveNodeConfig() {
   if (r.ok) loadNodeConfig();
 }
 
-// saveAutorun 即时切换开机自启（不随「保存节点配置」按钮提交，改动立即生效）。
+// saveAutorun 即时安装/卸载 Windows 自动启动服务（不随「保存节点配置」提交）。
 async function saveAutorun() {
   const on = $('cAutorun').checked;
   const r = await fetch('/api/node-config', { method: 'PUT',
@@ -781,7 +781,9 @@ async function saveAutorun() {
     body: JSON.stringify({ autorun: on }) });
   const res = await r.json().catch(() => ({}));
   if (r.ok) {
-    flash('cfgMsg', on ? '已开启开机自启' : '已关闭开机自启', true);
+    flash('cfgMsg', on
+      ? 'Windows 服务已安装：下次开机无需登录即可自动启动；当前节点继续运行'
+      : 'Windows 服务已卸载：下次开机不会自动启动', true);
   } else {
     $('cAutorun').checked = !on; // 失败回滚复选框
     flash('cfgMsg', '开机自启设置失败' + (res.error ? '：' + res.error : ''), false);
