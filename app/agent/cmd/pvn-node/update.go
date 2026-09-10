@@ -1,10 +1,15 @@
 // 自更新支持：
 //   - 程序启动后自动向 GitHub Releases 查询最新版本（每次启动检查一次），
 //     预先拉取发行说明，控制台「更新」弹框直接展示、无需等待；
-//   - /api/update    查询检查结果（含 has_update / notes / asset 信息）；
+//   - /api/update    查询检查结果（含 has_update / notes / asset / checked_at）；
+//     ?force=1 绕过缓存强制重查（打开弹框即触发，发布新版本后立刻可见）；
 //   - /api/update/apply  下载对应平台发行包 → sha256 校验 → 原子替换自身 → 重启；
 //   - /api/restart   以原参数重启程序；
 //   - /api/quit      退出程序。
+//
+// 缓存策略：检查结果复用 updateCacheTTL（3 分钟）；超窗口或 force 时同步重查，
+// 同步超时 updateSyncTimeout（6 秒，超时返回上次缓存并标记 timed_out），
+// 失败也刷新时间戳以退避，避免网络抖动时反复打 GitHub API。
 //
 // 仓库为私有时的限制：GitHub API 需要 Token —— 环境变量 GITHUB_TOKEN 或
 // lanet.json 的 github_token 字段（只需 contents:read 权限）；未提供时
@@ -32,6 +37,18 @@ import (
 )
 
 const updateRepoAPI = "https://api.github.com/repos/ayflying/lanet/releases/latest"
+
+// updateCacheTTL 检查结果的复用窗口：窗口内直接返回缓存，避免频繁打 GitHub API。
+// 窗口外（或带 ?force=1）会同步重新检查，因此发布新版本后用户「打开更新弹框」
+// 即可立刻看到，不必重启或等待 P2P 巡检。
+const updateCacheTTL = 3 * time.Minute
+
+// updateSyncTimeout 同步检查（页面请求触发）的超时：GitHub API 正常 < 1s，
+// 6 秒足够；超时则放弃本次检查、返回缓存结果，避免用户点开弹框干等。
+const updateSyncTimeout = 6 * time.Second
+
+// updateStartTimeout 启动时后台检查的超时（不阻塞任何交互，可放宽）。
+const updateStartTimeout = 20 * time.Second
 
 type updateState struct {
 	mu        sync.Mutex
@@ -66,27 +83,40 @@ func updateRoutes(cancel context.CancelFunc) map[string]http.HandlerFunc {
 	var syncCheckMu sync.Mutex
 	return map[string]http.HandlerFunc{
 		"GET /api/update": func(w http.ResponseWriter, r *http.Request) {
-			// 尚未检查过（启动检查未完成/失败）时同步补查一次，页面即点即有结果。
+			// force=1：跳过缓存强制重新检查（前端「检查更新」按钮用）。
+			// 其余情况：未检查过或缓存过期时同步补查一次，保证「点开弹框
+			// 即有相对新鲜的结果」；缓存窗口内直接返回，避免打爆 GitHub API。
+			force := r.URL.Query().Get("force") == "1"
 			syncCheckMu.Lock()
 			upd.mu.Lock()
 			checked, checkedAt := upd.checked, upd.checkedAt
 			upd.mu.Unlock()
-			if !checked || time.Since(checkedAt) > time.Hour {
-				ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-				_ = checkUpdate(ctx)
+			// 注意：失败路径也会刷新 checkedAt（见 fail），因此失败同样按 TTL 退避。
+			timedOut := false
+			if force || !checked || time.Since(checkedAt) > updateCacheTTL {
+				ctx, cancel := context.WithTimeout(r.Context(), updateSyncTimeout)
+				if err := checkUpdate(ctx); err != nil && ctx.Err() != nil {
+					timedOut = true // 超时：本次放弃，下面返回上次缓存结果
+				}
 				cancel()
 			}
 			syncCheckMu.Unlock()
 			checked, hasUpdate, needToken, latest, notes, _, assetName, errMsg := upd.snapshot()
+			upd.mu.Lock()
+			at := upd.checkedAt
+			upd.mu.Unlock()
 			writeJSONLocal(w, http.StatusOK, map[string]any{
-				"checked":    checked,
-				"has_update": hasUpdate,
-				"need_token": needToken,
-				"error":      errMsg,
-				"current":    upd.current,
-				"latest":     latest,
-				"notes":      notes,
-				"asset":      assetName,
+				"checked":     checked,
+				"has_update":  hasUpdate,
+				"need_token":  needToken,
+				"error":       errMsg,
+				"current":     upd.current,
+				"latest":      latest,
+				"notes":       notes,
+				"asset":       assetName,
+				"checked_at":  at.Format(time.RFC3339),
+				"cache_ttl_s": int(updateCacheTTL.Seconds()),
+				"timed_out":   timedOut,
 			})
 		},
 		"POST /api/update/apply": func(w http.ResponseWriter, r *http.Request) {
@@ -113,7 +143,7 @@ func updateRoutes(cancel context.CancelFunc) map[string]http.HandlerFunc {
 func StartUpdateCheck(token string) {
 	upd.token = token
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), updateStartTimeout)
 		defer cancel()
 		if err := checkUpdate(ctx); err != nil {
 			log.Printf("[update] 检查更新失败: %v", err)
@@ -127,9 +157,12 @@ func StartUpdateCheck(token string) {
 }
 
 // checkUpdate 查询 GitHub 最新 Release 并与当前版本比较。
+// 无论成功失败都会更新 checkedAt（失败时带 errMsg），使调用方可以按
+// updateCacheTTL 退避重试，不会因网络抖动而在每次请求里反复打 GitHub。
 func checkUpdate(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, updateRepoAPI, nil)
 	if err != nil {
+		upd.fail(err)
 		return err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -138,6 +171,7 @@ func checkUpdate(ctx context.Context) error {
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		upd.fail(err)
 		return err
 	}
 	defer resp.Body.Close()
@@ -148,7 +182,7 @@ func checkUpdate(ctx context.Context) error {
 		return nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GitHub API 返回 %d", resp.StatusCode)
+		return upd.fail(fmt.Errorf("GitHub API 返回 %d", resp.StatusCode))
 	}
 	var rel struct {
 		TagName string `json:"tag_name"`
@@ -160,6 +194,7 @@ func checkUpdate(ctx context.Context) error {
 		} `json:"assets"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		upd.fail(err)
 		return err
 	}
 	latest := strings.TrimPrefix(rel.TagName, "v")
@@ -207,6 +242,17 @@ func (u *updateState) finish(res updateResult, errMsg string) {
 	u.assetURL, u.assetName = res.assetURL, res.assetName
 	u.assetAPI, u.sumsAPI = res.assetAPIURL, res.sumsAPIURL
 	u.errMsg = errMsg
+}
+
+// fail 记录一次检查失败：更新时间戳使调用方按 TTL 退避，并保留错误信息。
+// 失败不影响上次成功拿到的版本信息（latest 等），页面仍可展示。
+func (u *updateState) fail(err error) error {
+	u.mu.Lock()
+	u.checked = true
+	u.checkedAt = time.Now()
+	u.errMsg = err.Error()
+	u.mu.Unlock()
+	return err
 }
 
 // downloadTargets 返回应用更新所需的真实下载地址（API 资产端点）。

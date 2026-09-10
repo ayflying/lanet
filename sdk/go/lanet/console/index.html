@@ -111,7 +111,9 @@
   <div class="modal">
     <h2 id="updTitle">发现新版本</h2>
     <div class="modal-body" id="updNotes">加载中…</div>
+    <div class="sub" id="updMeta"></div>
     <div class="modal-btns">
+      <button id="updCheck" class="ghost" onclick="recheckUpdate()">重新检查</button>
       <button id="updApply" onclick="applyUpdate()">立即更新并重启</button>
       <button class="ghost" onclick="closeUpdateModal()">关闭</button>
     </div>
@@ -607,14 +609,20 @@ async function saveAutorun() {
 
 // ---- 更新 / 重启 / 关闭（宿主注册 /api/update 时才显示按钮组） ----
 let updInfo = null;
+// loadUpdate 拉取更新检查结果。force=true 时绕过服务端缓存强制重新检查；
+// 服务端缓存窗口很短（3 分钟），失败也会按 TTL 退避，不会打爆 GitHub API。
+async function loadUpdate(force) {
+  const r = await fetch('/api/update' + (force ? '?force=1' : ''));
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  updInfo = await r.json();
+  return updInfo;
+}
 async function initTopActions() {
   try {
-    const r = await fetch('/api/update');
-    if (!r.ok) return; // 纯 SDK 场景无此接口：隐藏按钮组
-    updInfo = await r.json();
+    await loadUpdate(false);
     $('topBtns').style.display = '';
     $('updDot').style.display = updInfo.has_update ? '' : 'none';
-  } catch (e) { /* 无接口：隐藏 */ }
+  } catch (e) { /* 纯 SDK 场景无此接口：隐藏按钮组 */ }
 }
 function mdLite(md) {
   return esc(md || '')
@@ -623,8 +631,15 @@ function mdLite(md) {
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/^- (.*)$/gm, '• $1');
 }
-function onUpdateClick() {
-  if (!updInfo) return;
+function fmtCheckedAt(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+// renderUpdateModal 按当前 updInfo 刷新弹框内容（标题 / 说明 / 按钮可见性）。
+function renderUpdateModal() {
   const has = updInfo.has_update;
   $('updTitle').textContent = has
     ? `发现新版本 v${updInfo.latest}（当前 v${updInfo.current}）`
@@ -633,8 +648,42 @@ function onUpdateClick() {
     ? (mdLite(updInfo.notes) || '（无发行说明）')
     : '当前已是最新版本，无需更新。';
   $('updApply').style.display = has ? '' : 'none';
+  const at = fmtCheckedAt(updInfo.checked_at);
+  const note = updInfo.timed_out ? '本次检查超时（展示上次结果）' : '';
+  const err = updInfo.error ? '检查出错：' + updInfo.error : '';
+  $('updMeta').textContent = [at ? '检查时间：' + at : '', note, err].filter(Boolean).join('　');
+}
+async function onUpdateClick() {
+  if (!updInfo) return;
   $('updMsg').textContent = '';
+  $('updMeta').textContent = '正在检查更新…';
+  $('updApply').style.display = 'none';
   $('updOverlay').style.display = '';
+  // 打开弹框即强制重查一次：保证刚发布的版本能立刻被发现，无需重启等待。
+  try {
+    await loadUpdate(true);
+  } catch (e) {
+    $('updMeta').textContent = '检查更新失败：' + e;
+    return;
+  }
+  renderUpdateModal();
+  $('updDot').style.display = updInfo.has_update ? '' : 'none';
+}
+async function recheckUpdate() {
+  const btn = $('updCheck');
+  btn.disabled = true;
+  $('updMsg').textContent = '';
+  $('updMeta').textContent = '正在检查更新…';
+  try {
+    await loadUpdate(true);
+    renderUpdateModal();
+    $('updDot').style.display = updInfo.has_update ? '' : 'none';
+    if (!updInfo.has_update && !updInfo.error) flash('updMsg', '已是最新版本', true);
+  } catch (e) {
+    flash('updMsg', '检查更新失败：' + e, false);
+  } finally {
+    btn.disabled = false;
+  }
 }
 function closeUpdateModal() { $('updOverlay').style.display = 'none'; }
 
