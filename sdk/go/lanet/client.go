@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -57,6 +58,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	libprotocol "github.com/libp2p/go-libp2p/core/protocol"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 // Stream 是隧道流的对外视图：io.ReadWriteCloser + 链路信息。
@@ -159,6 +161,9 @@ type Config struct {
 	// 关闭、只用私有 DHT + mDNS 发现。跨网冷启动需保证首次通过种子节点
 	// 或局域网入网；需要零配置跨网冷启动时再显式开启。
 	EnablePublicDHT bool
+	// PublicDHTTimeout 公共 DHT 临时引导的最长运行时长（0 = 默认 10 分钟）。
+	// 超时无论是否发现同群成员都自动退出公共 DHT；找到同群成员则提前退出。
+	PublicDHTTimeout time.Duration
 	// LANForwards 局域网端口转发初始映射表：入向请求端口命中 Listen 时，
 	// 转发到 Target（本机所在真实局域网内的设备地址，如 192.168.1.100:5000）。
 	// 运行中可经 Web 控制台热更新；入向转发始终受防火墙约束（默认全拒绝）。
@@ -376,19 +381,20 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	// 2. 入网。
 	if cfg.Standalone {
 		disc, err = serverless.New(ctx, node, serverless.Config{
-			NetworkKey:            cfg.NetworkKey,
-			Channel:               cfg.Channel,
-			Name:                  cfg.Name,
-			Bootstrap:             cfg.Bootstrap,
+			NetworkKey:           cfg.NetworkKey,
+			Channel:              cfg.Channel,
+			Name:                 cfg.Name,
+			Bootstrap:            cfg.Bootstrap,
 			EnablePublicFallback: cfg.EnablePublicDHT,
-			EnableMDNS:            true,
-			Interval:              cfg.NetMapInterval,
-			MemberTTL:             cfg.MemberTTL,
-			Version:               cfg.Version,
-			Platform:              cfg.Platform,
-			OSHostname:            localHostname,
-			LocalIPs:              localIPs,
-			Quiet:                 cfg.Quiet,
+			PublicDHTTimeout:     cfg.PublicDHTTimeout,
+			EnableMDNS:           true,
+			Interval:             cfg.NetMapInterval,
+			MemberTTL:            cfg.MemberTTL,
+			Version:              cfg.Version,
+			Platform:             cfg.Platform,
+			OSHostname:           localHostname,
+			LocalIPs:             localIPs,
+			Quiet:                cfg.Quiet,
 		})
 		if err == nil {
 			err = disc.Start(ctx)
@@ -502,6 +508,58 @@ func (c *Client) Info() Info {
 		Created:     c.created,
 		InviteCode:  c.cfg.InviteCode,
 	}
+}
+
+// SeedAddrs 本节点的连接种子：可分享给同群成员作为引导地址的 multiaddr
+// 列表（已剔除回环与 TUN overlay 地址，均带 /p2p/<ID> 后缀）。对端把它
+// 填入 Bootstrap（或 Web 控制台「连接种子」）即可不经任何公共 DHT 直接入网。
+// 同群成员在控制台填入后重启生效；家庭宽带 IP 变化后需重新复制分享。
+func (c *Client) SeedAddrs() []string {
+	out := make([]string, 0, 4)
+	for _, a := range p2pkit.FilterUnderlayAddrs(c.node.Addrs()) {
+		if isLoopbackMultiaddr(a) {
+			continue
+		}
+		out = append(out, a.String()+"/p2p/"+c.peerID)
+	}
+	return out
+}
+
+// isLoopbackMultiaddr 判断 multiaddr 是否为回环地址（127.0.0.0/8、::1）。
+func isLoopbackMultiaddr(a ma.Multiaddr) bool {
+	if v, err := a.ValueForProtocol(ma.P_IP4); err == nil {
+		return net.ParseIP(v).IsLoopback()
+	}
+	if v, err := a.ValueForProtocol(ma.P_IP6); err == nil {
+		return net.ParseIP(strings.SplitN(v, "%", 2)[0]).IsLoopback()
+	}
+	return false
+}
+
+// PublicDHTStatus 公共 DHT 临时引导的运行状态（仅 Standalone 模式有值）。
+func (c *Client) PublicDHTStatus() (serverless.PublicDHTState, bool) {
+	if c.disc == nil {
+		return serverless.PublicDHTState{}, false
+	}
+	return c.disc.PublicDHTState(), true
+}
+
+// SetPublicDHT 运行时开启/关闭公共 DHT 临时引导（控制台开关，立即生效）。
+// 仅 Standalone（无服务器）模式支持。开启后受临时引导时长约束：连上同群
+// 成员立即退出，超时未连上也退出；不改动配置文件（下次启动由配置决定）。
+func (c *Client) SetPublicDHT(enable bool) error {
+	if c.disc == nil {
+		return fmt.Errorf("仅 Standalone（无服务器）模式支持公共 DHT 开关")
+	}
+	if !enable {
+		c.disc.DisablePublicDHTRuntime("手动关闭（控制台开关）")
+		return nil
+	}
+	ctx := c.rootCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.disc.EnablePublicDHTRuntime(ctx)
 }
 
 // selfHostname 本节点的虚拟地址：把自己并入当前成员表后按同一规则推导，

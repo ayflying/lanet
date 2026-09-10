@@ -115,7 +115,8 @@ client.OnStream(func(stream lanet.Stream) {
 | `NetworkKey` | string | `""` | Standalone 专用：网络密钥。留空 = 默认公共网络密钥（所有留空节点互通，群身份与历史派生一致）；相同密钥 = 私有网络 |
 | `Channel` | string | `lanet.ChannelSDK` | Standalone 专用：分发渠道，参与群组身份派生。SDK 构建默认与官方发行版网络互相隔离（相同 NetworkKey 也不互通）；确需互通显式设为 `"official"` |
 | `Bootstrap` | []string | `[]` | Standalone 专用：引导节点 multiaddr（已在网成员地址作为私有 DHT 种子；`lanet.DefaultBootstrap` 为公共引导，仅在开启公共兜底时使用） |
-| `EnablePublicDHT` | bool | `false` | Standalone 专用：启用公共 DHT 兜底（v0.5.16 起默认关闭以省流量）。开启后公共 DHT 仅用于跨网冷启动，找到同群成员即自动退出 |
+| `EnablePublicDHT` | bool | `false` | Standalone 专用：启用公共 DHT 临时引导（v0.5.16 起默认关闭以省流量）。开启后仅用于跨网冷启动，连上同群成员立即自动退出，超时未连上也自动退出 |
+| `PublicDHTTimeout` | time.Duration | `0`（=10 分钟） | Standalone 专用：公共 DHT 临时引导的最长运行时长，超时自动退出 |
 | `LANForwards` | []LANForward | `[]` | 局域网转发初始映射表（`{Listen, Target}`），可热更新 |
 | `ConsoleAddr` | string | `127.0.0.1:8900` | 内置 Web 控制台监听地址，`"-"` 关闭；占用时自动后移至 8910 |
 | `ConsolePassword` | string | `""` | 控制台密码；非空时启用登录与 7 天会话 Cookie |
@@ -204,17 +205,18 @@ info 协议同群校验四层全部隔离。这是软边界：显式设置 `Conf
 - **节点即服务端**：每个节点无条件运行 Circuit Relay v2 hop 中继（默认资源配额）
   与 kad-dht server 模式；公网可达的成员自然成为网络内的引导与中继节点，
   NAT 后成员经 DCUtR 打洞直连，打洞失败经可达成员中继兜底；
-- **双 DHT（私有优先 + 公共兜底可选）**：私有网络在每台节点上同时运行两张
+- **双 DHT（私有优先 + 公共临时引导可选）**：私有网络在每台节点上同时运行两张
   完全隔离的 DHT——私有 DHT（`/lanet/kad/1.0.0` 协议前缀）只有本网络节点参与，
   路由表小、发现快；公共 DHT（`/ipfs/kad/1.0.0`）**默认不建立**（v0.5.16 起，
-  公共 DHT 是全公网共享网络，挂上去空载也有约 4MB/分钟上行应答流量），
+  公共 DHT 是全公网共享网络，挂上去空载也有约 4MB/分钟上行应答流量）。
   `EnablePublicDHT: true` 显式开启后仅负责跨网冷启动时找到第一个「自己人」
-  （鸡生蛋的钥匙）即自动退出。同群成员一经确认即注入私有 DHT
-  路由表（互为种子），之后每轮发现全部走私有快路径；
+  （鸡生蛋的钥匙）即自动退出，超时（`PublicDHTTimeout`，默认 10 分钟）未连上
+  也自动退出。同群成员一经确认即注入私有 DHT 路由表（互为种子），之后每轮
+  发现全部走私有快路径。运行时可用 `SetPublicDHT(true/false)` 即时开关、
+  `PublicDHTStatus()` 查询状态；`SeedAddrs()` 返回本机可分享的连接种子；
 - **引导（Bootstrap）**：填任意已在网成员的 multiaddr（`<addr>/p2p/<peerID>`，
-  每台节点都是私有种子）可加速入网；跨网冷启动在关闭公共兜底的默认下依赖
-  成员种子或局域网 mDNS，历史公共兜底实测国内可达（2026-09-05，武汉电信/
-  联通出口均能连上 4 个官方引导节点）；纯局域网靠 mDNS 自动发现。
+  每台节点都是私有种子）可加速入网；**推荐**用种子而非公共 DHT——纯私有、
+  零公共流量、确定可达；纯局域网靠 mDNS 自动发现。
 
 **跨网络实测结论（2026-09-05，三节点 Docker 部署）**：两个处于不同物理局域网、
 公网入向均不可达的节点（A：192.168.50.x 家宽 + 运营商 NAT；B：另一局域网），
@@ -243,8 +245,8 @@ libp2p v0.49 + kad-dht v0.42）：相同 NetworkKey 双节点无 ctl/relay，
   但不建议依赖。
 
 当前限制：NAT 后节点在打洞成功前无法被直连（成员表中的中继候选打洞后可用）；
-公共 DHT 兜底默认关闭（`EnablePublicDHT` 开启），关闭时且无种子则跨网无法冷启动；
-虚拟 IP 冲突未仲裁（群规模大时注意）。
+公共 DHT 默认关闭（`EnablePublicDHT` 开启，且为限时临时引导），关闭且无种子时
+跨网无法冷启动；虚拟 IP 冲突未仲裁（群规模大时注意）。
 
 ### PortFWD：访问对端节点的 TCP 服务
 

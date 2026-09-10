@@ -60,6 +60,10 @@ const (
 // ProtocolInfo 节点信息交换协议（建连后校验同群 + 交换名称）。
 const ProtocolInfo = "/lanet/info/1.0.0"
 
+// DefaultPublicDHTTimeout 公共 DHT 临时引导的默认最长运行时长。
+// 超时无论是否发现同群成员都自动退出（省流量；重启可重新引导）。
+const DefaultPublicDHTTimeout = 10 * time.Minute
+
 // Config 发现服务配置。
 type Config struct {
 	// NetworkKey 网络密钥：相同密钥的节点组成同一张 P2P 网络。
@@ -80,10 +84,15 @@ type Config struct {
 	// EnablePublicFallback 启用公共 DHT 兜底（默认关闭）。默认关闭的
 	// 原因：公共 DHT 是全公网共享网络，作为 server 节点要持续应答全网
 	// 随机查询（实测空载上行 ~4MB/分钟），且国内连 bootstrap.libp2p.io
-	// 不稳定，反复重试也会产生无效流量。开启后公共 DHT 仅负责跨网冷
-	// 启动（找到第一个「自己人」即自动退出，见 maybeRetirePublicDHT）；
+	// 不稳定，反复重试也会产生无效流量。开启后公共 DHT 作为「临时引导」：
+	// 找到第一个「自己人」即自动退出（见 maybeRetirePublicDHT），最长
+	// 运行 PublicDHTTimeout（默认 10 分钟）——超时即使没连上也自动退出。
 	// 关闭时跨网冷启动需把已在网成员 multiaddr 配置为引导种子。
 	EnablePublicFallback bool
+	// PublicDHTTimeout 公共 DHT 临时引导的最长运行时长（默认 10 分钟，
+	// 0 = 用默认）。超时无论是否发现同群成员都自动退出公共 DHT，避免
+	// 开关忘关导致公共 DHT 长期挂载消耗流量。
+	PublicDHTTimeout time.Duration
 	// EnableMDNS 启用局域网 mDNS 自动发现。
 	EnableMDNS bool
 	// Interval 广播/发现周期，默认 30s。
@@ -150,7 +159,9 @@ type Discovery struct {
 	mu      sync.RWMutex
 	members map[string]*Member // peerID -> member
 
-	publicRetired bool // 公共 DHT 已退出（私有 DHT 就绪后省流量）
+	publicRetired      bool      // 公共 DHT 已退出（私有 DHT 就绪后省流量）
+	publicRetireReason string    // 退出原因（连上同群成员 / 超时），控制台展示用
+	publicStartedAt    time.Time // 公共 DHT 开启时刻（剩余时长展示用）
 
 	onDiscovered []Discovered
 }
@@ -179,6 +190,9 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = 30 * time.Second
+	}
+	if cfg.PublicDHTTimeout <= 0 {
+		cfg.PublicDHTTimeout = DefaultPublicDHTTimeout
 	}
 	switch {
 	case cfg.MemberTTL <= 0:
@@ -218,19 +232,11 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		return nil, fmt.Errorf("serverless: init private dht: %w", err)
 	}
 	if cfg.EnablePublicFallback {
-		pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		pubParsed, perr := parseBootstrap(pubCtx, []string{DefaultBootstrap})
-		cancel()
+		pub, perr := newPublicDHT(ctx, h, d.logf)
 		if perr != nil {
-			d.logf("公共引导解析失败，公共兜底暂不可用（下轮重试广播）: %v", perr)
+			return nil, fmt.Errorf("serverless: init public dht: %w", perr)
 		}
-		d.dhtPublic, err = kaddht.New(h,
-			kaddht.Mode(kaddht.ModeAutoServer),
-			kaddht.BootstrapPeers(pubParsed...),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("serverless: init public dht: %w", err)
-		}
+		d.dhtPublic = pub
 	}
 
 	// 2. mDNS（可选）：NewMdnsService 创建即启动。
@@ -239,6 +245,21 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		d.mdnsSvc = mdns.NewMdnsService(h, tag, &mdnsNotifee{d: d})
 	}
 	return d, nil
+}
+
+// newPublicDHT 创建公共 IPFS DHT 实例（/ipfs 协议前缀）。
+// 公共引导地址解析失败不致命：实例照建，后续每轮广播会重试自举。
+func newPublicDHT(ctx context.Context, h host.Host, logf func(string, ...any)) (*kaddht.IpfsDHT, error) {
+	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	pubParsed, perr := parseBootstrap(pubCtx, []string{DefaultBootstrap})
+	cancel()
+	if perr != nil && logf != nil {
+		logf("公共引导解析失败，公共兜底暂不可用（下轮重试广播）: %v", perr)
+	}
+	return kaddht.New(h,
+		kaddht.Mode(kaddht.ModeAutoServer),
+		kaddht.BootstrapPeers(pubParsed...),
+	)
 }
 
 // Start 完成引导连接、DHT 自举与信息协议注册。非阻塞部分尽力而为。
@@ -263,12 +284,81 @@ func (d *Discovery) Start(ctx context.Context) error {
 		}
 	}
 	if d.dhtPrivate != nil && d.dhtPublic != nil {
-		d.logf("双 DHT 模式：私有发现优先，公共 DHT 兜底（找到同群成员后自动退出）")
+		d.logf("双 DHT 模式：私有发现优先，公共 DHT 临时引导（找到同群成员即退出，最长 %s）",
+			d.cfg.PublicDHTTimeout)
 	} else {
 		d.logf("公共 DHT 兜底已关闭（私有 DHT + mDNS 发现；跨网冷启动需配置成员引导种子）")
 	}
+	// 公共 DHT 临时引导超时：到点无论是否发现同群成员都自动退出。
+	// 与「找到即退」（maybeRetirePublicDHT）双保险，防止开关忘关导致
+	// 公共 DHT 长期挂载消耗流量。
+	if d.dhtPublic != nil {
+		d.mu.Lock()
+		d.publicStartedAt = time.Now()
+		pub := d.dhtPublic
+		d.mu.Unlock()
+		d.armPublicDHTTimeout(ctx, pub, d.cfg.PublicDHTTimeout)
+	}
 	d.host.SetStreamHandler(ProtocolInfo, d.handleInfo)
 	return nil
+}
+
+// armPublicDHTTimeout 为某个公共 DHT 实例装上超时退出计时器：到点若该实例
+// 仍是当前实例（未被重开替换）则自动退出。重开时旧计时器因实例不匹配而失效。
+func (d *Discovery) armPublicDHTTimeout(ctx context.Context, pub *kaddht.IpfsDHT, timeout time.Duration) {
+	if pub == nil {
+		return
+	}
+	go func() {
+		t := time.NewTimer(timeout)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			d.mu.RLock()
+			same := d.dhtPublic == pub
+			d.mu.RUnlock()
+			if same {
+				d.retirePublicDHT(fmt.Sprintf("超时未发现同群成员（引导时限 %s）", timeout))
+			}
+		}
+	}()
+}
+
+// EnablePublicDHTRuntime 运行时开启公共 DHT 临时引导（控制台开关，立即生效）。
+// 已开启则无操作。开启后同样受 PublicDHTTimeout 约束：连上同群成员立即退出，
+// 超时未连上也退出。该操作不改动配置文件——下次启动是否自动开启由配置
+// EnablePublicFallback 决定。
+func (d *Discovery) EnablePublicDHTRuntime(ctx context.Context) error {
+	d.mu.RLock()
+	active := d.dhtPublic != nil
+	d.mu.RUnlock()
+	if active {
+		return nil
+	}
+	pub, err := newPublicDHT(ctx, d.host, d.logf)
+	if err != nil {
+		return fmt.Errorf("serverless: enable public dht: %w", err)
+	}
+	d.mu.Lock()
+	d.dhtPublic = pub
+	d.publicRetired = false
+	d.publicRetireReason = ""
+	d.publicStartedAt = time.Now()
+	timeout := d.cfg.PublicDHTTimeout
+	d.mu.Unlock()
+	if err := pub.Bootstrap(ctx); err != nil {
+		d.logf("公共 DHT 自举未完成（周期重试）: %v", err)
+	}
+	d.logf("已开启公共 DHT 临时引导（最长 %s，连上同群成员立即退出）", timeout)
+	d.armPublicDHTTimeout(ctx, pub, timeout)
+	return nil
+}
+
+// DisablePublicDHTRuntime 运行时关闭公共 DHT（控制台开关手动关闭）。
+func (d *Discovery) DisablePublicDHTRuntime(reason string) {
+	d.retirePublicDHT(reason)
 }
 
 // SelfVirtualIP 本节点在无服务器模式下的虚拟 IP。
@@ -426,28 +516,62 @@ func (d *Discovery) maybeRetirePublicDHT() {
 		d.mu.Unlock()
 		return
 	}
-	d.publicRetired = true // 先置位，防并发重复触发
+	reason := fmt.Sprintf("已连接 %d 个同群成员", n)
+	if d.dhtPrivate != nil {
+		reason = fmt.Sprintf("私有 DHT 就绪（路由表 %d 个同群节点）", n)
+	}
 	d.mu.Unlock()
 	if d.dhtPrivate != nil {
-		d.logf("私有 DHT 已就绪（路由表 %d 个同群节点），退出公共 DHT 省流量", n)
+		d.logf("%s，退出公共 DHT 省流量", reason)
 	} else {
-		d.logf("已连接 %d 个同群成员，退出公共 DHT 省流量", n)
+		d.logf("%s，退出公共 DHT 省流量", reason)
 	}
-	go d.retirePublicDHT()
+	go d.retirePublicDHT(reason)
 }
 
-// retirePublicDHT 退出公共 DHT：
+// PublicDHTState 公共 DHT 临时引导的运行状态（控制台展示用）。
+// Enabled=启动时开启了公共兜底；Active=当前仍挂在公共 DHT 上；
+// Reason=退出原因（连上同群成员 / 超时），未退出时为空；
+// StartedAt=开启时刻；Timeout=最长运行时长（前端可据此算剩余时间）。
+type PublicDHTState struct {
+	Enabled   bool      `json:"enabled"`
+	Active    bool      `json:"active"`
+	Retired   bool      `json:"retired"`
+	Reason    string    `json:"reason,omitempty"`
+	StartedAt time.Time `json:"started_at,omitempty"`
+	Timeout   float64   `json:"timeout_seconds"`
+}
+
+func (d *Discovery) PublicDHTState() PublicDHTState {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return PublicDHTState{
+		Enabled:   d.cfg.EnablePublicFallback,
+		Active:    d.dhtPublic != nil,
+		Retired:   d.publicRetired,
+		Reason:    d.publicRetireReason,
+		StartedAt: d.publicStartedAt,
+		Timeout:   d.cfg.PublicDHTTimeout.Seconds(),
+	}
+}
+
+// retirePublicDHT 退出公共 DHT（幂等，可被「找到即退」与「超时退出」并发触发）：
 //  1. Close 停掉 kad 协议流处理与周期刷新（不再应答公网随机查询）；
 //  2. 断开全部公网 DHT 连接（识别哪些连接来自公共 DHT 不可行，直接
 //     按「非同群成员」过滤——同群成员有成员表背书）；
 //  3. 置 nil，后续 advertiseAndDiscover 不再跑公共轮。
 //
 // 私有 DHT / mDNS / 成员表直连不受影响。
-func (d *Discovery) retirePublicDHT() {
-	pub := d.dhtPublic
-	if pub == nil {
+func (d *Discovery) retirePublicDHT(reason string) {
+	d.mu.Lock()
+	if d.dhtPublic == nil || d.publicRetired {
+		d.mu.Unlock()
 		return
 	}
+	d.publicRetired = true // 先置位，防并发重复触发
+	d.publicRetireReason = reason
+	pub := d.dhtPublic
+	d.mu.Unlock()
 	if err := pub.Close(); err != nil {
 		d.logf("公共 DHT 关闭失败（忽略）: %v", err)
 	}
@@ -468,7 +592,7 @@ func (d *Discovery) retirePublicDHT() {
 		}
 		_ = c.Close()
 	}
-	d.logf("已退出公共 DHT（同群发现继续：mDNS + 成员表 + 私有 DHT；彻底失联时重启可重新冷启动）")
+	d.logf("已退出公共 DHT（%s；同群发现继续：mDNS + 成员表 + 私有 DHT，彻底失联时重启可重新冷启动）", reason)
 }
 
 // addMember 记录成员并异步建连（连通后经 info 协议确认同群、拿名称）。
@@ -574,8 +698,8 @@ type infoPayload struct {
 	Name       string   `json:"name"`
 	Group      string   `json:"group"`
 	OS         string   `json:"os"`
-	Version    string   `json:"version,omitempty"`    // 程序版本（P2P 自更新用）
-	Platform   string   `json:"platform,omitempty"`   // GOOS/GOARCH
+	Version    string   `json:"version,omitempty"`     // 程序版本（P2P 自更新用）
+	Platform   string   `json:"platform,omitempty"`    // GOOS/GOARCH
 	OSHostname string   `json:"os_hostname,omitempty"` // 操作系统主机名（0.5.15 起）
 	LocalIPs   []string `json:"local_ips,omitempty"`   // 本机非回环网卡 IP（0.5.15 起）
 }

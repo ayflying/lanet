@@ -31,7 +31,8 @@ go run ./app/agent/cmd/pvn-node -name node-a -key 'private-network'
 | `-console` | `LANET_CONSOLE` | 控制台地址；默认 `127.0.0.1:8900`，`-` 为关闭 |
 | `-console-password` | `LANET_CONSOLE_PASSWORD` | 控制台密码 |
 | `-fw` | `LANET_FW` | `deny-all`、`allow-list`、`allow-all` |
-| `-public-dht` | `LANET_PUBLIC_DHT` | 启用公共 DHT 兜底（v0.5.16 起默认关闭以省流量） |
+| `-public-dht` | `LANET_PUBLIC_DHT` | 启用公共 DHT 临时引导（v0.5.16 起默认关闭以省流量） |
+| `-public-dht-minutes` | `LANET_PUBLIC_DHT_MINUTES` | 公共 DHT 最长运行分钟数（默认 10；连上同群成员或超时即自动退出） |
 | `-tun true/false` | - | 是否启用 TUN；默认读取配置，缺省为 `true` |
 | `-probe` | - | 成员探测间隔 |
 
@@ -44,12 +45,13 @@ go run ./app/agent/cmd/pvn-node -name node-a -key 'private-network'
 {
   "name": "node-a",
   "network_key": "private-network",
-  "bootstrap": "public",
+  "bootstrap": "none",
   "console": "127.0.0.1:8900",
   "console_password": "",
   "firewall": "allow-all",
   "listen": "",
-  "no_public_dht": false,
+  "enable_public_dht": false,
+  "public_dht_minutes": 10,
   "probe_seconds": 20,
   "tun": true,
   "github_token": ""

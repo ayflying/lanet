@@ -3,6 +3,7 @@ package serverless
 import (
 	"context"
 	"crypto/sha256"
+	"strings"
 	"testing"
 	"time"
 
@@ -258,6 +259,107 @@ func TestDefaultNoPublicFallback(t *testing.T) {
 			t.Fatalf("关闭兜底后公共引导地址应从引导列表剔除")
 		}
 	}
+}
+
+// TestPublicDHTTimeoutExpired 公共 DHT 临时引导超时：开启兜底但始终没有
+// 同群成员，到 PublicDHTTimeout 后必须自动退出（reason 标注超时）——
+// 防止开关忘关导致公共 DHT 长期挂载。离线可跑（不依赖任何引导节点）。
+func TestPublicDHTTimeoutExpired(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	h := testHost(t, false)
+	d, err := New(ctx, h, Config{
+		NetworkKey:           "timeout-test",
+		EnablePublicFallback: true,
+		PublicDHTTimeout:     1 * time.Second,
+		Interval:             500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new discovery: %v", err)
+	}
+	if err = d.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if st := d.PublicDHTState(); !st.Active {
+		t.Fatalf("启动后公共 DHT 应处于运行中，实际 %+v", st)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		st := d.PublicDHTState()
+		if st.Retired && !st.Active {
+			if !strings.Contains(st.Reason, "超时") {
+				t.Fatalf("退出原因应标注超时，实际 %q", st.Reason)
+			}
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("超时后公共 DHT 未自动退出：state=%+v", d.PublicDHTState())
+}
+
+// TestPublicDHTRuntimeToggle 运行时开关（控制台「启用公共 DHT 临时引导」）：
+// 启动时未开启 → 运行时可主动开启并进入 Active；手动关闭 → Retired 且原因
+// 标注手动；再次开启 → 复位为 Active；随后超时仍会自动退出。验证控制台
+// 开关「点击即时生效 + 自动退出后状态同步」的底层行为。离线可跑。
+func TestPublicDHTRuntimeToggle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	h := testHost(t, false)
+	d, err := New(ctx, h, Config{
+		NetworkKey:       "runtime-toggle",
+		PublicDHTTimeout: 1 * time.Second,
+		Interval:         500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new discovery: %v", err)
+	}
+	if err = d.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if st := d.PublicDHTState(); st.Active {
+		t.Fatalf("未开启兜底时不应有公共 DHT，实际 %+v", st)
+	}
+
+	// 运行时开启
+	if err := d.EnablePublicDHTRuntime(ctx); err != nil {
+		t.Fatalf("enable runtime: %v", err)
+	}
+	if st := d.PublicDHTState(); !st.Active || st.Retired {
+		t.Fatalf("运行时开启后应为 Active 且未 Retired，实际 %+v", st)
+	}
+
+	// 手动关闭
+	d.DisablePublicDHTRuntime("手动关闭（控制台开关）")
+	st := d.PublicDHTState()
+	if st.Active || !st.Retired {
+		t.Fatalf("手动关闭后应为已退出，实际 %+v", st)
+	}
+	if !strings.Contains(st.Reason, "手动") {
+		t.Fatalf("退出原因应标注手动，实际 %q", st.Reason)
+	}
+
+	// 再次开启：复位
+	if err := d.EnablePublicDHTRuntime(ctx); err != nil {
+		t.Fatalf("re-enable runtime: %v", err)
+	}
+	if st := d.PublicDHTState(); !st.Active || st.Retired || st.Reason != "" {
+		t.Fatalf("重新开启后应复位为 Active，实际 %+v", st)
+	}
+
+	// 重开后超时仍应自动退出
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := d.PublicDHTState(); s.Retired && !s.Active {
+			if !strings.Contains(s.Reason, "超时") {
+				t.Fatalf("重开后退出原因应标注超时，实际 %q", s.Reason)
+			}
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("重开后超时未自动退出：state=%+v", d.PublicDHTState())
 }
 
 // TestPublicNetworkAutoRetire 密钥留空（默认公共网络密钥）端到端：

@@ -101,8 +101,11 @@ TUN 虚拟 IP 可达，虚拟 IP 上的端口没有进程监听，群内成员�
 ./lanet.exe -name pc1 -key "our-network-key"
 ./lanet.exe -name pc2 -key "our-network-key"
 
-# 公共 DHT 兜底默认关闭（0.5.16 起），以下等效：
-./lanet.exe -name pc3 -key "our-network-key" -bootstrap none
+# 跨网冷启动：填成员连接种子（推荐，纯私有零公共流量）
+./lanet.exe -name pc3 -key "our-network-key" -bootstrap "<成员连接种子 multiaddr>"
+
+# 或临时开启公共 DHT 引导（最长 10 分钟后自动关闭，连上同群成员立即关闭）
+./lanet.exe -name pc4 -key "our-network-key" -public-dht -public-dht-minutes 10
 
 # 临时关闭 TUN，仅使用 SDK 流/端口转发能力
 ./lanet.exe -tun false
@@ -193,16 +196,19 @@ Windows 上这些文件位于 `lanet.exe`/配置文件目录；`node.key` 也随
 - 网络密钥留空 = 默认公共网络密钥（所有留空节点互通，群身份与历史派生一致），
   不适合传输敏感数据。
 - 非空且相同的密钥组成私有网络；密钥经 SHA-256 派生网络标识，不直接广播明文。
-- `bootstrap=none`（默认）不接触任何公共设施；`bootstrap=public` 且开启公共
-  兜底时用公共 DHT 跨网冷启动；指定任意已在网成员的完整 multiaddr 可加快
-  私有网络冷启动。
-- **公共 DHT 兜底默认关闭（0.5.16 起）**：`enable_public_dht=true` 或
-  `-public-dht` 显式开启。关闭时跨网必须有可达种子。
-- **自动退出公共 DHT（0.5.14 起）**：即使开启兜底，公共 DHT 也只用于冷启动
-  找「第一个自己人」，一旦私有 DHT 路由表有了同群成员就自动退出（关闭流处理
-  并断开公网 DHT 连接）。背景：公共 DHT 是全公网共享的，作为 server 节点要
-  应答全网随机查询，实测空载上行约 4~5MB/分钟（峰值连接上千公网节点）；
-  找到自己人后这笔流量完全可以省掉。
+- **入网方式（三选一）**：① 同一局域网 mDNS 自动发现；② 把已在网成员的
+  **连接种子**（multiaddr，控制台「成员」页可一键复制）填到 `bootstrap`
+  （`-bootstrap`）——纯私有、零公共流量、确定可达，**推荐**；③ 临时开启
+  公共 DHT 引导完成跨网零配置冷启动。
+- **公共 DHT 默认关闭（0.5.16 起）**：`enable_public_dht=true` 或 `-public-dht`
+  显式开启。关闭时跨网必须有可达种子（方式 ②）。
+- **公共 DHT 临时引导（0.5.18 起）**：即使开启，公共 DHT 也是「限时介绍人」——
+  连上第一个同群成员立即自动退出；到时限（`-public-dht-minutes`，
+  配置项 `public_dht_minutes`，默认 **10 分钟**）仍未连上也自动退出。
+  控制台「节点配置」里的开关**实时反映运行状态**：自动退出后开关自动变灰，
+  重新勾选可即时再开（无需重启）。背景：公共 DHT 是全公网共享的，作为
+  server 节点要应答全网随机查询，实测空载上行约 4~5MB/分钟（峰值连接上千
+  公网节点），找到自己人后这笔流量完全可以省掉。
 
 官方发行版固定为 `official` 渠道，Go SDK 默认是 `sdk` 渠道。即使网络密钥相同，
 两个渠道也不会互相发现；Go SDK 只有显式设置 `Channel: lanet.ChannelOfficial`

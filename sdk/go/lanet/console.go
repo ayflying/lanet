@@ -96,6 +96,7 @@ func (c *Client) startConsole() error {
 	mux.HandleFunc("GET /api/member-info", c.apiMemberInfo)
 	mux.HandleFunc("PUT /api/firewall", c.apiSetFirewall)
 	mux.HandleFunc("PUT /api/forwards", c.apiSetForwards)
+	mux.HandleFunc("POST /api/public-dht", c.apiSetPublicDHT)
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		if logo, err := consoleFS.ReadFile("console/logo.png"); err == nil {
@@ -266,13 +267,36 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		}
 		return members[i].VirtualIP < members[j].VirtualIP
 	})
+	// 公共 DHT 临时引导状态 + 连接种子（Standalone 专用；常规模式为零值）。
+	pubState, hasPub := c.PublicDHTStatus()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"info":     c.Info(),
-		"members":  members,
-		"mode":     mode,
-		"rules":    rules,
-		"forwards": forwards,
+		"info":                  c.Info(),
+		"members":               members,
+		"mode":                  mode,
+		"rules":                 rules,
+		"forwards":              forwards,
+		"public_dht":            pubState,
+		"has_public_dht_config": hasPub,
+		"seed_addrs":            c.SeedAddrs(),
 	})
+}
+
+// apiSetPublicDHT 运行时开关公共 DHT 临时引导（控制台开关，立即生效）。
+// 不改动配置文件：下次启动是否自动开启由节点配置的 enable_public_dht 决定。
+func (c *Client) apiSetPublicDHT(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enable *bool `json:"enable"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Enable == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体需包含 enable 布尔值"})
+		return
+	}
+	if err := c.SetPublicDHT(*req.Enable); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	st, _ := c.PublicDHTStatus()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "public_dht": st})
 }
 
 // apiSetFirewall 热更新防火墙（模式 + 规则）。
@@ -359,9 +383,9 @@ func (c *Client) saveState() {
 
 // localIPView 本机网卡 IP 信息（详情弹框用）。
 type localIPView struct {
-	Iface string `json:"iface"` // 网卡名
-	IP    string `json:"ip"`    // IP 地址（含掩码位数）
-	Type  string `json:"type"`  // v4 / v6
+	Iface string `json:"iface"`         // 网卡名
+	IP    string `json:"ip"`            // IP 地址（含掩码位数）
+	Type  string `json:"type"`          // v4 / v6
 	MAC   string `json:"mac,omitempty"` // 物理网卡附带的 MAC
 }
 
@@ -406,16 +430,16 @@ func (c *Client) apiLocalInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"hostname":    hostname,
-		"os":          c.cfg.OS,
-		"platform":    c.platform(),
-		"go_version":  runtime.Version(),
-		"version":     c.cfg.Version,
-		"node_name":   c.cfg.Name,
-		"virtual_ip":  c.myIP,
+		"hostname":     hostname,
+		"os":           c.cfg.OS,
+		"platform":     c.platform(),
+		"go_version":   runtime.Version(),
+		"version":      c.cfg.Version,
+		"node_name":    c.cfg.Name,
+		"virtual_ip":   c.myIP,
 		"virtual_host": c.selfHostname(),
-		"peer_id":     c.peerID,
-		"ips":         ips,
+		"peer_id":      c.peerID,
+		"ips":          ips,
 	})
 }
 
@@ -441,15 +465,15 @@ func (c *Client) apiMemberInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	m := *found
 	writeJSON(w, http.StatusOK, map[string]any{
-		"peer_id":     m.PeerID,
-		"node_name":   m.Name,
-		"virtual_ip":  m.VirtualIP,
+		"peer_id":      m.PeerID,
+		"node_name":    m.Name,
+		"virtual_ip":   m.VirtualIP,
 		"virtual_host": m.Hostname,
-		"os":          m.OS,
-		"platform":    m.Platform,
-		"version":     m.Version,
-		"os_hostname": m.OSHostname,
-		"local_ips":   m.LocalIPs,
+		"os":           m.OS,
+		"platform":     m.Platform,
+		"version":      m.Version,
+		"os_hostname":  m.OSHostname,
+		"local_ips":    m.LocalIPs,
 	})
 }
 

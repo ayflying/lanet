@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -65,6 +66,8 @@ func main() {
 		publicDHT = flag.Bool("public-dht",
 			envOr("LANET_PUBLIC_DHT", "") == "1" || strings.EqualFold(envOr("LANET_PUBLIC_DHT", ""), "true"),
 			"启用公共 DHT 兜底（默认关闭：省流量，跨网冷启动需成员引导种子）")
+		publicDHTMin = flag.Int("public-dht-minutes", atoiOr(envOr("LANET_PUBLIC_DHT_MINUTES", ""), 0),
+			"公共 DHT 临时引导最长运行分钟数（默认 10；连上同群成员立即退出，超时未连上也退出）")
 		probe = flag.Duration("probe", 0, "成员探测间隔；不传则读配置文件（默认 20s）")
 	)
 	// ---- 开机自启路径识别：注册表 Run 键带 -autorun 参数拉起 ----
@@ -130,6 +133,15 @@ func main() {
 		effTun = strings.EqualFold(*tun, "true") || *tun == "1"
 	}
 	effPublic := *publicDHT || nc.EnablePublicDHT
+	// 公共 DHT 临时引导时长（分钟）：命令行/环境变量 > 配置文件 > 默认 10。
+	// 未显式开启公共 DHT 时该值仍保存，下次开启即用。
+	effPublicMin := *publicDHTMin
+	if effPublicMin <= 0 {
+		effPublicMin = nc.PublicDHTMinutes
+	}
+	if effPublicMin <= 0 {
+		effPublicMin = 10
+	}
 	// .lanet DNS 强制开启（无开关）：内置 DNS + Windows NRPT 是基础能力，
 	// 关闭只会造成「同版本下有的机器能 ping .lanet 有的不能」的困惑。
 	effProbe := *probe
@@ -146,18 +158,19 @@ func main() {
 	// P2P 自动更新强制开启：签名信任锚保证安全，无需用户决策。
 	// 仅 dev 构建与容器环境自动禁用（见 StartP2PUpdate 返回值）。
 	eff := nodeRuntime{
-		Name:        effName,
-		NetworkKey:  effKey,
-		Console:     effConsole,
-		Listen:      effListen,
-		Firewall:    effFW,
-		EnablePublicDHT: effPublic,
-		Tun:         effTun,
+		Name:             effName,
+		NetworkKey:       effKey,
+		Console:          effConsole,
+		Listen:           effListen,
+		Firewall:         effFW,
+		EnablePublicDHT:  effPublic,
+		PublicDHTMinutes: effPublicMin,
+		Tun:              effTun,
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s publicDHT=%v tun=%v version=%s config=%s",
-		effName, effKey, effFW, effConsole, effPublic, effTun, version, *config)
+	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s publicDHT=%v(%dm) tun=%v version=%s config=%s",
+		effName, effKey, effFW, effConsole, effPublic, effPublicMin, effTun, version, *config)
 
 	switch strings.TrimSpace(effBootstrap) {
 	case "", "none":
@@ -188,6 +201,7 @@ func main() {
 		Channel:          lanet.ChannelOfficial, // 官方发行渠道：与第三方 SDK 构建网络隔离
 		Bootstrap:        nc.bootstrapAddrs,
 		EnablePublicDHT:  effPublic,
+		PublicDHTTimeout: time.Duration(effPublicMin) * time.Minute,
 		IdentityFile:     effIdentity,
 		ConsoleAddr:      effConsole,
 		ConsolePassword:  effConsolePW,
@@ -389,6 +403,23 @@ func envOr(k, def string) string {
 	return def
 }
 
+// atoiOr 解析十进制整数，失败或空串时返回 def。
+func atoiOr(s string, def int) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// publicDHTMinutesOr 公共 DHT 时长归一化：≤0（旧配置未设置）一律回落到默认 10 分钟。
+func publicDHTMinutesOr(v int) int {
+	if v <= 0 {
+		return 10
+	}
+	return v
+}
+
 // tolerantWriter 逐个写出、忽略单个目标错误（io.MultiWriter 遇错即返回，
 // windowsgui 下 stderr 无效会把整个日志写挂）。
 type tolerantWriter struct{ ws []io.Writer }
@@ -456,8 +487,12 @@ type nodeConfig struct {
 	Firewall        string `json:"firewall"`
 	Listen          string `json:"listen"`
 	EnablePublicDHT bool   `json:"enable_public_dht"` // 公共 DHT 兜底开关（默认关闭，v0.5.16 起语义反转）
-	ProbeSec        int    `json:"probe_seconds"`
-	Tun             *bool  `json:"tun,omitempty"` // 虚拟网卡 TUN；nil = 默认开启（兼容旧配置文件）
+	// PublicDHTMinutes 公共 DHT 临时引导的最长运行分钟数（默认 10）。
+	// 开启公共 DHT 后：连上第一个同群成员立即退出；超时仍未连上也退出。
+	// 控制台可改，重启生效。
+	PublicDHTMinutes int   `json:"public_dht_minutes,omitempty"`
+	ProbeSec         int   `json:"probe_seconds"`
+	Tun              *bool `json:"tun,omitempty"` // 虚拟网卡 TUN；nil = 默认开启（兼容旧配置文件）
 	// dns 字段已移除：.lanet DNS 强制开启（无开关），旧配置遗留 dns 键被忽略。
 	// self_update 字段已移除：P2P 自动更新强制开启（签名信任锚保证安全）。
 	// 旧配置文件里遗留的 self_update 键会被 json 忽略，无副作用。
@@ -494,13 +529,14 @@ func defaultNodeConfig() *nodeConfig {
 		name = "node"
 	}
 	return &nodeConfig{
-		Name:       name,
-		NetworkKey: "",
-		Bootstrap:  "none",
-		Console:    "127.0.0.1:8900",
-		Firewall:   "allow-all",
-		ProbeSec:   20,
-		Tun:        boolPtr(true),
+		Name:             name,
+		NetworkKey:       "",
+		Bootstrap:        "none",
+		Console:          "127.0.0.1:8900",
+		Firewall:         "allow-all",
+		PublicDHTMinutes: 10,
+		ProbeSec:         20,
+		Tun:              boolPtr(true),
 	}
 }
 
@@ -523,13 +559,14 @@ func (nc *nodeConfig) save(path string) error {
 // nodeRuntime 当前进程实际生效的运行参数。可能来自命令行/环境变量，
 // 与 lanet.json 保存值不一致（配置页据此提示「重启后才切换」）。
 type nodeRuntime struct {
-	Name            string
-	NetworkKey      string
-	Console         string
-	Listen          string
-	Firewall        string
-	EnablePublicDHT bool
-	Tun             bool
+	Name             string
+	NetworkKey       string
+	Console          string
+	Listen           string
+	Firewall         string
+	EnablePublicDHT  bool
+	PublicDHTMinutes int
+	Tun              bool
 }
 
 // networkID 运行时网络标识（与 SDK/控制台页眉一致）：standalone- + 群组指纹。
@@ -553,39 +590,58 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 			nc := read()
 			tunOn := nc.Tun == nil || *nc.Tun
 			writeJSONLocal(w, http.StatusOK, map[string]any{
-				"config_path":   path,
-				"name":          nc.Name,
-				"network_key":   nc.NetworkKey,
-				"bootstrap":     nc.Bootstrap,
-				"console":       nc.Console,
-				"has_password":  nc.ConsolePassword != "",
-				"firewall":      nc.Firewall,
-				"listen":        nc.Listen,
-				"no_public_dht":     true, // 兼容旧前端字段，恒 true（v0.5.16 起默认关闭公共 DHT）
-				"enable_public_dht": nc.EnablePublicDHT,
-				"probe_seconds":     nc.ProbeSec,
-				"tun":               tunOn,
-				"autorun":           isAutorunEnabled(),
-				"autorun_supported": autorunSupported(),
+				"config_path":        path,
+				"name":               nc.Name,
+				"network_key":        nc.NetworkKey,
+				"bootstrap":          nc.Bootstrap,
+				"console":            nc.Console,
+				"has_password":       nc.ConsolePassword != "",
+				"firewall":           nc.Firewall,
+				"listen":             nc.Listen,
+				"no_public_dht":      true, // 兼容旧前端字段，恒 true（v0.5.16 起默认关闭公共 DHT）
+				"enable_public_dht":  nc.EnablePublicDHT,
+				"public_dht_minutes": publicDHTMinutesOr(nc.PublicDHTMinutes),
+				"probe_seconds":      nc.ProbeSec,
+				"tun":                tunOn,
+				"autorun":            isAutorunEnabled(),
+				"autorun_supported":  autorunSupported(),
 				"runtime": map[string]any{
-					"name":              eff.Name,
-					"network_key":       eff.NetworkKey,
-					"network_id":        networkID(eff.NetworkKey),
-					"network_text":      networkLabel(eff.NetworkKey),
-					"console":           eff.Console,
-					"listen":            eff.Listen,
-					"firewall":          eff.Firewall,
-					"enable_public_dht": eff.EnablePublicDHT,
-					"tun":               eff.Tun,
+					"name":               eff.Name,
+					"network_key":        eff.NetworkKey,
+					"network_id":         networkID(eff.NetworkKey),
+					"network_text":       networkLabel(eff.NetworkKey),
+					"console":            eff.Console,
+					"listen":             eff.Listen,
+					"firewall":           eff.Firewall,
+					"enable_public_dht":  eff.EnablePublicDHT,
+					"public_dht_minutes": eff.PublicDHTMinutes,
+					"tun":                eff.Tun,
 				},
 			})
 		},
 		"PUT /api/node-config": func(w http.ResponseWriter, r *http.Request) {
 			var req struct {
 				nodeConfig
+				// PartialPublicDHT 标记「仅更新公共 DHT 开关及时长」的轻量请求
+				// （控制台开关点击时调用：运行时已即时生效，这里只持久化配置意图）。
+				PartialPublicDHT *bool `json:"partial_public_dht"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				writeJSONLocal(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
+				return
+			}
+			// 仅公共 DHT 开关的轻量持久化（不改动其它字段，不触发重启校验）。
+			if req.PartialPublicDHT != nil && req.Name == "" && req.Console == "" {
+				cur := read()
+				cur.EnablePublicDHT = *req.PartialPublicDHT
+				if req.PublicDHTMinutes > 0 {
+					cur.PublicDHTMinutes = req.PublicDHTMinutes
+				}
+				if err := cur.save(path); err != nil {
+					writeJSONLocal(w, http.StatusInternalServerError, map[string]string{"error": "保存失败: " + err.Error()})
+					return
+				}
+				writeJSONLocal(w, http.StatusOK, map[string]any{"saved": true, "restart_required": false})
 				return
 			}
 			// autorun-only 请求（自启复选框即时切换）：只带 autorun 字段，
@@ -621,6 +677,11 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 			}
 			if req.ProbeSec < 0 {
 				req.ProbeSec = 20
+			}
+			// 公共 DHT 时长：≤0 视为页面未提供（旧版控制台），保留原值/默认 10。
+			if req.PublicDHTMinutes <= 0 {
+				prev := read()
+				req.PublicDHTMinutes = publicDHTMinutesOr(prev.PublicDHTMinutes)
 			}
 			prev := read()
 			if req.Tun == nil {

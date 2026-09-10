@@ -37,8 +37,9 @@ DHT 自动发现，优先打洞直连，失败时经网络内可达成员的 Cir
   -config            配置文件路径
   -name              节点名称
   -key               网络密钥
-  -bootstrap         public / none / 成员 multiaddr
-  -public-dht        启用公共 DHT 兜底（默认关闭以省流量）
+  -bootstrap         none / 成员连接种子 multiaddr（推荐，纯私有无公共流量）
+  -public-dht        启用公共 DHT 临时引导（默认关闭以省流量）
+  -public-dht-minutes 公共 DHT 最长运行分钟数（默认 10，连上同群成员或超时自动退出）
   -listen            逗号分隔的 libp2p 监听地址
   -console           控制台地址，传 - 关闭
   -console-password  控制台密码

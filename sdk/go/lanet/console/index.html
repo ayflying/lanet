@@ -146,6 +146,17 @@
       <button class="ghost" id="mNext" onclick="mPage++;renderMembers()">下一页</button>
     </div>
   </div>
+  <div class="card" id="seedCard" style="display:none">
+    <h2>连接种子 <span class="tag unknown">不经公共 DHT 直连入网</span></h2>
+    <div class="sub" style="margin-bottom:8px">把「我的连接种子」发给同群成员，对方粘贴到「节点配置 → 连接种子」并重启，双方即可不经任何公共 DHT 直接入网——之后互相发现全部走私有 DHT。这是省流量且确定可达的入网方式（配合一台固定公网 IP 的节点最理想）。</div>
+    <div class="kv"><b>我的连接种子</b>
+      <div class="row" style="margin:0">
+        <input type="text" id="seedMine" readonly placeholder="加载中…">
+        <button class="ghost" onclick="copyText($('seedMine').value, this)">复制</button>
+      </div>
+    </div>
+    <div class="sub" style="color:#8a94a6">家庭宽带公网地址变化后，旧种子会失效，需重新复制分享。</div>
+  </div>
 </div>
 
 <div class="panel" id="pFirewall">
@@ -203,11 +214,17 @@
     <div class="kv"><b>控制台</b><input type="text" id="cConsole" placeholder="127.0.0.1:8900 = 仅本机，0.0.0.0:8900 = 允许远程，- = 关闭"></div>
     <div class="kv"><b>控制台密码</b><input type="password" id="cPassword" placeholder="未设置；远程访问时务必设置"></div>
     <div class="kv"><b>监听地址</b><input type="text" id="cListen" placeholder="留空 = tcp/ws/quic 随机端口"></div>
-    <div class="row" style="margin-top:10px">
+    <div class="kv"><b>连接种子</b><input type="text" id="cBootstrap" placeholder="已在网成员的连接种子（多行 / 逗号分隔）；留空或 none = 仅私有 DHT + mDNS"></div>
+    <div class="row" style="margin-top:10px;flex-wrap:wrap;gap:12px;align-items:center">
       <label style="display:flex;gap:6px;align-items:center">
-        <input type="checkbox" id="cEnablePublic"> 启用公共 DHT 兜底（默认关闭以省流量；开启后跨网可零配置冷启动，找到同群成员即自动退出）
+        <input type="checkbox" id="cEnablePublic" onchange="togglePublicDHT()"> 启用公共 DHT 临时引导
       </label>
+      <span style="display:flex;gap:4px;align-items:center;font-size:12px">最长
+        <input type="number" id="cPublicMin" min="1" max="1440" style="width:66px"> 分钟后自动关闭
+      </span>
+      <span id="cPublicState" class="tag unknown">未启用</span>
     </div>
+    <div class="sub" style="margin:2px 0 0">公共 DHT 默认关闭。开启后仅用于跨网冷启动找「自己人」：连上同群成员立即自动退出；到时限仍未连上也自动退出。<b>上方开关实时反映运行状态</b>，退出后自动变灰。</div>
     <div class="row">
       <label style="display:flex;gap:6px;align-items:center">
         <input type="checkbox" id="cTun"> 虚拟网卡 TUN（IP 层互通：ping / 任意端口直达虚拟 IP，需管理员权限运行）
@@ -243,6 +260,84 @@ async function loadState() {
   $('bRules').textContent = S.rules.length;
   $('bForwards').textContent = S.forwards.length;
   renderRules(); renderForwards();
+  renderSeed(); renderPublicDHT();
+}
+
+// ---- 连接种子：本机可分享的 multiaddr（不依赖公共 DHT 的入网凭据） ----
+function renderSeed() {
+  const card = $('seedCard');
+  const addrs = S && S.seed_addrs || [];
+  if (!S || !S.has_public_dht_config) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  $('seedMine').value = addrs.length ? addrs.join('\n') : '';
+  $('seedMine').placeholder = addrs.length
+    ? ''
+    : '暂无可用地址（节点可能只绑定了回环地址，或尚未就绪）';
+}
+
+// ---- 公共 DHT 临时引导状态：实时反映运行情况，退出后开关自动变灰 ----
+let cfgPublicDHT = false;   // 配置意图（下次启动是否自动开启），仅在用户点击开关时更新
+let pubTouchedAt = 0;       // 最近一次用户点击开关的时刻（毫秒）
+function fmtMMSS(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m + ':' + String(s).padStart(2, '0');
+}
+function renderPublicDHT() {
+  const st = S && S.public_dht;
+  const badge = $('cPublicState');
+  if (!st || (!st.enabled && !st.active && !st.retired)) {
+    badge.textContent = '未启用';
+    badge.className = 'tag unknown';
+    if (Date.now() - pubTouchedAt > 3000) $('cEnablePublic').checked = false;
+    return;
+  }
+  if (st.active) {
+    let remain = '';
+    if (st.started_at && st.timeout_seconds) {
+      // Go 的 RFC3339 带 7 位小数纳秒，JS 只认到毫秒，截断后解析更稳。
+      const iso = String(st.started_at).replace(/(\.\d{3})\d+/, '$1');
+      const end = new Date(iso).getTime() + st.timeout_seconds * 1000;
+      if (!isNaN(end)) remain = ' · 剩余 ' + fmtMMSS((end - Date.now()) / 1000);
+    }
+    badge.textContent = '运行中' + remain;
+    badge.className = 'tag online';
+    if (Date.now() - pubTouchedAt > 3000) $('cEnablePublic').checked = true;
+    return;
+  }
+  // 已退出（连上同群成员 / 超时 / 手动关闭）
+  badge.textContent = '已退出' + (st.reason ? '（' + st.reason + '）' : '');
+  badge.className = 'tag offline';
+  if (Date.now() - pubTouchedAt > 3000) $('cEnablePublic').checked = false;
+}
+
+// togglePublicDHT 用户点击「启用公共 DHT 临时引导」：立即生效（无需重启）。
+// 同时记录配置意图，供「保存节点配置」写入 lanet.json（决定下次启动是否自动开启）。
+async function togglePublicDHT() {
+  const on = $('cEnablePublic').checked;
+  const mins = parseInt($('cPublicMin').value, 10) || 10;
+  cfgPublicDHT = on;
+  pubTouchedAt = Date.now();
+  try {
+    // ① 运行时即时生效（无需重启）
+    const r = await fetch('/api/public-dht', { method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ enable: on }) });
+    const res = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      $('cEnablePublic').checked = !on;
+      cfgPublicDHT = !on;
+      flash('cfgMsg', '公共 DHT 切换失败' + (res.error ? '：' + res.error : ''), false);
+      return;
+    }
+    // ② 持久化配置意图（下次启动据此自动开启；宿主未注册节点配置接口时忽略）
+    fetch('/api/node-config', { method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ partial_public_dht: on, enable_public_dht: on, public_dht_minutes: mins })
+    }).catch(() => {});
+    flash('cfgMsg', on ? '已开启公共 DHT 临时引导（连上同群成员或超时后自动退出）' : '已关闭公共 DHT', true);
+  } finally {
+    loadState();
+  }
 }
 
 // ---- 成员列表：后端已按「在线在前 + 最后活跃倒序」稳定排序，这里做筛选/搜索/分页 ----
@@ -395,7 +490,12 @@ async function loadNodeConfig() {
     $('cPassword').value = '';
     $('cPassword').placeholder = c.has_password ? '已设置（输入新值可覆盖）' : '未设置；远程访问时务必设置';
     $('cListen').value = c.listen || '';
-    $('cEnablePublic').checked = !!c.enable_public_dht;
+    $('cBootstrap').value = (c.bootstrap && c.bootstrap !== 'none') ? c.bootstrap : '';
+    $('cPublicMin').value = c.public_dht_minutes || 10;
+    // 开关本身由 loadState 持续同步为「实时运行状态」；这里只记录配置意图，
+    // 保存时以配置意图为准（避免自动退出后保存把配置误写为关闭）。
+    cfgPublicDHT = !!c.enable_public_dht;
+    $('cEnablePublic').checked = cfgPublicDHT;
     $('cTun').checked = c.tun === undefined ? true : !!c.tun;
     if (c.autorun_supported) {
       $('cAutorunRow').style.display = '';
@@ -424,7 +524,9 @@ async function saveNodeConfig() {
     console: $('cConsole').value.trim(),
     console_password: $('cPassword').value,
     listen: $('cListen').value.trim(),
-    enable_public_dht: $('cEnablePublic').checked,
+    bootstrap: ($('cBootstrap').value.trim() || 'none'),
+    enable_public_dht: cfgPublicDHT,
+    public_dht_minutes: parseInt($('cPublicMin').value, 10) || 10,
     tun: $('cTun').checked,
     autorun: $('cAutorunRow').style.display !== 'none' ? $('cAutorun').checked : undefined,
   };
