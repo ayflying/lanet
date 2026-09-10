@@ -236,7 +236,7 @@
       </span>
       <span id="cPublicState" class="tag unknown">未启用</span>
     </div>
-    <div class="sub" style="margin:2px 0 0">公共 DHT 默认关闭。开启后仅用于跨网冷启动找「自己人」：连上同群成员立即自动退出；到时限仍未连上也自动退出。<b>上方开关实时反映运行状态</b>，退出后自动变灰。</div>
+    <div class="sub" style="margin:2px 0 0">公共 DHT 默认关闭。开启后仅用于跨网冷启动找「自己人」：连上同群成员立即自动退出；到时限仍未连上也自动退出。开关表示配置意图（保存后下次启动自动开启），右侧徽标显示本轮实际运行状态——两者独立，进程自动退出不会改动开关。</div>
     <div class="row">
       <label style="display:flex;gap:6px;align-items:center">
         <input type="checkbox" id="cTun"> 虚拟网卡 TUN（IP 层互通：ping / 任意端口直达虚拟 IP，需管理员权限运行）
@@ -316,22 +316,31 @@ function renderSeed() {
     : '暂无可用地址（节点可能只绑定了回环地址，或尚未就绪）';
 }
 
-// ---- 公共 DHT 临时引导状态：实时反映运行情况，退出后开关自动变灰 ----
-let cfgPublicDHT = false;   // 配置意图（下次启动是否自动开启），仅在用户点击开关时更新
-let pubTouchedAt = 0;       // 最近一次用户点击开关的时刻（毫秒）
+// ---- 公共 DHT 临时引导状态：徽标显示「实时运行状态」，复选框只表示「配置意图」 ----
+// 关键语义分离（修复复选框与运行状态打架的问题）：
+//   复选框 = 配置意图 cfgPublicDHT（是否在保存后、下次启动自动开启），
+//            只在用户点击开关时改变，不被运行时状态回写；
+//   徽标   = 本轮进程的真实运行状态（运行中 / 已退出 / 待运行 / 未启用）。
+// 此前「已退出」会把复选框取消勾选，导致「进程已退出但配置仍是开启」的状态
+// 被无声改写，且 3 秒保护窗口还会让同步时而失效——两者都不该发生。
+let cfgPublicDHT = false;   // 配置意图（下次启动是否自动开启），仅由配置读取/用户点击更新
 function fmtMMSS(sec) {
   sec = Math.max(0, Math.round(sec));
   const m = Math.floor(sec / 60), s = sec % 60;
   return m + ':' + String(s).padStart(2, '0');
 }
+// setPublicBox 同步复选框到「配置意图」——只有配置变化时才调用。
+function setPublicBox(v) {
+  cfgPublicDHT = !!v;
+  const el = $('cEnablePublic');
+  if (el) el.checked = cfgPublicDHT;
+}
 function renderPublicDHT() {
   const st = S && S.public_dht;
   const badge = $('cPublicState');
-  const syncBox = v => { if (Date.now() - pubTouchedAt > 3000) $('cEnablePublic').checked = v; };
   if (!st || (!st.enabled && !st.active && !st.retired)) {
     badge.textContent = '未启用';
     badge.className = 'tag unknown';
-    syncBox(false);
     return;
   }
   if (st.active) {
@@ -344,16 +353,14 @@ function renderPublicDHT() {
     }
     badge.textContent = '运行中' + remain;
     badge.className = 'tag online';
-    syncBox(true);
     return;
   }
   if (st.retired) {
-    badge.textContent = '已退出' + (st.reason ? '（' + st.reason + '）' : '');
+    badge.textContent = '本轮已退出' + (st.reason ? '（' + st.reason + '）' : '');
     badge.className = 'tag offline';
-    syncBox(false);
     return;
   }
-  // 配置已开启但本次尚未建立（启动中 / 刚重新开启的短暂窗口）：不改开关状态。
+  // 配置已开启但本次尚未建立（启动中 / 刚重新开启的短暂窗口）。
   badge.textContent = st.enabled ? '待运行' : '未启用';
   badge.className = 'tag unknown';
 }
@@ -364,15 +371,13 @@ async function togglePublicDHT() {
   const on = $('cEnablePublic').checked;
   const mins = parseInt($('cPublicMin').value, 10) || 10;
   cfgPublicDHT = on;
-  pubTouchedAt = Date.now();
   try {
     // ① 运行时即时生效（无需重启）
     const r = await fetch('/api/public-dht', { method: 'POST',
       headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ enable: on }) });
     const res = await r.json().catch(() => ({}));
     if (!r.ok) {
-      $('cEnablePublic').checked = !on;
-      cfgPublicDHT = !on;
+      setPublicBox(!on);
       flash('cfgMsg', '公共 DHT 切换失败' + (res.error ? '：' + res.error : ''), false);
       return;
     }
@@ -539,10 +544,9 @@ async function loadNodeConfig() {
     $('cListen').value = c.listen || '';
     $('cBootstrap').value = (c.bootstrap && c.bootstrap !== 'none') ? c.bootstrap : '';
     $('cPublicMin').value = c.public_dht_minutes || 10;
-    // 开关本身由 loadState 持续同步为「实时运行状态」；这里只记录配置意图，
-    // 保存时以配置意图为准（避免自动退出后保存把配置误写为关闭）。
-    cfgPublicDHT = !!c.enable_public_dht;
-    $('cEnablePublic').checked = cfgPublicDHT;
+    // 复选框 = 配置意图（下次启动是否自动开启），与运行时状态解耦：
+    // 运行中/已退出只影响徽标，不再回写复选框。
+    setPublicBox(!!c.enable_public_dht);
     $('cTun').checked = c.tun === undefined ? true : !!c.tun;
     if (c.autorun_supported) {
       $('cAutorunRow').style.display = '';

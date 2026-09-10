@@ -63,9 +63,11 @@ func main() {
 			"覆盖监听地址（逗号分隔）；默认 tcp/ws/quic 全部随机端口")
 		tun = flag.String("tun", "@@unset@@",
 			"虚拟网卡 TUN（IP 层互通：ping/任意端口直达虚拟 IP）；true/false，缺省读配置文件（默认 true）")
-		publicDHT = flag.Bool("public-dht",
-			envOr("LANET_PUBLIC_DHT", "") == "1" || strings.EqualFold(envOr("LANET_PUBLIC_DHT", ""), "true"),
-			"启用公共 DHT 兜底（默认关闭：省流量，跨网冷启动需成员引导种子）")
+		// 三态哨兵：未传 = 读配置文件；显式传 true/false = 覆盖配置文件。
+		// 不能用 flag.Bool——它的零值 false 无法区分「用户显式传了 false」
+		// 与「用户根本没传」，会让配置文件里的 true 被无声忽略。
+		publicDHT = flag.String("public-dht", envOr("LANET_PUBLIC_DHT", "@@unset@@"),
+			"启用公共 DHT 临时引导（true/false）；不传则读配置文件（默认关闭：省流量，跨网冷启动需成员引导种子）")
 		publicDHTMin = flag.Int("public-dht-minutes", atoiOr(envOr("LANET_PUBLIC_DHT_MINUTES", ""), 0),
 			"公共 DHT 临时引导最长运行分钟数（默认 10；连上同群成员立即退出，超时未连上也退出）")
 		probe = flag.Duration("probe", 0, "成员探测间隔；不传则读配置文件（默认 20s）")
@@ -132,7 +134,10 @@ func main() {
 	if *tun != "@@unset@@" {
 		effTun = strings.EqualFold(*tun, "true") || *tun == "1"
 	}
-	effPublic := *publicDHT || nc.EnablePublicDHT
+	// 公共 DHT 开关优先级：显式命令行/环境变量 > 配置文件 > 默认关闭。
+	// 环境变量与命令行共用 "@@unset@@" 哨兵：只有真正传了值才覆盖配置，
+	// 避免「配置文件写 false、命令行没传」时被误判为开启（或反之）。
+	effPublic := resolvePublicDHT(*publicDHT, nc.EnablePublicDHT)
 	// 公共 DHT 临时引导时长（分钟）：命令行/环境变量 > 配置文件 > 默认 10。
 	// 未显式开启公共 DHT 时该值仍保存，下次开启即用。
 	effPublicMin := *publicDHTMin
@@ -317,12 +322,30 @@ func main() {
 		}
 		self := node.Info().VirtualIP
 		for _, m := range members {
-			if m.VirtualIP == self || m.VirtualIP == "" {
+			if !shouldProbe(self, m) {
 				continue
 			}
 			probeOnce(ctx, node, m.Name, m.VirtualIP)
 		}
 	}
+}
+
+// shouldProbe 判断某个成员是否值得做 echo 探测。
+//
+// 跳过两类无意义目标，避免每轮对必然失败的成员反复拨号（刷日志 + 白耗流量）：
+//   - 自己（虚拟 IP 相同）或虚拟 IP 缺失；
+//   - 「幽灵成员」：从未通过 info 协议握手成功（Version 为空）且没有任何
+//     可用 underlay 地址。它们通常只是 DHT/mDNS 里的陈旧记录，对端早已下线。
+//
+// 一旦对端真正上线并完成握手（Version 被填上），会被自动纳入探测。
+func shouldProbe(selfIP string, m netmapclient.Member) bool {
+	if m.VirtualIP == "" || m.VirtualIP == selfIP {
+		return false
+	}
+	if m.Version == "" && len(m.Addrs) == 0 {
+		return false
+	}
+	return true
 }
 
 // probeOnce 对单个成员做一次 echo 往返探测。
@@ -418,6 +441,22 @@ func publicDHTMinutesOr(v int) int {
 		return 10
 	}
 	return v
+}
+
+// resolvePublicDHT 解析公共 DHT 开关的最终生效值。
+//
+// flagVal 为命令行/环境变量的原始字符串，约定 "@@unset@@" 表示「本次未传」：
+//   - 未传 → 采用配置文件的值（cfgVal）；
+//   - 传了 → 用显式值覆盖配置（"1"/"true"（忽略大小写）为真，其余为假）。
+//
+// 这一点必须用哨兵而非 flag.Bool：flag.Bool 的零值 false 无法区分
+// 「用户显式传了 false」与「用户根本没传」，会让配置文件里的 true
+// 被无声忽略（历史 bug：`-public-dht` 曾是无条件 OR，传什么都会开启）。
+func resolvePublicDHT(flagVal string, cfgVal bool) bool {
+	if flagVal == "@@unset@@" {
+		return cfgVal
+	}
+	return flagVal == "1" || strings.EqualFold(flagVal, "true")
 }
 
 // tolerantWriter 逐个写出、忽略单个目标错误（io.MultiWriter 遇错即返回，
