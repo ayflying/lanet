@@ -50,7 +50,8 @@ func main() {
 		name = flag.String("name", envOr("LANET_NAME", ""),
 			"节点名称（成员表中的虚拟域名）；不传则读配置文件，再退回主机名")
 		key = flag.String("key", envOr("LANET_NETWORK_KEY", "@@unset@@"),
-			"网络密钥（留空 = 公共网络）；不传则读配置文件")
+			"网络密钥：留空 = 按本机身份派生的专属默认网络（开箱即用但默认不与他人同网）；"+
+				"填相同值才能与对方互通；不传则读配置文件")
 		bootstrap = flag.String("bootstrap", envOr("LANET_BOOTSTRAP", ""),
 			"引导节点：public = 公共 DHT / none = 仅 mDNS / 成员 multiaddr；不传则读配置文件")
 		console = flag.String("console", envOr("LANET_CONSOLE", ""),
@@ -70,6 +71,13 @@ func main() {
 			"启用公共 DHT 临时引导（true/false）；不传则读配置文件（默认关闭：省流量，跨网冷启动需成员引导种子）")
 		publicDHTMin = flag.Int("public-dht-minutes", atoiOr(envOr("LANET_PUBLIC_DHT_MINUTES", ""), 0),
 			"公共 DHT 临时引导最长运行分钟数（默认 10；连上同群成员立即退出，超时未连上也退出）")
+		autoAccept = flag.String("auto-accept", envOr("LANET_AUTO_ACCEPT", "@@unset@@"),
+			"自动同意所有连接申请（true/false，默认 false）：无人值守中央服务器用；"+
+				"开启后陌生节点无需人工审批即可互连（等于放弃加好友这道安全边界）")
+		requireApproval = flag.String("require-approval", envOr("LANET_REQUIRE_APPROVAL", "@@unset@@"),
+			"是否要求连接审批（true/false，默认 true）：开启后陌生节点需在控制台同意后才能互连")
+		dbPath = flag.String("db", envOr("LANET_DB", ""),
+			"地址簿数据库路径（默认 exe 同目录 lanet.db；设为 - 关闭持久化，仅内存运行）")
 		probe = flag.Duration("probe", 0, "成员探测间隔；不传则读配置文件（默认 20s）")
 	)
 	// ---- 开机自启路径识别：注册表 Run 键带 -autorun 参数拉起 ----
@@ -117,10 +125,7 @@ func main() {
 			effName = "node"
 		}
 	}
-	effKey := nc.NetworkKey // 注意：空串是合法值（公共网络），不能用 "非空才覆盖" 逻辑
-	if *key != "@@unset@@" {
-		effKey = *key
-	}
+	effKey, effLegacyKey := resolveNetworkKey(*key, nc.NetworkKey)
 	effBootstrap := firstNonEmpty(*bootstrap, nc.Bootstrap, "public")
 	// 身份文件路径固定：exe 同目录 node.key（Windows）/ /data/node.key（其他平台），
 	// 不读配置、不暴露到控制台；文件不存在即新用户，SDK 自动创建新身份。
@@ -149,6 +154,15 @@ func main() {
 	}
 	// .lanet DNS 强制开启（无开关）：内置 DNS + Windows NRPT 是基础能力，
 	// 关闭只会造成「同版本下有的机器能 ping .lanet 有的不能」的困惑。
+	// 连接审批：默认开启（需要用户同意才互连），可用配置文件 / 环境变量关闭。
+	// AutoAccept 为「自动同意」，供无人值守中央服务器使用，默认关闭。
+	effRequireApproval := resolveTriBool(*requireApproval, nc.RequireApproval, true)
+	effAutoAccept := resolveTriBool(*autoAccept, nc.AutoAccept, false)
+	// 地址簿路径：命令行/环境变量 > 配置文件 > 默认（exe 同目录 lanet.db）。
+	effDBPath := firstNonEmpty(*dbPath, nc.DBPath)
+	if effDBPath == "" {
+		effDBPath = filepath.Join(filepath.Dir(*config), "lanet.db")
+	}
 	effProbe := *probe
 	if effProbe <= 0 {
 		if nc.ProbeSec > 0 {
@@ -171,11 +185,16 @@ func main() {
 		EnablePublicDHT:  effPublic,
 		PublicDHTMinutes: effPublicMin,
 		Tun:              effTun,
+		AutoAccept:       effAutoAccept,
+		RequireApproval:  effRequireApproval,
+		DBPath:           effDBPath,
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s publicDHT=%v(%dm) tun=%v version=%s config=%s",
 		effName, effKey, effFW, effConsole, effPublic, effPublicMin, effTun, version, *config)
+	log.Printf("[node] 连接审批：require=%v autoAccept=%v db=%s",
+		effRequireApproval, effAutoAccept, effDBPath)
 
 	switch strings.TrimSpace(effBootstrap) {
 	case "", "none":
@@ -202,6 +221,7 @@ func main() {
 	cfg := lanet.Config{
 		Name:             effName,
 		NetworkKey:       effKey,
+		LegacyDefaultKey: effLegacyKey,
 		Standalone:       true,
 		Channel:          lanet.ChannelOfficial, // 官方发行渠道：与第三方 SDK 构建网络隔离
 		Bootstrap:        nc.bootstrapAddrs,
@@ -215,6 +235,11 @@ func main() {
 		Tun:              effTun,
 		Version:          version,
 		Platform:         runtime.GOOS + "/" + runtime.GOARCH,
+		// 连接审批（加好友式）：陌生节点需用户同意后才能互连；
+		// auto_accept 供无人值守中央服务器使用；地址簿落 lanet.db。
+		AutoAccept:      effAutoAccept,
+		RequireApproval: &effRequireApproval,
+		DBPath:          effDBPath,
 	}
 	switch effFW {
 	case "allow-list":
@@ -459,6 +484,30 @@ func resolvePublicDHT(flagVal string, cfgVal bool) bool {
 	return flagVal == "1" || strings.EqualFold(flagVal, "true")
 }
 
+// resolveNetworkKey 解析网络密钥，返回 (生效密钥, 是否历史公共网络)。
+//
+// 优先级：命令行/环境变量 > 配置文件 > 按身份派生默认网络。
+// 迁移规则（为什么要区分「未设置」与「显式留空」）：
+//   - 老版本留空 = 固定公共网络密钥 lanet/public，所有零配置节点同网。
+//     若升级后直接改成「按身份派生」，老节点会静默脱离原网络，互相失联。
+//   - 因此：配置文件从未写过 network_key（nil）→ 判定为老部署，保持
+//     历史公共网络（legacy=true），升级后网络关系不变，零迁移。
+//   - 而显式留空（""）视为新语义：使用按身份派生的本机专属默认网络，
+//     避免所有零配置用户挤在一张超大网里。
+//   - 非空值一律照用（自定义密钥不受影响）。
+func resolveNetworkKey(flagVal string, cfgVal *string) (string, bool) {
+	// 命令行/环境变量显式给了值（含显式空串）→ 按新语义处理：
+	// 空串 = 本机专属默认网络（非 legacy）。
+	if flagVal != "@@unset@@" {
+		return flagVal, false
+	}
+	if cfgVal == nil {
+		// 老配置文件没有该字段：保持历史公共网络，避免升级后失联。
+		return "", true
+	}
+	return *cfgVal, false
+}
+
 // tolerantWriter 逐个写出、忽略单个目标错误（io.MultiWriter 遇错即返回，
 // windowsgui 下 stderr 无效会把整个日志写挂）。
 type tolerantWriter struct{ ws []io.Writer }
@@ -518,14 +567,19 @@ func defaultIdentityPath(exeDir string) string {
 // 双击/零参数启动时全靠它；Web 控制台「节点配置」编辑的就是这个文件，
 // 保存后重启程序生效（防火墙与转发映射在控制台里是热生效的，不在此列）。
 type nodeConfig struct {
-	Name            string `json:"name"`
-	NetworkKey      string `json:"network_key"`
-	Bootstrap       string `json:"bootstrap"`
-	Console         string `json:"console"`
-	ConsolePassword string `json:"console_password,omitempty"`
-	Firewall        string `json:"firewall"`
-	Listen          string `json:"listen"`
-	EnablePublicDHT bool   `json:"enable_public_dht"` // 公共 DHT 兜底开关（默认关闭，v0.5.16 起语义反转）
+	Name string `json:"name"`
+	// NetworkKey 网络密钥（*string 以便区分「未设置」与「显式留空」）：
+	//   - nil   = 老配置文件从未写过该字段 → 视为历史公共网络（迁移兼容）；
+	//   - ""     = 用户显式留空 → 使用按身份派生的本机专属默认网络；
+	//   - 非空   = 用户指定的网络密钥。
+	// 详见 resolveNetworkKey 的迁移规则。
+	NetworkKey      *string `json:"network_key,omitempty"`
+	Bootstrap       string  `json:"bootstrap"`
+	Console         string  `json:"console"`
+	ConsolePassword string  `json:"console_password,omitempty"`
+	Firewall        string  `json:"firewall"`
+	Listen          string  `json:"listen"`
+	EnablePublicDHT bool    `json:"enable_public_dht"` // 公共 DHT 兜底开关（默认关闭，v0.5.16 起语义反转）
 	// PublicDHTMinutes 公共 DHT 临时引导的最长运行分钟数（默认 10）。
 	// 开启公共 DHT 后：连上第一个同群成员立即退出；超时仍未连上也退出。
 	// 控制台可改，重启生效。
@@ -539,6 +593,15 @@ type nodeConfig struct {
 	// Autorun 开机自启（仅控制台 PUT 请求体使用，GET 走注册表实时查询）。
 	// 不落 lanet.json：真实状态在注册表 Run 键，避免两处状态不一致。
 	Autorun *bool `json:"autorun,omitempty"`
+	// RequireApproval 是否要求连接审批（默认 true）：开启后陌生节点必须经
+	// 用户同意（类似加好友）才能互连；关闭则同网络密钥的节点可直接互连。
+	// nil = 未设置（按默认 true）。
+	RequireApproval *bool `json:"require_approval,omitempty"`
+	// AutoAccept 自动同意连接申请（默认 false）：无人值守中央服务器用。
+	// 开启后陌生节点无需人工审批即自动信任——会放弃「加好友」这道边界。
+	AutoAccept *bool `json:"auto_accept,omitempty"`
+	// DBPath 地址簿数据库路径（默认 exe 同目录 lanet.db，"-" = 仅内存）。
+	DBPath string `json:"db_path,omitempty"`
 
 	bootstrapAddrs []string `json:"-"` // 运行时由 Bootstrap 解析而来
 }
@@ -568,19 +631,49 @@ func defaultNodeConfig() *nodeConfig {
 		name = "node"
 	}
 	return &nodeConfig{
-		Name:             name,
-		NetworkKey:       "",
+		Name: name,
+		// 显式写空串（而非省略字段）：新生成的配置文件明确表达「使用按身份
+		// 派生的本机专属默认网络」，避免日后被迁移逻辑误判为老配置。
+		// 要与他人互通，把这里改成双方约定的相同密钥即可。
+		NetworkKey:       strPtr(""),
 		Bootstrap:        "none",
 		Console:          "127.0.0.1:8900",
 		Firewall:         "allow-all",
 		PublicDHTMinutes: 10,
 		ProbeSec:         20,
 		Tun:              boolPtr(true),
+		// 连接审批默认开启：陌生节点需用户同意后才互连（类似加好友）。
+		// 无人值守的中央服务器可把 auto_accept 置 true 免除人工审批。
+		RequireApproval: boolPtr(true),
+		AutoAccept:      boolPtr(false),
 	}
+}
+
+// resolveTriBool 三态布尔解析：显式传值（"true"/"false"/"1"/"0"）优先，
+// 其次配置文件（nil = 未设置），最后默认值。用于审批这类「默认开启、
+// 允许关闭」的开关——不能用 flag.Bool，其零值 false 无法区分未传与显式 false。
+func resolveTriBool(flagVal string, cfgVal *bool, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(flagVal)) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	}
+	if flagVal != "@@unset@@" && strings.TrimSpace(flagVal) != "" {
+		// 传了非法值：按默认处理，但明确提示，避免静默误配。
+		log.Printf("[node] 布尔参数取值无法识别（%q），按默认 %v 处理", flagVal, def)
+	}
+	if cfgVal != nil {
+		return *cfgVal
+	}
+	return def
 }
 
 // boolPtr 返回布尔指针（配置文件可选字段用）。
 func boolPtr(v bool) *bool { return &v }
+
+// strPtr 返回字符串指针（配置文件可选字段用）。
+func strPtr(v string) *string { return &v }
 
 // save 原子写入配置文件。
 func (nc *nodeConfig) save(path string) error {
@@ -606,6 +699,11 @@ type nodeRuntime struct {
 	EnablePublicDHT  bool
 	PublicDHTMinutes int
 	Tun              bool
+	// 连接审批（加好友式）：RequireApproval 是否需要用户同意；
+	// AutoAccept 自动同意（无人值守中央服务器）；DBPath 地址簿路径。
+	RequireApproval bool
+	AutoAccept      bool
+	DBPath          string
 }
 
 // networkID 运行时网络标识（与 SDK/控制台页眉一致）：standalone- + 群组指纹。
@@ -628,6 +726,8 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 		"GET /api/node-config": func(w http.ResponseWriter, r *http.Request) {
 			nc := read()
 			tunOn := nc.Tun == nil || *nc.Tun
+			requireApprovalOn := nc.RequireApproval == nil || *nc.RequireApproval
+			autoAcceptOn := nc.AutoAccept != nil && *nc.AutoAccept
 			writeJSONLocal(w, http.StatusOK, map[string]any{
 				"config_path":        path,
 				"name":               nc.Name,
@@ -644,6 +744,9 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				"tun":                tunOn,
 				"autorun":            isAutorunEnabled(),
 				"autorun_supported":  autorunSupported(),
+				"require_approval":   requireApprovalOn,
+				"auto_accept":        autoAcceptOn,
+				"db_path":            nc.DBPath,
 				"runtime": map[string]any{
 					"name":               eff.Name,
 					"network_key":        eff.NetworkKey,
@@ -655,6 +758,9 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 					"enable_public_dht":  eff.EnablePublicDHT,
 					"public_dht_minutes": eff.PublicDHTMinutes,
 					"tun":                eff.Tun,
+					"require_approval":   eff.RequireApproval,
+					"auto_accept":        eff.AutoAccept,
+					"db_path":            eff.DBPath,
 				},
 			})
 		},
@@ -664,9 +770,28 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				// PartialPublicDHT 标记「仅更新公共 DHT 开关及时长」的轻量请求
 				// （控制台开关点击时调用：运行时已即时生效，这里只持久化配置意图）。
 				PartialPublicDHT *bool `json:"partial_public_dht"`
+				// PartialApproval 标记「仅更新连接审批开关」的轻量请求
+				// （控制台复选框点击时调用：无需重启即可持久化，重启后生效）。
+				PartialApproval *bool `json:"partial_approval"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				writeJSONLocal(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
+				return
+			}
+			// 仅连接审批开关的轻量持久化（不改动其它字段）。
+			if req.PartialApproval != nil && req.Name == "" && req.Console == "" {
+				cur := read()
+				if req.RequireApproval != nil {
+					cur.RequireApproval = req.RequireApproval
+				}
+				if req.AutoAccept != nil {
+					cur.AutoAccept = req.AutoAccept
+				}
+				if err := cur.save(path); err != nil {
+					writeJSONLocal(w, http.StatusInternalServerError, map[string]string{"error": "保存失败: " + err.Error()})
+					return
+				}
+				writeJSONLocal(w, http.StatusOK, map[string]any{"saved": true, "restart_required": true})
 				return
 			}
 			// 仅公共 DHT 开关的轻量持久化（不改动其它字段，不触发重启校验）。
@@ -725,6 +850,16 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 			prev := read()
 			if req.Tun == nil {
 				req.Tun = prev.Tun // 页面未提供（旧版控制台）时保留原值
+			}
+			// 连接审批：页面未提供（旧版控制台）时保留原值。
+			if req.RequireApproval == nil {
+				req.RequireApproval = prev.RequireApproval
+			}
+			if req.AutoAccept == nil {
+				req.AutoAccept = prev.AutoAccept
+			}
+			if req.DBPath == "" {
+				req.DBPath = prev.DBPath
 			}
 			// 开机自启：平台支持时按请求值切换（立即生效，无需重启）。
 			if req.Autorun != nil && autorunSupported() {

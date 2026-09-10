@@ -49,6 +49,7 @@ import (
 	"github.com/ayflying/pvn/pkg/firewall"
 	"github.com/ayflying/pvn/pkg/netmapclient"
 	"github.com/ayflying/pvn/pkg/p2pkit"
+	"github.com/ayflying/pvn/pkg/peersdb"
 	"github.com/ayflying/pvn/pkg/peersource"
 	"github.com/ayflying/pvn/pkg/protocol"
 	"github.com/ayflying/pvn/pkg/serverless"
@@ -138,13 +139,19 @@ type Config struct {
 	// （客户端即服务端），公网可达成员自动成为网络内的引导与中继节点。
 	Standalone bool
 	// NetworkKey 仅 Standalone 模式生效：网络密钥。
-	//   - 留空：加入公共网络——所有未设置密钥的节点在同一张大网内互相可见可连；
-	//   - 填写非空值（任意约定字符串）：加入私有网络，只有持相同密钥的节点
+	//   - 留空：使用「按本机身份（PeerID）派生」的专属默认网络——开箱即用，
+	//     但默认自成一张网，不会与其他零配置节点同网（避免超大网络带来的
+	//     发现流量与成员表膨胀）。要与他人互通须显式设置相同密钥。
+	//   - 填写非空值（任意约定字符串）：加入指定网络，只有持相同密钥的节点
 	//     能互相发现与连接（密钥经 SHA256 派生，不可反推）。
 	// 注意：SDK 构建的程序与官方发行版程序默认互相隔离（渠道隔离），
 	// 即使使用完全相同的 NetworkKey 也不在同一张网络内；如确需互通，
 	// 将 Channel 显式设为与对方一致的渠道值（见 Channel 字段说明）。
 	NetworkKey string
+	// LegacyDefaultKey 迁移兼容开关（仅 Standalone 模式生效）：
+	// 置 true 时「NetworkKey 留空」按历史公共网络密钥（lanet/public）处理，
+	// 用于老部署升级后保持原有网络关系不失效。新部署不应设置此项。
+	LegacyDefaultKey bool
 	// Channel 分发渠道（仅 Standalone 模式生效）：参与群组密钥派生，
 	// 用于把不同分发途径的程序隔离在不同网络。留空默认 ChannelSDK
 	// （第三方 SDK 构建与官方发行版互不相通）；官方发行版程序
@@ -210,6 +217,22 @@ type Config struct {
 	// Windows 官方程序已自动注册 NRPT 规则。
 	// LanetDNSAddr 覆盖 DNS 监听地址，默认 127.0.0.1:53。
 	LanetDNSAddr string
+
+	// ---- 连接审批（加好友式）与地址簿（仅 Standalone 模式生效）----
+
+	// DBPath 地址簿与审批记录 SQLite 文件路径，默认 "lanet.db"
+	// （空 = 用默认；设为 "-" 关闭持久化，仅内存运行）。
+	// 保存内容：已知节点（含各自可用地址、连接成功次数）、待审批申请、
+	// 信任白名单。有了本地地址簿，重复连接无需再走 DHT 查询。
+	DBPath string
+	// AutoAccept 自动同意连接审批（默认 false）。开启后陌生节点申请连接
+	// 无需人工确认即自动信任——供无人值守的中央服务器/种子节点使用。
+	// 普通客户端不建议开启（等于放弃了「加好友」这道安全边界）。
+	AutoAccept bool
+	// RequireApproval 是否要求连接审批（默认 true）。
+	// true：只有已信任（用户同意过）的节点才能互连，陌生节点进待审批列表；
+	// false：同网络密钥的节点可直接互连（旧版行为，兼容用）。
+	RequireApproval *bool
 }
 
 // LoadOrCreateIdentity 加载（或首次生成）Ed25519 节点身份密钥。
@@ -279,6 +302,8 @@ type Client struct {
 	tunRouter *tundevice.Router // TUN 数据面路由器（非 nil 时 Tunnel 协议已由 TUN 接管）
 
 	dns *serverless.DNSServer // .lanet DNS 应答器（启动成功时非 nil）
+
+	peers *peersdb.DB // 地址簿 + 审批记录（Standalone 且 DBPath != "-" 时非 nil）
 }
 
 // Info 节点入网后的身份信息。
@@ -380,8 +405,16 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 
 	// 2. 入网。
 	if cfg.Standalone {
+		// 地址簿 + 审批记录（SQLite，独立 lanet.db）：本地保存已知节点、
+		// 待审批申请与信任白名单。DBPath 为 "-" 时关闭持久化（仅内存）。
+		if db, dbErr := c.openPeersDB(ctx); dbErr != nil {
+			c.logf("地址簿打开失败（连接审批降级为内存态）: %v", dbErr)
+		} else {
+			c.peers = db
+		}
 		disc, err = serverless.New(ctx, node, serverless.Config{
 			NetworkKey:           cfg.NetworkKey,
+			LegacyDefaultKey:     cfg.LegacyDefaultKey,
 			Channel:              cfg.Channel,
 			Name:                 cfg.Name,
 			Bootstrap:            cfg.Bootstrap,
@@ -395,6 +428,10 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 			OSHostname:           localHostname,
 			LocalIPs:             localIPs,
 			Quiet:                cfg.Quiet,
+			IsTrusted:            c.isTrustedPeer,
+			AutoAccept:           c.maybeAutoAccept,
+			OnPending:            c.onPendingRequest,
+			HasKnownPeers:        c.hasKnownPeers,
 		})
 		if err == nil {
 			err = disc.Start(ctx)
@@ -410,9 +447,16 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		c.created = true
 		keyLabel := cfg.NetworkKey
 		if keyLabel == "" {
-			keyLabel = serverless.PublicNetworkKey + "（默认）"
+			keyLabel = "本机专属默认网络"
 		}
 		c.logf("无服务器模式入网：虚拟 IP=%s，网络密钥=%s", c.myIP, keyLabel)
+		if c.requireApproval() {
+			mode := "需要用户同意"
+			if cfg.AutoAccept {
+				mode = "自动同意（无人值守）"
+			}
+			c.logf("连接审批：开启（%s）；其他节点需先在控制台添加本机节点 ID 才能互通", mode)
+		}
 	} else {
 		c.netmapCli = netmapclient.NewClient(cfg.CTLURL, c.peerID)
 		if cfg.InviteCode == "" {
@@ -864,6 +908,12 @@ func (c *Client) Close() error {
 	}
 	c.lfListeners = make(map[int]*fwdListener)
 	c.lfMu.Unlock()
+	if c.peers != nil {
+		if err := c.peers.Close(); err != nil {
+			c.logf("地址簿关闭失败（忽略）: %v", err)
+		}
+		c.peers = nil
+	}
 	return c.node.Close()
 }
 

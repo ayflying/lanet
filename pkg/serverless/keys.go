@@ -19,12 +19,34 @@ import (
 	"fmt"
 )
 
-// PublicNetworkKey 默认公共网络密钥：NetworkKey 留空时自动使用（Standalone
-// 与 SDK 均如此）。所有使用默认密钥的节点加入同一张 P2P 网络，互相可见
-// 可连接；想私有组网请各自约定相同的 NetworkKey。留空归一化后群身份与
-// 历史派生完全一致（GroupKey(channel, "") == GroupKey(channel, 本值)），
-// 老网络零迁移。
+// PublicNetworkKey 历史公共网络密钥：早期版本 NetworkKey 留空时使用的固定值。
+// 保留仅为兼容老网络派生（GroupKey(channel, "") 的历史语义）与迁移识别，
+// 新部署的「留空」不再使用此值——见 DeriveDefaultNetworkKey。
 const PublicNetworkKey = "lanet/public"
+
+// DefaultNetworkKeyPrefix 自动派生的默认网络密钥前缀。
+// 留空密钥时使用，保证「每个部署默认自成一张网」：不填密钥 = 不与他人
+// 自动同网（避免所有零配置节点挤在一张超大网络里，导致发现流量与
+// 成员表膨胀）；要互通必须显式设置相同密钥。
+const DefaultNetworkKeyPrefix = "lanet/auto/"
+
+// DeriveDefaultNetworkKey 按节点身份（PeerID）派生本机专属默认网络密钥。
+//
+// 设计意图（为什么不是固定的 lanet/public）：
+//   - 固定值会让所有「没填密钥」的节点落到同一张网，网内节点越多，
+//     DHT 发现、成员表、探测流量越大（实测过全局同网时的流量与幽灵成员问题）；
+//   - 按 PeerID 派生后，每台机器开箱即用且天然独立，零配置不再等于
+//     「和全世界同网」；想互通需显式约定相同 NetworkKey（或互发连接种子）。
+//
+// 稳定性：PeerID 由 node.key（持久化身份文件）派生，重启/升级不变；
+// 更换身份文件即更换默认网络，语义上等于换了一个身份，符合预期。
+func DeriveDefaultNetworkKey(peerID string) string {
+	if peerID == "" {
+		return PublicNetworkKey // 极端兜底：拿不到身份时退回历史默认值
+	}
+	h := sha256.Sum256([]byte("lanet-default-network-v1:" + peerID))
+	return DefaultNetworkKeyPrefix + hex.EncodeToString(h[:8])
+}
 
 // 分发渠道（Channel）：参与群组密钥派生，用于把不同分发途径的程序
 // 隔离在不同的网络里——即使双方使用完全相同的 NetworkKey 也不互通
@@ -39,7 +61,9 @@ const (
 )
 
 // GroupKey 由（渠道, 网络密钥）派生群组密钥（32 字节）。
-// 网络密钥留空时按公共网络密钥处理；渠道留空时与历史版本派生一致。
+// 网络密钥留空时按历史公共网络密钥处理（仅供内部兜底调用；
+// 正常路径下 New() 已把留空替换为 DeriveDefaultNetworkKey 的派生值）；
+// 渠道留空时与历史版本派生一致。
 func GroupKey(channel, networkKey string) []byte {
 	if networkKey == "" {
 		networkKey = PublicNetworkKey

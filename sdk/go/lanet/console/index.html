@@ -152,24 +152,59 @@
       <button class="ghost" id="mNext" onclick="mPage++;renderMembers()">下一页</button>
     </div>
   </div>
-  <div class="card" id="seedCard" style="display:none">
-    <h2>连接种子 <span class="tag unknown">不经公共 DHT 直连入网</span></h2>
-    <div class="sub" style="margin-bottom:8px">把「我的连接种子」发给同群成员；对方粘贴到「直接连接」输入框并点连接，<b>立即生效、无需重启</b>。连上后双方互相进入私有 DHT 路由表，之后所有发现都走私有通道，全程零公共 DHT 流量。</div>
-    <div class="kv"><b>我的连接种子</b>
+  <div class="card" id="connectCard" style="display:none">
+    <h2>连接其他节点 <span class="tag unknown">按节点 ID 直连</span></h2>
+    <div class="sub" style="margin-bottom:8px">把对方发来的<b>节点 ID</b>（12D3Koo… 开头）粘贴进去点连接即可；也支持完整连接地址。首次连接需对方在控制台<b>同意</b>，同意一次即永久信任，之后自动重连。</div>
+    <div class="kv"><b>我的节点 ID</b>
       <div class="row" style="margin:0">
-        <input type="text" id="seedMine" readonly placeholder="加载中…">
-        <button class="ghost" onclick="copyText($('seedMine').value, this)">复制</button>
+        <input type="text" id="myNodeID" readonly
+               onclick="copyText($('myNodeID').value, $('myNodeID'))"
+               title="点击即复制"
+               style="cursor:pointer"
+               placeholder="加载中…">
+        <button class="ghost" id="myNodeIDBtn" onclick="copyText($('myNodeID').value, $('myNodeIDBtn'))">复制</button>
       </div>
+      <div class="sub" style="color:#8a94a6;margin-top:4px">把这一串发给对方，对方添加后即可连入。点输入框或按钮都能复制。</div>
     </div>
-    <div class="kv"><b>直接连接</b>
+    <div class="kv"><b>添加节点</b>
       <div class="row" style="margin:0">
-        <input type="text" id="seedInput" placeholder="粘贴对方的连接种子（multiaddr，可含多个，逗号/换行分隔）"
-               onkeydown="if(event.key==='Enter')connectSeed()">
-        <button onclick="connectSeed()">连接</button>
+        <input type="text" id="peerInput" placeholder="粘贴对方节点 ID（12D3Koo…）或完整连接地址"
+               onkeydown="if(event.key==='Enter')connectPeer()">
+        <button onclick="connectPeer()">连接</button>
       </div>
+      <div class="msg" id="peerMsg" style="display:none"></div>
     </div>
-    <div class="msg" id="seedMsg"></div>
-    <div class="sub" style="color:#8a94a6">家庭宽带公网地址变化后旧种子会失效，需重新复制分享。</div>
+    <div id="pendingBox" style="display:none;margin-top:14px">
+      <b style="font-size:13px">待审批的连接申请 <span class="badge" id="pendingBadge">0</span></b>
+      <div class="sub" style="color:#8a94a6;margin:4px 0 8px">以下节点申请连接到本机。同意后永久信任（下次自动连通），拒绝则移出列表。</div>
+      <div id="pendingList"></div>
+    </div>
+    <details style="margin-top:14px">
+      <summary class="sub" style="cursor:pointer;color:#8a94a6">高级：使用连接种子（不经任何查询直接拨号）</summary>
+      <div style="margin-top:10px">
+        <div class="kv"><b>我的连接种子</b>
+          <div class="row" style="margin:0">
+            <input type="text" id="seedMine" readonly
+                   onclick="copyText($('seedMine').value, $('seedMine'))"
+                   title="点击即复制"
+                   style="cursor:pointer"
+                   placeholder="加载中…">
+            <button class="ghost" id="seedMineBtn" onclick="copySeedMine()">复制</button>
+          </div>
+        </div>
+        <div class="kv"><b>按种子连接</b>
+          <div class="row" style="margin:0">
+            <input type="text" id="seedInput" placeholder="粘贴对方的连接种子（multiaddr，可含多个，逗号/换行分隔）"
+                   onkeydown="if(event.key==='Enter')connectSeed()"
+                   onpaste="setTimeout(seedPasteHint, 0)">
+            <button onclick="connectSeed()">连接</button>
+          </div>
+          <div class="msg" id="seedHint" style="display:none"></div>
+        </div>
+        <div class="msg" id="seedMsg"></div>
+        <div class="sub" style="color:#8a94a6">家庭宽带公网地址变化后旧种子会失效，需重新复制分享。</div>
+      </div>
+    </details>
   </div>
 </div>
 
@@ -244,6 +279,18 @@
         <input type="checkbox" id="cTun"> 虚拟网卡 TUN（IP 层互通：ping / 任意端口直达虚拟 IP，需管理员权限运行）
       </label>
     </div>
+    <div class="row" style="margin-top:10px">
+      <label style="display:flex;gap:6px;align-items:center">
+        <input type="checkbox" id="cRequireApproval" onchange="saveApproval()"> 需要审批才能连接（默认开启）
+      </label>
+    </div>
+    <div class="sub" style="margin:2px 0 0">开启后，陌生节点必须先经你同意（类似加好友）才能互连；同意一次即永久信任，之后自动重连。关闭则相同网络密钥的节点可直接互连。</div>
+    <div class="row" style="margin-top:8px">
+      <label style="display:flex;gap:6px;align-items:center">
+        <input type="checkbox" id="cAutoAccept" onchange="saveApproval()"> 自动同意所有连接申请
+      </label>
+    </div>
+    <div class="sub" style="margin:2px 0 0">供<b>无人值守的中央服务器 / 种子节点</b>使用：开启后陌生节点无需人工审批即可互连。普通客户端不建议开启（等于放弃审批这道安全边界）。</div>
     <div class="row" id="cAutorunRow" style="display:none">
       <label style="display:flex;gap:6px;align-items:center">
         <input type="checkbox" id="cAutorun" onchange="saveAutorun()"> 开机自启（登录 Windows 后自动在后台启动，<b>不打开控制台网页</b>，可从系统托盘打开）
@@ -279,13 +326,95 @@ async function loadState() {
   $('bRules').textContent = S.rules.length;
   $('bForwards').textContent = S.forwards.length;
   renderRules(); renderForwards();
-  renderSeed(); renderPublicDHT();
+  renderConnect(); renderSeed(); renderPublicDHT();
+}
+
+// ---- 连接其他节点（统一入口：节点 ID 或完整地址，自动识别） ----
+// 降低操作门槛：用户只需要把对方的「节点 ID」粘进去即可，地址由本地地址簿
+// 或私有 DHT 自动补齐；首次连接需对方同意（加好友语义）。
+async function connectPeer() {
+  const address = $('peerInput').value.trim();
+  if (!address) { flash('peerMsg', '请先粘贴对方的节点 ID', false); return; }
+  const btn = event && event.target;
+  if (btn && btn.tagName === 'BUTTON') { btn.disabled = true; }
+  flash('peerMsg', '正在连接…（先在本地地址簿查找，未命中再走私有 DHT）', true);
+  try {
+    const r = await fetch('/api/connect-peer', { method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ address }) });
+    const res = await r.json().catch(() => ({}));
+    if (r.ok) {
+      if (res.pending) {
+        flash('peerMsg', res.message || '已提交连接申请，等待对方同意', true);
+      } else {
+        const who = res.name ? `「${res.name}」` : '';
+        const vip = res.virtual_ip ? `（虚拟 IP ${res.virtual_ip}）` : '';
+        const how = res.via === 'local' ? '本地地址簿' : (res.via === 'dht' ? '私有 DHT' : '直接拨号');
+        flash('peerMsg', `已连接 ${who}${vip} · 地址来源：${how}`, true);
+        $('peerInput').value = '';
+      }
+      loadState();
+    } else {
+      flash('peerMsg', '连接失败' + (res.error ? '：' + res.error : ''), false);
+    }
+  } finally {
+    if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; }
+  }
+}
+
+// resolvePending 同意或拒绝一个待审批的连接申请。
+async function resolvePending(peerID, approve) {
+  try {
+    const r = await fetch('/api/pending', { method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ peer_id: peerID, approve }) });
+    const res = await r.json().catch(() => ({}));
+    if (!r.ok) { flash('peerMsg', (approve ? '同意失败' : '拒绝失败') + '：' + (res.error || ''), false); return; }
+    flash('peerMsg', approve ? '已同意该节点连接（永久信任）' : '已拒绝该节点连接申请', true);
+    loadState();
+  } catch (e) {
+    flash('peerMsg', '操作失败：' + e, false);
+  }
+}
+
+// renderConnect 渲染「连接其他节点」卡片：本机 ID + 待审批列表。
+function renderConnect() {
+  const card = $('connectCard');
+  if (!S) { card.style.display = 'none'; return; }
+  const standalone = (S.info && (S.info.group_id === 'standalone' || String(S.info.group || '').startsWith('standalone-')));
+  if (!standalone) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  const myID = (S.info && S.info.peer_id) || '';
+  $('myNodeID').value = myID;
+  // 待审批列表
+  const pending = S.pending || [];
+  const box = $('pendingBox');
+  $('pendingBadge').textContent = pending.length;
+  if (!pending.length) {
+    box.style.display = 'none';
+    return;
+  }
+  box.style.display = '';
+  $('pendingList').innerHTML = pending.map(p => {
+    const nm = p.name ? `<b>${esc(p.name)}</b> · ` : '';
+    const t = p.created_at ? new Date(p.created_at * 1000).toLocaleString() : '';
+    return `<div class="listitem" style="align-items:center">
+      <div style="min-width:0;flex:1">
+        <div style="font-size:12.5px;word-break:break-all">${nm}<code style="font-size:11.5px">${esc(p.peer_id)}</code></div>
+        <div class="sub" style="color:#8a94a6;font-size:11.5px">申请时间 ${esc(t)}</div>
+      </div>
+      <button style="margin-left:8px" onclick="resolvePending('${esc(p.peer_id)}', true)">同意</button>
+      <button class="ghost danger" style="margin-left:6px" onclick="resolvePending('${esc(p.peer_id)}', false)">拒绝</button>
+    </div>`;
+  }).join('');
 }
 
 // connectSeed 按输入的连接种子立即直连（运行时生效，无需重启）。
 async function connectSeed() {
   const seed = $('seedInput').value.trim();
   if (!seed) { flash('seedMsg', '请先粘贴对方的连接种子', false); return; }
+  // 本地预检：粘错东西时当场说明白，别等后端报一句看不懂的错。
+  const warn = seedCheck(seed);
+  if (warn) { flash('seedMsg', warn, false); return; }
   const btn = event && event.target;
   if (btn && btn.tagName === 'BUTTON') { btn.disabled = true; }
   flash('seedMsg', '正在连接…', true);
@@ -297,6 +426,7 @@ async function connectSeed() {
       const who = res.virtual_ip ? `（虚拟 IP ${res.virtual_ip}）` : '';
       flash('seedMsg', '已连接成员 ' + (res.peer_id ? res.peer_id.slice(0, 16) + '…' : '') + who, true);
       $('seedInput').value = '';
+      $('seedHint').style.display = 'none';
       loadState();
     } else {
       flash('seedMsg', '连接失败' + (res.error ? '：' + res.error : ''), false);
@@ -306,14 +436,60 @@ async function connectSeed() {
   }
 }
 
-// ---- 连接种子：本机可分享的 multiaddr（不依赖公共 DHT 的入网凭据） ----
+// isPeerID 判断是否为裸 libp2p 节点 ID（12D3Koo… / Qm… 开头，不含 "/"）。
+function isPeerID(s) {
+  return !s.includes('/') && /^(12D3Koo|Qm|16Uiu2)[1-9A-HJ-NP-Za-km-z]{10,}$/.test(s.trim());
+}
+
+// seedCheck 检查输入是否像连接种子；返回错误提示文案，OK 返回空串。
+// 目的是「粘错了立刻说人话」——尤其是裸节点 ID（应走上面的「添加节点」）。
+function seedCheck(seed) {
+  const s = seed.trim();
+  if (s.includes('/')) return '';                       // 至少有 "/ip4/…" 结构，交给后端校验
+  if (isPeerID(s)) {
+    return '这是「节点 ID」，不需要用连接种子 —— 直接粘到上面的「添加节点」输入框点连接即可。';
+  }
+  if (/^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(s)) {
+    return '这看起来是 IP 地址，但不能只填 IP。请让对方复制完整连接种子（含 /tcp/端口 与 /p2p/节点ID）发给你。';
+  }
+  return '看不出这是连接种子。连接种子以 /ip4/ 或 /ip6/ 开头（如 /ip4/1.2.3.4/tcp/4001/p2p/12D3Koo…），请让对方在控制台复制后粘贴。';
+}
+
+// seedPasteHint 粘贴后即时给出反馈，减少「粘了但不敢点」的犹豫。
+function seedPasteHint() {
+  const s = $('seedInput').value.trim();
+  const el = $('seedHint');
+  if (!s) { el.style.display = 'none'; return; }
+  const warn = seedCheck(s);
+  el.style.display = '';
+  if (warn) {
+    el.style.color = '#d9534f';
+    el.textContent = warn;
+  } else {
+    el.style.color = '#2fa65a';
+    el.textContent = '格式看起来正确，点「连接」即可。';
+  }
+}
+
+// copySeedMine 复制本机连接种子并给出明确反馈（含无地址时的引导）。
+function copySeedMine() {
+  const addrs = (S && S.seed_addrs) || [];
+  if (!addrs.length) {
+    flash('seedMsg', '本机暂无可用连接地址（可能只绑定了回环地址）。请确认节点已正常入网。', false);
+    return;
+  }
+  copyText(addrs.join('\n'), $('seedMineBtn'));
+  flash('seedMsg', '已复制连接种子，发给对方即可。', true);
+}
+
+// ---- 连接种子（高级）：本机可分享的 multiaddr ----
+// 主流路径已是「添加节点 ID」（见 connectPeer），种子输入是备选高级用法。
 function renderSeed() {
-  const card = $('seedCard');
-  const addrs = S && S.seed_addrs || [];
-  if (!S || !S.has_public_dht_config) { card.style.display = 'none'; return; }
-  card.style.display = '';
-  $('seedMine').value = addrs.length ? addrs.join('\n') : '';
-  $('seedMine').placeholder = addrs.length
+  const addrs = (S && S.seed_addrs) || [];
+  const el = $('seedMine');
+  if (!el) return;
+  el.value = addrs.length ? addrs.join('\n') : '';
+  el.placeholder = addrs.length
     ? ''
     : '暂无可用地址（节点可能只绑定了回环地址，或尚未就绪）';
 }
@@ -550,6 +726,9 @@ async function loadNodeConfig() {
     // 运行中/已退出只影响徽标，不再回写复选框。
     setPublicBox(!!c.enable_public_dht);
     $('cTun').checked = c.tun === undefined ? true : !!c.tun;
+    // 连接审批开关（配置意图，重启生效）：默认开启审批、默认不自动同意。
+    $('cRequireApproval').checked = c.require_approval === undefined ? true : !!c.require_approval;
+    $('cAutoAccept').checked = !!c.auto_accept;
     if (c.autorun_supported) {
       $('cAutorunRow').style.display = '';
       $('cAutorun').checked = !!c.autorun;
@@ -581,6 +760,8 @@ async function saveNodeConfig() {
     enable_public_dht: cfgPublicDHT,
     public_dht_minutes: parseInt($('cPublicMin').value, 10) || 10,
     tun: $('cTun').checked,
+    require_approval: $('cRequireApproval').checked,
+    auto_accept: $('cAutoAccept').checked,
     autorun: $('cAutorunRow').style.display !== 'none' ? $('cAutorun').checked : undefined,
   };
   if (!body.name || !body.console) { flash('cfgMsg', '节点名称与控制台地址不能为空', false); return; }
@@ -604,6 +785,29 @@ async function saveAutorun() {
   } else {
     $('cAutorun').checked = !on; // 失败回滚复选框
     flash('cfgMsg', '开机自启设置失败' + (res.error ? '：' + res.error : ''), false);
+  }
+}
+
+// saveApproval 即时持久化连接审批开关（重启程序后生效）。
+// 与「自动同意」联动：关掉审批时自动同意已无意义，一并取消勾选避免误导。
+async function saveApproval() {
+  if (!$('cRequireApproval').checked && $('cAutoAccept').checked) {
+    $('cAutoAccept').checked = false;
+  }
+  const body = {
+    partial_approval: true,
+    require_approval: $('cRequireApproval').checked,
+    auto_accept: $('cAutoAccept').checked,
+  };
+  const r = await fetch('/api/node-config', { method: 'PUT',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+  const res = await r.json().catch(() => ({}));
+  if (r.ok) {
+    flash('cfgMsg', '连接审批设置已保存，重启程序后生效', true);
+    loadNodeConfig();
+  } else {
+    flash('cfgMsg', '连接审批设置失败' + (res.error ? '：' + res.error : ''), false);
+    loadNodeConfig();
   }
 }
 

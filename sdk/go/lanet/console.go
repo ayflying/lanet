@@ -1,6 +1,7 @@
 package lanet
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"embed"
@@ -98,6 +99,12 @@ func (c *Client) startConsole() error {
 	mux.HandleFunc("PUT /api/forwards", c.apiSetForwards)
 	mux.HandleFunc("POST /api/public-dht", c.apiSetPublicDHT)
 	mux.HandleFunc("POST /api/connect-seed", c.apiConnectSeed)
+	// 统一连接入口（节点 ID 或完整地址，自动识别）+ 待审批 / 地址簿管理。
+	mux.HandleFunc("POST /api/connect-peer", c.apiConnectPeer)
+	mux.HandleFunc("GET /api/pending", c.apiPending)
+	mux.HandleFunc("POST /api/pending", c.apiResolvePending)
+	mux.HandleFunc("GET /api/peers", c.apiPeers)
+	mux.HandleFunc("POST /api/peers", c.apiRemovePeer)
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		if logo, err := consoleFS.ReadFile("console/logo.png"); err == nil {
@@ -270,6 +277,15 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 	})
 	// 公共 DHT 临时引导状态 + 连接种子（Standalone 专用；常规模式为零值）。
 	pubState, hasPub := c.PublicDHTStatus()
+	// 待审批连接申请 + 地址簿规模（连接审批启用时有意义）。
+	pending := []map[string]any{}
+	for _, p := range c.PendingList() {
+		item := map[string]any{"peer_id": p.PeerID, "name": p.Name}
+		if !p.RequestedAt.IsZero() {
+			item["created_at"] = p.RequestedAt.Unix()
+		}
+		pending = append(pending, item)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"info":                  c.Info(),
 		"members":               members,
@@ -279,7 +295,109 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		"public_dht":            pubState,
 		"has_public_dht_config": hasPub,
 		"seed_addrs":            c.SeedAddrs(),
+		"pending":               pending,
+		"pending_count":         len(pending),
+		"trusted_count":         len(c.TrustedPeers()),
+		"auto_accept":           c.cfg.AutoAccept,
+		"require_approval":      c.requireApproval(),
+		"db_path":               c.PeersDBPath(),
 	})
+}
+
+// apiConnectPeer 统一连接入口：按节点 ID 或完整 multiaddr 连接同网络节点。
+// 请求体 {"address": "12D3Koo…" | "/ip4/…/p2p/12D3Koo…"}。
+// 若对方尚未审批本机，返回 pending=true（已提交申请，等待对方同意）。
+func (c *Client) apiConnectPeer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	res, err := c.ConnectPeer(ctx, req.Address)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// apiPending 待审批连接申请列表。
+func (c *Client) apiPending(w http.ResponseWriter, r *http.Request) {
+	list := []map[string]any{}
+	for _, p := range c.PendingList() {
+		item := map[string]any{"peer_id": p.PeerID, "name": p.Name, "addrs": p.Addrs}
+		if !p.RequestedAt.IsZero() {
+			item["created_at"] = p.RequestedAt.Unix()
+		}
+		list = append(list, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pending":       list,
+		"auto_accept":   c.cfg.AutoAccept,
+		"db_path":       c.PeersDBPath(),
+		"trusted_count": len(c.TrustedPeers()),
+	})
+}
+
+// apiResolvePending 同意或拒绝某个节点的连接申请。
+// 请求体 {"peer_id": "12D3Koo…", "approve": true}。
+func (c *Client) apiResolvePending(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PeerID  string `json:"peer_id"`
+		Approve *bool  `json:"approve"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PeerID == "" || req.Approve == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体需包含 peer_id 与 approve"})
+		return
+	}
+	var err error
+	if *req.Approve {
+		err = c.ApprovePeer(req.PeerID)
+	} else {
+		err = c.RejectPeer(req.PeerID)
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "approved": *req.Approve, "peer_id": req.PeerID})
+}
+
+// apiPeers 地址簿（已信任节点）列表。
+func (c *Client) apiPeers(w http.ResponseWriter, r *http.Request) {
+	list := []map[string]any{}
+	for _, p := range c.TrustedPeers() {
+		item := map[string]any{"peer_id": p.PeerID, "name": p.Name}
+		if !p.LastSeen.IsZero() {
+			item["last_seen"] = p.LastSeen.Unix()
+		}
+		if p.LastIP != "" {
+			item["last_ip"] = p.LastIP
+		}
+		list = append(list, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"peers": list, "db_path": c.PeersDBPath()})
+}
+
+// apiRemovePeer 从地址簿移除节点（撤销信任）。
+// 请求体 {"peer_id": "12D3Koo…"}。
+func (c *Client) apiRemovePeer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PeerID string `json:"peer_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PeerID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体需包含 peer_id"})
+		return
+	}
+	if err := c.RemovePeer(req.PeerID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "peer_id": req.PeerID})
 }
 
 // apiConnectSeed 立即按连接种子直连一个同群节点（运行时可调，无需重启）。

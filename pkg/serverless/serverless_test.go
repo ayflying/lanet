@@ -251,8 +251,12 @@ func TestDefaultNoPublicFallback(t *testing.T) {
 	if d.dhtPrivate == nil {
 		t.Fatalf("私有 DHT 应始终建立")
 	}
-	if d.cfg.NetworkKey != PublicNetworkKey {
-		t.Fatalf("留空密钥应归一化为默认公共网络密钥，实际 %q", d.cfg.NetworkKey)
+	if !strings.HasPrefix(d.cfg.NetworkKey, DefaultNetworkKeyPrefix) {
+		t.Fatalf("留空密钥应按节点身份派生「本机专属默认网络」（前缀 %q），实际 %q",
+			DefaultNetworkKeyPrefix, d.cfg.NetworkKey)
+	}
+	if d.cfg.NetworkKey != DeriveDefaultNetworkKey(h.ID().String()) {
+		t.Fatalf("派生结果应与 DeriveDefaultNetworkKey(peerID) 一致：got %q", d.cfg.NetworkKey)
 	}
 	for _, b := range d.cfg.Bootstrap {
 		if b == DefaultBootstrap {
@@ -446,11 +450,14 @@ func TestPublicNetworkAutoRetire(t *testing.T) {
 	for _, a := range hb.Addrs() {
 		seedsB = append(seedsB, a.String()+"/p2p/"+hb.ID().String())
 	}
-	// 网络密钥留空 = 默认公共网络密钥（归一化 + 双 DHT）。
+	// 显式使用 LegacyDefaultKey（等价历史留空语义）：两个节点落到同一张
+	// 网络，才能触发「发现同群成员后自动退出公共 DHT」。
+	// 注意：新语义下留空不再是共享的公共网络，而是按 PeerID 派生的
+	// 本机专属网络，因此这里必须显式声明使用历史默认密钥。
 	// EnablePublicFallback 显式开启：验证开关打开时「发现同群成员后
 	// 自动退出公共 DHT」仍然生效（默认关闭时 dhtPublic 本就不建立）。
 	da, err := New(ctx, ha, Config{
-		NetworkKey: "", Name: "pub-a",
+		NetworkKey: "", LegacyDefaultKey: true, Name: "pub-a",
 		Bootstrap:            seedsB,
 		Interval:             500 * time.Millisecond,
 		EnablePublicFallback: true,
@@ -459,7 +466,7 @@ func TestPublicNetworkAutoRetire(t *testing.T) {
 		t.Fatalf("new discovery A: %v", err)
 	}
 	db, err := New(ctx, hb, Config{
-		NetworkKey: "", Name: "pub-b",
+		NetworkKey: "", LegacyDefaultKey: true, Name: "pub-b",
 		Bootstrap:            seedsA,
 		Interval:             500 * time.Millisecond,
 		EnablePublicFallback: true,
@@ -467,9 +474,9 @@ func TestPublicNetworkAutoRetire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new discovery B: %v", err)
 	}
-	// 归一化断言：留空必须被填充为默认密钥，且双 DHT 均已建立。
+	// 归一化断言：LegacyDefaultKey 下留空必须填为历史公共网络密钥，双 DHT 均已建立。
 	if da.cfg.NetworkKey != PublicNetworkKey || db.cfg.NetworkKey != PublicNetworkKey {
-		t.Fatalf("留空密钥应归一化为 PublicNetworkKey：a=%q b=%q",
+		t.Fatalf("LegacyDefaultKey 下留空应归一化为 PublicNetworkKey：a=%q b=%q",
 			da.cfg.NetworkKey, db.cfg.NetworkKey)
 	}
 	if da.dhtPrivate == nil || db.dhtPrivate == nil {
@@ -652,5 +659,73 @@ func TestMemberReclaim(t *testing.T) {
 	da.mu.RUnlock()
 	if !ok2 || vip == "" {
 		t.Fatalf("回收后成员未重新入表")
+	}
+}
+
+// TestDeriveDefaultNetworkKey 本机专属默认网络密钥的派生规则：
+//   - 不同 PeerID → 不同密钥（每台机器默认自成一张网，避免超大网络）；
+//   - 相同 PeerID → 相同密钥（重启稳定，不会每次启动换网）；
+//   - 与历史公共网络密钥 PublicNetworkKey 不相等（老网络语义已变，靠
+//     LegacyDefaultKey 显式迁移，而不是靠默认值撞回旧网）。
+func TestDeriveDefaultNetworkKey(t *testing.T) {
+	a := DeriveDefaultNetworkKey("12D3KooWAAAA")
+	b := DeriveDefaultNetworkKey("12D3KooWBBBB")
+	if a == b {
+		t.Fatalf("不同 PeerID 必须派生不同默认密钥，实际都等于 %q", a)
+	}
+	if a != DeriveDefaultNetworkKey("12D3KooWAAAA") {
+		t.Fatalf("相同 PeerID 必须派生稳定密钥（重启不换网）")
+	}
+	if !strings.HasPrefix(a, DefaultNetworkKeyPrefix) {
+		t.Fatalf("派生密钥应带前缀 %q，实际 %q", DefaultNetworkKeyPrefix, a)
+	}
+	if a == PublicNetworkKey {
+		t.Fatalf("派生默认密钥不应等于历史公共网络密钥（否则又回到全局同网）")
+	}
+	// 空 PeerID 兜底：退回历史默认值，不能 panic 或产生空密钥。
+	if got := DeriveDefaultNetworkKey(""); got != PublicNetworkKey {
+		t.Fatalf("空 PeerID 应兜底为 PublicNetworkKey，实际 %q", got)
+	}
+}
+
+// TestBlankKeyIsolatedPerNode 留空密钥的两个节点（不同身份）必须落在
+// 不同网络：GroupKey 不同 → DHT rendezvous / mDNS 标签 / 虚拟 IP 全部隔离。
+// 这是「零配置不再等于与全世界同网」的核心保证。
+func TestBlankKeyIsolatedPerNode(t *testing.T) {
+	ka := DeriveDefaultNetworkKey("12D3KooWAAAA")
+	kb := DeriveDefaultNetworkKey("12D3KooWBBBB")
+	ga := GroupKey(ChannelOfficial, ka)
+	gb := GroupKey(ChannelOfficial, kb)
+	if string(ga) == string(gb) {
+		t.Fatalf("不同默认密钥必须派生出不同群组密钥")
+	}
+	if RendezvousKey(ga) == RendezvousKey(gb) {
+		t.Fatalf("不同默认网络必须使用不同 DHT rendezvous key")
+	}
+	if MdnsTag(ga) == MdnsTag(gb) {
+		t.Fatalf("不同默认网络必须使用不同 mDNS 标签")
+	}
+	// 同一台机器重启后（PeerID 不变）群身份必须保持一致。
+	if string(GroupKey(ChannelOfficial, DeriveDefaultNetworkKey("12D3KooWAAAA"))) != string(ga) {
+		t.Fatalf("同身份重启后群身份必须稳定")
+	}
+}
+
+// TestLegacyDefaultKeyKeepsOldNetwork 迁移兼容：显式 LegacyDefaultKey 时
+// 留空仍归一化为历史 PublicNetworkKey，老节点升级后不脱离原网络。
+func TestLegacyDefaultKeyKeepsOldNetwork(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	h := testHost(t, false)
+	d, err := New(ctx, h, Config{NetworkKey: "", LegacyDefaultKey: true})
+	if err != nil {
+		t.Fatalf("new discovery: %v", err)
+	}
+	if d.cfg.NetworkKey != PublicNetworkKey {
+		t.Fatalf("LegacyDefaultKey 下留空应保持历史公共网络密钥，实际 %q", d.cfg.NetworkKey)
+	}
+	if string(d.GroupKey()) != string(GroupKey(ChannelOfficial, PublicNetworkKey)) {
+		t.Fatalf("LegacyDefaultKey 下群身份必须与历史派生完全一致（老网络零迁移）")
 	}
 }

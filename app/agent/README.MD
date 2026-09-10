@@ -15,9 +15,11 @@
 go run ./app/agent/cmd/pvn-node -name node-a -key 'private-network'
 ```
 
-相同网络密钥的节点经 mDNS 和 DHT 自动发现。节点默认启用 TUN 与 `allow-all`
-防火墙，获得 `10.7.x.x` 虚拟 IP；Windows 需要管理员权限，Linux 需要
-`/dev/net/tun` 与 `CAP_NET_ADMIN`。TUN 初始化失败只会降级为应用层模式。
+相同网络密钥的节点才能互相查找到地址（查找仅限同密钥内）。连接采用**按节点
+ID 互连 + 连接审批**模型：把对方节点 ID 填进控制台并点连接，对方同意一次即
+永久信任；未审批的陌生节点完全隔离。节点默认启用 TUN 与 `allow-all` 防火墙，
+获得 `10.7.x.x` 虚拟 IP；Windows 需要管理员权限，Linux 需要 `/dev/net/tun` 与
+`CAP_NET_ADMIN`。TUN 初始化失败只会降级为应用层模式。
 
 常用参数和对应环境变量：
 
@@ -25,14 +27,17 @@ go run ./app/agent/cmd/pvn-node -name node-a -key 'private-network'
 |---|---|---|
 | `-config` | `LANET_CONFIG` | 配置路径；默认可执行文件同目录 `lanet.json` |
 | `-name` | `LANET_NAME` | 节点名称 |
-| `-key` | `LANET_NETWORK_KEY` | 网络密钥；空值为官方公共网络 |
-| `-bootstrap` | `LANET_BOOTSTRAP` | `public`、`none` 或逗号分隔的成员 multiaddr |
+| `-key` | `LANET_NETWORK_KEY` | 网络密钥；留空 = 按本机身份派生的专属默认网络 |
+| `-bootstrap` | `LANET_BOOTSTRAP` | `public`、`none` 或逗号分隔的成员 multiaddr（连接种子） |
 | `-listen` | `LANET_LISTEN` | 逗号分隔的 libp2p 监听地址 |
 | `-console` | `LANET_CONSOLE` | 控制台地址；默认 `127.0.0.1:8900`，`-` 为关闭 |
 | `-console-password` | `LANET_CONSOLE_PASSWORD` | 控制台密码 |
 | `-fw` | `LANET_FW` | `deny-all`、`allow-list`、`allow-all` |
+| `-require-approval` | `LANET_REQUIRE_APPROVAL` | 是否要求连接审批（默认 `true`）；`false` = 同密钥节点可直接互连 |
+| `-auto-accept` | `LANET_AUTO_ACCEPT` | 自动同意所有连接申请（默认 `false`）；无人值守中央服务器/种子节点用 |
+| `-db` | `LANET_DB` | 地址簿数据库路径（默认 exe 同目录 `lanet.db`；`-` = 仅内存） |
 | `-public-dht` | `LANET_PUBLIC_DHT` | 启用公共 DHT 临时引导（v0.5.16 起默认关闭以省流量） |
-| `-public-dht-minutes` | `LANET_PUBLIC_DHT_MINUTES` | 公共 DHT 最长运行分钟数（默认 10；连上同群成员或超时即自动退出） |
+| `-public-dht-minutes` | `LANET_PUBLIC_DHT_MINUTES` | 公共 DHT 最长运行分钟数（默认 10；连上同网络成员或超时即自动退出） |
 | `-tun true/false` | - | 是否启用 TUN；默认读取配置，缺省为 `true` |
 | `-probe` | - | 成员探测间隔 |
 
@@ -54,12 +59,14 @@ go run ./app/agent/cmd/pvn-node -name node-a -key 'private-network'
   "public_dht_minutes": 10,
   "probe_seconds": 20,
   "tun": true,
+  "require_approval": true,
+  "auto_accept": false,
   "github_token": ""
 }
 ```
 
 Windows 的 `node.key` 与程序目录一起迁移；其他平台身份路径固定为
-`/data/node.key`。`state.json` 和 `lanet.log` 位于配置文件目录。
+`/data/node.key`。`lanet.db`（地址簿）、`state.json` 和 `lanet.log` 位于配置文件目录。
 
 ## pvn-agent
 

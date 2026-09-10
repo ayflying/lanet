@@ -13,6 +13,11 @@ resource/output/
 node_modules/
 # 发布签名私钥等机密文件（严禁入库）
 secrets/
+# 节点运行时本地状态：身份私钥 / 地址簿 / 日志（由本地调试启动产生，严禁入库）
+node.key
+lanet.db
+lanet.db-*
+lanet.log
 # C# 构建产物
 sdk/csharp/**/bin/
 sdk/csharp/**/obj/
