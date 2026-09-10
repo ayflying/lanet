@@ -362,6 +362,69 @@ func TestPublicDHTRuntimeToggle(t *testing.T) {
 	t.Fatalf("重开后超时未自动退出：state=%+v", d.PublicDHTState())
 }
 
+// TestDialSeedRuntime 运行时「连接种子直连」：A、B 都关闭公共 DHT（默认），
+// 互不配置引导，只靠 A 主动调用 DialSeed(B 的 multiaddr) 建立成员关系——
+// 验证控制台「直接连接」输入框的底层行为：不经任何公共 DHT、无需重启即可
+// 入网，且双方互认为成员、各自注入私有 DHT 路由表。离线可跑。
+func TestDialSeedRuntime(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	ha := testHost(t, false)
+	hb := testHost(t, false)
+
+	seedsB := make([]string, 0, len(hb.Addrs()))
+	for _, a := range hb.Addrs() {
+		seedsB = append(seedsB, a.String()+"/p2p/"+hb.ID().String())
+	}
+
+	// 两侧都不开启公共 DHT、也不配置任何引导种子。
+	da, err := New(ctx, ha, Config{NetworkKey: "seed-direct", Name: "seed-a", Interval: 500 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("new discovery A: %v", err)
+	}
+	db, err := New(ctx, hb, Config{NetworkKey: "seed-direct", Name: "seed-b", Interval: 500 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("new discovery B: %v", err)
+	}
+	if err = da.Start(ctx); err != nil {
+		t.Fatalf("start A: %v", err)
+	}
+	if err = db.Start(ctx); err != nil {
+		t.Fatalf("start B: %v", err)
+	}
+	go da.Run(ctx)
+	go db.Run(ctx)
+
+	// 运行时按种子直连（等价于控制台点「连接」）。
+	peerID, err := da.DialSeed(ctx, seedsB)
+	if err != nil {
+		t.Fatalf("dial seed: %v", err)
+	}
+	if peerID != hb.ID().String() {
+		t.Fatalf("返回的节点 ID 不符：got %s want %s", peerID, hb.ID())
+	}
+
+	// A 侧成员表应立刻出现 B；B 侧由入向 info 握手反向确认 A。
+	seen := func(d *Discovery, id string) bool {
+		for _, m := range d.Peers() {
+			if m.PeerID == id {
+				return true
+			}
+		}
+		return false
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if seen(da, hb.ID().String()) && seen(db, ha.ID().String()) {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("种子直连后成员关系未建立：A见B=%v B见A=%v",
+		seen(da, hb.ID().String()), seen(db, ha.ID().String()))
+}
+
 // TestPublicNetworkAutoRetire 密钥留空（默认公共网络密钥）端到端：
 // 留空在 New 内归一化为 PublicNetworkKey 并建立双 DHT，两节点经私有
 // DHT 互相发现并确认同群后，公共 DHT 必须自动退出（dhtPublic 置 nil、

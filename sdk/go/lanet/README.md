@@ -213,7 +213,8 @@ info 协议同群校验四层全部隔离。这是软边界：显式设置 `Conf
   （鸡生蛋的钥匙）即自动退出，超时（`PublicDHTTimeout`，默认 10 分钟）未连上
   也自动退出。同群成员一经确认即注入私有 DHT 路由表（互为种子），之后每轮
   发现全部走私有快路径。运行时可用 `SetPublicDHT(true/false)` 即时开关、
-  `PublicDHTStatus()` 查询状态；`SeedAddrs()` 返回本机可分享的连接种子；
+  `PublicDHTStatus()` 查询状态；`SeedAddrs()` 返回本机可分享的连接种子，
+  `ConnectSeed(multiaddr)` 运行时立即直连对方（无需重启）；
 - **引导（Bootstrap）**：填任意已在网成员的 multiaddr（`<addr>/p2p/<peerID>`，
   每台节点都是私有种子）可加速入网；**推荐**用种子而非公共 DHT——纯私有、
   零公共流量、确定可达；纯局域网靠 mDNS 自动发现。

@@ -35,6 +35,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
@@ -361,6 +362,44 @@ func (d *Discovery) DisablePublicDHTRuntime(reason string) {
 	d.retirePublicDHT(reason)
 }
 
+// DialSeed 运行时按连接种子（成员 multiaddr，需带 /p2p/<ID>）直接拨号并
+// 建立成员关系：连通后经 info 协议确认同群、注入私有 DHT 路由表（互为
+// 种子），从而完全不经公共 DHT 完成跨网入网。返回连通的对端节点 ID。
+// 支持一次传入多个地址（同一成员的多个候选地址逐个尝试）。
+func (d *Discovery) DialSeed(ctx context.Context, addrs []string) (string, error) {
+	infos, err := parseBootstrap(ctx, addrs)
+	if err != nil {
+		return "", err
+	}
+	if len(infos) == 0 {
+		return "", fmt.Errorf("连接种子非法：需要形如 /ip4/1.2.3.4/tcp/4001/p2p/12D3Koo... 的完整地址")
+	}
+	var lastErr error
+	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	for _, ai := range infos {
+		if ai.ID == d.host.ID() {
+			return "", fmt.Errorf("连接种子指向本机，无需连接")
+		}
+		d.host.Peerstore().AddAddrs(ai.ID, ai.Addrs, peerstore.PermanentAddrTTL)
+		if err := d.host.Connect(dialCtx, ai); err != nil {
+			lastErr = err
+			continue
+		}
+		// 建连后立刻走 info 协议确认同群（拿到名称、校验渠道与密钥）。
+		if err := d.connectAndIdentify(ai.ID); err != nil {
+			lastErr = fmt.Errorf("已连通但同群校验失败（网络密钥或渠道不一致）: %w", err)
+			continue
+		}
+		d.logf("已按连接种子直连成员 %s（未使用公共 DHT）", ai.ID.ShortString())
+		return ai.ID.String(), nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("连接失败")
+	}
+	return "", fmt.Errorf("连接种子拨号失败: %w", lastErr)
+}
+
 // SelfVirtualIP 本节点在无服务器模式下的虚拟 IP。
 func (d *Discovery) SelfVirtualIP() string { return d.selfIP }
 
@@ -642,26 +681,27 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 }
 
 // connectAndIdentify 建连并交换成员信息；失败静默（下轮发现会重试）。
-func (d *Discovery) connectAndIdentify(id peer.ID) {
+// 返回 error 供主动拨号场景（DialSeed）判成败；周期发现路径忽略返回值。
+func (d *Discovery) connectAndIdentify(id peer.ID) error {
 	connCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if d.host.Network().Connectedness(id) != network.Connected {
 		if err := d.host.Connect(connCtx, peer.AddrInfo{ID: id}); err != nil {
 			d.logf("连接成员 %s 失败: %v", id.ShortString(), err)
-			return
+			return fmt.Errorf("建连失败: %w", err)
 		}
 	}
 	info, err := d.fetchInfo(connCtx, id)
 	if err != nil {
 		d.logf("成员信息交换失败 %s: %v", id.ShortString(), err)
-		return
+		return fmt.Errorf("信息交换失败: %w", err)
 	}
 	if info.Group != GroupFingerprint(d.groupKey) {
 		d.logf("忽略异群节点 %s", id.ShortString())
 		d.mu.Lock()
 		delete(d.members, id.String())
 		d.mu.Unlock()
-		return
+		return fmt.Errorf("对方与本节点不在同一网络（网络密钥或分发渠道不一致）")
 	}
 	// 同群成员互为私有 DHT 种子：确认后立即进路由表，
 	// 后续发现不再依赖公共 DHT（快路径生效）。
@@ -682,7 +722,7 @@ func (d *Discovery) connectAndIdentify(id peer.ID) {
 		m.LastSeen = time.Now()
 	} else {
 		d.mu.Unlock()
-		return
+		return nil
 	}
 	d.mu.Unlock()
 	d.mu.RLock()
@@ -691,6 +731,7 @@ func (d *Discovery) connectAndIdentify(id peer.ID) {
 		d.emit(*m)
 	}
 	d.mu.RUnlock()
+	return nil
 }
 
 // infoPayload info 协议载荷。

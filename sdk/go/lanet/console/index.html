@@ -88,6 +88,10 @@
   <div>
     <h1 id="nodeTitle">Lanet 节点控制台</h1>
     <div class="sub" id="addrLine">加载中…</div>
+    <div class="sub" id="peerLine" style="display:none;margin-top:2px">
+      我的节点 ID：<code id="myPeerID" style="font-size:12px"></code>
+      <button class="ghost" style="font-size:11px;padding:1px 8px;margin-left:6px" onclick="copyText($('myPeerID').textContent, this)">复制</button>
+    </div>
   </div>
   <div class="topbtns" id="topBtns" style="display:none">
     <button class="ghost" id="btnUpdate" onclick="onUpdateClick()">更新<span class="reddot" id="updDot" style="display:none"></span></button>
@@ -148,14 +152,22 @@
   </div>
   <div class="card" id="seedCard" style="display:none">
     <h2>连接种子 <span class="tag unknown">不经公共 DHT 直连入网</span></h2>
-    <div class="sub" style="margin-bottom:8px">把「我的连接种子」发给同群成员，对方粘贴到「节点配置 → 连接种子」并重启，双方即可不经任何公共 DHT 直接入网——之后互相发现全部走私有 DHT。这是省流量且确定可达的入网方式（配合一台固定公网 IP 的节点最理想）。</div>
+    <div class="sub" style="margin-bottom:8px">把「我的连接种子」发给同群成员；对方粘贴到「直接连接」输入框并点连接，<b>立即生效、无需重启</b>。连上后双方互相进入私有 DHT 路由表，之后所有发现都走私有通道，全程零公共 DHT 流量。</div>
     <div class="kv"><b>我的连接种子</b>
       <div class="row" style="margin:0">
         <input type="text" id="seedMine" readonly placeholder="加载中…">
         <button class="ghost" onclick="copyText($('seedMine').value, this)">复制</button>
       </div>
     </div>
-    <div class="sub" style="color:#8a94a6">家庭宽带公网地址变化后，旧种子会失效，需重新复制分享。</div>
+    <div class="kv"><b>直接连接</b>
+      <div class="row" style="margin:0">
+        <input type="text" id="seedInput" placeholder="粘贴对方的连接种子（multiaddr，可含多个，逗号/换行分隔）"
+               onkeydown="if(event.key==='Enter')connectSeed()">
+        <button onclick="connectSeed()">连接</button>
+      </div>
+    </div>
+    <div class="msg" id="seedMsg"></div>
+    <div class="sub" style="color:#8a94a6">家庭宽带公网地址变化后旧种子会失效，需重新复制分享。</div>
   </div>
 </div>
 
@@ -254,6 +266,11 @@ async function loadState() {
   $('addrLine').textContent = `虚拟 IP ${i.virtual_ip}` +
     (i.virtual_host ? ` · 虚拟地址 ${i.virtual_host}` : '') +
     ` · 节点 ${i.peer_id.slice(0,16)}… · 网络 ${i.group || i.group_id}`;
+  // 页眉展示完整节点 ID，方便复制分享（连接种子 / 身份识别都要用它）。
+  if (i.peer_id) {
+    $('myPeerID').textContent = i.peer_id;
+    $('peerLine').style.display = '';
+  }
   $('members').innerHTML = '';
   renderMembers();
   $('fwMode').value = S.mode;
@@ -261,6 +278,30 @@ async function loadState() {
   $('bForwards').textContent = S.forwards.length;
   renderRules(); renderForwards();
   renderSeed(); renderPublicDHT();
+}
+
+// connectSeed 按输入的连接种子立即直连（运行时生效，无需重启）。
+async function connectSeed() {
+  const seed = $('seedInput').value.trim();
+  if (!seed) { flash('seedMsg', '请先粘贴对方的连接种子', false); return; }
+  const btn = event && event.target;
+  if (btn && btn.tagName === 'BUTTON') { btn.disabled = true; }
+  flash('seedMsg', '正在连接…', true);
+  try {
+    const r = await fetch('/api/connect-seed', { method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ seed }) });
+    const res = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const who = res.virtual_ip ? `（虚拟 IP ${res.virtual_ip}）` : '';
+      flash('seedMsg', '已连接成员 ' + (res.peer_id ? res.peer_id.slice(0, 16) + '…' : '') + who, true);
+      $('seedInput').value = '';
+      loadState();
+    } else {
+      flash('seedMsg', '连接失败' + (res.error ? '：' + res.error : ''), false);
+    }
+  } finally {
+    if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; }
+  }
 }
 
 // ---- 连接种子：本机可分享的 multiaddr（不依赖公共 DHT 的入网凭据） ----

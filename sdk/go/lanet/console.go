@@ -97,6 +97,7 @@ func (c *Client) startConsole() error {
 	mux.HandleFunc("PUT /api/firewall", c.apiSetFirewall)
 	mux.HandleFunc("PUT /api/forwards", c.apiSetForwards)
 	mux.HandleFunc("POST /api/public-dht", c.apiSetPublicDHT)
+	mux.HandleFunc("POST /api/connect-seed", c.apiConnectSeed)
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		if logo, err := consoleFS.ReadFile("console/logo.png"); err == nil {
@@ -279,6 +280,32 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		"has_public_dht_config": hasPub,
 		"seed_addrs":            c.SeedAddrs(),
 	})
+}
+
+// apiConnectSeed 立即按连接种子直连一个同群节点（运行时可调，无需重启）。
+// 请求体 {"seed": "<multiaddr>"}；成功返回 peer_id 与对应虚拟 IP。
+func (c *Client) apiConnectSeed(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Seed string `json:"seed"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
+		return
+	}
+	peerID, err := c.ConnectSeed(req.Seed)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	// 回查成员的虚拟 IP，便于前端直接展示「已连接到 xxx」。
+	vip := ""
+	for _, m := range c.NetMap().Members {
+		if m.PeerID == peerID {
+			vip = m.VirtualIP
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "peer_id": peerID, "virtual_ip": vip})
 }
 
 // apiSetPublicDHT 运行时开关公共 DHT 临时引导（控制台开关，立即生效）。

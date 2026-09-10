@@ -544,6 +544,33 @@ func (c *Client) PublicDHTStatus() (serverless.PublicDHTState, bool) {
 	return c.disc.PublicDHTState(), true
 }
 
+// ConnectSeed 立即按连接种子直连一个同群节点（运行时生效，无需重启）。
+// seed 为对方在控制台「成员」页复制的连接种子（multiaddr，需带 /p2p/<ID>），
+// 可一次传入多个地址（逗号/换行分隔），逐个尝试。连通并确认同群后，
+// 对方会注入本机私有 DHT 路由表，后续发现不再依赖公共 DHT。
+// 仅 Standalone（无服务器）模式支持。
+func (c *Client) ConnectSeed(seed string) (string, error) {
+	if c.disc == nil {
+		return "", fmt.Errorf("仅 Standalone（无服务器）模式支持连接种子")
+	}
+	addrs := []string{}
+	for _, part := range strings.FieldsFunc(seed, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r' || r == ' ' || r == '\t' || r == ';'
+	}) {
+		if p := strings.TrimSpace(part); p != "" {
+			addrs = append(addrs, p)
+		}
+	}
+	if len(addrs) == 0 {
+		return "", fmt.Errorf("请填写对方的连接种子")
+	}
+	ctx := c.rootCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.disc.DialSeed(ctx, addrs)
+}
+
 // SetPublicDHT 运行时开启/关闭公共 DHT 临时引导（控制台开关，立即生效）。
 // 仅 Standalone（无服务器）模式支持。开启后受临时引导时长约束：连上同群
 // 成员立即退出，超时未连上也退出；不改动配置文件（下次启动由配置决定）。
