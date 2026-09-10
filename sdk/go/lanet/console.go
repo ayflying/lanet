@@ -121,6 +121,9 @@ func (c *Client) startConsole() error {
 	}
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		page, _ := consoleFS.ReadFile("console/index.html")
+		// 页面随二进制内置，每次升级内容都会变：禁止缓存，避免升级后浏览器
+		// 仍用旧页面导致「新功能看不到 / 字段对不上」的假故障。
+		w.Header().Set("Cache-Control", "no-store, must-revalidate")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(page)
 	})
