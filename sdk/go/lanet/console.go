@@ -236,6 +236,14 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 	c.fwMu.RLock()
 	forwards := append([]LANForward(nil), c.forwards...)
 	c.fwMu.RUnlock()
+	// 空切片必须序列化为 [] 而不是 null：前端读 xxx.length 不做判空，
+	// 一旦返回 null 整个 loadState 中断，后续渲染（连接卡片等）全部失效。
+	if forwards == nil {
+		forwards = []LANForward{}
+	}
+	if rules == nil {
+		rules = []FirewallRule{}
+	}
 	type memberView struct {
 		PeerID    string `json:"peer_id"`
 		Name      string `json:"name"`
@@ -505,6 +513,9 @@ func (c *Client) loadState() {
 	}
 	c.fw.Set(st.Mode, st.Rules)
 	c.forwards = st.Forwards
+	if c.forwards == nil {
+		c.forwards = []LANForward{}
+	}
 	c.logf("已从 %s 恢复控制台状态（防火墙 %s，映射 %d 条）", filepath.Base(c.statePath), st.Mode, len(st.Forwards))
 }
 

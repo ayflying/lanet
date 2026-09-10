@@ -324,6 +324,10 @@ async function loadState() {
   renderMembers();
   $('fwMode').value = S.mode;
   $('bRules').textContent = S.rules.length;
+  // 防御旧版后端/异常响应返回 null：任何列表字段缺失都兜底为空数组，
+  // 保证 loadState 不中断（一处抛错会让后面的 renderConnect 全部失效）。
+  S.rules = S.rules || []; S.forwards = S.forwards || [];
+  S.members = S.members || []; S.pending = S.pending || [];
   $('bForwards').textContent = S.forwards.length;
   renderRules(); renderForwards();
   renderConnect(); renderSeed(); renderPublicDHT();
