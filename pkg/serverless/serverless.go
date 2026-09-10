@@ -96,6 +96,10 @@ type Config struct {
 	Version string
 	// Platform 本节点运行平台（GOOS/GOARCH，如 windows/amd64）。
 	Platform string
+	// OSHostname 本节点操作系统主机名（info 协议交换，供成员识别设备）。空 = 不上报。
+	OSHostname string
+	// LocalIPs 本节点非回环网卡 IP 列表（info 协议交换，供成员识别设备网段）。空 = 不上报。
+	LocalIPs []string
 	// Quiet 为 true 时不打日志。
 	Quiet bool
 }
@@ -116,6 +120,12 @@ type Member struct {
 	Version string `json:"version,omitempty"`
 	// Platform 成员运行平台 GOOS/GOARCH。
 	Platform string `json:"platform,omitempty"`
+	// OSHostname 成员的操作系统主机名（info 协议交换；旧节点为空）。
+	// 与 Name（节点配置名）互相独立，用于识别「这是哪台机器」。
+	OSHostname string `json:"os_hostname,omitempty"`
+	// LocalIPs 成员本机所有非回环网卡 IP（含掩码位数，如 192.168.50.100/24）。
+	// info 协议交换，用于在控制台上识别设备归属网段；旧节点为空。
+	LocalIPs []string `json:"local_ips,omitempty"`
 }
 
 // Discovered 新成员被发现（尚未连通也会触发；连通并确认同群后 Name 有效）。
@@ -368,30 +378,49 @@ func (d *Discovery) dhtRound(ctx context.Context, dht *kaddht.IpfsDHT, source st
 	}
 }
 
-// publicRetireThreshold 私有 DHT 路由表达到该数量的同群节点后，
-// 公共 DHT 视为「已完成冷启动使命」并退出（省流量）。
+// publicRetireThreshold 达到该数量的同群节点后，公共 DHT 视为
+// 「已完成冷启动使命」并退出（省流量）。
 // 1 = 只要有一个同群种子就退（同群成员互为种子，后续发现可持续）。
 const publicRetireThreshold = 1
 
-// maybeRetirePublicDHT 每确认一个同群成员就检查一次：私有 DHT 路由表
-// 攒够足够多的「自己人」后，主动退出公共 DHT（停止广告、清空路由表、
-// 关闭流处理），不再承担公共 DHT server 的应答流量（实测上行 ~4MB/分钟）。
+// maybeRetirePublicDHT 每确认一个同群成员就检查一次：攒够足够多的
+// 「自己人」后，主动退出公共 DHT（停止广告、清空路由表、关闭流处理），
+// 不再承担公共 DHT server 的应答流量（实测上行 ~4MB/分钟）。
+// 判据按模式区分：
+//   - 私有网络（双 DHT）：私有 DHT 路由表中的同群节点数；
+//   - 公共网络（密钥留空，无私有 DHT）：成员表中仍活跃（memberTTL 内
+//     有真实通讯）的同群成员数。
+//
 // 退出后不自动回归公共——mDNS 与成员表里的地址仍可重连；彻底失联时
 // 重启节点即可重新冷启动。
 func (d *Discovery) maybeRetirePublicDHT() {
 	d.mu.Lock()
-	if d.dhtPublic == nil || d.dhtPrivate == nil || d.publicRetired {
+	if d.dhtPublic == nil || d.publicRetired {
 		d.mu.Unlock()
 		return
 	}
-	n := len(d.dhtPrivate.RoutingTable().ListPeers())
+	var n int
+	if d.dhtPrivate != nil {
+		n = len(d.dhtPrivate.RoutingTable().ListPeers())
+	} else {
+		cutoff := time.Now().Add(-d.memberTTL)
+		for _, m := range d.members {
+			if m.LastSeen.After(cutoff) {
+				n++
+			}
+		}
+	}
 	if n < publicRetireThreshold {
 		d.mu.Unlock()
 		return
 	}
 	d.publicRetired = true // 先置位，防并发重复触发
 	d.mu.Unlock()
-	d.logf("私有 DHT 已就绪（路由表 %d 个同群节点），退出公共 DHT 省流量", n)
+	if d.dhtPrivate != nil {
+		d.logf("私有 DHT 已就绪（路由表 %d 个同群节点），退出公共 DHT 省流量", n)
+	} else {
+		d.logf("已连接 %d 个同群成员，退出公共 DHT 省流量", n)
+	}
 	go d.retirePublicDHT()
 }
 
@@ -427,7 +456,7 @@ func (d *Discovery) retirePublicDHT() {
 		}
 		_ = c.Close()
 	}
-	d.logf("已退出公共 DHT（发现继续：私有 DHT + mDNS + 成员表）")
+	d.logf("已退出公共 DHT（同群发现继续：mDNS + 成员表 + 私有 DHT；彻底失联时重启可重新冷启动）")
 }
 
 // addMember 记录成员并异步建连（连通后经 info 协议确认同群、拿名称）。
@@ -502,13 +531,18 @@ func (d *Discovery) connectAndIdentify(id peer.ID) {
 	// 后续发现不再依赖公共 DHT（快路径生效）。
 	if d.dhtPrivate != nil {
 		_, _ = d.dhtPrivate.RoutingTable().TryAddPeer(id, false, false)
-		d.maybeRetirePublicDHT()
 	}
+	// 确认同群即检查公共 DHT 退出（公共网络模式无私有 DHT，同样适用）。
+	d.maybeRetirePublicDHT()
 	d.mu.Lock()
 	if m, ok := d.members[id.String()]; ok {
 		m.Name = info.Name
 		m.Version = info.Version
 		m.Platform = info.Platform
+		m.OSHostname = info.OSHostname
+		if len(info.LocalIPs) > 0 {
+			m.LocalIPs = info.LocalIPs
+		}
 		m.LastSeen = time.Now()
 	} else {
 		d.mu.Unlock()
@@ -525,11 +559,13 @@ func (d *Discovery) connectAndIdentify(id peer.ID) {
 
 // infoPayload info 协议载荷。
 type infoPayload struct {
-	Name     string `json:"name"`
-	Group    string `json:"group"`
-	OS       string `json:"os"`
-	Version  string `json:"version,omitempty"`  // 程序版本（P2P 自更新用）
-	Platform string `json:"platform,omitempty"` // GOOS/GOARCH
+	Name       string   `json:"name"`
+	Group      string   `json:"group"`
+	OS         string   `json:"os"`
+	Version    string   `json:"version,omitempty"`    // 程序版本（P2P 自更新用）
+	Platform   string   `json:"platform,omitempty"`   // GOOS/GOARCH
+	OSHostname string   `json:"os_hostname,omitempty"` // 操作系统主机名（0.5.15 起）
+	LocalIPs   []string `json:"local_ips,omitempty"`   // 本机非回环网卡 IP（0.5.15 起）
 }
 
 // handleInfo 入向信息交换。
@@ -554,18 +590,24 @@ func (d *Discovery) handleInfo(s network.Stream) {
 		}
 		m.Version = req.Version
 		m.Platform = req.Platform
+		m.OSHostname = req.OSHostname
+		if len(req.LocalIPs) > 0 {
+			m.LocalIPs = req.LocalIPs
+		}
 		m.LastSeen = time.Now()
 	}
 	d.mu.Unlock()
 	if d.dhtPrivate != nil {
 		_, _ = d.dhtPrivate.RoutingTable().TryAddPeer(remote, false, false)
-		d.maybeRetirePublicDHT()
 	}
+	d.maybeRetirePublicDHT()
 	resp := infoPayload{
-		Name:     d.cfg.Name,
-		Group:    GroupFingerprint(d.groupKey),
-		Version:  d.cfg.Version,
-		Platform: d.cfg.Platform,
+		Name:       d.cfg.Name,
+		Group:      GroupFingerprint(d.groupKey),
+		Version:    d.cfg.Version,
+		Platform:   d.cfg.Platform,
+		OSHostname: d.cfg.OSHostname,
+		LocalIPs:   d.cfg.LocalIPs,
 	}
 	_ = json.NewEncoder(s).Encode(resp)
 }
@@ -578,10 +620,12 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 	}
 	defer stream.Close()
 	req := infoPayload{
-		Name:     d.cfg.Name,
-		Group:    GroupFingerprint(d.groupKey),
-		Version:  d.cfg.Version,
-		Platform: d.cfg.Platform,
+		Name:       d.cfg.Name,
+		Group:      GroupFingerprint(d.groupKey),
+		Version:    d.cfg.Version,
+		Platform:   d.cfg.Platform,
+		OSHostname: d.cfg.OSHostname,
+		LocalIPs:   d.cfg.LocalIPs,
 	}
 	if err = json.NewEncoder(stream).Encode(req); err != nil {
 		return infoPayload{}, err

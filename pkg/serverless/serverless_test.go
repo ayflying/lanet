@@ -222,6 +222,87 @@ func TestDualDHTPrivateDiscovery(t *testing.T) {
 	}
 }
 
+// TestPublicNetworkAutoRetire 公共网络模式（密钥留空，无私有 DHT）端到端：
+// 两节点经公共 DHT 互相发现并确认同群后，公共 DHT 必须自动退出
+// （dhtPublic 置 nil、publicRetired 置位）——这是修复前公共网络模式
+// 永远挂着公共 DHT 承担 ~4MB/分钟上行应答流量的缺口。离线可跑
+// （公共 DHT 以对方为引导，不依赖 bootstrap.libp2p.io）。
+func TestPublicNetworkAutoRetire(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	ha := testHost(t, false)
+	hb := testHost(t, false)
+
+	seedsA := make([]string, 0, len(ha.Addrs()))
+	for _, a := range ha.Addrs() {
+		seedsA = append(seedsA, a.String()+"/p2p/"+ha.ID().String())
+	}
+	seedsB := make([]string, 0, len(hb.Addrs()))
+	for _, a := range hb.Addrs() {
+		seedsB = append(seedsB, a.String()+"/p2p/"+hb.ID().String())
+	}
+	// 网络密钥留空 = 公共网络模式（NetworkKey=="" 分支，只建公共 DHT）。
+	da, err := New(ctx, ha, Config{
+		NetworkKey: "", Name: "pub-a",
+		Bootstrap: seedsB,
+		Interval:  500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new discovery A: %v", err)
+	}
+	db, err := New(ctx, hb, Config{
+		NetworkKey: "", Name: "pub-b",
+		Bootstrap: seedsA,
+		Interval:  500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new discovery B: %v", err)
+	}
+	if err = da.Start(ctx); err != nil {
+		t.Fatalf("start A: %v", err)
+	}
+	if err = db.Start(ctx); err != nil {
+		t.Fatalf("start B: %v", err)
+	}
+	go da.Run(ctx)
+	go db.Run(ctx)
+
+	// dhtPublicState 线程安全读取公共 DHT 退出状态。
+	dhtPublicState := func(d *Discovery) (alive, retired bool) {
+		d.mu.RLock()
+		defer d.mu.RUnlock()
+		return d.dhtPublic != nil, d.publicRetired
+	}
+
+	// 观察窗口：互相发现（成员表非空）且两侧公共 DHT 均已退出。
+	aSeesB, bSeesA := false, false
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, m := range da.Peers() {
+			if m.PeerID == hb.ID().String() {
+				aSeesB = true
+			}
+		}
+		for _, m := range db.Peers() {
+			if m.PeerID == ha.ID().String() {
+				bSeesA = true
+			}
+		}
+		aAlive, aRetired := dhtPublicState(da)
+		bAlive, bRetired := dhtPublicState(db)
+		if aSeesB && bSeesA && !aAlive && !bAlive && aRetired && bRetired {
+			return // 全部条件达成
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	aAlive, aRetired := dhtPublicState(da)
+	bAlive, bRetired := dhtPublicState(db)
+	t.Fatalf("公共网络模式自动退出未达成：aSeesB=%v bSeesA=%v "+
+		"publicAlive(a=%v b=%v) retired(a=%v b=%v) membersA=%v membersB=%v",
+		aSeesB, bSeesA, aAlive, bAlive, aRetired, bRetired, da.Peers(), db.Peers())
+}
+
 // TestChannelIsolationNoDiscovery 渠道隔离端到端验证：两节点使用完全相同的
 // NetworkKey，但渠道不同（official vs sdk）——即使 B 把 A 配置为私有 DHT
 // 种子并互相拨号，也必须在观察窗口内互相发现不到（成员表为空）。
