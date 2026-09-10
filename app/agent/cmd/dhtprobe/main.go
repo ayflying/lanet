@@ -78,7 +78,9 @@ func main() {
 		Quiet:      *quiet,
 	}
 	if *mode == "private" {
-		discCfg.DisablePublicFallback = true
+		discCfg.EnablePublicFallback = false // 显式声明（当前默认即关闭）
+	} else {
+		discCfg.EnablePublicFallback = true // public 模式测的就是公共 DHT 流量
 	}
 	disc, err := serverless.New(ctx, h, discCfg)
 	must(err)

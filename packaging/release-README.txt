@@ -38,7 +38,7 @@ DHT 自动发现，优先打洞直连，失败时经网络内可达成员的 Cir
   -name              节点名称
   -key               网络密钥
   -bootstrap         public / none / 成员 multiaddr
-  -no-public-dht     关闭公共 DHT 兜底
+  -public-dht        启用公共 DHT 兜底（默认关闭以省流量）
   -listen            逗号分隔的 libp2p 监听地址
   -console           控制台地址，传 - 关闭
   -console-password  控制台密码

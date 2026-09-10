@@ -150,15 +150,15 @@ type Config struct {
 	// 软隔离边界：显式设置相同 Channel 值即可互通。
 	Channel string
 	// Bootstrap 仅 Standalone 模式生效：DHT 引导节点 multiaddr 列表。
-	// 私有网络下作为「私有 DHT 种子」——填任意已在网成员的 multiaddr 可
-	// 加速入网（每台节点都是种子）；填 DefaultBootstrap 会被识别为公共引导。
-	// 私有网络默认同时挂公共 DHT 兜底：私有种子全不可达时仍能经公共 DHT
-	// 找到第一个同群成员（跨网冷启动零配置）。
+	// 作为「私有 DHT 种子」——填任意已在网成员的 multiaddr 可加速入网
+	// （每台节点都是种子）；填 DefaultBootstrap 且开启 EnablePublicDHT
+	// 时作为公共引导。
 	Bootstrap []string
-	// DisablePublicDHT 仅 Standalone 私有网络生效：关闭公共 DHT 兜底，
-	// 只用私有 DHT + mDNS 发现。适用于不想接入公共网络、且能保证首次
-	// 通过种子节点或局域网入网的场景。
-	DisablePublicDHT bool
+	// EnablePublicDHT 启用公共 DHT 兜底（默认关闭）。公共 DHT 是全公网
+	// 共享网络，挂上去会持续消耗上行流量（实测空载 ~4MB/分钟），故默认
+	// 关闭、只用私有 DHT + mDNS 发现。跨网冷启动需保证首次通过种子节点
+	// 或局域网入网；需要零配置跨网冷启动时再显式开启。
+	EnablePublicDHT bool
 	// LANForwards 局域网端口转发初始映射表：入向请求端口命中 Listen 时，
 	// 转发到 Target（本机所在真实局域网内的设备地址，如 192.168.1.100:5000）。
 	// 运行中可经 Web 控制台热更新；入向转发始终受防火墙约束（默认全拒绝）。
@@ -319,8 +319,8 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	localHostname, _ := os.Hostname()
 	localIPs := collectLocalIPs()
 	if cfg.Standalone {
-		// 网络密钥：NetworkKey 优先；兼容回退 InviteCode（旧用法）；
-		// 都为空 = 公共网络（所有留空节点互通）。
+		// 密钥留空会在 serverless.New 内归一化为默认公共网络密钥
+		//（群身份与历史一致），此处仅做 InviteCode 兼容回退。
 		if cfg.NetworkKey == "" {
 			cfg.NetworkKey = cfg.InviteCode
 		}
@@ -380,7 +380,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 			Channel:               cfg.Channel,
 			Name:                  cfg.Name,
 			Bootstrap:             cfg.Bootstrap,
-			DisablePublicFallback: cfg.DisablePublicDHT,
+			EnablePublicFallback: cfg.EnablePublicDHT,
 			EnableMDNS:            true,
 			Interval:              cfg.NetMapInterval,
 			MemberTTL:             cfg.MemberTTL,
@@ -402,11 +402,11 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		c.group = "standalone-" + serverless.GroupFingerprint(disc.GroupKey())
 		c.myIP = disc.SelfVirtualIP()
 		c.created = true
-		if cfg.NetworkKey == "" {
-			c.logf("无服务器模式入网（公共网络）：虚拟 IP=%s", c.myIP)
-		} else {
-			c.logf("无服务器模式入网（私有网络）：虚拟 IP=%s，网络密钥=%s", c.myIP, cfg.NetworkKey)
+		keyLabel := cfg.NetworkKey
+		if keyLabel == "" {
+			keyLabel = serverless.PublicNetworkKey + "（默认）"
 		}
+		c.logf("无服务器模式入网：虚拟 IP=%s，网络密钥=%s", c.myIP, keyLabel)
 	} else {
 		c.netmapCli = netmapclient.NewClient(cfg.CTLURL, c.peerID)
 		if cfg.InviteCode == "" {

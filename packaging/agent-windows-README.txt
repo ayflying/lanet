@@ -47,9 +47,10 @@ node.key 同时复制给多个在线节点。
 【常用命令行参数】
   -config            配置文件路径，默认程序目录 lanet.json
   -name              节点名称
-  -key               网络密钥；留空加入官方公共网络
-  -bootstrap         public（默认）/ none / 逗号分隔的成员 multiaddr
-  -no-public-dht     关闭公共 DHT 兜底
+  -key               网络密钥；留空 = 默认公共网络密钥（所有留空节点互通）
+  -bootstrap         none（默认）/ public / 逗号分隔的成员 multiaddr
+  -public-dht        启用公共 DHT 兜底（默认关闭以省流量；开启后跨网可零配置
+                     冷启动，找到同群成员即自动退出）
   -listen            逗号分隔的 libp2p 监听地址
   -console           控制台地址，传 - 关闭
   -console-password  控制台密码
@@ -62,7 +63,8 @@ node.key 同时复制给多个在线节点。
   .\lanet.exe -name pc2 -key "our-network-key"
 
 【发现、路由和防火墙】
-  - public 引导使用公共 DHT 完成跨网冷启动；none 仅使用局域网 mDNS。
+  - 默认无引导（none）：私有 DHT + mDNS 发现，不接触任何公共设施；跨网
+    冷启动可 -bootstrap 成员 multiaddr，或 -public-dht 开启公共兜底。
   - Windows 会为每个成员维护 /32 on-link 路由和邻居项。日志出现“TUN 网卡
     lanet 已就绪”后，虚拟 IP 才能由系统应用直接使用。
   - TUN 初始化失败会自动降级；应用协议和端口转发仍可用，原因写入 lanet.log。

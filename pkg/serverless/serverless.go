@@ -77,10 +77,13 @@ type Config struct {
 	// 成员的 multiaddr 即可加速入网；填 DefaultBootstrap 会被识别为公共
 	// 引导（不作为私有种子）。公共网络下即公共 DHT 引导列表。
 	Bootstrap []string
-	// DisablePublicFallback 私有网络下关闭公共 DHT 兜底（纯私有发现：
-	// 私有引导节点 + mDNS）。默认开启兜底：私有种子不可达时仍可经公共
-	// DHT 找到同群成员。仅对 NetworkKey 非空时生效。
-	DisablePublicFallback bool
+	// EnablePublicFallback 启用公共 DHT 兜底（默认关闭）。默认关闭的
+	// 原因：公共 DHT 是全公网共享网络，作为 server 节点要持续应答全网
+	// 随机查询（实测空载上行 ~4MB/分钟），且国内连 bootstrap.libp2p.io
+	// 不稳定，反复重试也会产生无效流量。开启后公共 DHT 仅负责跨网冷
+	// 启动（找到第一个「自己人」即自动退出，见 maybeRetirePublicDHT）；
+	// 关闭时跨网冷启动需把已在网成员 multiaddr 配置为引导种子。
+	EnablePublicFallback bool
 	// EnableMDNS 启用局域网 mDNS 自动发现。
 	EnableMDNS bool
 	// Interval 广播/发现周期，默认 30s。
@@ -154,6 +157,26 @@ type Discovery struct {
 
 // New 创建并启动发现服务：连引导节点、初始化 DHT、启动 mDNS。
 func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
+	if cfg.NetworkKey == "" {
+		// 密钥留空 = 默认公共网络密钥：群身份与历史「留空派生」完全一致
+		//（GroupKey(channel, "") == GroupKey(channel, PublicNetworkKey)，零迁移），
+		// 但统一走双 DHT 路径——私有优先 + 公共兜底，发现同群成员后自动
+		// 退出公共 DHT 省流量。不再存在「无密钥公共网络模式」特例，
+		// 为单机同时加入多个网络铺平道路：每个网络实例都有明确密钥。
+		cfg.NetworkKey = PublicNetworkKey
+	}
+	// 关闭公共兜底时，公共引导地址不参与任何连接——连 Start 阶段的
+	// 引导 Connect 也不去碰 bootstrap.libp2p.io（国内解析/连接常超时，
+	// 白白产生重试流量）。
+	if !cfg.EnablePublicFallback {
+		kept := make([]string, 0, len(cfg.Bootstrap))
+		for _, b := range cfg.Bootstrap {
+			if b != DefaultBootstrap {
+				kept = append(kept, b)
+			}
+		}
+		cfg.Bootstrap = kept
+	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = 30 * time.Second
 	}
@@ -173,54 +196,40 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
 
 	// 1. DHT：每台节点都是 server（客户端即服务端）。
-	//    私有网络跑双 DHT：私有（/lanet 前缀，只有本网络节点）优先发现，
+	//    双 DHT：私有（/lanet 前缀，只有本网络节点）优先发现，
 	//    公共（/ipfs 前缀）兜底——负责跨网冷启动时找到第一个「自己人」。
-	//    公共网络（密钥留空）只跑公共 DHT，语义与此前一致。
-	if cfg.NetworkKey != "" {
-		privSeeds := make([]string, 0, len(cfg.Bootstrap))
-		for _, b := range cfg.Bootstrap {
-			if b != DefaultBootstrap { // 公共引导地址不作为私有种子
-				privSeeds = append(privSeeds, b)
-			}
+	//    密钥留空的节点已在上方归一化为公共网络密钥，同样走此路径。
+	privSeeds := make([]string, 0, len(cfg.Bootstrap))
+	for _, b := range cfg.Bootstrap {
+		if b != DefaultBootstrap { // 公共引导地址不作为私有种子
+			privSeeds = append(privSeeds, b)
 		}
-		privParsed, err := parseBootstrap(ctx, privSeeds)
-		if err != nil {
-			return nil, err
-		}
-		d.dhtPrivate, err = kaddht.New(h,
-			kaddht.Mode(kaddht.ModeAutoServer),
-			kaddht.BootstrapPeers(privParsed...),
-			kaddht.ProtocolPrefix(PrivateDHTPrefix),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("serverless: init private dht: %w", err)
-		}
-		if !cfg.DisablePublicFallback {
-			pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			pubParsed, perr := parseBootstrap(pubCtx, []string{DefaultBootstrap})
-			cancel()
-			if perr != nil {
-				d.logf("公共引导解析失败，公共兜底暂不可用（下轮重试广播）: %v", perr)
-			}
-			d.dhtPublic, err = kaddht.New(h,
-				kaddht.Mode(kaddht.ModeAutoServer),
-				kaddht.BootstrapPeers(pubParsed...),
-			)
-			if err != nil {
-				return nil, fmt.Errorf("serverless: init public dht: %w", err)
-			}
-		}
-	} else {
-		bootstraps, err := parseBootstrap(ctx, cfg.Bootstrap)
-		if err != nil {
-			return nil, err
+	}
+	privParsed, err := parseBootstrap(ctx, privSeeds)
+	if err != nil {
+		return nil, err
+	}
+	d.dhtPrivate, err = kaddht.New(h,
+		kaddht.Mode(kaddht.ModeAutoServer),
+		kaddht.BootstrapPeers(privParsed...),
+		kaddht.ProtocolPrefix(PrivateDHTPrefix),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("serverless: init private dht: %w", err)
+	}
+	if cfg.EnablePublicFallback {
+		pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		pubParsed, perr := parseBootstrap(pubCtx, []string{DefaultBootstrap})
+		cancel()
+		if perr != nil {
+			d.logf("公共引导解析失败，公共兜底暂不可用（下轮重试广播）: %v", perr)
 		}
 		d.dhtPublic, err = kaddht.New(h,
 			kaddht.Mode(kaddht.ModeAutoServer),
-			kaddht.BootstrapPeers(bootstraps...),
+			kaddht.BootstrapPeers(pubParsed...),
 		)
 		if err != nil {
-			return nil, fmt.Errorf("serverless: init dht: %w", err)
+			return nil, fmt.Errorf("serverless: init public dht: %w", err)
 		}
 	}
 
@@ -254,7 +263,9 @@ func (d *Discovery) Start(ctx context.Context) error {
 		}
 	}
 	if d.dhtPrivate != nil && d.dhtPublic != nil {
-		d.logf("双 DHT 模式：私有发现优先，公共 DHT 兜底")
+		d.logf("双 DHT 模式：私有发现优先，公共 DHT 兜底（找到同群成员后自动退出）")
+	} else {
+		d.logf("公共 DHT 兜底已关闭（私有 DHT + mDNS 发现；跨网冷启动需配置成员引导种子）")
 	}
 	d.host.SetStreamHandler(ProtocolInfo, d.handleInfo)
 	return nil
@@ -387,9 +398,10 @@ const publicRetireThreshold = 1
 // 「自己人」后，主动退出公共 DHT（停止广告、清空路由表、关闭流处理），
 // 不再承担公共 DHT server 的应答流量（实测上行 ~4MB/分钟）。
 // 判据按模式区分：
-//   - 私有网络（双 DHT）：私有 DHT 路由表中的同群节点数；
-//   - 公共网络（密钥留空，无私有 DHT）：成员表中仍活跃（memberTTL 内
-//     有真实通讯）的同群成员数。
+//   - 有私有 DHT（当前所有路径，含密钥留空默认归一化后）：私有 DHT
+//     路由表中的同群节点数；
+//   - 无私有 DHT（防御分支，为后续单机多网络重构保留）：成员表中
+//     仍活跃（memberTTL 内有真实通讯）的同群成员数。
 //
 // 退出后不自动回归公共——mDNS 与成员表里的地址仍可重连；彻底失联时
 // 重启节点即可重新冷启动。

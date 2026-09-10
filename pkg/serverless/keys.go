@@ -19,9 +19,11 @@ import (
 	"fmt"
 )
 
-// PublicNetworkKey 公共网络密钥：Standalone 模式下 NetworkKey 留空时使用。
-// 所有未设置网络密钥的节点都加入同一张公共 P2P 网络，互相可见可连接；
-// 想私有组网请各自约定相同的 NetworkKey。
+// PublicNetworkKey 默认公共网络密钥：NetworkKey 留空时自动使用（Standalone
+// 与 SDK 均如此）。所有使用默认密钥的节点加入同一张 P2P 网络，互相可见
+// 可连接；想私有组网请各自约定相同的 NetworkKey。留空归一化后群身份与
+// 历史派生完全一致（GroupKey(channel, "") == GroupKey(channel, 本值)），
+// 老网络零迁移。
 const PublicNetworkKey = "lanet/public"
 
 // 分发渠道（Channel）：参与群组密钥派生，用于把不同分发途径的程序

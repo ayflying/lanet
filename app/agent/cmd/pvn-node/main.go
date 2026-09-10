@@ -62,9 +62,9 @@ func main() {
 			"覆盖监听地址（逗号分隔）；默认 tcp/ws/quic 全部随机端口")
 		tun = flag.String("tun", "@@unset@@",
 			"虚拟网卡 TUN（IP 层互通：ping/任意端口直达虚拟 IP）；true/false，缺省读配置文件（默认 true）")
-		noPublic = flag.Bool("no-public-dht",
-			envOr("LANET_NO_PUBLIC_DHT", "") == "1" || strings.EqualFold(envOr("LANET_NO_PUBLIC_DHT", ""), "true"),
-			"私有网络下关闭公共 DHT 兜底（纯私有种子 + mDNS）")
+		publicDHT = flag.Bool("public-dht",
+			envOr("LANET_PUBLIC_DHT", "") == "1" || strings.EqualFold(envOr("LANET_PUBLIC_DHT", ""), "true"),
+			"启用公共 DHT 兜底（默认关闭：省流量，跨网冷启动需成员引导种子）")
 		probe = flag.Duration("probe", 0, "成员探测间隔；不传则读配置文件（默认 20s）")
 	)
 	// ---- 开机自启路径识别：注册表 Run 键带 -autorun 参数拉起 ----
@@ -129,7 +129,7 @@ func main() {
 	if *tun != "@@unset@@" {
 		effTun = strings.EqualFold(*tun, "true") || *tun == "1"
 	}
-	effNoPublic := *noPublic || nc.NoPublicDHT
+	effPublic := *publicDHT || nc.EnablePublicDHT
 	// .lanet DNS 强制开启（无开关）：内置 DNS + Windows NRPT 是基础能力，
 	// 关闭只会造成「同版本下有的机器能 ping .lanet 有的不能」的困惑。
 	effProbe := *probe
@@ -151,18 +151,17 @@ func main() {
 		Console:     effConsole,
 		Listen:      effListen,
 		Firewall:    effFW,
-		NoPublicDHT: effNoPublic,
+		EnablePublicDHT: effPublic,
 		Tun:         effTun,
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s noPublicDHT=%v tun=%v version=%s config=%s",
-		effName, effKey, effFW, effConsole, effNoPublic, effTun, version, *config)
+	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s publicDHT=%v tun=%v version=%s config=%s",
+		effName, effKey, effFW, effConsole, effPublic, effTun, version, *config)
 
 	switch strings.TrimSpace(effBootstrap) {
 	case "", "none":
-		// 仅 mDNS 局域网发现（完全不接入公共 DHT）。
-		effNoPublic = true
+		// 无引导节点（默认）：私有 DHT + mDNS 发现，不接触任何公共设施。
 	case "public":
 		nc.bootstrapAddrs = []string{serverless.DefaultBootstrap}
 	default:
@@ -188,7 +187,7 @@ func main() {
 		Standalone:       true,
 		Channel:          lanet.ChannelOfficial, // 官方发行渠道：与第三方 SDK 构建网络隔离
 		Bootstrap:        nc.bootstrapAddrs,
-		DisablePublicDHT: effNoPublic,
+		EnablePublicDHT:  effPublic,
 		IdentityFile:     effIdentity,
 		ConsoleAddr:      effConsole,
 		ConsolePassword:  effConsolePW,
@@ -456,7 +455,7 @@ type nodeConfig struct {
 	ConsolePassword string `json:"console_password,omitempty"`
 	Firewall        string `json:"firewall"`
 	Listen          string `json:"listen"`
-	NoPublicDHT     bool   `json:"no_public_dht"`
+	EnablePublicDHT bool   `json:"enable_public_dht"` // 公共 DHT 兜底开关（默认关闭，v0.5.16 起语义反转）
 	ProbeSec        int    `json:"probe_seconds"`
 	Tun             *bool  `json:"tun,omitempty"` // 虚拟网卡 TUN；nil = 默认开启（兼容旧配置文件）
 	// dns 字段已移除：.lanet DNS 强制开启（无开关），旧配置遗留 dns 键被忽略。
@@ -487,7 +486,8 @@ func loadNodeConfig(path string) (*nodeConfig, bool) {
 	return nc, true
 }
 
-// defaultNodeConfig 开箱即用默认值：主机名作为节点名、公共 DHT 引导、控制台全开。
+// defaultNodeConfig 开箱即用默认值：主机名作为节点名、无引导（私有 DHT +
+// mDNS，不接触公共 DHT）、控制台全开。
 func defaultNodeConfig() *nodeConfig {
 	name, err := os.Hostname()
 	if err != nil || name == "" {
@@ -496,7 +496,7 @@ func defaultNodeConfig() *nodeConfig {
 	return &nodeConfig{
 		Name:       name,
 		NetworkKey: "",
-		Bootstrap:  "public",
+		Bootstrap:  "none",
 		Console:    "127.0.0.1:8900",
 		Firewall:   "allow-all",
 		ProbeSec:   20,
@@ -523,13 +523,13 @@ func (nc *nodeConfig) save(path string) error {
 // nodeRuntime 当前进程实际生效的运行参数。可能来自命令行/环境变量，
 // 与 lanet.json 保存值不一致（配置页据此提示「重启后才切换」）。
 type nodeRuntime struct {
-	Name        string
-	NetworkKey  string
-	Console     string
-	Listen      string
-	Firewall    string
-	NoPublicDHT bool
-	Tun         bool
+	Name            string
+	NetworkKey      string
+	Console         string
+	Listen          string
+	Firewall        string
+	EnablePublicDHT bool
+	Tun             bool
 }
 
 // networkID 运行时网络标识（与 SDK/控制台页眉一致）：standalone- + 群组指纹。
@@ -561,21 +561,22 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				"has_password":  nc.ConsolePassword != "",
 				"firewall":      nc.Firewall,
 				"listen":        nc.Listen,
-				"no_public_dht": nc.NoPublicDHT,
-				"probe_seconds": nc.ProbeSec,
-				"tun":           tunOn,
-				"autorun":       isAutorunEnabled(),
+				"no_public_dht":     true, // 兼容旧前端字段，恒 true（v0.5.16 起默认关闭公共 DHT）
+				"enable_public_dht": nc.EnablePublicDHT,
+				"probe_seconds":     nc.ProbeSec,
+				"tun":               tunOn,
+				"autorun":           isAutorunEnabled(),
 				"autorun_supported": autorunSupported(),
 				"runtime": map[string]any{
-					"name":          eff.Name,
-					"network_key":   eff.NetworkKey,
-					"network_id":    networkID(eff.NetworkKey),
-					"network_text":  networkLabel(eff.NetworkKey),
-					"console":       eff.Console,
-					"listen":        eff.Listen,
-					"firewall":      eff.Firewall,
-					"no_public_dht": eff.NoPublicDHT,
-					"tun":           eff.Tun,
+					"name":              eff.Name,
+					"network_key":       eff.NetworkKey,
+					"network_id":        networkID(eff.NetworkKey),
+					"network_text":      networkLabel(eff.NetworkKey),
+					"console":           eff.Console,
+					"listen":            eff.Listen,
+					"firewall":          eff.Firewall,
+					"enable_public_dht": eff.EnablePublicDHT,
+					"tun":               eff.Tun,
 				},
 			})
 		},

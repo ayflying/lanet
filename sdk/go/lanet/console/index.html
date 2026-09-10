@@ -205,7 +205,7 @@
     <div class="kv"><b>监听地址</b><input type="text" id="cListen" placeholder="留空 = tcp/ws/quic 随机端口"></div>
     <div class="row" style="margin-top:10px">
       <label style="display:flex;gap:6px;align-items:center">
-        <input type="checkbox" id="cNoPublic"> 关闭公共 DHT 兜底（纯私有种子 + mDNS）
+        <input type="checkbox" id="cEnablePublic"> 启用公共 DHT 兜底（默认关闭以省流量；开启后跨网可零配置冷启动，找到同群成员即自动退出）
       </label>
     </div>
     <div class="row">
@@ -395,7 +395,7 @@ async function loadNodeConfig() {
     $('cPassword').value = '';
     $('cPassword').placeholder = c.has_password ? '已设置（输入新值可覆盖）' : '未设置；远程访问时务必设置';
     $('cListen').value = c.listen || '';
-    $('cNoPublic').checked = !!c.no_public_dht;
+    $('cEnablePublic').checked = !!c.enable_public_dht;
     $('cTun').checked = c.tun === undefined ? true : !!c.tun;
     if (c.autorun_supported) {
       $('cAutorunRow').style.display = '';
@@ -424,7 +424,7 @@ async function saveNodeConfig() {
     console: $('cConsole').value.trim(),
     console_password: $('cPassword').value,
     listen: $('cListen').value.trim(),
-    no_public_dht: $('cNoPublic').checked,
+    enable_public_dht: $('cEnablePublic').checked,
     tun: $('cTun').checked,
     autorun: $('cAutorunRow').style.display !== 'none' ? $('cAutorun').checked : undefined,
   };

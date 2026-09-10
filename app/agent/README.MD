@@ -31,7 +31,7 @@ go run ./app/agent/cmd/pvn-node -name node-a -key 'private-network'
 | `-console` | `LANET_CONSOLE` | 控制台地址；默认 `127.0.0.1:8900`，`-` 为关闭 |
 | `-console-password` | `LANET_CONSOLE_PASSWORD` | 控制台密码 |
 | `-fw` | `LANET_FW` | `deny-all`、`allow-list`、`allow-all` |
-| `-no-public-dht` | `LANET_NO_PUBLIC_DHT` | 关闭公共 DHT 兜底 |
+| `-public-dht` | `LANET_PUBLIC_DHT` | 启用公共 DHT 兜底（v0.5.16 起默认关闭以省流量） |
 | `-tun true/false` | - | 是否启用 TUN；默认读取配置，缺省为 `true` |
 | `-probe` | - | 成员探测间隔 |
 

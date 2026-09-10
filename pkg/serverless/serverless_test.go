@@ -163,8 +163,9 @@ func TestDualDHTPrivateDiscovery(t *testing.T) {
 
 	da, err := New(ctx, ha, Config{
 		NetworkKey: "dual-dht", Name: "node-a",
-		Interval:              500 * time.Millisecond,
-		DisablePublicFallback: true,
+		Interval: 500 * time.Millisecond,
+		// 公共兜底 v0.5.16 起默认关闭，此处显式声明测试意图（纯私有）。
+		EnablePublicFallback: false,
 	})
 	if err != nil {
 		t.Fatalf("new discovery A: %v", err)
@@ -175,9 +176,9 @@ func TestDualDHTPrivateDiscovery(t *testing.T) {
 	}
 	db, err := New(ctx, hb, Config{
 		NetworkKey: "dual-dht", Name: "node-b",
-		Bootstrap:             seeds,
-		Interval:              500 * time.Millisecond,
-		DisablePublicFallback: true,
+		Bootstrap:            seeds,
+		Interval:             500 * time.Millisecond,
+		EnablePublicFallback: false,
 	})
 	if err != nil {
 		t.Fatalf("new discovery B: %v", err)
@@ -222,11 +223,49 @@ func TestDualDHTPrivateDiscovery(t *testing.T) {
 	}
 }
 
-// TestPublicNetworkAutoRetire 公共网络模式（密钥留空，无私有 DHT）端到端：
-// 两节点经公共 DHT 互相发现并确认同群后，公共 DHT 必须自动退出
-// （dhtPublic 置 nil、publicRetired 置位）——这是修复前公共网络模式
-// 永远挂着公共 DHT 承担 ~4MB/分钟上行应答流量的缺口。离线可跑
-// （公共 DHT 以对方为引导，不依赖 bootstrap.libp2p.io）。
+// TestDefaultNoPublicFallback 默认语义（v0.5.16 起）：公共 DHT 兜底默认
+// 关闭——不建立公共 DHT、留空密钥归一化为默认公共网络密钥、公共引导
+// 地址从引导列表剔除（连 Start 阶段也不接触 bootstrap.libp2p.io）。
+func TestDefaultNoPublicFallback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	h := testHost(t, false)
+	d, err := New(ctx, h, Config{
+		NetworkKey: "",
+		Bootstrap: []string{
+			DefaultBootstrap, // 关闭兜底后必须被剔除（否则 dnsaddr 解析会联网）
+			"/ip4/127.0.0.1/tcp/1/p2p/" + h.ID().String(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("new discovery: %v", err)
+	}
+	if d.cfg.EnablePublicFallback {
+		t.Fatalf("公共 DHT 兜底默认应为关闭")
+	}
+	if d.dhtPublic != nil {
+		t.Fatalf("默认不应建立公共 DHT")
+	}
+	if d.dhtPrivate == nil {
+		t.Fatalf("私有 DHT 应始终建立")
+	}
+	if d.cfg.NetworkKey != PublicNetworkKey {
+		t.Fatalf("留空密钥应归一化为默认公共网络密钥，实际 %q", d.cfg.NetworkKey)
+	}
+	for _, b := range d.cfg.Bootstrap {
+		if b == DefaultBootstrap {
+			t.Fatalf("关闭兜底后公共引导地址应从引导列表剔除")
+		}
+	}
+}
+
+// TestPublicNetworkAutoRetire 密钥留空（默认公共网络密钥）端到端：
+// 留空在 New 内归一化为 PublicNetworkKey 并建立双 DHT，两节点经私有
+// DHT 互相发现并确认同群后，公共 DHT 必须自动退出（dhtPublic 置 nil、
+// publicRetired 置位）——验证修复前「留空节点永远挂着公共 DHT 承担
+// ~4MB/分钟上行应答流量」的缺口不再回归。离线可跑（引导指向对方节点，
+// 不依赖 bootstrap.libp2p.io）。
 func TestPublicNetworkAutoRetire(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -242,22 +281,38 @@ func TestPublicNetworkAutoRetire(t *testing.T) {
 	for _, a := range hb.Addrs() {
 		seedsB = append(seedsB, a.String()+"/p2p/"+hb.ID().String())
 	}
-	// 网络密钥留空 = 公共网络模式（NetworkKey=="" 分支，只建公共 DHT）。
+	// 网络密钥留空 = 默认公共网络密钥（归一化 + 双 DHT）。
+	// EnablePublicFallback 显式开启：验证开关打开时「发现同群成员后
+	// 自动退出公共 DHT」仍然生效（默认关闭时 dhtPublic 本就不建立）。
 	da, err := New(ctx, ha, Config{
 		NetworkKey: "", Name: "pub-a",
-		Bootstrap: seedsB,
-		Interval:  500 * time.Millisecond,
+		Bootstrap:            seedsB,
+		Interval:             500 * time.Millisecond,
+		EnablePublicFallback: true,
 	})
 	if err != nil {
 		t.Fatalf("new discovery A: %v", err)
 	}
 	db, err := New(ctx, hb, Config{
 		NetworkKey: "", Name: "pub-b",
-		Bootstrap: seedsA,
-		Interval:  500 * time.Millisecond,
+		Bootstrap:            seedsA,
+		Interval:             500 * time.Millisecond,
+		EnablePublicFallback: true,
 	})
 	if err != nil {
 		t.Fatalf("new discovery B: %v", err)
+	}
+	// 归一化断言：留空必须被填充为默认密钥，且双 DHT 均已建立。
+	if da.cfg.NetworkKey != PublicNetworkKey || db.cfg.NetworkKey != PublicNetworkKey {
+		t.Fatalf("留空密钥应归一化为 PublicNetworkKey：a=%q b=%q",
+			da.cfg.NetworkKey, db.cfg.NetworkKey)
+	}
+	if da.dhtPrivate == nil || db.dhtPrivate == nil {
+		t.Fatalf("留空密钥也应建立私有 DHT：a=%v b=%v", da.dhtPrivate != nil, db.dhtPrivate != nil)
+	}
+	// 群身份兼容：留空与显式默认密钥的派生必须一致（老网络零迁移）。
+	if string(da.GroupKey()) != string(GroupKey(ChannelOfficial, PublicNetworkKey)) {
+		t.Fatalf("留空群身份派生与历史不一致")
 	}
 	if err = da.Start(ctx); err != nil {
 		t.Fatalf("start A: %v", err)
@@ -319,17 +374,17 @@ func TestChannelIsolationNoDiscovery(t *testing.T) {
 	}
 	da, err := New(ctx, ha, Config{
 		NetworkKey: "same-key", Channel: ChannelOfficial, Name: "official-a",
-		Interval:              500 * time.Millisecond,
-		DisablePublicFallback: true,
+		Interval:             500 * time.Millisecond,
+		EnablePublicFallback: false,
 	})
 	if err != nil {
 		t.Fatalf("new discovery A: %v", err)
 	}
 	db, err := New(ctx, hb, Config{
 		NetworkKey: "same-key", Channel: ChannelSDK, Name: "sdk-b",
-		Bootstrap:             seeds,
-		Interval:              500 * time.Millisecond,
-		DisablePublicFallback: true,
+		Bootstrap:            seeds,
+		Interval:             500 * time.Millisecond,
+		EnablePublicFallback: false,
 	})
 	if err != nil {
 		t.Fatalf("new discovery B: %v", err)
