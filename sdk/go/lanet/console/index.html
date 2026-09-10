@@ -115,10 +115,10 @@
   </div>
 </div>
 
-<!-- 本机详情弹框（识别当前设备用） -->
+<!-- 设备详情弹框（成员设备或本机，识别设备用） -->
 <div class="overlay" id="infoOverlay" style="display:none" onclick="if(event.target===this)closeInfoModal()">
   <div class="modal" style="max-width:520px">
-    <h2>本机设备详情</h2>
+    <h2 id="infoTitle">设备详情</h2>
     <div class="modal-body" id="infoBody" style="white-space:normal;max-height:60vh">加载中…</div>
     <div class="modal-btns">
       <button class="ghost" onclick="copyInfoSummary()">复制信息</button>
@@ -130,7 +130,7 @@
 
 <div class="panel active" id="pMembers">
   <div class="card">
-    <h2>成员与链路</h2>
+    <h2>成员与链路 <button class="ghost" style="float:right;font-size:12px;padding:2px 10px" onclick="openInfoModal()">本机信息</button></h2>
     <div class="row" style="margin:0 0 10px">
       <input type="text" id="mSearch" placeholder="搜索：设备名 / 虚拟地址 / 虚拟 IP / PeerID" oninput="mPage=1;renderMembers()">
       <select id="mFilter" style="flex:0 0 140px" onchange="mPage=1;renderMembers()">
@@ -295,7 +295,7 @@ function renderMembers() {
       return `<tr><td class="mname">${esc(label)}${pid}</td><td>${host}</td><td>${esc(m.virtual_ip)}</td>` +
         `<td><span class="tag ${m.online ? 'online' : 'offline'}"><span class="dot ${m.online ? 'on' : 'off'}"></span>${m.online ? '在线' : '离线'}</span></td>` +
         `<td>${path}</td><td>${ver}</td><td>${esc(last)}</td>` +
-        `<td><button class="ghost mdetail" onclick="openInfoModal()">详情</button></td></tr>`;
+        `<td><button class="ghost mdetail" onclick="openMemberModal('${esc(m.peer_id)}')">详情</button></td></tr>`;
     }).join('') +
     '</table>';
   $('mPager').style.display = 'flex';
@@ -485,9 +485,12 @@ function onUpdateClick() {
 }
 function closeUpdateModal() { $('updOverlay').style.display = 'none'; }
 
-// ---- 本机设备详情弹框（识别当前控制台所在设备） ----
-let localInfo = null;
+// ---- 设备详情弹框（成员设备或本机，识别设备用） ----
+let localInfo = null;   // 本机信息（/api/local-info）
+let memberInfo = null;  // 成员信息（/api/member-info?peer_id=...）；null = 显示本机
 async function openInfoModal() {
+  memberInfo = null;
+  $('infoTitle').textContent = '本机设备详情';
   $('infoMsg').textContent = '';
   $('infoBody').textContent = '加载中…';
   $('infoOverlay').style.display = '';
@@ -501,36 +504,63 @@ async function openInfoModal() {
     $('infoBody').textContent = '获取本机信息失败：' + e;
   }
 }
+async function openMemberModal(peerId) {
+  memberInfo = { peer_id: peerId };
+  $('infoTitle').textContent = '成员设备详情';
+  $('infoMsg').textContent = '';
+  $('infoBody').textContent = '加载中…';
+  $('infoOverlay').style.display = '';
+  try {
+    const r = await fetch('/api/member-info?peer_id=' + encodeURIComponent(peerId));
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || ('HTTP ' + r.status));
+    memberInfo = await r.json();
+    renderInfoModal();
+  } catch (e) {
+    $('infoBody').textContent = '获取成员信息失败：' + e;
+  }
+}
 function renderInfoModal() {
-  const i = localInfo;
+  const i = memberInfo || localInfo;
   if (!i) return;
-  const ipRows = (i.ips || []).map(x =>
-    `<tr><td>${esc(x.iface)}</td><td><span class="vhost" title="点击复制" onclick="copyText('${esc(x.ip)}', this)">${esc(x.ip)}</span></td><td>${esc(x.type)}</td></tr>`
-  ).join('') || '<tr><td colspan="3" class="empty">未获取到网卡地址</td></tr>';
+  const isSelf = !memberInfo;
+  // 本机有 iface/type 明细；成员侧是 info 协议交换的纯 IP 列表。
+  const ipRows = isSelf
+    ? ((localInfo.ips || []).map(x =>
+        `<tr><td>${esc(x.iface)}</td><td><span class="vhost" title="点击复制" onclick="copyText('${esc(x.ip)}', this)">${esc(x.ip)}</span></td><td>${esc(x.type)}</td></tr>`
+      ).join('') || '<tr><td colspan="3" class="empty">未获取到网卡地址</td></tr>')
+    : ((i.local_ips || []).map(ip =>
+        `<tr><td>—</td><td><span class="vhost" title="点击复制" onclick="copyText('${esc(ip)}', this)">${esc(ip)}</span></td><td>${ip.includes(':') ? 'v6' : 'v4'}</td></tr>`
+      ).join('') || '<tr><td colspan="3" class="empty">对端为旧版本，未上报本机 IP（需对方升级到 0.5.16+）</td></tr>');
+  const kv = (label, val, copyable) =>
+    `<div class="kv"><b>${label}</b>${copyable && val && val !== '—'
+      ? `<span class="vhost" title="点击复制" onclick="copyText('${esc(val)}', this)">${esc(val)}</span>` : esc(val || '—')}</div>`;
   $('infoBody').innerHTML = `
-    <div class="kv"><b>主机名</b>${esc(i.hostname || '—')}</div>
-    <div class="kv"><b>节点名</b>${esc(i.node_name || '—')}</div>
-    <div class="kv"><b>虚拟 IP</b><span class="vhost" title="点击复制" onclick="copyText('${esc(i.virtual_ip || '')}', this)">${esc(i.virtual_ip || '—')}</span></div>
-    <div class="kv"><b>虚拟地址</b>${i.virtual_host ? `<span class="vhost" title="点击复制" onclick="copyText('${esc(i.virtual_host)}', this)">${esc(i.virtual_host)}</span>` : '—'}</div>
-    <div class="kv"><b>节点 ID</b><span style="word-break:break-all">${esc(i.peer_id || '—')}</span></div>
-    <div class="kv"><b>系统</b>${esc(i.os || '—')} · ${esc(i.platform || '—')}</div>
-    <div class="kv"><b>程序版本</b>${esc(i.version ? 'v' + i.version : 'dev')}</div>
-    <div class="kv"><b>Go 版本</b>${esc(i.go_version || '—')}</div>
-    <div style="margin:10px 0 4px;font-weight:600">本机所有 IP 地址</div>
-    <table><tr><th>网卡</th><th>地址</th><th>类型</th></tr>${ipRows}</table>`;
+    ${kv('主机名', i.os_hostname)}
+    ${kv('节点名', i.node_name)}
+    ${kv('虚拟 IP', i.virtual_ip, true)}
+    ${kv('虚拟地址', i.virtual_host, true)}
+    ${kv('节点 ID', i.peer_id)}
+    ${kv('系统', (i.os || '—') + ' · ' + (i.platform || '—'))}
+    ${kv('程序版本', i.version ? 'v' + i.version : (isSelf ? 'dev' : '—'))}
+    ${isSelf ? kv('Go 版本', i.go_version) : ''}
+    <div style="margin:10px 0 4px;font-weight:600">${isSelf ? '本机所有 IP 地址' : '对方本机 IP 地址'}</div>
+    <table><tr><th>网卡</th><th>地址</th><th>类型</th></tr>${ipRows}</table>
+    ${!isSelf && !(i.local_ips || []).length ? '<div class="sub" style="margin-top:6px">提示：主机名与本机 IP 需对端节点升级到 0.5.16+ 后才会显示。</div>' : ''}`;
 }
 function copyInfoSummary() {
-  if (!localInfo) return;
-  const i = localInfo;
+  const i = memberInfo || localInfo;
+  if (!i) return;
+  const isSelf = !memberInfo;
   const lines = [
-    '主机名: ' + (i.hostname || '—'),
+    '主机名: ' + (i.os_hostname || '—'),
     '节点名: ' + (i.node_name || '—'),
     '虚拟 IP: ' + (i.virtual_ip || '—'),
     '虚拟地址: ' + (i.virtual_host || '—'),
     '系统: ' + (i.os || '—') + ' · ' + (i.platform || '—'),
     '程序版本: ' + (i.version ? 'v' + i.version : 'dev'),
-    '本机 IP:',
-    ...(i.ips || []).map(x => '  [' + x.iface + '] ' + x.ip + ' (' + x.type + ')'),
+    (isSelf ? '本机' : '对方本机') + ' IP:',
+    ...((isSelf ? (i.ips || []).map(x => '  [' + x.iface + '] ' + x.ip + ' (' + x.type + ')')
+               : (i.local_ips || []).map(ip => '  ' + ip))),
   ];
   copyText(lines.join('\n'), $('infoMsg'));
   flash('infoMsg', '已复制到剪贴板', true);

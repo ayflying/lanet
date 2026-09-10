@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/ayflying/pvn/pkg/firewall"
+	"github.com/ayflying/pvn/pkg/netmapclient"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -92,6 +93,7 @@ func (c *Client) startConsole() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", c.apiState)
 	mux.HandleFunc("GET /api/local-info", c.apiLocalInfo)
+	mux.HandleFunc("GET /api/member-info", c.apiMemberInfo)
 	mux.HandleFunc("PUT /api/firewall", c.apiSetFirewall)
 	mux.HandleFunc("PUT /api/forwards", c.apiSetForwards)
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
@@ -368,8 +370,7 @@ type localIPView struct {
 func (c *Client) apiLocalInfo(w http.ResponseWriter, r *http.Request) {
 	hostname, _ := os.Hostname()
 
-	// 枚举所有网卡的活动 IP（排除回环与链路本地单播的 v6 冗余项保留决策：
-	// fe80:: 链路本地地址对识别设备无用，跳过；v6 全局地址保留）。
+	// 枚举所有网卡的活动 IP（排除回环与链路本地地址，详见 collectLocalIPs）。
 	ips := []localIPView{}
 	if ifaces, err := net.Interfaces(); err == nil {
 		for _, ifc := range ifaces {
@@ -387,12 +388,11 @@ func (c *Client) apiLocalInfo(w http.ResponseWriter, r *http.Request) {
 				}
 				ip4 := ipn.IP.To4()
 				if ip4 == nil {
-					// v6：跳过链路本地（fe80::/10）
 					if ipn.IP.IsLinkLocalUnicast() {
 						continue
 					}
 				} else if ip4.IsLinkLocalUnicast() {
-					continue // 169.254.x.x 自动专用地址同样无识别价值
+					continue
 				}
 				mask, _ := ipn.Mask.Size()
 				ips = append(ips, localIPView{
@@ -416,6 +416,40 @@ func (c *Client) apiLocalInfo(w http.ResponseWriter, r *http.Request) {
 		"virtual_host": c.selfHostname(),
 		"peer_id":     c.peerID,
 		"ips":         ips,
+	})
+}
+
+// apiMemberInfo 指定成员的设备信息：主机名、系统/平台、版本、虚拟身份、
+// 本机网卡 IP（经 info 协议从对端交换所得）。0.5.15 起；旧版本对端
+// 未上报这些字段时返回空值，前端回退显示已知信息。
+func (c *Client) apiMemberInfo(w http.ResponseWriter, r *http.Request) {
+	peerID := r.URL.Query().Get("peer_id")
+	if peerID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少 peer_id"})
+		return
+	}
+	var found *netmapclient.Member
+	for i := range c.NetMap().Members {
+		if c.NetMap().Members[i].PeerID == peerID {
+			found = &c.NetMap().Members[i]
+			break
+		}
+	}
+	if found == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "成员不存在或已下线"})
+		return
+	}
+	m := *found
+	writeJSON(w, http.StatusOK, map[string]any{
+		"peer_id":     m.PeerID,
+		"node_name":   m.Name,
+		"virtual_ip":  m.VirtualIP,
+		"virtual_host": m.Hostname,
+		"os":          m.OS,
+		"platform":    m.Platform,
+		"version":     m.Version,
+		"os_hostname": m.OSHostname,
+		"local_ips":   m.LocalIPs,
 	})
 }
 

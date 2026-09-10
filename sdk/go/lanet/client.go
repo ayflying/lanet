@@ -314,6 +314,10 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = 8 * time.Second
 	}
+	// 本机设备信息（info 协议交换给同群成员，供对方控制台「详情」识别设备）：
+	// 操作系统主机名 + 全部非回环网卡 IP。采集失败仅留空，不影响入网。
+	localHostname, _ := os.Hostname()
+	localIPs := collectLocalIPs()
 	if cfg.Standalone {
 		// 网络密钥：NetworkKey 优先；兼容回退 InviteCode（旧用法）；
 		// 都为空 = 公共网络（所有留空节点互通）。
@@ -382,6 +386,8 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 			MemberTTL:             cfg.MemberTTL,
 			Version:               cfg.Version,
 			Platform:              cfg.Platform,
+			OSHostname:            localHostname,
+			LocalIPs:              localIPs,
 			Quiet:                 cfg.Quiet,
 		})
 		if err == nil {
@@ -617,6 +623,7 @@ func (c *Client) NetMap() netmapclient.Snapshot {
 				PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, Addrs: m.Addrs,
 				Hostname: m.Hostname, FirstSeen: m.FirstSeen, LastSeen: m.LastSeen,
 				Version: m.Version, Platform: m.Platform,
+				OSHostname: m.OSHostname, LocalIPs: m.LocalIPs,
 			})
 		}
 		return netmapclient.Snapshot{

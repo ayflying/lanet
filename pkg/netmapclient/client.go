@@ -31,6 +31,10 @@ type Member struct {
 	// Version/Platform 成员程序版本与平台（info 协议交换；旧节点为空）。
 	Version  string `json:"version,omitempty"`
 	Platform string `json:"platform,omitempty"`
+	// OSHostname 成员操作系统主机名（info 协议交换；旧节点为空）。
+	OSHostname string `json:"os_hostname,omitempty"`
+	// LocalIPs 成员本机非回环网卡 IP（info 协议交换；旧节点为空）。
+	LocalIPs []string `json:"local_ips,omitempty"`
 }
 
 type Snapshot struct {
