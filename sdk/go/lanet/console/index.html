@@ -286,10 +286,11 @@ function fmtMMSS(sec) {
 function renderPublicDHT() {
   const st = S && S.public_dht;
   const badge = $('cPublicState');
+  const syncBox = v => { if (Date.now() - pubTouchedAt > 3000) $('cEnablePublic').checked = v; };
   if (!st || (!st.enabled && !st.active && !st.retired)) {
     badge.textContent = '未启用';
     badge.className = 'tag unknown';
-    if (Date.now() - pubTouchedAt > 3000) $('cEnablePublic').checked = false;
+    syncBox(false);
     return;
   }
   if (st.active) {
@@ -302,13 +303,18 @@ function renderPublicDHT() {
     }
     badge.textContent = '运行中' + remain;
     badge.className = 'tag online';
-    if (Date.now() - pubTouchedAt > 3000) $('cEnablePublic').checked = true;
+    syncBox(true);
     return;
   }
-  // 已退出（连上同群成员 / 超时 / 手动关闭）
-  badge.textContent = '已退出' + (st.reason ? '（' + st.reason + '）' : '');
-  badge.className = 'tag offline';
-  if (Date.now() - pubTouchedAt > 3000) $('cEnablePublic').checked = false;
+  if (st.retired) {
+    badge.textContent = '已退出' + (st.reason ? '（' + st.reason + '）' : '');
+    badge.className = 'tag offline';
+    syncBox(false);
+    return;
+  }
+  // 配置已开启但本次尚未建立（启动中 / 刚重新开启的短暂窗口）：不改开关状态。
+  badge.textContent = st.enabled ? '待运行' : '未启用';
+  badge.className = 'tag unknown';
 }
 
 // togglePublicDHT 用户点击「启用公共 DHT 临时引导」：立即生效（无需重启）。
