@@ -38,6 +38,8 @@ ID 互连 + 连接审批**模型：把对方节点 ID 填进控制台并点连�
 | `-db` | `LANET_DB` | 地址簿数据库路径（默认 exe 同目录 `lanet.db`；`-` = 仅内存） |
 | `-public-dht` | `LANET_PUBLIC_DHT` | 启用公共 DHT 临时引导（v0.5.16 起默认关闭以省流量） |
 | `-public-dht-minutes` | `LANET_PUBLIC_DHT_MINUTES` | 公共 DHT 最长运行分钟数（默认 10；连上同网络成员或超时即自动退出） |
+| `-tun` | `LANET_TUN` | 虚拟网卡 TUN（`true`/`false`，默认 `true`）；容器/无权限环境自动降级 |
+| `-probe` | `LANET_PROBE` | 成员探测间隔（Go duration，如 `20s`/`1m`；默认 20s） |
 | `-tun true/false` | - | 是否启用 TUN；默认读取配置，缺省为 `true` |
 | `-probe` | - | 成员探测间隔 |
 

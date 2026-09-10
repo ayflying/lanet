@@ -85,8 +85,8 @@ func runNode(parent context.Context, serviceMode bool) {
 			"防火墙模式：deny-all / allow-list / allow-all；不传则读配置文件")
 		listen = flag.String("listen", envOr("LANET_LISTEN", ""),
 			"覆盖监听地址（逗号分隔）；默认 tcp/ws/quic 全部随机端口")
-		tun = flag.String("tun", "@@unset@@",
-			"虚拟网卡 TUN（IP 层互通：ping/任意端口直达虚拟 IP）；true/false，缺省读配置文件（默认 true）")
+		tun = flag.String("tun", envOr("LANET_TUN", "@@unset@@"),
+			"虚拟网卡 TUN（true/false，可经 LANET_TUN 设置）；缺省读配置文件（默认 true）")
 		// 三态哨兵：未传 = 读配置文件；显式传 true/false = 覆盖配置文件。
 		// 不能用 flag.Bool——它的零值 false 无法区分「用户显式传了 false」
 		// 与「用户根本没传」，会让配置文件里的 true 被无声忽略。
@@ -101,7 +101,8 @@ func runNode(parent context.Context, serviceMode bool) {
 			"是否要求连接审批（true/false，默认 true）：开启后陌生节点需在控制台同意后才能互连")
 		dbPath = flag.String("db", envOr("LANET_DB", ""),
 			"地址簿数据库路径（默认 exe 同目录 lanet.db；设为 - 关闭持久化，仅内存运行）")
-		probe = flag.Duration("probe", 0, "成员探测间隔；不传则读配置文件（默认 20s）")
+		probe = flag.Duration("probe", envDurationOr("LANET_PROBE"),
+			"成员探测间隔（可经 LANET_PROBE 设置，Go duration 如 20s/1m）；不传则读配置文件（默认 20s）")
 	)
 	// ---- 开机自启路径识别：注册表 Run 键带 -autorun 参数拉起 ----
 	// 必须在 flag.Parse 之前剔除 -autorun（flag 包对未定义 flag 会报错退出），
@@ -160,7 +161,7 @@ func runNode(parent context.Context, serviceMode bool) {
 	// TUN 默认开启：配置文件缺省字段（nil）视为 true，命令行显式 true/false 优先。
 	effTun := nc.Tun == nil || *nc.Tun
 	if *tun != "@@unset@@" {
-		effTun = strings.EqualFold(*tun, "true") || *tun == "1"
+		effTun = parseBoolLike(*tun)
 	}
 	// 公共 DHT 开关优先级：显式命令行/环境变量 > 配置文件 > 默认关闭。
 	// 环境变量与命令行共用 "@@unset@@" 哨兵：只有真正传了值才覆盖配置，
@@ -483,6 +484,32 @@ func atoiOr(s string, def int) int {
 		return def
 	}
 	return n
+}
+
+// envDurationOr 读取环境变量并按 Go duration 解析（如 20s/1m）；
+// 未设置或解析失败返回 0（视为「未显式指定」，回落配置文件/内置默认）。
+func envDurationOr(k string) time.Duration {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Printf("[node] 环境变量 %s=%q 无法解析为时长，忽略", k, v)
+		return 0
+	}
+	return d
+}
+
+// parseBoolLike 宽松布尔解析：true/1/yes/on 为真，false/0/no/off 为假，
+// 其余按真处理前已由调用方哨兵值拦截，这里兜底返回原字符串非空的真值语义。
+func parseBoolLike(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return true
+	}
 }
 
 // publicDHTMinutesOr 公共 DHT 时长归一化：≤0（旧配置未设置）一律回落到默认 10 分钟。

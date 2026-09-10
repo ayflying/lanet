@@ -8,14 +8,10 @@
 #         docker compose up -d
 #   防火墙放行：8900/tcp（控制台）+ 4001/tcp + 4001/udp（P2P 直连与打洞）
 #
-# 配置直接改本文件的 environment 段（保存后 docker compose up -d 重建生效）：
-#   LANET_NAME              节点名称（成员表中的虚拟域名）
-#   LANET_NETWORK_KEY       网络密钥；与要服务的群组保持一致（留空 = 公共网络）
-#   LANET_CONSOLE           控制台监听地址：0.0.0.0:8900 = 允许外网访问；
-#                           127.0.0.1:8900 = 仅本机（用 SSH 隧道查看，更安全）
-#   LANET_CONSOLE_PASSWORD  控制台访问密码；LANET_CONSOLE 允许外网访问时务必设置！
-#   LANET_BOOTSTRAP         引导方式（默认 public = 公共 DHT）
-#   LANET_LISTEN            P2P 监听地址（默认随机端口；这里固定 4001 便于防火墙放行）
+# 参数优先级：命令行参数 > 环境变量（LANET_*）> /data/lanet.json > 内置默认。
+# 环境变量取值支持 true/1/yes/on 与 false/0/no/off（不区分大小写）；布尔项
+# 环境变量留空 = 不覆盖，回落到容器内 /data/lanet.json（控制台「节点配置」写的）。
+# 修改 environment 后 `docker compose up -d` 重建容器生效。
 # =================================================================================
 
 services:
@@ -24,30 +20,98 @@ services:
     container_name: lanet-node
     restart: unless-stopped
     environment:
+      # ==================== 身份与网络 ====================
+      # 节点名称（成员表中的虚拟域名，成员可通过 <名称>.lanet 访问）
       LANET_NAME: vps-node
+      # 网络密钥：与要服务的群组保持一致，相同密钥的节点才互相可见。
+      # 留空 = 按本机身份派生的专属默认网络（自成一张网，不与他人互通）。
+      # 注意：控制台页面上「显式留空」与「老配置从未写过该字段」语义不同
+      # （后者兼容为历史公共网络），容器里以本变量为准，语义明确。
       LANET_NETWORK_KEY: lanet-test
-      # ---- 控制台：能否外网访问 + 访问密码 ----
+
+      # ==================== 发现与引导 ====================
+      # 引导方式三选一：
+      #   none    = （默认）纯私有发现：私有 DHT + 局域网 mDNS，不接触任何公共设施
+      #   public  = 使用公共 DHT（IPFS 引导节点）做跨网冷启动牵线
+      #   种子列表 = 逗号分隔的已在网成员 multiaddr，如
+      #             /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...（推荐：固定公网 VPS 当种子）
+      # 本机就是种子节点时保持 none 即可——其他成员把「我的连接种子」填到自己的
+      # bootstrap / 控制台「直接连接」里，单向牵线，本节点不需要引导任何人。
+      LANET_BOOTSTRAP: none
+      # 是否启用公共 DHT 临时引导（true/false，默认 false）。公共 DHT 是全公网
+      # 共享网络，作为 server 要应答随机查询，上行流量大（实测空载 ~4MB/分钟），
+      # 故默认关闭。开启后它只负责冷启动牵线：连上第一个同群成员立即自动退出。
+      LANET_PUBLIC_DHT: "false"
+      # 公共 DHT 临时引导最长运行分钟数（默认 10）：到时限仍未连上同群成员也
+      # 自动退出。仅在 LANET_PUBLIC_DHT=true 时有意义。
+      LANET_PUBLIC_DHT_MINUTES: "10"
+
+      # ==================== 连接审批（加好友式） ====================
+      # 是否要求连接审批（true/false，默认 true）：开启后陌生节点需在控制台
+      # 「成员」页同意（类似加好友）后才能互连，同意后永久信任。
+      LANET_REQUIRE_APPROVAL: "true"
+      # 自动同意所有连接申请（true/false，默认 false）：无人值守的中央服务器
+      # （就是本机这种 VPS 引导节点）建议置 true，否则新成员首次入网会卡在
+      # 待审批列表里等人工点同意。开启等于放弃「加好友」这道安全边界。
+      LANET_AUTO_ACCEPT: "true"
+      # 地址簿数据库路径：持久化已认识的成员地址，重启后自动回拨（默认
+      # /data/lanet.db，与命名卷同目录，一般不用改）。设为 "-" = 仅内存运行
+      # 不持久化（每次重建容器都重新冷启动，不建议）。
+      LANET_DB: /data/lanet.db
+
+      # ==================== 控制台 ====================
+      # 控制台监听地址：0.0.0.0:8900 = 允许外网访问；
+      # 127.0.0.1:8900 = 仅容器内（配合下方 ports 映射到宿主 127.0.0.1，
+      # 或用 SSH 隧道查看，更安全）。
       LANET_CONSOLE: 0.0.0.0:8900
+      # 控制台访问密码；LANET_CONSOLE 允许外网访问时务必设置！
       LANET_CONSOLE_PASSWORD: "请改成强密码"
-      LANET_BOOTSTRAP: public
-      # ---- 固定 P2P 端口，防火墙只需放行 4001/tcp + 4001/udp ----
+
+      # ==================== P2P 监听与探测 ====================
+      # P2P 监听地址（逗号分隔）。默认随机端口；这里固定 4001 便于防火墙放行，
+      # 也让连接种子里的地址稳定不变。
       LANET_LISTEN: "/ip4/0.0.0.0/tcp/4001,/ip4/0.0.0.0/udp/4001/quic-v1"
+      # 成员探测间隔（Go duration 格式，如 5s/20s/1m；留空用内置默认）。
+      # 探测是 P2P 连接的保温机制，间隔过长会导致连接被空闲回收、ping 偶发高延迟。
+      LANET_PROBE: 20s
+
+      # ==================== 防火墙 ====================
+      # 防火墙模式：allow-all（默认，放行全部）/ deny-all（全拒，仅本机管理）/
+      # allow-list（白名单模式，规则在控制台「防火墙」页配置后热生效）。
+      LANET_FW: allow-all
+
+      # ==================== 虚拟网卡与配置持久化 ====================
+      # TUN 虚拟网卡（true/false，默认 true）：开启后成员间可 ping / 任意端口
+      # 直达虚拟 IP。容器内要真正生效需同时启用下方 user/cap_add/devices 段，
+      # 否则自动降级为纯应用层（Dial / 端口转发不受影响），日志记录原因。
+      # 本编排默认按「引导/中继节点」场景关闭（日志干净）；需要 IP 层互通时
+      # 改为 "true" 并取消下方权限段注释。
+      LANET_TUN: "false"
+      # 配置文件路径（镜像默认已设为 /data/lanet.json：lanet.json / state.json /
+      # lanet.log / node.key 全部落命名卷，重建容器身份与虚拟 IP 不变）。
+      # 一般无需修改；改成别的路径时注意同步挂载。
+      # LANET_CONFIG: /data/lanet.json
+
+      # ==================== 更新检查（可选） ====================
+      # GitHub Token（contents:read 权限）：官方仓库公开、检查更新无需 token，
+      # 仅当自建私有发行仓库时取消注释填入，可提高 GitHub API 检查频率上限。
+      # GITHUB_TOKEN: "ghp_xxx"
+
     ports:
-      - "8900:8900"      # Web 控制台（仅当 LANET_CONSOLE=0.0.0.0:8900 时对外有意义）
+      - "8900:8900"      # Web 控制台（仅当 LANET_CONSOLE=0.0.0.0:8900 时对外有意义；
+                         # 若只想本机访问，改为 "127.0.0.1:8900:8900" 并配 SSH 隧道）
       - "4001:4001/tcp"  # P2P 直连与中继流量
       - "4001:4001/udp"  # QUIC / 打洞
     volumes:
-      # 命名卷：node.key / lanet.json / state.json / lanet.log 全部落在这里，
-      # 首次挂载自动继承镜像内 /data 属主（lanet），重建容器身份不变。
+      # 命名卷：node.key / lanet.json / state.json / lanet.db / lanet.log 全部落在这里，
+      # 首次挂载自动继承镜像内 /data 属主，重建容器身份与虚拟 IP 不变。
       - lanet-node-data:/data
     # ---- TUN 虚拟网卡（按需二选一）----
-    # 节点默认尝试创建 TUN（IP 层互通：ping / 任意端口直达虚拟 IP）。
-    # 镜像进程是 root，但本编排默认未授予 NET_ADMIN 且未挂载 /dev/net/tun，
-    # 因此会自动降级为纯应用层（Dial / 端口转发不受影响），日志记录原因。
-    # ① 引导/中继节点不需要 TUN，建议显式关闭保持日志干净（取消下行注释）：
-    # command: ["-tun", "false"]
-    # ② 要让容器节点真正启用 TUN（其他成员需 ping 通它的虚拟 IP）时，
-    #    改为 root 运行并授予网卡权限（同时要求宿主机已加载 tun 模块）：
+    # ① 引导/中继节点不需要 TUN（只做牵线和中继）：保持 LANET_TUN="false"，
+    #    下面权限段全部保持注释，日志干净：
+    # ② 要让容器节点真正启用 TUN（其他成员需 ping 通它的虚拟 IP）时：
+    #    LANET_TUN 置 "true"，并取消下方注释授予网卡权限
+    #    （要求宿主机已加载 tun 模块：modprobe tun）：
     # user: "0:0"
     # cap_add:
     #   - NET_ADMIN
