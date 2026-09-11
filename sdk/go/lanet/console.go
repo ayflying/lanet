@@ -318,6 +318,7 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		"public_dht":            pubState,
 		"has_public_dht_config": hasPub,
 		"seed_addrs":            c.SeedAddrs(),
+		"invite_code":           c.InviteCode(),
 		"pending":               pending,
 		"pending_count":         len(pending),
 		"nearby":                nearby,

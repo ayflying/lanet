@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ayflying/pvn/pkg/invitecode"
 	"github.com/ayflying/pvn/pkg/peersdb"
 	"github.com/ayflying/pvn/pkg/serverless"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -230,6 +231,8 @@ func (c *Client) clearUnfriended(ctx context.Context, peerID string) {
 // ConnectPeer 按节点 ID 发起连接（控制台统一输入框的后端）。
 //
 // address 可以是：
+//   - 连接码（lanet://12D3Koo...@1.2.3.4:4001）：节点 ID + 直拨地址合一，
+//     直接拨号，跳过一切查找（推荐，最快的连接方式）；
 //   - 纯节点 ID（12D3Koo...）：先查本地地址簿（快、零流量），
 //     未命中再走私有 DHT 查找（仅同网络密钥内可见）；
 //   - 完整 multiaddr（/ip4/1.2.3.4/tcp/4001/p2p/12D3Koo...）：直接拨号。
@@ -241,10 +244,38 @@ func (c *Client) ConnectPeer(ctx context.Context, address string) (*ConnResult, 
 	}
 	address = strings.TrimSpace(address)
 	if address == "" {
-		return nil, fmt.Errorf("请输入对方节点 ID 或连接地址")
+		return nil, fmt.Errorf("请输入对方连接码或节点 ID")
 	}
 
-	// 1) multiaddr 形式（含 /p2p/<ID>）：直接按连接种子拨号。
+	// 1) 连接码形式（lanet://<ID>@<ip>:<port>）：节点 ID + 直拨地址合一，
+	//    直接拨号，跳过一切查找（最快的连接方式）。
+	//    先在本机记为已信任（同「添加节点」语义），否则会被自己的审批门拦住。
+	if invitecode.IsInviteCode(address) {
+		id, addrs, derr := invitecode.ToMultiaddrs(address)
+		if derr != nil {
+			return nil, derr
+		}
+		if id.String() == c.peerID {
+			return nil, fmt.Errorf("这是本机连接码，无需连接")
+		}
+		c.rememberPeer(id.String(), toStringAddrs(addrs), "", true)
+		c.clearUnfriended(ctx, id.String())
+		if len(addrs) == 0 {
+			// 仅身份的连接码：退回按 ID 查找路径。
+			return c.connectByID(ctx, id.String())
+		}
+		ai := peer.AddrInfo{ID: id, Addrs: addrs}
+		connectedID, cerr := c.disc.RequestConnect(ctx, ai)
+		if cerr != nil {
+			return pendingOrError(connectedID, "manual", cerr)
+		}
+		c.noteDialSuccess(ctx, id.String(), addrs)
+		res := c.resultFor(id.String(), "manual")
+		res.Message = "已连接（连接码直拨）"
+		return res, nil
+	}
+
+	// 2) multiaddr 形式（含 /p2p/<ID>）：直接按连接种子拨号。
 	//    先解析出对端 ID 并在本机记为已信任（同「添加节点」语义），
 	//    否则会被自己的审批门拦住。
 	if strings.Contains(address, "/p2p/") {
@@ -263,25 +294,7 @@ func (c *Client) ConnectPeer(ctx context.Context, address string) (*ConnResult, 
 		c.clearUnfriended(ctx, ai.ID.String())
 		id, err := c.disc.DialSeed(ctx, []string{address})
 		if err != nil {
-			if errors.Is(err, serverless.ErrNotApproved) {
-				return &ConnResult{
-					PeerID:  ai.ID.String(),
-					Pending: true,
-					Via:     "manual",
-					Message: "已提交连接申请，等待对方在控制台同意后即可连通（同意一次即永久信任）",
-				}, nil
-			}
-			if errors.Is(err, serverless.ErrUnfriended) {
-				// 对方删除过本机（墓碑生效）：本机的同步移除已由协议层回调
-				// 完成，这里给用户明确的下一步指引，而不是一个看不懂的失败。
-				return &ConnResult{
-					PeerID:  ai.ID.String(),
-					Pending: true,
-					Via:     "manual",
-					Message: "对方已把本机删除好友——需要你重新加它：把你的节点 ID 发给对方，让对方在「附近」列表找到本机点「申请连接」，或直接添加本机节点 ID。",
-				}, nil
-			}
-			return nil, err
+			return pendingOrError(ai.ID.String(), "manual", err)
 		}
 		res := c.resultFor(id, "manual")
 		res.Message = "已连接"
@@ -289,9 +302,15 @@ func (c *Client) ConnectPeer(ctx context.Context, address string) (*ConnResult, 
 	}
 
 	// 2) 纯节点 ID：本地地址簿优先 → 私有 DHT 兜底。
+	return c.connectByID(ctx, address)
+}
+
+// connectByID 纯节点 ID 连接路径：本地地址簿优先 → 私有 DHT 兜底 →
+// 未命中转入后台自动发现。
+func (c *Client) connectByID(ctx context.Context, address string) (*ConnResult, error) {
 	id, err := peer.Decode(address)
 	if err != nil {
-		return nil, fmt.Errorf("节点 ID 或连接地址格式不正确：需要 12D3Koo… 形式的节点 ID，或 /ip4/…/p2p/… 完整地址")
+		return nil, fmt.Errorf("节点 ID 或连接地址格式不正确：需要 12D3Koo… 形式的节点 ID、连接码（lanet://…）或 /ip4/…/p2p/… 完整地址")
 	}
 	if id.String() == c.peerID {
 		return nil, fmt.Errorf("这是本机节点 ID，无需连接")
@@ -356,39 +375,51 @@ func (c *Client) ConnectPeer(ctx context.Context, address string) (*ConnResult, 
 
 	connectedID, cerr := c.disc.RequestConnect(ctx, ai)
 	if cerr != nil {
-		// 对方已把本机删除好友：本机的同步移除已由协议层回调完成，
-		// 这里给出明确下一步指引（需对方主动添加本机）。
-		if errors.Is(cerr, serverless.ErrUnfriended) {
-			return &ConnResult{
-				PeerID:  connectedID,
-				Pending: true,
-				Via:     via,
-				Message: "对方已把本机删除好友——请把本机节点 ID 发给对方，让对方在「附近」列表中找到本机并申请连接（或直接添加本机节点 ID）。",
-			}, nil
-		}
-		// 对方尚未同意本机：这不算失败，是「申请已送达」的正常中间态。
-		if errors.Is(cerr, serverless.ErrNotApproved) || strings.Contains(cerr.Error(), "等待对方同意") {
-			return &ConnResult{
-				PeerID:  connectedID,
-				Pending: true,
-				Via:     via,
-				Message: "已提交连接申请，等待对方在控制台同意后即可连通（同意一次即永久信任）",
-			}, nil
-		}
-		return nil, cerr
+		return pendingOrError(connectedID, via, cerr)
 	}
 
-	if c.peers != nil {
-		for _, a := range toStringAddrs(ai.Addrs) {
-			dbCtx, dbCancel := context.WithTimeout(ctx, 3*time.Second)
-			_ = c.peers.NoteDialResult(dbCtx, id.String(), a, true)
-			dbCancel()
-			break // 记录首个成功地址即可
-		}
-	}
+	c.noteDialSuccess(ctx, id.String(), ai.Addrs)
 	res := c.resultFor(id.String(), via)
 	res.Message = "已连接"
 	return res, nil
+}
+
+// pendingOrError 把建连错误归一化：Pending 中间态转成友好的 ConnResult，
+// 其余原样返回错误。
+func pendingOrError(peerID, via string, err error) (*ConnResult, error) {
+	// 对方已把本机删除好友：本机的同步移除已由协议层回调完成，
+	// 这里给出明确下一步指引（需对方主动添加本机）。
+	if errors.Is(err, serverless.ErrUnfriended) {
+		return &ConnResult{
+			PeerID:  peerID,
+			Pending: true,
+			Via:     via,
+			Message: "对方已把本机删除好友——请把本机连接码或节点 ID 发给对方，让对方在「附近」列表中找到本机并申请连接（或直接添加本机节点 ID）。",
+		}, nil
+	}
+	// 对方尚未同意本机：这不算失败，是「申请已送达」的正常中间态。
+	if errors.Is(err, serverless.ErrNotApproved) || strings.Contains(err.Error(), "等待对方同意") {
+		return &ConnResult{
+			PeerID:  peerID,
+			Pending: true,
+			Via:     via,
+			Message: "已提交连接申请，等待对方在控制台同意后即可连通（同意一次即永久信任）",
+		}, nil
+	}
+	return nil, err
+}
+
+// noteDialSuccess 把首个成功地址记入地址簿拨号统计。
+func (c *Client) noteDialSuccess(ctx context.Context, peerID string, addrs []ma.Multiaddr) {
+	if c.peers == nil || len(addrs) == 0 {
+		return
+	}
+	for _, a := range toStringAddrs(addrs) {
+		dbCtx, dbCancel := context.WithTimeout(ctx, 3*time.Second)
+		_ = c.peers.NoteDialResult(dbCtx, peerID, a, true)
+		dbCancel()
+		break // 记录首个成功地址即可
+	}
 }
 
 // resultFor 组装连接成功的结果（尽量补上名称与虚拟 IP）。

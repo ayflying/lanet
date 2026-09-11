@@ -149,9 +149,9 @@
 
 <div class="panel active" id="pMembers">
   <div class="card" id="connectCard" style="display:none">
-    <h2>连接其他节点 <span class="tag unknown">按节点 ID 直连</span></h2>
-    <div class="sub" style="margin-bottom:8px">把对方发来的<b>节点 ID</b>（12D3Koo… 开头）粘贴进去点连接即可；也支持完整连接地址。首次连接需对方在控制台<b>同意</b>，同意一次即永久信任，之后自动重连。</div>
-    <div class="kv"><b>我的节点 ID</b>
+    <h2>连接其他节点 <span class="tag unknown">连接码直连</span></h2>
+    <div class="sub" style="margin-bottom:8px">把对方发来的<b>连接码</b>（lanet://… 开头）粘贴进去点连接即可；也支持纯节点 ID 或完整连接地址。首次连接需对方在控制台<b>同意</b>，同意一次即永久信任，之后自动重连。</div>
+    <div class="kv"><b>我的连接码</b>
       <div class="row" style="margin:0">
         <input type="text" id="myNodeID" readonly
                onclick="copyText($('myNodeID').value, $('myNodeID'))"
@@ -160,11 +160,11 @@
                placeholder="加载中…">
         <button class="ghost" id="myNodeIDBtn" onclick="copyText($('myNodeID').value, $('myNodeIDBtn'))">复制</button>
       </div>
-      <div class="sub" style="color:#8a94a6;margin-top:4px">把这一串发给对方，对方添加后即可连入。点输入框或按钮都能复制。</div>
+      <div class="sub" style="color:#8a94a6;margin-top:4px">连接码 = 节点 ID + 直拨地址合一串，对方粘贴这一串即可发起连接（一串顶过去两串）。地址变化后需重新复制分享。</div>
     </div>
     <div class="kv"><b>添加节点</b>
       <div class="row" style="margin:0">
-        <input type="text" id="peerInput" placeholder="粘贴对方节点 ID（12D3Koo…）或完整连接地址"
+        <input type="text" id="peerInput" placeholder="粘贴对方连接码（lanet://…）、节点 ID 或完整连接地址"
                onkeydown="if(event.key==='Enter')connectPeer()">
         <button onclick="connectPeer()">连接</button>
       </div>
@@ -359,10 +359,12 @@ async function loadState() {
 // 或私有 DHT 自动补齐；首次连接需对方同意（加好友语义）。
 async function connectPeer() {
   const address = $('peerInput').value.trim();
-  if (!address) { flash('peerMsg', '请先粘贴对方的节点 ID', false); return; }
+  if (!address) { flash('peerMsg', '请先粘贴对方的连接码或节点 ID', false); return; }
   const btn = event && event.target;
   if (btn && btn.tagName === 'BUTTON') { btn.disabled = true; }
-  flash('peerMsg', '正在连接…（先在本地地址簿查找，未命中再走私有 DHT）', true);
+  flash('peerMsg', address.startsWith('lanet://')
+    ? '正在连接…（连接码直拨，跳过查找）'
+    : '正在连接…（先在本地地址簿查找，未命中再走私有 DHT）', true);
   try {
     const r = await fetch('/api/connect-peer', { method: 'POST',
       headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ address }) });
@@ -405,15 +407,15 @@ async function resolvePending(peerID, approve) {
   }
 }
 
-// renderConnect 渲染「连接其他节点」卡片：本机 ID + 待审批列表。
+// renderConnect 渲染「连接其他节点」卡片：本机连接码 + 待审批列表。
 function renderConnect() {
   const card = $('connectCard');
   if (!S) { card.style.display = 'none'; return; }
   const standalone = (S.info && (S.info.group_id === 'standalone' || String(S.info.group || '').startsWith('standalone-')));
   if (!standalone) { card.style.display = 'none'; return; }
   card.style.display = '';
-  const myID = (S.info && S.info.peer_id) || '';
-  $('myNodeID').value = myID;
+  // 连接码 = 节点 ID + 直拨地址合一串（lanet://ID@ip:port）；后端未返回时回退纯节点 ID。
+  $('myNodeID').value = S.invite_code || (S.info && S.info.peer_id) || '';
   // 待审批列表
   const pending = S.pending || [];
   const box = $('pendingBox');
@@ -576,14 +578,17 @@ function isPeerID(s) {
 // 目的是「粘错了立刻说人话」——尤其是裸节点 ID（应走上面的「添加节点」）。
 function seedCheck(seed) {
   const s = seed.trim();
+  if (s.startsWith('lanet://')) {
+    return '这是「连接码」，不需要用连接种子 —— 直接粘到上面的「添加节点」输入框点连接即可（连接码自带直拨地址，更快）。';
+  }
   if (s.includes('/')) return '';                       // 至少有 "/ip4/…" 结构，交给后端校验
   if (isPeerID(s)) {
     return '这是「节点 ID」，不需要用连接种子 —— 直接粘到上面的「添加节点」输入框点连接即可。';
   }
   if (/^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(s)) {
-    return '这看起来是 IP 地址，但不能只填 IP。请让对方复制完整连接种子（含 /tcp/端口 与 /p2p/节点ID）发给你。';
+    return '这看起来是 IP 地址，但不能只填 IP。请让对方复制「我的连接码」（lanet://…）发给你。';
   }
-  return '看不出这是连接种子。连接种子以 /ip4/ 或 /ip6/ 开头（如 /ip4/1.2.3.4/tcp/4001/p2p/12D3Koo…），请让对方在控制台复制后粘贴。';
+  return '看不出这是连接种子。请让对方在控制台复制「我的连接码」（lanet://…）粘贴到这里，或粘贴 /ip4/ 开头的完整连接种子。';
 }
 
 // seedPasteHint 粘贴后即时给出反馈，减少「粘了但不敢点」的犹豫。

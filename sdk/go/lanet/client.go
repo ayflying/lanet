@@ -47,6 +47,7 @@ import (
 	"time"
 
 	"github.com/ayflying/pvn/pkg/firewall"
+	"github.com/ayflying/pvn/pkg/invitecode"
 	"github.com/ayflying/pvn/pkg/netmapclient"
 	"github.com/ayflying/pvn/pkg/p2pkit"
 	"github.com/ayflying/pvn/pkg/peersdb"
@@ -571,6 +572,26 @@ func (c *Client) SeedAddrs() []string {
 		out = append(out, a.String()+"/p2p/"+c.peerID)
 	}
 	return out
+}
+
+// InviteCode 本节点的连接码：把「节点 ID + 直拨地址」合并成一串短字符串
+// （lanet://<ID>@<ip>:<port>），用户复制粘贴一串即可完成连接。
+// 取首个可用地址生成；无可用地址时回退为仅身份形式 lanet://<ID>
+// （对端识别后自动退回按 ID 查找）。连接码与连接种子语义等价，但更短、
+// 可读、不易复制出错。
+func (c *Client) InviteCode() string {
+	if c.peerID == "" {
+		return ""
+	}
+	for _, a := range p2pkit.FilterUnderlayAddrs(c.node.Addrs()) {
+		if isLoopbackMultiaddr(a) {
+			continue
+		}
+		if code := invitecode.EncodeFromMultiaddr(a.String() + "/p2p/" + c.peerID); code != "" {
+			return code
+		}
+	}
+	return invitecode.Encode(c.peerID, "")
 }
 
 // isLoopbackMultiaddr 判断 multiaddr 是否为回环地址（127.0.0.0/8、::1）。

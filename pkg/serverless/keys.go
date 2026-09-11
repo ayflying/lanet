@@ -102,3 +102,18 @@ func DeriveVirtualIP(groupKey []byte, peerID string) string {
 func GroupFingerprint(groupKey []byte) string {
 	return hex.EncodeToString(groupKey[:4])
 }
+
+// GroupProtoPrefix 群组私有协议前缀（0.5.32 起）：
+// 「/lanet/<群指纹>」，与 PublicDHT 的 /ipfs、历史固定前缀 /lanet 隔离。
+//
+// 设计动机（流量与安全）：历史版本 info/unfriend/私有 DHT/自更新协议都是
+// 固定 ID（/lanet/info/1.0.0 等），任何能拨通端口的 libp2p 节点（包括
+// 完全不相干网络的老版本客户端、公网扫描器）都能在 multistream 协商成功、
+// 进入应用层 handler——产生无效握手、撑大待审批列表，而私有 DHT 固定前缀
+// 更是让所有 lanet 网络共用一张全局路由网（跨群路由表膨胀与查询中继流量）。
+// 按群派生后，异群节点连协议都对不上，协商即失败：零 handler 触发、
+// 零应用层流量、待审批不再被外部噪音污染；不知道网络密钥就构造不出
+// 正确的协议 ID，密钥即成为真正的私有协议准入凭证。
+func GroupProtoPrefix(groupKey []byte) string {
+	return "/lanet/" + GroupFingerprint(groupKey)
+}

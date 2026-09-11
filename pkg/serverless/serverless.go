@@ -237,6 +237,9 @@ type Discovery struct {
 	nearbySeenMu sync.Mutex           // 附近上报去抖（独立锁，不与 members 混用）
 	nearbySeen   map[string]time.Time // peerID -> 上次上报时间
 
+	advFailMu    sync.Mutex // DHT 广播失败日志降噪计数（独立锁）
+	advFailCount int        // 连续「路由表空」失败次数
+
 	onDiscovered []Discovered
 }
 
@@ -739,7 +742,7 @@ func (d *Discovery) dhtRound(ctx context.Context, dht *kaddht.IpfsDHT, source st
 
 	advCtx, cancel := context.WithTimeout(ctx, advTimeout)
 	if err := dht.Provide(advCtx, key, true); err != nil {
-		d.logf("DHT 广播失败（%s，下轮重试）: %v", source, err)
+		d.logAdvFailure(source, err)
 	}
 	cancel()
 
@@ -754,6 +757,26 @@ func (d *Discovery) dhtRound(ctx context.Context, dht *kaddht.IpfsDHT, source st
 			continue
 		}
 		d.addMember(pi.ID, pi.Addrs, source)
+	}
+}
+
+// logAdvFailure DHT 广播失败日志降噪：路由表为空（冷启动、无种子）时
+// 每轮都失败且每次都是同一句噪音，每 15s 刷屏毫无信息量。改为递增间隔
+// 提醒：前 2 次每条都记，之后每 20 次失败记一次（30s 周期 ≈ 10 分钟
+// 一条），恢复成功即清零。
+func (d *Discovery) logAdvFailure(source string, err error) {
+	d.advFailMu.Lock()
+	defer d.advFailMu.Unlock()
+	if err == nil || !strings.Contains(err.Error(), "failed to find any peer in table") {
+		// 其他错误（网络抖动等）不吞，照常记录并清零计数。
+		d.advFailCount = 0
+		d.logf("DHT 广播失败（%s，下轮重试）: %v", source, err)
+		return
+	}
+	d.advFailCount++
+	if d.advFailCount <= 2 || d.advFailCount%20 == 0 {
+		d.logf("DHT 广播失败（%s，第 %d 次，多为路由表空/无种子的冷启动状态，下轮重试）: %v",
+			source, d.advFailCount, err)
 	}
 }
 
