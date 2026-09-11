@@ -174,6 +174,9 @@ docker compose logs -f node
 | `LANET_DB` | 地址簿数据库路径，容器内默认 `/data/lanet.db`（随数据卷持久化） |
 
 放行 `4001/tcp`、`4001/udp`；只有确实远程开放控制台时才放行 `8900/tcp`。
+Compose 默认使用 `network_mode: host`（容器直接使用宿主机网络栈，打洞成功率
+最高、TUN 工作在推荐形态），端口语义即宿主机端口；如需 bridge 模式请按
+compose 文件内注释恢复 `ports` 映射。
 身份、配置、状态和日志保存在 `lanet-node-data` 命名卷中。
 
 Compose 默认已启用 TUN（`LANET_TUN: "true"`，并授予 `NET_ADMIN` 与

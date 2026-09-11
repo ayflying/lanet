@@ -6,6 +6,7 @@
 #
 #   启动：改好下方 environment 后
 #         docker compose up -d
+#   网络模式：默认 host（容器直接用宿主机网络栈，打洞成功率最高）。
 #   防火墙放行：8900/tcp（控制台）+ 4001/tcp + 4001/udp（P2P 直连与打洞）
 #
 # 参数优先级：命令行参数 > 环境变量（LANET_*）> /data/lanet.json > 内置默认。
@@ -78,11 +79,19 @@ services:
       #   LANET_LEGACY_PROTOCOLS                        私有协议逃生开关（默认 false）：
       #                                                 仅与未升级老版本互通异常时临时置 "true"
 
-    ports:
-      - "8900:8900"      # Web 控制台（仅当 LANET_CONSOLE=0.0.0.0:8900 时对外有意义；
-                         # 若只想本机访问，改为 "127.0.0.1:8900:8900" 并配 SSH 隧道）
-      - "4001:4001/tcp"  # P2P 直连与中继流量
-      - "4001:4001/udp"  # QUIC / 打洞
+    # ---- 网络模式：host（默认）----
+    # host 模式下容器直接使用宿主机网络栈：P2P 监听/打洞不经 Docker NAT 转换，
+    # 直连成功率与中继效率更高，也是容器内 TUN 正常工作的推荐形态。
+    # 注意：host 模式下 ports 映射不生效，8900/4001 直接以宿主机端口对外，
+    # 防火墙在宿主机上放行即可（见文件头说明）。
+    network_mode: host
+    # 若必须用 bridge 模式（如端口冲突），删除上面 network_mode 后恢复下方 ports，
+    # 并知晓代价：NAT 转换会降低打洞成功率，控制台仅经映射端口访问。
+    # ports:
+    #   - "8900:8900"      # Web 控制台（仅当 LANET_CONSOLE=0.0.0.0:8900 时对外有意义；
+    #                      # 若只想本机访问，改为 "127.0.0.1:8900:8900" 并配 SSH 隧道）
+    #   - "4001:4001/tcp"  # P2P 直连与中继流量
+    #   - "4001:4001/udp"  # QUIC / 打洞
     volumes:
       # 命名卷：node.key / lanet.json / state.json / lanet.db / lanet.log 全部落在这里，
       # 首次挂载自动继承镜像内 /data 属主，重建容器身份与虚拟 IP 不变。
