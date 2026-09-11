@@ -176,9 +176,10 @@ docker compose logs -f node
 放行 `4001/tcp`、`4001/udp`；只有确实远程开放控制台时才放行 `8900/tcp`。
 身份、配置、状态和日志保存在 `lanet-node-data` 命名卷中。
 
-Compose 默认没有授予 TUN 权限，因此该公网节点作为引导/中继运行并自动降级为
-应用层模式。若还要让容器本身响应虚拟 IP，请按文件内注释启用
-`NET_ADMIN` 与 `/dev/net/tun`。
+Compose 默认已启用 TUN（`LANET_TUN: "true"`，并授予 `NET_ADMIN` 与
+`/dev/net/tun`），容器节点开箱即可响应虚拟 IP（前提：宿主机已加载 tun 模块，
+`modprobe tun`）。若只做纯引导/中继用途，可将 `LANET_TUN` 改为 `"false"`
+并注释掉权限段，日志更干净、容器权限更小。
 
 ### 源码运行
 

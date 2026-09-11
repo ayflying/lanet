@@ -63,11 +63,10 @@ services:
 
       # ==================== 虚拟网卡 ====================
       # TUN 虚拟网卡（true/false，默认 true）：开启后成员间可 ping / 任意端口
-      # 直达虚拟 IP。容器内要真正生效需同时启用下方 user/cap_add/devices 段，
-      # 否则自动降级为纯应用层（Dial / 端口转发不受影响），日志记录原因。
-      # 本编排默认按「引导/中继节点」场景关闭（日志干净）；需要 IP 层互通时
-      # 改为 "true" 并取消下方权限段注释。
-      LANET_TUN: "false"
+      # 直达虚拟 IP。本编排已同时启用下方 user/cap_add/devices 权限段，
+      # 开箱即有 TUN（要求宿主机已加载 tun 模块：modprobe tun）。
+      # 纯引导/中继用途（不需要 IP 层互通）时可改为 "false"，日志更干净。
+      LANET_TUN: "true"
 
       # 其余参数不改也能正常工作，需要时再加 environment 键：
       #   LANET_PUBLIC_DHT / LANET_PUBLIC_DHT_MINUTES  公共 DHT 临时引导（默认关）
@@ -86,17 +85,15 @@ services:
       # 命名卷：node.key / lanet.json / state.json / lanet.db / lanet.log 全部落在这里，
       # 首次挂载自动继承镜像内 /data 属主，重建容器身份与虚拟 IP 不变。
       - lanet-node-data:/data
-    # ---- TUN 虚拟网卡（按需二选一）----
-    # ① 引导/中继节点不需要 TUN（只做牵线和中继）：保持 LANET_TUN="false"，
-    #    下面权限段全部保持注释，日志干净：
-    # ② 要让容器节点真正启用 TUN（其他成员需 ping 通它的虚拟 IP）时：
-    #    LANET_TUN 置 "true"，并取消下方注释授予网卡权限
-    #    （要求宿主机已加载 tun 模块：modprobe tun）：
-    # user: "0:0"
-    # cap_add:
-    #   - NET_ADMIN
-    # devices:
-    #   - /dev/net/tun
+    # ---- TUN 虚拟网卡（默认启用，与上方 LANET_TUN: "true" 配套）----
+    # 权限段已默认放开：容器内可直接创建 TUN 网卡，成员可 ping 通本节点虚拟 IP。
+    # 要求宿主机已加载 tun 模块（modprobe tun）。
+    # 若改为纯引导/中继节点（LANET_TUN: "false"），可将下面三段注释掉以最小化权限：
+    user: "0:0"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
 
 volumes:
   lanet-node-data:
