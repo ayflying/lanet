@@ -11,6 +11,8 @@
 # 参数优先级：命令行参数 > 环境变量（LANET_*）> /data/lanet.json > 内置默认。
 # 环境变量取值支持 true/1/yes/on 与 false/0/no/off（不区分大小写）；布尔项
 # 环境变量留空 = 不覆盖，回落到容器内 /data/lanet.json（控制台「节点配置」写的）。
+# 本文件只列需要按部署场景修改的重点参数，其余（探测间隔、地址簿路径、公共 DHT
+# 时长、GitHub Token 等）内置默认即可；完整参数列表见 README 或 --help。
 # 修改 environment 后 `docker compose up -d` 重建容器生效。
 # =================================================================================
 
@@ -38,26 +40,14 @@ services:
       # 本机就是种子节点时保持 none 即可——其他成员把「我的连接种子」填到自己的
       # bootstrap / 控制台「直接连接」里，单向牵线，本节点不需要引导任何人。
       LANET_BOOTSTRAP: none
-      # 是否启用公共 DHT 临时引导（true/false，默认 false）。公共 DHT 是全公网
-      # 共享网络，作为 server 要应答随机查询，上行流量大（实测空载 ~4MB/分钟），
-      # 故默认关闭。开启后它只负责冷启动牵线：连上第一个同群成员立即自动退出。
-      LANET_PUBLIC_DHT: "false"
-      # 公共 DHT 临时引导最长运行分钟数（默认 10）：到时限仍未连上同群成员也
-      # 自动退出。仅在 LANET_PUBLIC_DHT=true 时有意义。
-      LANET_PUBLIC_DHT_MINUTES: "10"
 
       # ==================== 连接审批（加好友式） ====================
-      # 是否要求连接审批（true/false，默认 true）：开启后陌生节点需在控制台
-      # 「成员」页同意（类似加好友）后才能互连，同意后永久信任。
-      LANET_REQUIRE_APPROVAL: "true"
+      # 是否要求连接审批：默认 true（开启后陌生节点需在控制台「成员」页
+      # 同意（类似加好友）后才能互连，同意后永久信任），一般不用改。
       # 自动同意所有连接申请（true/false，默认 false）：无人值守的中央服务器
       # （就是本机这种 VPS 引导节点）建议置 true，否则新成员首次入网会卡在
       # 待审批列表里等人工点同意。开启等于放弃「加好友」这道安全边界。
       LANET_AUTO_ACCEPT: "true"
-      # 地址簿数据库路径：持久化已认识的成员地址，重启后自动回拨（默认
-      # /data/lanet.db，与命名卷同目录，一般不用改）。设为 "-" = 仅内存运行
-      # 不持久化（每次重建容器都重新冷启动，不建议）。
-      LANET_DB: /data/lanet.db
 
       # ==================== 控制台 ====================
       # 控制台监听地址：0.0.0.0:8900 = 允许外网访问；
@@ -67,35 +57,25 @@ services:
       # 控制台访问密码；LANET_CONSOLE 允许外网访问时务必设置！
       LANET_CONSOLE_PASSWORD: "请改成强密码"
 
-      # ==================== P2P 监听与探测 ====================
       # P2P 监听地址（逗号分隔）。默认随机端口；这里固定 4001 便于防火墙放行，
       # 也让连接种子里的地址稳定不变。
       LANET_LISTEN: "/ip4/0.0.0.0/tcp/4001,/ip4/0.0.0.0/udp/4001/quic-v1"
-      # 成员探测间隔（Go duration 格式，如 5s/20s/1m；留空用内置默认）。
-      # 探测是 P2P 连接的保温机制，间隔过长会导致连接被空闲回收、ping 偶发高延迟。
-      LANET_PROBE: 20s
 
-      # ==================== 防火墙 ====================
-      # 防火墙模式：allow-all（默认，放行全部）/ deny-all（全拒，仅本机管理）/
-      # allow-list（白名单模式，规则在控制台「防火墙」页配置后热生效）。
-      LANET_FW: allow-all
-
-      # ==================== 虚拟网卡与配置持久化 ====================
+      # ==================== 虚拟网卡 ====================
       # TUN 虚拟网卡（true/false，默认 true）：开启后成员间可 ping / 任意端口
       # 直达虚拟 IP。容器内要真正生效需同时启用下方 user/cap_add/devices 段，
       # 否则自动降级为纯应用层（Dial / 端口转发不受影响），日志记录原因。
       # 本编排默认按「引导/中继节点」场景关闭（日志干净）；需要 IP 层互通时
       # 改为 "true" 并取消下方权限段注释。
       LANET_TUN: "false"
-      # 配置文件路径（镜像默认已设为 /data/lanet.json：lanet.json / state.json /
-      # lanet.log / node.key 全部落命名卷，重建容器身份与虚拟 IP 不变）。
-      # 一般无需修改；改成别的路径时注意同步挂载。
-      # LANET_CONFIG: /data/lanet.json
 
-      # ==================== 更新检查（可选） ====================
-      # GitHub Token（contents:read 权限）：官方仓库公开、检查更新无需 token，
-      # 仅当自建私有发行仓库时取消注释填入，可提高 GitHub API 检查频率上限。
-      # GITHUB_TOKEN: "ghp_xxx"
+      # 其余参数不改也能正常工作，需要时再加 environment 键：
+      #   LANET_PUBLIC_DHT / LANET_PUBLIC_DHT_MINUTES  公共 DHT 临时引导（默认关）
+      #   LANET_REQUIRE_APPROVAL                        连接审批（默认 true）
+      #   LANET_DB                                      地址簿路径（默认 /data/lanet.db）
+      #   LANET_PROBE                                   成员探测间隔（默认 20s）
+      #   LANET_FW                                      防火墙模式（默认 allow-all）
+      #   LANET_CONFIG                                  配置文件路径（默认 /data/lanet.json）
 
     ports:
       - "8900:8900"      # Web 控制台（仅当 LANET_CONSOLE=0.0.0.0:8900 时对外有意义；
