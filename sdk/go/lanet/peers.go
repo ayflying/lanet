@@ -59,6 +59,11 @@ func (c *Client) requireApproval() bool {
 	return true
 }
 
+// IsPeerTrusted 导出封装：某节点是否为已信任好友。供 P2P 自更新分发源
+// 在「混版本过渡期固定协议 ID handler」上做成员门——只有已确认好友能从
+// 本机拉取二进制，公网扫描器与异群节点被挡在门外。
+func (c *Client) IsPeerTrusted(peerID string) bool { return c.isTrustedPeer(peerID) }
+
 // isTrustedPeer 供 serverless 审批门查询：该节点是否已被信任。
 // 未启用审批（RequireApproval=false）或地址簿不可用时一律放行。
 func (c *Client) isTrustedPeer(peerID string) bool {

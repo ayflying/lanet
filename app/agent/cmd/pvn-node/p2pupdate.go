@@ -71,6 +71,13 @@ func StartP2PUpdate(ctx context.Context, c *lanet.Client, version string, exeDir
 		Platform:       runtime.GOOS + "/" + runtime.GOARCH,
 		ExePath:        exePath,
 		ManifestPath:   filepath.Join(exeDir, "update-manifest.json"),
+		// 0.5.33 私有协议加固：更新协议 ID 按群派生——公网扫描器与异群
+		// 节点协商不上协议，再也拉不走二进制（此前是公网节点最大流量放大器）。
+		// 混版本过渡：新节点仍注册固定 ID 分发入口（老版本好友靠它升级），
+		// 但该入口带成员门——只有已互加好友的节点能征询清单/下载文件。
+		GroupKey:        c.GroupKey(),
+		LegacyProtocols: c.LegacyProtocols(),
+		IsMember:        c.IsPeerTrusted,
 	}, func(newPath string, m selfupdate.Manifest) {
 		applyP2PUpdate(newPath, m, exePath)
 	})

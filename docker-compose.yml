@@ -75,6 +75,8 @@ services:
       #   LANET_PROBE                                   成员探测间隔（默认 20s）
       #   LANET_FW                                      防火墙模式（默认 allow-all）
       #   LANET_CONFIG                                  配置文件路径（默认 /data/lanet.json）
+      #   LANET_LEGACY_PROTOCOLS                        私有协议逃生开关（默认 false）：
+      #                                                 仅与未升级老版本互通异常时临时置 "true"
 
     ports:
       - "8900:8900"      # Web 控制台（仅当 LANET_CONSOLE=0.0.0.0:8900 时对外有意义；

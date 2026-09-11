@@ -37,16 +37,23 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ayflying/pvn/pkg/protocol"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/protocol"
+	libprotocol "github.com/libp2p/go-libp2p/core/protocol"
 )
 
 // 节点间更新协议：manifest = 版本清单征询；file = 文件分发。
+//
+// 0.5.33 起为「历史固定 ID」：默认协议 ID 已按群密钥派生
+// （pkg/protocol.GroupProtoID）——未入网的扫描器和异群节点协商不上这两个
+// 协议，就再也拉不走任何字节（此前任何能拨通端口的人都能下载完整二进制，
+// 是公网节点最大的流量放大器）。保留常量仅供 LegacyProtocols 逃生开关
+// 与出向「老版本兜底」使用。
 const (
-	ProtocolManifest protocol.ID = "/lanet/update-manifest/1.0.0"
-	ProtocolFile     protocol.ID = "/lanet/update-file/1.0.0"
+	ProtocolManifest libprotocol.ID = "/lanet/update-manifest/1.0.0"
+	ProtocolFile     libprotocol.ID = "/lanet/update-file/1.0.0"
 )
 
 // signPrefix 签名域分隔：签名内容 = prefix + version + ":" + platform + ":" + size + ":" + sha256hex。
@@ -166,6 +173,22 @@ type Config struct {
 	// 发现 1 个更高版本成员即征询其清单；验签通过即可信（签名信任锚
 	// 保证清单出自发布私钥，无需多票灰度），多份时要求完全一致。
 	MinNewPeers int
+	// GroupKey 本群群组密钥（serverless.Discovery.GroupKey）。非空时更新
+	// 协议 ID 按群派生：只有同网络密钥的节点能协商这两个协议，异群扫描器
+	// 与公网流量在 multistream 阶段即被挡（0.5.33 私有协议加固）。留空
+	// （如单测）则退回历史固定 ID。
+	GroupKey []byte
+	// LegacyProtocols 逃生开关：置 true 强制使用历史固定 ID（与未升级老
+	// 对端互通）。默认 false。无论真假，出向都会在派生 ID 协商失败后自动
+	// 兜底尝试固定 ID，因此通常无需开启。
+	LegacyProtocols bool
+	// IsMember 判定某个节点是否为「本机已确认的同群成员」（好友）。仅在
+	// 派生模式下有意义：派生协议 ID 本身已按群隔离，但为了让「尚未升级的
+	// 老版本同群成员」仍能从我这里拉取新二进制（升级不能卡住），入向会
+	// 同时注册一个历史固定 ID 的 handler；固定 ID 谁都能协商，故用它时必须
+	// 经此成员门校验——只放行同群好友，挡住公网扫描器与异群节点拉包。
+	// nil = 不做成员门（单测/无成员视图时按老行为放行）。
+	IsMember func(peerID string) bool
 	// Quiet 关闭日志。
 	Quiet bool
 }
@@ -195,6 +218,13 @@ type Coordinator struct {
 	src  PeerSource
 	cfg  Config
 
+	// 更新协议 ID（0.5.33 起按群密钥派生）。Alt 为出向兜底用的历史固定
+	// ID（仅主 ID 协商失败后尝试），入向只注册主 ID——不把私有协议重新敞开。
+	protoManifest    libprotocol.ID
+	protoFile        libprotocol.ID
+	protoManifestAlt libprotocol.ID
+	protoFileAlt     libprotocol.ID
+
 	onUpdate func(path string, m Manifest) // 下载校验成功回调（宿主替换+重启）
 
 	mu   sync.Mutex
@@ -214,9 +244,30 @@ func New(h host.Host, src PeerSource, cfg Config, onUpdate func(path string, m M
 		onUpdate: onUpdate,
 		attempts: make(map[string]bool),
 	}
+	// 协议 ID：有群密钥时按群派生（异群/未入网者在 multistream 协商阶段
+	// 即被拒，拉不走任何字节）；出向保留固定 ID 作老版本兜底。
+	derived := len(cfg.GroupKey) > 0 && !cfg.LegacyProtocols
+	switch {
+	case derived:
+		c.protoManifest = protocol.GroupProtoID(protocol.BaseUpdManifest, cfg.GroupKey)
+		c.protoFile = protocol.GroupProtoID(protocol.BaseUpdFile, cfg.GroupKey)
+		c.protoManifestAlt = ProtocolManifest
+		c.protoFileAlt = ProtocolFile
+	default:
+		c.protoManifest = ProtocolManifest
+		c.protoFile = ProtocolFile
+	}
 	c.self = c.loadSelfManifest()
-	h.SetStreamHandler(ProtocolManifest, c.handleManifest)
-	h.SetStreamHandler(ProtocolFile, c.handleFile)
+	h.SetStreamHandler(c.protoManifest, c.handleManifest)
+	h.SetStreamHandler(c.protoFile, c.handleFile)
+	if derived {
+		// 混版本过渡：老版本（≤0.5.32）只认固定 ID，若不额外注册，
+		// 已升级节点无法给未升级好友分发新二进制——P2P 升级链恰在最需要
+		// 它的时候断掉。固定 ID handler 带成员门：只应答「本机已确认的
+		// 同群成员」，公网扫描器与异群节点协商得上也拿不到任何字节。
+		h.SetStreamHandler(ProtocolManifest, c.gateMember(c.handleManifest))
+		h.SetStreamHandler(ProtocolFile, c.gateMember(c.handleFile))
+	}
 	if c.self != nil {
 		c.logf("分发源就绪：v%s %s sha256=%s…", c.self.Version, c.self.Platform, c.self.SHA256[:12])
 	} else {
@@ -393,6 +444,24 @@ func (c *Coordinator) loadSelfManifest() *Manifest {
 
 // ---- 分发源侧（handler） ----
 
+// gateMember 给固定协议 ID 的 handler 包一层成员门（0.5.33 混版本过渡用）：
+// 派生模式下额外注册固定 ID handler 是为了让未升级的老版本好友仍能拉取
+// 新二进制（P2P 升级链不断），但固定 ID 任何节点都能协商成功——公网扫描
+// 器与异群节点必须被挡在门外。IsMember 未配置时直接放行（单测/无成员
+// 视图的旧集成）。
+func (c *Coordinator) gateMember(next func(network.Stream)) func(network.Stream) {
+	return func(s network.Stream) {
+		if c.cfg.IsMember != nil {
+			remote := s.Conn().RemotePeer()
+			if !c.cfg.IsMember(remote.String()) {
+				_ = s.Reset() // 非好友：立即重置，零字节分发
+				return
+			}
+		}
+		next(s)
+	}
+}
+
 // handleManifest 响应版本清单征询：无有效凭证则静默关闭。
 // 顺序与 info 协议一致：先读完请求（对端 CloseWrite 后 EOF）再回写。
 func (c *Coordinator) handleManifest(s network.Stream) {
@@ -456,13 +525,27 @@ func (c *Coordinator) handleFile(s network.Stream) {
 
 // ---- 请求方侧 ----
 
+// newStream 出向建流：优先主协议 ID（按群派生）；传了兜底 ID 时把它一并
+// 交给 multistream 协商（一次拨号同时携带两个候选，对端注册了哪个就命中
+// 哪个），用于同群新老版本混跑的过渡期。全部协商失败才报错。
+func (c *Coordinator) newStream(ctx context.Context, pid peer.ID, primary libprotocol.ID, fallbacks ...libprotocol.ID) (network.Stream, error) {
+	protos := make([]libprotocol.ID, 0, 1+len(fallbacks))
+	protos = append(protos, primary)
+	for _, f := range fallbacks {
+		if f != "" && f != primary {
+			protos = append(protos, f)
+		}
+	}
+	return c.host.NewStream(ctx, pid, protos...)
+}
+
 // requestManifest 向对端征询版本清单。
 func (c *Coordinator) requestManifest(ctx context.Context, id string) (Manifest, error) {
 	pid, err := peer.Decode(id)
 	if err != nil {
 		return Manifest{}, err
 	}
-	s, err := c.host.NewStream(ctx, pid, ProtocolManifest)
+	s, err := c.newStream(ctx, pid, c.protoManifest, c.protoManifestAlt)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -513,7 +596,7 @@ func (c *Coordinator) requestFile(ctx context.Context, id string, m Manifest, de
 	if err != nil {
 		return err
 	}
-	s, err := c.host.NewStream(ctx, pid, ProtocolFile)
+	s, err := c.newStream(ctx, pid, c.protoFile, c.protoFileAlt)
 	if err != nil {
 		return err
 	}

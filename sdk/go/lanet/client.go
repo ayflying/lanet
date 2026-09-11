@@ -153,6 +153,13 @@ type Config struct {
 	// 置 true 时「NetworkKey 留空」按历史公共网络密钥（lanet/public）处理，
 	// 用于老部署升级后保持原有网络关系不失效。新部署不应设置此项。
 	LegacyDefaultKey bool
+	// LegacyProtocols 迁移兼容开关（仅 Standalone 模式生效，0.5.33 起）：
+	// 0.5.33 起控制面协议（成员信息交换、删除好友通知、P2P 更新分发、
+	// 私有 DHT、探测回显）的协议 ID 按群组密钥派生——不知道网络密钥的
+	// 节点连协议都协商不上，跨群噪音（陌生握手、附近列表污染、公网扫描器
+	// 拉取二进制）在传输层归零。置 true 退回历史固定协议 ID，用于与
+	// 「未升级的老版本对端」重新互通（出向已自带固定 ID 兜底，一般无需开启）。
+	LegacyProtocols bool
 	// Channel 分发渠道（仅 Standalone 模式生效）：参与群组密钥派生，
 	// 用于把不同分发途径的程序隔离在不同网络。留空默认 ChannelSDK
 	// （第三方 SDK 构建与官方发行版互不相通）；官方发行版程序
@@ -416,6 +423,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		disc, err = serverless.New(ctx, node, serverless.Config{
 			NetworkKey:           cfg.NetworkKey,
 			LegacyDefaultKey:     cfg.LegacyDefaultKey,
+			LegacyProtocols:      cfg.LegacyProtocols,
 			Channel:              cfg.Channel,
 			Name:                 cfg.Name,
 			Bootstrap:            cfg.Bootstrap,
@@ -765,6 +773,28 @@ func (c *Client) DialProtocol(ctx context.Context, virtualIP string, protoID str
 	return streamAdapter{Stream: raw, viaRelay: viaRelay}, viaRelay, nil
 }
 
+// DialProtocols 同 DialProtocol，但一次提供多个候选协议 ID（按优先级）。
+// multistream 会选中对端实际支持的第一个——用于「同群新老版本混跑」
+// 过渡期（派生 ID 优先，历史固定 ID 兜底），省去协商失败后的重拨往返。
+func (c *Client) DialProtocols(ctx context.Context, virtualIP string, protoIDs []string) (Stream, bool, error) {
+	virtualIP, err := c.resolveVirtualIP(virtualIP)
+	if err != nil {
+		return nil, false, err
+	}
+	protos := make([]libprotocol.ID, 0, len(protoIDs))
+	for _, p := range protoIDs {
+		protos = append(protos, libprotocol.ID(p))
+	}
+	raw, viaRelay, err := c.tunnelSvc.OpenStreamToVirtualIPProtocols(ctx, virtualIP, protos)
+	if err != nil {
+		return nil, false, err
+	}
+	if raw == nil {
+		return nil, false, fmt.Errorf("lanet: 拨号 %s 返回空流（内部错误）", virtualIP)
+	}
+	return streamAdapter{Stream: raw, viaRelay: viaRelay}, viaRelay, nil
+}
+
 // LastPathUsed 返回到对端最近一次链路类型：direct / relay / offline / unknown。
 func (c *Client) LastPathUsed(peerID string) string { return c.tunnelSvc.LastPathUsed(peerID) }
 
@@ -790,6 +820,21 @@ func (c *Client) NetMap() netmapclient.Snapshot {
 
 // Host 暴露底层 libp2p Host（进阶用法：自定义协议等）。
 func (c *Client) Host() host.Host { return c.node }
+
+// GroupKey 本群群组密钥（Standalone 模式由渠道+网络密钥派生；
+// 非 Standalone 或未入网返回 nil）。用于派生私有协议 ID 等场景
+// （如 P2P 自更新的按群协议 ID），调用方不应将其外泄。
+func (c *Client) GroupKey() []byte {
+	if c.disc != nil {
+		return c.disc.GroupKey()
+	}
+	return nil
+}
+
+// LegacyProtocols 是否启用历史固定协议 ID（迁移逃生开关）。
+// 上层派生自有协议 ID（如探测回显、P2P 更新）时须与此保持一致，
+// 否则会出现「本端注册派生 ID、对端只认固定 ID」的不对称。
+func (c *Client) LegacyProtocols() bool { return c.cfg.LegacyProtocols }
 
 // startTUN 创建 TUN 虚拟网卡并启动 IP 包路由（IP 层互通：ping / 任意 TCP/UDP 直达虚拟 IP）。
 // 创建或配置失败时仅降级为应用层模式并记日志，不阻断入网（常见原因：

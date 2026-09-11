@@ -31,12 +31,14 @@ import (
 
 	"github.com/ayflying/pvn/pkg/netmapclient"
 	"github.com/ayflying/pvn/pkg/p2pkit"
+	lproto "github.com/ayflying/pvn/pkg/protocol"
 	"github.com/ipfs/go-cid"
 	kaddht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
+	libprotocol "github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
@@ -48,9 +50,13 @@ import (
 // 已在网成员的 multiaddr（每台节点都是潜在种子）。
 const DefaultBootstrap = "/dnsaddr/bootstrap.libp2p.io"
 
-// PrivateDHTPrefix 私有 DHT 的协议前缀。私有 DHT 的协议为
-// /lanet/kad/1.0.0（ProtocolPrefix 补全），与公共 /ipfs/kad/1.0.0
+// PrivateDHTPrefix 私有 DHT 的「历史」协议前缀（固定值）。
+// 私有 DHT 的协议为 /lanet/kad/1.0.0（ProtocolPrefix 补全），与公共 /ipfs/kad/1.0.0
 // 完全隔离：只有本网络节点互相参与路由与 provider 记录。
+//
+// 0.5.33 起默认不再使用此固定前缀——改用按群派生的 protocol.DHTPrefixFor
+// （每个网络一张独立 DHT，跨群路由/查询流量归零）。保留此常量仅供
+// Config.LegacyProtocols 逃生开关回退到老行为。
 const PrivateDHTPrefix = "/lanet"
 
 // 默认成员回收时限与下限。过小会误删 NAT 重连慢的成员。
@@ -59,14 +65,14 @@ const (
 	MinMemberTTL     = 2 * time.Minute
 )
 
-// ProtocolInfo 节点信息交换协议（建连后校验同群 + 交换名称）。
-const ProtocolInfo = "/lanet/info/1.0.0"
-
-// ProtocolUnfriend 删除好友通知协议（0.5.31 起）：A 删除 B 时若 B 在线，
-// 立刻单向推送本消息，B 收到后自动把 A 从自己的地址簿/成员表移除并记下
-// 「已被 A 删除」墓碑——删除因此是双向的。B 离线时走 info 协议里的
-// rejection=unfriended 标记，在下次通讯时同样完成同步（自愈式）。
-const ProtocolUnfriend = "/lanet/unfriend/1.0.0"
+// ProtocolInfo / ProtocolUnfriend 历史固定协议 ID。
+// 0.5.33 起默认改为按群密钥派生（见 Discovery.protoInfo/protoUnfriend 与
+// pkg/protocol.GroupProtoID），未知网络密钥者在 multistream 协商阶段即被拒。
+// 保留这两个常量仅供 Config.LegacyProtocols 逃生开关回退老行为。
+const (
+	ProtocolInfo     = "/lanet/info/1.0.0"
+	ProtocolUnfriend = "/lanet/unfriend/1.0.0"
+)
 
 // ErrNotApproved 对端拒绝本次握手：它不是不理你，而是明确告诉你
 // 「本机尚未同意你的连接申请」。上层据此给出「等待对方同意」的提示，
@@ -139,6 +145,11 @@ type Config struct {
 	OSHostname string
 	// LocalIPs 本节点非回环网卡 IP 列表（info 协议交换，供成员识别设备网段）。空 = 不上报。
 	LocalIPs []string
+	// LegacyProtocols 逃生开关（0.5.33 引入私有协议后）：置 true 退回历史
+	// 固定协议 ID（/lanet/info、/lanet/unfriend）与全局固定私有 DHT 前缀
+	// （/lanet/kad），使本网节点能与「未升级的老版本对端」重新互通。
+	// 代价是重新暴露于跨群噪音。默认 false = 启用按群派生的私有协议。
+	LegacyProtocols bool
 	// Quiet 为 true 时不打日志。
 	Quiet bool
 
@@ -219,9 +230,22 @@ type Discovery struct {
 	groupKey []byte
 	selfIP   string
 
-	dhtPrivate *kaddht.IpfsDHT // 私有 DHT（/lanet 前缀；仅私有网络非 nil）
+	dhtPrivate *kaddht.IpfsDHT // 私有 DHT（前缀按群派生；仅私有网络非 nil）
 	dhtPublic  *kaddht.IpfsDHT // 公共 DHT（/ipfs 前缀；兜底与公共网络）
 	mdnsSvc    mdns.Service
+
+	// protoInfo / protoUnfriend 控制面协议 ID（0.5.33 起按群密钥派生）。
+	// LegacyProtocols 开启时退回历史固定常量 ProtocolInfo / ProtocolUnfriend。
+	// 派生 ID 让异群节点 multistream 协商即失败：无效握手、待审批/附近污染、
+	// 探测流量在传输层就被挡掉（详见 pkg/protocol 包注释）。
+	protoInfo     libprotocol.ID
+	protoUnfriend libprotocol.ID
+	// protoInfoAlt / protoUnfriendAlt 历史固定协议 ID（派生模式下非空）：
+	// 同群新老版本混跑过渡用——出向建流时作为候选兜底（对端只认固定 ID
+	// 时仍能握手成功），入向也注册同一 handler（跨群伪造不了载荷里的群
+	// 指纹，异群请求在 handleInfo 第一步即被静默丢弃，不会记入待审批）。
+	protoInfoAlt     libprotocol.ID
+	protoUnfriendAlt libprotocol.ID
 
 	memberTTL time.Duration // 成员不活跃回收时限（Config.MemberTTL 归一化后）
 
@@ -292,6 +316,20 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		trigger:    make(chan struct{}, 1),
 		nearbySeen: make(map[string]time.Time),
 	}
+	// 控制面协议 ID：默认按群密钥派生（异群 multistream 协商即失败，
+	// 从传输层过滤跨群噪音）；LegacyProtocols 逃生开关退回历史固定 ID。
+	// 派生模式下保留固定 ID 作为「出向兜底」：同群混版本过渡期（对端还是
+	// 0.5.31 及以前的老版本）拨号时先试派生 ID，协商不上再试固定 ID，
+	// 已保存地址的好友关系不断；入向只注册派生 handler，不把门重新敞开。
+	if cfg.LegacyProtocols {
+		d.protoInfo = ProtocolInfo
+		d.protoUnfriend = ProtocolUnfriend
+	} else {
+		d.protoInfo = lproto.GroupProtoID(lproto.BaseInfo, d.groupKey)
+		d.protoUnfriend = lproto.GroupProtoID(lproto.BaseUnfriend, d.groupKey)
+		d.protoInfoAlt = ProtocolInfo
+		d.protoUnfriendAlt = ProtocolUnfriend
+	}
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
 
 	// 1. DHT：每台节点都是 server（客户端即服务端）。
@@ -308,10 +346,14 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	if err != nil {
 		return nil, err
 	}
+	privPrefix := lproto.DHTPrefixFor(d.groupKey)
+	if cfg.LegacyProtocols {
+		privPrefix = PrivateDHTPrefix // 逃生：退回全局固定 /lanet/kad（与老版本对端同网）
+	}
 	d.dhtPrivate, err = kaddht.New(h,
 		kaddht.Mode(kaddht.ModeAutoServer),
 		kaddht.BootstrapPeers(privParsed...),
-		kaddht.ProtocolPrefix(PrivateDHTPrefix),
+		kaddht.ProtocolPrefix(libprotocol.ID(privPrefix)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("serverless: init private dht: %w", err)
@@ -384,9 +426,33 @@ func (d *Discovery) Start(ctx context.Context) error {
 		d.mu.Unlock()
 		d.armPublicDHTTimeout(ctx, pub, d.cfg.PublicDHTTimeout)
 	}
-	d.host.SetStreamHandler(ProtocolInfo, d.handleInfo)
-	d.host.SetStreamHandler(ProtocolUnfriend, d.handleUnfriend)
+	d.host.SetStreamHandler(d.protoInfo, d.handleInfo)
+	d.host.SetStreamHandler(d.protoUnfriend, d.handleUnfriend)
+	if d.protoInfoAlt != "" {
+		// 混版本过渡（0.5.33）：未升级的老版本对端（≤0.5.32）只认历史固定
+		// ID。派生模式下同时注册固定 ID handler——老→新握手不断（升级节奏
+		// 不一致时好友关系可双向收敛，老用户也能照常把新用户加进待审批）。
+		// 安全不依赖 handler 种类：info/unfriend 载荷第一步都有群指纹校验
+		// （handleInfo/handleUnfriend 现成逻辑），异群扫描器伪造不出正确
+		// 指纹，在审批门之前就被静默丢弃，零待审批污染。
+		d.host.SetStreamHandler(d.protoInfoAlt, d.handleInfo)
+		d.host.SetStreamHandler(d.protoUnfriendAlt, d.handleUnfriend)
+	}
 	return nil
+}
+
+// protoCandidates 出向建流使用的协议 ID 候选：主 ID（按群派生）优先，
+// 附带历史固定 ID 兜底——同群新老版本混跑时，multistream 一次拨号同时
+// 携带两个候选，对端注册了哪个就命中哪个。
+func (d *Discovery) protoCandidates(primary libprotocol.ID, fallbacks ...libprotocol.ID) []libprotocol.ID {
+	protos := make([]libprotocol.ID, 0, 1+len(fallbacks))
+	protos = append(protos, primary)
+	for _, f := range fallbacks {
+		if f != "" && f != primary {
+			protos = append(protos, f)
+		}
+	}
+	return protos
 }
 
 // armPublicDHTTimeout 为某个公共 DHT 实例装上超时退出计时器：到点若该实例
@@ -1165,7 +1231,7 @@ func (d *Discovery) handleInfo(s network.Stream) {
 
 // fetchInfo 主动交换成员信息。
 func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, error) {
-	stream, err := d.host.NewStream(ctx, id, ProtocolInfo)
+	stream, err := d.host.NewStream(ctx, id, d.protoCandidates(d.protoInfo, d.protoInfoAlt)...)
 	if err != nil {
 		return infoPayload{}, err
 	}
@@ -1222,7 +1288,7 @@ func (d *Discovery) NotifyUnfriend(ctx context.Context, peerID string) error {
 	if err != nil {
 		return fmt.Errorf("节点 ID 格式非法: %w", err)
 	}
-	stream, err := d.host.NewStream(ctx, id, ProtocolUnfriend)
+	stream, err := d.host.NewStream(ctx, id, d.protoCandidates(d.protoUnfriend, d.protoUnfriendAlt)...)
 	if err != nil {
 		return fmt.Errorf("对端不在线或未连通: %w", err)
 	}

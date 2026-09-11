@@ -30,14 +30,25 @@ import (
 	"time"
 
 	"github.com/ayflying/pvn/pkg/netmapclient"
+	lanetproto "github.com/ayflying/pvn/pkg/protocol"
 	"github.com/ayflying/pvn/pkg/serverless"
 	"github.com/ayflying/pvn/sdk/go/lanet"
 	"github.com/libp2p/go-libp2p/core/network"
 	libprotocol "github.com/libp2p/go-libp2p/core/protocol"
 )
 
-// echoProto 节点间探测回显协议。
+// echoProto 节点间探测回显协议（历史固定 ID，0.5.33 起默认按群派生——
+// 见 echoProtoFor；此常量保留作 LegacyProtocols 逃生与新老混跑兜底）。
 const echoProto = libprotocol.ID("/lanet/echo/1.0.0")
+
+// echoProtoFor 按本群密钥派生探测回显协议 ID（LegacyProtocols 时退回固定值）。
+// 探测本质是成员间私有链路，固定 ID 会让任意公网扫描器都能触发回显消耗流量。
+func echoProtoFor(groupKey []byte, legacy bool) libprotocol.ID {
+	if legacy || len(groupKey) == 0 {
+		return echoProto
+	}
+	return lanetproto.GroupProtoID(lanetproto.BaseEcho, groupKey)
+}
 
 // version 由 CI 经 -ldflags "-X main.version=<VERSION 文件内容>" 注入。
 var version = "dev"
@@ -101,6 +112,9 @@ func runNode(parent context.Context, serviceMode bool) {
 			"是否要求连接审批（true/false，默认 true）：开启后陌生节点需在控制台同意后才能互连")
 		dbPath = flag.String("db", envOr("LANET_DB", ""),
 			"地址簿数据库路径（默认 exe 同目录 lanet.db；设为 - 关闭持久化，仅内存运行）")
+		legacyProto = flag.String("legacy-protocols", envOr("LANET_LEGACY_PROTOCOLS", "@@unset@@"),
+			"退回历史固定协议 ID（true/false，默认 false）：仅在与未升级到 0.5.33 的老版本对端互通受阻时临时开启；"+
+				"开启后重新暴露于跨群噪音，问题解决后应关闭")
 		probe = flag.Duration("probe", envDurationOr("LANET_PROBE"),
 			"成员探测间隔（可经 LANET_PROBE 设置，Go duration 如 20s/1m）；不传则读配置文件（默认 20s）")
 	)
@@ -182,6 +196,8 @@ func runNode(parent context.Context, serviceMode bool) {
 	// AutoAccept 为「自动同意」，供无人值守中央服务器使用，默认关闭。
 	effRequireApproval := resolveTriBool(*requireApproval, nc.RequireApproval, true)
 	effAutoAccept := resolveTriBool(*autoAccept, nc.AutoAccept, false)
+	// 私有协议加固逃生开关（0.5.33）：默认 false = 派生协议 ID；置 true 退回固定 ID。
+	effLegacyProto := resolveTriBool(*legacyProto, nc.LegacyProtocols, false)
 	// 地址簿路径：命令行/环境变量 > 配置文件 > 默认（exe 同目录 lanet.db）。
 	effDBPath := firstNonEmpty(*dbPath, nc.DBPath)
 	if effDBPath == "" {
@@ -212,6 +228,7 @@ func runNode(parent context.Context, serviceMode bool) {
 		AutoAccept:       effAutoAccept,
 		RequireApproval:  effRequireApproval,
 		DBPath:           effDBPath,
+		LegacyProtocols:  effLegacyProto,
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -246,6 +263,7 @@ func runNode(parent context.Context, serviceMode bool) {
 		Name:             effName,
 		NetworkKey:       effKey,
 		LegacyDefaultKey: effLegacyKey,
+		LegacyProtocols:  effLegacyProto,
 		Standalone:       true,
 		Channel:          lanet.ChannelOfficial, // 官方发行渠道：与第三方 SDK 构建网络隔离
 		Bootstrap:        nc.bootstrapAddrs,
@@ -333,7 +351,11 @@ func runNode(parent context.Context, serviceMode bool) {
 	// 注意：不再向 OnStream 注册 Tunnel 协议 echo——TUN 开启时该协议是
 	// IP 数据面（ping/任意端口直达虚拟 IP 的承载），应用层 echo 会与之
 	// 抢流、吞掉入向 IP 包导致 ping 不通。探测统一走独立 echoProto。
-	node.Host().SetStreamHandler(echoProto, func(s network.Stream) {
+	// 0.5.33：协议 ID 按群派生，异群/扫描器协商不上，不再浪费回显流量。
+	// 混版本过渡：派生 ID 为主 handler；同群老版本（≤0.5.32）只认固定 ID，
+	// 故固定 ID 也注册一个「仅已信任好友」的门禁版本，老→新探测不断。
+	echoP := echoProtoFor(node.GroupKey(), cfg.LegacyProtocols)
+	echoHandler := func(s network.Stream) {
 		defer s.Close()
 		buf := make([]byte, 4096)
 		for {
@@ -347,7 +369,17 @@ func runNode(parent context.Context, serviceMode bool) {
 				return
 			}
 		}
-	})
+	}
+	node.Host().SetStreamHandler(echoP, echoHandler)
+	if string(echoP) != string(echoProto) {
+		node.Host().SetStreamHandler(echoProto, func(s network.Stream) {
+			if !node.IsPeerTrusted(s.Conn().RemotePeer().String()) {
+				_ = s.Reset()
+				return
+			}
+			echoHandler(s)
+		})
+	}
 	// （原 Tunnel 协议 OnStream echo 已删除：与 TUN 数据面冲突，见上）
 
 	go node.Run(ctx)
@@ -404,7 +436,13 @@ func probeOnce(ctx context.Context, node *lanet.Client, name, virtualIP string) 
 	start := time.Now()
 	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	stream, viaRelay, err := node.DialProtocol(pctx, virtualIP, string(echoProto))
+	// 出向候选：派生 ID 优先（与新版对端匹配）；同群老版本只认固定 ID，
+	// 因此追加固定 ID 兜底（与 serverless/selfupdate 的迁移策略一致）。
+	protos := []string{string(echoProtoFor(node.GroupKey(), node.LegacyProtocols()))}
+	if p := string(echoProto); p != protos[0] {
+		protos = append(protos, p)
+	}
+	stream, viaRelay, err := node.DialProtocols(pctx, virtualIP, protos)
 	if err != nil {
 		log.Printf("[probe] FAIL %s(%s): %v", name, virtualIP, err)
 		return
@@ -654,6 +692,11 @@ type nodeConfig struct {
 	AutoAccept *bool `json:"auto_accept,omitempty"`
 	// DBPath 地址簿数据库路径（默认 exe 同目录 lanet.db，"-" = 仅内存）。
 	DBPath string `json:"db_path,omitempty"`
+	// LegacyProtocols 迁移逃生开关（0.5.33 起）：置 true 退回历史固定协议 ID
+	// （/lanet/info、/lanet/unfriend、/lanet/kad 等），用于与未升级的老版本
+	// 对端互通。默认 false = 启用按群派生的私有协议（跨群噪音在协商层归零）。
+	// nil = 未设置（按默认 false）。
+	LegacyProtocols *bool `json:"legacy_protocols,omitempty"`
 
 	bootstrapAddrs []string `json:"-"` // 运行时由 Bootstrap 解析而来
 }
@@ -756,6 +799,8 @@ type nodeRuntime struct {
 	RequireApproval bool
 	AutoAccept      bool
 	DBPath          string
+	// LegacyProtocols 迁移逃生开关（0.5.33）：true = 退回历史固定协议 ID。
+	LegacyProtocols bool
 }
 
 // networkID 运行时网络标识（与 SDK/控制台页眉一致）：standalone- + 群组指纹。
@@ -781,9 +826,9 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 			requireApprovalOn := nc.RequireApproval == nil || *nc.RequireApproval
 			autoAcceptOn := nc.AutoAccept != nil && *nc.AutoAccept
 			writeJSONLocal(w, http.StatusOK, map[string]any{
-				"config_path":        path,
-				"name":               nc.Name,
-				"network_key":        nc.NetworkKey,
+				"config_path": path,
+				"name":        nc.Name,
+				"network_key": nc.NetworkKey,
 				// network_key_env 标记当前进程的网络密钥来自环境变量
 				// LANET_NETWORK_KEY（容器编排常见）：lanet.json 里可能没有该值，
 				// 前端据此把输入框回填为实际生效值，避免「容器里填了密钥、页面上是空的」。
@@ -804,6 +849,10 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				"require_approval":   requireApprovalOn,
 				"auto_accept":        autoAcceptOn,
 				"db_path":            nc.DBPath,
+				// 私有协议逃生开关（0.5.33）：true = 历史固定协议 ID（老版本互通），
+				// 默认 false = 按群派生（跨群噪音协商层归零）。控制台不展示开关，
+				// 仅编辑 lanet.json / 环境变量 LANET_LEGACY_PROTOCOLS 可改。
+				"legacy_protocols": nc.LegacyProtocols != nil && *nc.LegacyProtocols,
 				"runtime": map[string]any{
 					"name":               eff.Name,
 					"network_key":        eff.NetworkKey,
@@ -917,6 +966,10 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 			}
 			if req.DBPath == "" {
 				req.DBPath = prev.DBPath
+			}
+			// 私有协议逃生开关：页面未提供（无该控件）时保留原值。
+			if req.LegacyProtocols == nil {
+				req.LegacyProtocols = prev.LegacyProtocols
 			}
 			// 开机自启：平台支持时按请求值切换（立即生效，无需重启）。
 			if req.Autorun != nil && autorunSupported() {

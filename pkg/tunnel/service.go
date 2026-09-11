@@ -59,6 +59,14 @@ func (s *Service) OpenStreamToVirtualIP(ctx context.Context, virtualIP string) (
 // OpenStreamToVirtualIPProtocol 同上，但指定应用层协议 ID
 // （如 portfwd 端口转发），三段降级策略与隧道流一致。
 func (s *Service) OpenStreamToVirtualIPProtocol(ctx context.Context, virtualIP string, proto libprotocol.ID) (network.Stream, bool, error) {
+	return s.OpenStreamToVirtualIPProtocols(ctx, virtualIP, []libprotocol.ID{proto})
+}
+
+// OpenStreamToVirtualIPProtocols 同 OpenStreamToVirtualIPProtocol，但一次
+// 传入多个候选协议 ID（按优先级）。multistream 会用对端实际支持的第一个：
+// 用于「同群新老版本混跑」过渡期（如探测协议既发派生 ID 又发历史固定 ID），
+// 省去协商失败后再拨一次的往返。
+func (s *Service) OpenStreamToVirtualIPProtocols(ctx context.Context, virtualIP string, protos []libprotocol.ID) (network.Stream, bool, error) {
 	route, ok := s.netmapCli.Resolve(virtualIP)
 	if !ok {
 		return nil, false, fmt.Errorf("virtual IP %s not in group netmap", virtualIP)
@@ -76,7 +84,7 @@ func (s *Service) OpenStreamToVirtualIPProtocol(ctx context.Context, virtualIP s
 	//    backoff，且 addrs 里常混有 127.0.0.1/169.254 等不可达地址，
 	//    逐个试会耗尽 dialTimeout——而此时连接明明是健康的。
 	if s.self.Network().Connectedness(target) == network.Connected {
-		stream, streamErr := s.openStream(dialCtx, target, proto)
+		stream, streamErr := s.openStream(dialCtx, target, protos...)
 		if streamErr == nil {
 			viaRelay := hasCircuit(stream.Conn().RemoteMultiaddr())
 			s.markRelay(route.PeerID, viaRelay)
@@ -90,7 +98,7 @@ func (s *Service) OpenStreamToVirtualIPProtocol(ctx context.Context, virtualIP s
 	//    反而错过物理可达的内网路径。
 	directErr := s.self.Connect(dialCtx, peer.AddrInfo{ID: target})
 	if directErr == nil {
-		stream, streamErr := s.openStream(dialCtx, target, proto)
+		stream, streamErr := s.openStream(dialCtx, target, protos...)
 		if streamErr == nil {
 			s.markRelay(route.PeerID, false)
 			return stream, false, nil
@@ -99,7 +107,7 @@ func (s *Service) OpenStreamToVirtualIPProtocol(ctx context.Context, virtualIP s
 	}
 
 	// 3) 中继保底：逐个候选 Relay 预约，成功即经中继转发。
-	stream, relayErr := s.openViaRelay(ctx, target, proto)
+	stream, relayErr := s.openViaRelay(ctx, target, protos...)
 	if relayErr != nil {
 		return nil, false, fmt.Errorf("direct and relay dial both failed: direct=%s relay=%s",
 			describeDirect(route, directErr), compactError(relayErr))
@@ -108,11 +116,11 @@ func (s *Service) OpenStreamToVirtualIPProtocol(ctx context.Context, virtualIP s
 	return stream, true, nil
 }
 
-func (s *Service) openStream(ctx context.Context, target peer.ID, proto libprotocol.ID) (network.Stream, error) {
-	return s.self.NewStream(ctx, target, proto)
+func (s *Service) openStream(ctx context.Context, target peer.ID, protos ...libprotocol.ID) (network.Stream, error) {
+	return s.self.NewStream(ctx, target, protos...)
 }
 
-func (s *Service) openViaRelay(ctx context.Context, target peer.ID, proto libprotocol.ID) (network.Stream, error) {
+func (s *Service) openViaRelay(ctx context.Context, target peer.ID, protos ...libprotocol.ID) (network.Stream, error) {
 	candidates, err := s.relays.Candidates(ctx, 2)
 	if err != nil {
 		return nil, fmt.Errorf("fetch relay candidates: %w", err)
@@ -142,7 +150,7 @@ func (s *Service) openViaRelay(ctx context.Context, target peer.ID, proto libpro
 			lastErr = fmt.Errorf("connect via %s: %w", candidate.ID, connectErr)
 			continue
 		}
-		stream, streamErr := s.openStream(ctx, target, proto)
+		stream, streamErr := s.openStream(ctx, target, protos...)
 		if streamErr != nil {
 			lastErr = fmt.Errorf("open stream via %s: %w", candidate.ID, streamErr)
 			continue
