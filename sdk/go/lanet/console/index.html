@@ -135,23 +135,6 @@
 </div>
 
 <div class="panel active" id="pMembers">
-  <div class="card">
-    <h2>成员与链路 <button class="ghost" style="float:right;font-size:12px;padding:2px 10px" onclick="openInfoModal()">本机信息</button></h2>
-    <div class="row" style="margin:0 0 10px">
-      <input type="text" id="mSearch" placeholder="搜索：设备名 / 虚拟地址 / 虚拟 IP / PeerID" oninput="mPage=1;renderMembers()">
-      <select id="mFilter" style="flex:0 0 140px" onchange="mPage=1;renderMembers()">
-        <option value="all">全部状态</option>
-        <option value="online">仅在线</option>
-        <option value="offline">仅离线</option>
-      </select>
-    </div>
-    <div id="members" class="empty">加载中…</div>
-    <div class="row" id="mPager" style="display:none;margin:10px 0 0;justify-content:flex-end">
-      <button class="ghost" id="mPrev" onclick="mPage--;renderMembers()">上一页</button>
-      <span class="sub" id="mPageInfo" style="margin:0 10px;align-self:center"></span>
-      <button class="ghost" id="mNext" onclick="mPage++;renderMembers()">下一页</button>
-    </div>
-  </div>
   <div class="card" id="connectCard" style="display:none">
     <h2>连接其他节点 <span class="tag unknown">按节点 ID 直连</span></h2>
     <div class="sub" style="margin-bottom:8px">把对方发来的<b>节点 ID</b>（12D3Koo… 开头）粘贴进去点连接即可；也支持完整连接地址。首次连接需对方在控制台<b>同意</b>，同意一次即永久信任，之后自动重连。</div>
@@ -205,6 +188,23 @@
         <div class="sub" style="color:#8a94a6">家庭宽带公网地址变化后旧种子会失效，需重新复制分享。</div>
       </div>
     </details>
+  </div>
+  <div class="card">
+    <h2>成员与链路 <button class="ghost" style="float:right;font-size:12px;padding:2px 10px" onclick="openInfoModal()">本机信息</button></h2>
+    <div class="row" style="margin:0 0 10px">
+      <input type="text" id="mSearch" placeholder="搜索：设备名 / 虚拟地址 / 虚拟 IP / PeerID" oninput="mPage=1;renderMembers()">
+      <select id="mFilter" style="flex:0 0 140px" onchange="mPage=1;renderMembers()">
+        <option value="all">全部状态</option>
+        <option value="online">仅在线</option>
+        <option value="offline">仅离线</option>
+      </select>
+    </div>
+    <div id="members" class="empty">加载中…</div>
+    <div class="row" id="mPager" style="display:none;margin:10px 0 0;justify-content:flex-end">
+      <button class="ghost" id="mPrev" onclick="mPage--;renderMembers()">上一页</button>
+      <span class="sub" id="mPageInfo" style="margin:0 10px;align-self:center"></span>
+      <button class="ghost" id="mNext" onclick="mPage++;renderMembers()">下一页</button>
+    </div>
   </div>
 </div>
 
