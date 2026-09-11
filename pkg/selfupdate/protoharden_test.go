@@ -1,6 +1,6 @@
 package selfupdate
 
-// 私有协议加固（0.5.33）测试：更新协议 ID 按群派生 + 固定 ID 成员门。
+// 私有协议加固（0.5.34）测试：更新协议 ID 按群派生 + 固定 ID 成员门。
 
 import (
 	"context"

@@ -54,7 +54,7 @@ const DefaultBootstrap = "/dnsaddr/bootstrap.libp2p.io"
 // 私有 DHT 的协议为 /lanet/kad/1.0.0（ProtocolPrefix 补全），与公共 /ipfs/kad/1.0.0
 // 完全隔离：只有本网络节点互相参与路由与 provider 记录。
 //
-// 0.5.33 起默认不再使用此固定前缀——改用按群派生的 protocol.DHTPrefixFor
+// 0.5.34 起默认不再使用此固定前缀——改用按群派生的 protocol.DHTPrefixFor
 // （每个网络一张独立 DHT，跨群路由/查询流量归零）。保留此常量仅供
 // Config.LegacyProtocols 逃生开关回退到老行为。
 const PrivateDHTPrefix = "/lanet"
@@ -66,7 +66,7 @@ const (
 )
 
 // ProtocolInfo / ProtocolUnfriend 历史固定协议 ID。
-// 0.5.33 起默认改为按群密钥派生（见 Discovery.protoInfo/protoUnfriend 与
+// 0.5.34 起默认改为按群密钥派生（见 Discovery.protoInfo/protoUnfriend 与
 // pkg/protocol.GroupProtoID），未知网络密钥者在 multistream 协商阶段即被拒。
 // 保留这两个常量仅供 Config.LegacyProtocols 逃生开关回退老行为。
 const (
@@ -145,7 +145,7 @@ type Config struct {
 	OSHostname string
 	// LocalIPs 本节点非回环网卡 IP 列表（info 协议交换，供成员识别设备网段）。空 = 不上报。
 	LocalIPs []string
-	// LegacyProtocols 逃生开关（0.5.33 引入私有协议后）：置 true 退回历史
+	// LegacyProtocols 逃生开关（0.5.34 引入私有协议后）：置 true 退回历史
 	// 固定协议 ID（/lanet/info、/lanet/unfriend）与全局固定私有 DHT 前缀
 	// （/lanet/kad），使本网节点能与「未升级的老版本对端」重新互通。
 	// 代价是重新暴露于跨群噪音。默认 false = 启用按群派生的私有协议。
@@ -234,7 +234,7 @@ type Discovery struct {
 	dhtPublic  *kaddht.IpfsDHT // 公共 DHT（/ipfs 前缀；兜底与公共网络）
 	mdnsSvc    mdns.Service
 
-	// protoInfo / protoUnfriend 控制面协议 ID（0.5.33 起按群密钥派生）。
+	// protoInfo / protoUnfriend 控制面协议 ID（0.5.34 起按群密钥派生）。
 	// LegacyProtocols 开启时退回历史固定常量 ProtocolInfo / ProtocolUnfriend。
 	// 派生 ID 让异群节点 multistream 协商即失败：无效握手、待审批/附近污染、
 	// 探测流量在传输层就被挡掉（详见 pkg/protocol 包注释）。
@@ -319,7 +319,7 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	// 控制面协议 ID：默认按群密钥派生（异群 multistream 协商即失败，
 	// 从传输层过滤跨群噪音）；LegacyProtocols 逃生开关退回历史固定 ID。
 	// 派生模式下保留固定 ID 作为「出向兜底」：同群混版本过渡期（对端还是
-	// 0.5.31 及以前的老版本）拨号时先试派生 ID，协商不上再试固定 ID，
+	// 0.5.33 及以前的老版本）拨号时先试派生 ID，协商不上再试固定 ID，
 	// 已保存地址的好友关系不断；入向只注册派生 handler，不把门重新敞开。
 	if cfg.LegacyProtocols {
 		d.protoInfo = ProtocolInfo
@@ -429,7 +429,7 @@ func (d *Discovery) Start(ctx context.Context) error {
 	d.host.SetStreamHandler(d.protoInfo, d.handleInfo)
 	d.host.SetStreamHandler(d.protoUnfriend, d.handleUnfriend)
 	if d.protoInfoAlt != "" {
-		// 混版本过渡（0.5.33）：未升级的老版本对端（≤0.5.32）只认历史固定
+		// 混版本过渡（0.5.34）：未升级的老版本对端（≤0.5.33）只认历史固定
 		// ID。派生模式下同时注册固定 ID handler——老→新握手不断（升级节奏
 		// 不一致时好友关系可双向收敛，老用户也能照常把新用户加进待审批）。
 		// 安全不依赖 handler 种类：info/unfriend 载荷第一步都有群指纹校验

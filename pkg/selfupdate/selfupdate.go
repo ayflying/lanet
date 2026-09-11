@@ -46,7 +46,7 @@ import (
 
 // 节点间更新协议：manifest = 版本清单征询；file = 文件分发。
 //
-// 0.5.33 起为「历史固定 ID」：默认协议 ID 已按群密钥派生
+// 0.5.34 起为「历史固定 ID」：默认协议 ID 已按群密钥派生
 // （pkg/protocol.GroupProtoID）——未入网的扫描器和异群节点协商不上这两个
 // 协议，就再也拉不走任何字节（此前任何能拨通端口的人都能下载完整二进制，
 // 是公网节点最大的流量放大器）。保留常量仅供 LegacyProtocols 逃生开关
@@ -175,7 +175,7 @@ type Config struct {
 	MinNewPeers int
 	// GroupKey 本群群组密钥（serverless.Discovery.GroupKey）。非空时更新
 	// 协议 ID 按群派生：只有同网络密钥的节点能协商这两个协议，异群扫描器
-	// 与公网流量在 multistream 阶段即被挡（0.5.33 私有协议加固）。留空
+	// 与公网流量在 multistream 阶段即被挡（0.5.34 私有协议加固）。留空
 	// （如单测）则退回历史固定 ID。
 	GroupKey []byte
 	// LegacyProtocols 逃生开关：置 true 强制使用历史固定 ID（与未升级老
@@ -218,7 +218,7 @@ type Coordinator struct {
 	src  PeerSource
 	cfg  Config
 
-	// 更新协议 ID（0.5.33 起按群密钥派生）。Alt 为出向兜底用的历史固定
+	// 更新协议 ID（0.5.34 起按群密钥派生）。Alt 为出向兜底用的历史固定
 	// ID（仅主 ID 协商失败后尝试），入向只注册主 ID——不把私有协议重新敞开。
 	protoManifest    libprotocol.ID
 	protoFile        libprotocol.ID
@@ -261,7 +261,7 @@ func New(h host.Host, src PeerSource, cfg Config, onUpdate func(path string, m M
 	h.SetStreamHandler(c.protoManifest, c.handleManifest)
 	h.SetStreamHandler(c.protoFile, c.handleFile)
 	if derived {
-		// 混版本过渡：老版本（≤0.5.32）只认固定 ID，若不额外注册，
+		// 混版本过渡：老版本（≤0.5.33）只认固定 ID，若不额外注册，
 		// 已升级节点无法给未升级好友分发新二进制——P2P 升级链恰在最需要
 		// 它的时候断掉。固定 ID handler 带成员门：只应答「本机已确认的
 		// 同群成员」，公网扫描器与异群节点协商得上也拿不到任何字节。
@@ -444,7 +444,7 @@ func (c *Coordinator) loadSelfManifest() *Manifest {
 
 // ---- 分发源侧（handler） ----
 
-// gateMember 给固定协议 ID 的 handler 包一层成员门（0.5.33 混版本过渡用）：
+// gateMember 给固定协议 ID 的 handler 包一层成员门（0.5.34 混版本过渡用）：
 // 派生模式下额外注册固定 ID handler 是为了让未升级的老版本好友仍能拉取
 // 新二进制（P2P 升级链不断），但固定 ID 任何节点都能协商成功——公网扫描
 // 器与异群节点必须被挡在门外。IsMember 未配置时直接放行（单测/无成员

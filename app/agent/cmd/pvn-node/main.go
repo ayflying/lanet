@@ -37,7 +37,7 @@ import (
 	libprotocol "github.com/libp2p/go-libp2p/core/protocol"
 )
 
-// echoProto 节点间探测回显协议（历史固定 ID，0.5.33 起默认按群派生——
+// echoProto 节点间探测回显协议（历史固定 ID，0.5.34 起默认按群派生——
 // 见 echoProtoFor；此常量保留作 LegacyProtocols 逃生与新老混跑兜底）。
 const echoProto = libprotocol.ID("/lanet/echo/1.0.0")
 
@@ -113,7 +113,7 @@ func runNode(parent context.Context, serviceMode bool) {
 		dbPath = flag.String("db", envOr("LANET_DB", ""),
 			"地址簿数据库路径（默认 exe 同目录 lanet.db；设为 - 关闭持久化，仅内存运行）")
 		legacyProto = flag.String("legacy-protocols", envOr("LANET_LEGACY_PROTOCOLS", "@@unset@@"),
-			"退回历史固定协议 ID（true/false，默认 false）：仅在与未升级到 0.5.33 的老版本对端互通受阻时临时开启；"+
+			"退回历史固定协议 ID（true/false，默认 false）：仅在与未升级到 0.5.34 的老版本对端互通受阻时临时开启；"+
 				"开启后重新暴露于跨群噪音，问题解决后应关闭")
 		probe = flag.Duration("probe", envDurationOr("LANET_PROBE"),
 			"成员探测间隔（可经 LANET_PROBE 设置，Go duration 如 20s/1m）；不传则读配置文件（默认 20s）")
@@ -196,7 +196,7 @@ func runNode(parent context.Context, serviceMode bool) {
 	// AutoAccept 为「自动同意」，供无人值守中央服务器使用，默认关闭。
 	effRequireApproval := resolveTriBool(*requireApproval, nc.RequireApproval, true)
 	effAutoAccept := resolveTriBool(*autoAccept, nc.AutoAccept, false)
-	// 私有协议加固逃生开关（0.5.33）：默认 false = 派生协议 ID；置 true 退回固定 ID。
+	// 私有协议加固逃生开关（0.5.34）：默认 false = 派生协议 ID；置 true 退回固定 ID。
 	effLegacyProto := resolveTriBool(*legacyProto, nc.LegacyProtocols, false)
 	// 地址簿路径：命令行/环境变量 > 配置文件 > 默认（exe 同目录 lanet.db）。
 	effDBPath := firstNonEmpty(*dbPath, nc.DBPath)
@@ -351,8 +351,8 @@ func runNode(parent context.Context, serviceMode bool) {
 	// 注意：不再向 OnStream 注册 Tunnel 协议 echo——TUN 开启时该协议是
 	// IP 数据面（ping/任意端口直达虚拟 IP 的承载），应用层 echo 会与之
 	// 抢流、吞掉入向 IP 包导致 ping 不通。探测统一走独立 echoProto。
-	// 0.5.33：协议 ID 按群派生，异群/扫描器协商不上，不再浪费回显流量。
-	// 混版本过渡：派生 ID 为主 handler；同群老版本（≤0.5.32）只认固定 ID，
+	// 0.5.34：协议 ID 按群派生，异群/扫描器协商不上，不再浪费回显流量。
+	// 混版本过渡：派生 ID 为主 handler；同群老版本（≤0.5.33）只认固定 ID，
 	// 故固定 ID 也注册一个「仅已信任好友」的门禁版本，老→新探测不断。
 	echoP := echoProtoFor(node.GroupKey(), cfg.LegacyProtocols)
 	echoHandler := func(s network.Stream) {
@@ -692,7 +692,7 @@ type nodeConfig struct {
 	AutoAccept *bool `json:"auto_accept,omitempty"`
 	// DBPath 地址簿数据库路径（默认 exe 同目录 lanet.db，"-" = 仅内存）。
 	DBPath string `json:"db_path,omitempty"`
-	// LegacyProtocols 迁移逃生开关（0.5.33 起）：置 true 退回历史固定协议 ID
+	// LegacyProtocols 迁移逃生开关（0.5.34 起）：置 true 退回历史固定协议 ID
 	// （/lanet/info、/lanet/unfriend、/lanet/kad 等），用于与未升级的老版本
 	// 对端互通。默认 false = 启用按群派生的私有协议（跨群噪音在协商层归零）。
 	// nil = 未设置（按默认 false）。
@@ -799,7 +799,7 @@ type nodeRuntime struct {
 	RequireApproval bool
 	AutoAccept      bool
 	DBPath          string
-	// LegacyProtocols 迁移逃生开关（0.5.33）：true = 退回历史固定协议 ID。
+	// LegacyProtocols 迁移逃生开关（0.5.34）：true = 退回历史固定协议 ID。
 	LegacyProtocols bool
 }
 
@@ -849,7 +849,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				"require_approval":   requireApprovalOn,
 				"auto_accept":        autoAcceptOn,
 				"db_path":            nc.DBPath,
-				// 私有协议逃生开关（0.5.33）：true = 历史固定协议 ID（老版本互通），
+				// 私有协议逃生开关（0.5.34）：true = 历史固定协议 ID（老版本互通），
 				// 默认 false = 按群派生（跨群噪音协商层归零）。控制台不展示开关，
 				// 仅编辑 lanet.json / 环境变量 LANET_LEGACY_PROTOCOLS 可改。
 				"legacy_protocols": nc.LegacyProtocols != nil && *nc.LegacyProtocols,

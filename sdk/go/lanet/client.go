@@ -153,8 +153,8 @@ type Config struct {
 	// 置 true 时「NetworkKey 留空」按历史公共网络密钥（lanet/public）处理，
 	// 用于老部署升级后保持原有网络关系不失效。新部署不应设置此项。
 	LegacyDefaultKey bool
-	// LegacyProtocols 迁移兼容开关（仅 Standalone 模式生效，0.5.33 起）：
-	// 0.5.33 起控制面协议（成员信息交换、删除好友通知、P2P 更新分发、
+	// LegacyProtocols 迁移兼容开关（仅 Standalone 模式生效，0.5.34 起）：
+	// 0.5.34 起控制面协议（成员信息交换、删除好友通知、P2P 更新分发、
 	// 私有 DHT、探测回显）的协议 ID 按群组密钥派生——不知道网络密钥的
 	// 节点连协议都协商不上，跨群噪音（陌生握手、附近列表污染、公网扫描器
 	// 拉取二进制）在传输层归零。置 true 退回历史固定协议 ID，用于与
