@@ -645,7 +645,10 @@ func (c *Client) ConnectSeed(seed string) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return c.disc.DialSeed(ctx, addrs)
+	// 终局语义错误（跨群/未审批/已删好友）翻译成可读文案，
+	// 不再让「信息交换失败: EOF」这类裸错误直达用户。
+	id, err := c.disc.DialSeed(ctx, addrs)
+	return id, friendlyDialErr(err)
 }
 
 // SetPublicDHT 运行时开启/关闭公共 DHT 临时引导（控制台开关，立即生效）。

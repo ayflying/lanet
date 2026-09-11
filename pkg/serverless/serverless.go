@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 	"sync"
@@ -86,6 +87,16 @@ var ErrNotApproved = errors.New("serverless: 对端尚未同意本次连接（�
 // 「你已被删除，请让它重新添加你」。上层据此把对端从本机地址簿移除，
 // 完成双向删除的自愈闭环。
 var ErrUnfriended = errors.New("serverless: 对方已将本机删除好友，需对方重新添加你")
+
+// ErrGroupMismatch 对端与本节点不在同一网络（网络密钥或分发渠道不一致）。
+//
+// 判定依据：入向 info 握手在群指纹校验失败时按防泄漏设计静默关闭流
+// （不向陌生网络回任何身份字节），本端表现为「TCP 已连通、协议已协商、
+// 但响应读到 EOF」。这个特征几乎只对应跨群拒绝——对端若同群且已审批
+// 会正常回 JSON，若未审批会明确回 not_approved 标记。
+// 上层据此把裸 EOF 换成用户能看懂的提示（历史上这里直接把
+// 「信息交换失败: EOF」抛给用户，无从判断原因）。
+var ErrGroupMismatch = errors.New("serverless: 对端与本节点不在同一网络（网络密钥或分发渠道不一致）")
 
 // DefaultPublicDHTTimeout 公共 DHT 临时引导的默认最长运行时长。
 // 超时无论是否发现同群成员都自动退出（省流量；重启可重新引导）。
@@ -539,10 +550,12 @@ func (d *Discovery) DialSeed(ctx context.Context, addrs []string) (string, error
 		}
 		// 建连后立刻走 info 协议确认同群（拿到名称、校验渠道与密钥）。
 		if err := d.connectAndIdentify(ai.ID); err != nil {
-			// 对方明确拒绝（未审批 / 已删除本机）时原样上抛，保留可识别语义。
-			if errors.Is(err, ErrNotApproved) || errors.Is(err, ErrUnfriended) {
-				lastErr = err
-				continue
+			// 对方明确拒绝（未审批 / 已删除本机 / 不在同一网络）：这些是
+			// 对端给出的终局结论，不是链路抖动，换下一个地址重试也不会变，
+			// 直接原样上抛、保留可识别语义——跨群拒绝尤其不能套「拨号
+			// 失败」的外壳，否则用户以为是不通，实际是两边密钥不一样。
+			if errors.Is(err, ErrNotApproved) || errors.Is(err, ErrUnfriended) || errors.Is(err, ErrGroupMismatch) {
+				return ai.ID.String(), err
 			}
 			lastErr = fmt.Errorf("已连通但同群校验失败（网络密钥或渠道不一致）: %w", err)
 			continue
@@ -552,6 +565,12 @@ func (d *Discovery) DialSeed(ctx context.Context, addrs []string) (string, error
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("连接失败")
+	}
+	// 终局语义错误（未审批/已删好友/不在同一网络）直接上抛：它们是对端
+	// 给出的明确结论，套「连接种子拨号失败」的外壳会把用户引向「网络不通」
+	// 的错误方向（历史上跨群拒绝就是这样变成一句看不懂的报错的）。
+	if errors.Is(lastErr, ErrNotApproved) || errors.Is(lastErr, ErrUnfriended) || errors.Is(lastErr, ErrGroupMismatch) {
+		return "", lastErr
 	}
 	return "", fmt.Errorf("连接种子拨号失败: %w", lastErr)
 }
@@ -1046,6 +1065,17 @@ func (d *Discovery) connectAndIdentify(id peer.ID) error {
 	}
 	info, err := d.fetchInfo(connCtx, id)
 	if err != nil {
+		// 跨群拒绝：对端静默关流的特征已在上游识别为 ErrGroupMismatch。
+		// 这是终局结论（不是抖动），把它从成员表摘掉，避免界面出现
+		// 「连上了但握手没成」的幽灵成员；错误原样上抛供主动拨号场景
+		// 给出友好提示，不再套「信息交换失败」这种看不懂的包装。
+		if errors.Is(err, ErrGroupMismatch) {
+			d.logf("节点 %s 与本节点不在同一网络，握手被对端静默拒绝", id.ShortString())
+			d.mu.Lock()
+			delete(d.members, id.String())
+			d.mu.Unlock()
+			return err
+		}
 		d.logf("成员信息交换失败 %s: %v", id.ShortString(), err)
 		return fmt.Errorf("信息交换失败: %w", err)
 	}
@@ -1071,7 +1101,7 @@ func (d *Discovery) connectAndIdentify(id peer.ID) error {
 		d.mu.Lock()
 		delete(d.members, id.String())
 		d.mu.Unlock()
-		return fmt.Errorf("对方与本节点不在同一网络（网络密钥或分发渠道不一致）")
+		return ErrGroupMismatch
 	}
 	// 同群成员互为私有 DHT 种子：确认后立即进路由表，
 	// 后续发现不再依赖公共 DHT（快路径生效）。
@@ -1250,6 +1280,12 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 	_ = stream.CloseWrite()
 	var resp infoPayload
 	if err = json.NewDecoder(stream).Decode(&resp); err != nil {
+		// 对端在群指纹校验失败时按防泄漏设计静默关流（不回任何身份字节），
+		// 本端表现为协议已协商、但响应读到 EOF。把这一特征识别为「跨群拒绝」，
+		// 上抛可判定的 ErrGroupMismatch，避免把裸 EOF 直接抛给用户。
+		if errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF") {
+			return infoPayload{}, ErrGroupMismatch
+		}
 		return infoPayload{}, err
 	}
 	return resp, nil

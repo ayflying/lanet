@@ -9,6 +9,7 @@ package serverless
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -138,5 +139,41 @@ func TestLegacyFlagUsesFixedIDs(t *testing.T) {
 	}
 	if d.protoInfoAlt != "" || d.protoUnfriendAlt != "" {
 		t.Fatalf("固定模式下不应再有兜底 ID: %s/%s", d.protoInfoAlt, d.protoUnfriendAlt)
+	}
+}
+
+// TestCrossGroupEOFBecomesGroupMismatch 跨群拒绝友好化（0.5.35）：
+// 群指纹校验失败时 handleInfo 按防泄漏设计静默关流（不回任何字节），
+// 本端 fetchInfo 解码到 EOF——必须识别为可判定的 ErrGroupMismatch，
+// 而不是把「信息交换失败: EOF」这种裸错误抛给用户。
+// 两端都用固定协议 ID（LegacyProtocols）模拟异网直拨场景。
+func TestCrossGroupEOFBecomesGroupMismatch(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	ha, hb := testHost(t, false), testHost(t, false)
+	da, err := New(ctx, ha, Config{NetworkKey: "grp-eof-a", Name: "node-a", LegacyProtocols: true})
+	if err != nil {
+		t.Fatalf("new A: %v", err)
+	}
+	db, err := New(ctx, hb, Config{NetworkKey: "grp-eof-b", Name: "node-b", LegacyProtocols: true})
+	if err != nil {
+		t.Fatalf("new B: %v", err)
+	}
+	if err = da.Start(ctx); err != nil {
+		t.Fatalf("start A: %v", err)
+	}
+	if err = db.Start(ctx); err != nil {
+		t.Fatalf("start B: %v", err)
+	}
+	if err = ha.Connect(ctx, peer.AddrInfo{ID: hb.ID(), Addrs: hb.Addrs()}); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if _, err = da.fetchInfo(ctx, hb.ID()); !errors.Is(err, ErrGroupMismatch) {
+		t.Fatalf("跨群 EOF 应识别为 ErrGroupMismatch，实际: %v", err)
+	}
+	// connectAndIdentify（控制台连接入口的实际调用路径）透传同一语义。
+	if err = da.connectAndIdentify(hb.ID()); !errors.Is(err, ErrGroupMismatch) {
+		t.Fatalf("connectAndIdentify 应透传 ErrGroupMismatch，实际: %v", err)
 	}
 }

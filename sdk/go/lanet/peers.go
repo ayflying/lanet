@@ -411,7 +411,33 @@ func pendingOrError(peerID, via string, err error) (*ConnResult, error) {
 			Message: "已提交连接申请，等待对方在控制台同意后即可连通（同意一次即永久信任）",
 		}, nil
 	}
+	// 对端与本节点不在同一网络：终局结论而非中间态，转成带排查指引的
+	// 友好错误文案返回（前端直接展示 res.error），不再是「EOF」。
+	if errors.Is(err, serverless.ErrGroupMismatch) {
+		return nil, errors.New(FriendlyGroupMismatchHint)
+	}
 	return nil, err
+}
+
+// FriendlyGroupMismatchHint 跨网络密钥拒绝的统一友好文案（0.5.35 起）。
+// 历史上这里抛的是「信息交换失败: EOF」——对端按防泄漏设计对异群握手
+// 静默关流，裸 EOF 对用户毫无信息量。
+const FriendlyGroupMismatchHint = "对方与本节点不在同一个网络：双方的「网络密钥」（或分发渠道）不一致。" +
+	"请与对方核对并设置成相同的网络密钥后重试；若对方是官方客户端而本机是 SDK/自研集成，请确认渠道（channel）一致。"
+
+// friendlyDialErr 把 DialSeed/ConnectSeed 上抛的错误翻译成用户可读的文案
+// （控制台「连接种子」入口与「连接其他节点」共用同一语义）。
+func friendlyDialErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, serverless.ErrGroupMismatch) {
+		return errors.New(FriendlyGroupMismatchHint)
+	}
+	if errors.Is(err, serverless.ErrUnfriended) {
+		return errors.New("对方已把本机删除好友——请把本机连接码发给对方，让对方在「附近」列表中找到本机并申请连接。")
+	}
+	return err
 }
 
 // noteDialSuccess 把首个成功地址记入地址簿拨号统计。
