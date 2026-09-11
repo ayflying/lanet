@@ -142,7 +142,7 @@ func TestLegacyFlagUsesFixedIDs(t *testing.T) {
 	}
 }
 
-// TestCrossGroupEOFBecomesGroupMismatch 跨群拒绝友好化（0.5.35）：
+// TestCrossGroupEOFBecomesGroupMismatch 跨群拒绝友好化（0.5.36）：
 // 群指纹校验失败时 handleInfo 按防泄漏设计静默关流（不回任何字节），
 // 本端 fetchInfo 解码到 EOF——必须识别为可判定的 ErrGroupMismatch，
 // 而不是把「信息交换失败: EOF」这种裸错误抛给用户。

@@ -419,7 +419,7 @@ func pendingOrError(peerID, via string, err error) (*ConnResult, error) {
 	return nil, err
 }
 
-// FriendlyGroupMismatchHint 跨网络密钥拒绝的统一友好文案（0.5.35 起）。
+// FriendlyGroupMismatchHint 跨网络密钥拒绝的统一友好文案（0.5.36 起）。
 // 历史上这里抛的是「信息交换失败: EOF」——对端按防泄漏设计对异群握手
 // 静默关流，裸 EOF 对用户毫无信息量。
 const FriendlyGroupMismatchHint = "对方与本节点不在同一个网络：双方的「网络密钥」（或分发渠道）不一致。" +
