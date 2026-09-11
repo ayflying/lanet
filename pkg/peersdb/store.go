@@ -209,6 +209,135 @@ func (d *DB) DeletePeer(ctx context.Context, peerID string) error {
 }
 
 // =================================================================================
+// 附近节点（发现到但尚未成为好友的同网络节点）
+// =================================================================================
+
+// Nearby 一条「附近」观察：同网络密钥内可见、但本机未信任的节点。
+type Nearby struct {
+	PeerID    string
+	Name      string
+	Addrs     []string
+	Source    string
+	FirstSeen time.Time
+	LastSeen  time.Time
+}
+
+// UpsertNearby 记录一次「发现某个非好友节点」：不存在则插入，存在则刷新
+// 地址/来源/最近时间。已信任节点直接忽略（好友不进附近）。被删除过的好友
+// 同样会回到附近（墓碑只改握手拒绝语义，不屏蔽可见性）——用户正是靠这条
+// 记录点「申请连接」重新加回对方。
+// 表容量封顶 200 条（按最近发现时间保留），防止公共大网下无限膨胀。
+func (d *DB) UpsertNearby(ctx context.Context, n Nearby) error {
+	if n.PeerID == "" {
+		return nil
+	}
+	trusted, err := d.IsTrusted(ctx, n.PeerID)
+	if err != nil {
+		return err
+	}
+	if trusted {
+		return nil
+	}
+	now := time.Now()
+	if _, err = d.db.ExecContext(ctx, `
+INSERT INTO nearby (peer_id, name, addrs, source, first_seen, last_seen)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(peer_id) DO UPDATE SET
+	name      = CASE WHEN excluded.name != '' THEN excluded.name ELSE nearby.name END,
+	addrs     = CASE WHEN excluded.addrs != '' THEN excluded.addrs ELSE nearby.addrs END,
+	source    = CASE WHEN excluded.source != '' THEN excluded.source ELSE nearby.source END,
+	last_seen = excluded.last_seen`,
+		n.PeerID, n.Name, strings.Join(NormalizeAddrs(n.Addrs), ","), n.Source, now, now); err != nil {
+		return fmt.Errorf("peersdb: upsert nearby %s: %w", n.PeerID, err)
+	}
+	// 封顶修剪：只保留最近出现的 200 条。
+	if _, err = d.db.ExecContext(ctx, `
+DELETE FROM nearby WHERE peer_id NOT IN (
+	SELECT peer_id FROM nearby ORDER BY last_seen DESC LIMIT 200)`); err != nil {
+		return fmt.Errorf("peersdb: prune nearby: %w", err)
+	}
+	return nil
+}
+
+// ListNearby 列出附近节点（按最近发现时间倒序）。
+func (d *DB) ListNearby(ctx context.Context) ([]Nearby, error) {
+	rows, err := d.db.QueryContext(ctx, `
+SELECT peer_id, name, addrs, source, first_seen, last_seen
+FROM nearby ORDER BY last_seen DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("peersdb: list nearby: %w", err)
+	}
+	defer rows.Close()
+	var out []Nearby
+	for rows.Next() {
+		var n Nearby
+		var addrs string
+		var firstSeen, lastSeen sql.NullTime
+		if err := rows.Scan(&n.PeerID, &n.Name, &addrs, &n.Source, &firstSeen, &lastSeen); err != nil {
+			return nil, err
+		}
+		n.Addrs = NormalizeAddrs(strings.Split(addrs, ","))
+		n.FirstSeen, n.LastSeen = firstSeen.Time, lastSeen.Time
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// RemoveNearby 从附近列表移除一条观察（成为好友后清理）。
+func (d *DB) RemoveNearby(ctx context.Context, peerID string) error {
+	if _, err := d.db.ExecContext(ctx, `DELETE FROM nearby WHERE peer_id = ?`, peerID); err != nil {
+		return fmt.Errorf("peersdb: remove nearby %s: %w", peerID, err)
+	}
+	return nil
+}
+
+// =================================================================================
+// 删除好友墓碑（unfriended）
+// =================================================================================
+
+// AddUnfriended 记录「本机已主动删除该节点」的墓碑。附近列表记录**保留**：
+// 被删除的好友仍应出现在「附近」里，用户点「申请连接」即可重新加回
+// （那会清除墓碑）——如果顺手删了，删除过的节点就再也刷不出来了。
+func (d *DB) AddUnfriended(ctx context.Context, peerID, name string) error {
+	if peerID == "" {
+		return nil
+	}
+	if name == "" {
+		// 尽量保留已知名称，墓碑信息更友好。
+		if p, err := d.GetPeer(ctx, peerID); err == nil && p != nil {
+			name = p.Name
+		}
+	}
+	if _, err := d.db.ExecContext(ctx, `
+INSERT INTO unfriended (peer_id, name, at) VALUES (?, ?, ?)
+ON CONFLICT(peer_id) DO UPDATE SET
+	name = CASE WHEN excluded.name != '' THEN excluded.name ELSE unfriended.name END,
+	at   = excluded.at`, peerID, name, time.Now()); err != nil {
+		return fmt.Errorf("peersdb: add unfriended %s: %w", peerID, err)
+	}
+	return nil
+}
+
+// IsUnfriended 查询本机是否主动删除过该节点。
+func (d *DB) IsUnfriended(ctx context.Context, peerID string) (bool, error) {
+	var n int
+	err := d.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM unfriended WHERE peer_id = ?`, peerID).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("peersdb: is unfriended %s: %w", peerID, err)
+	}
+	return n > 0, nil
+}
+
+// ClearUnfriended 清除墓碑（重新加好友 / 收到对方的 unfriend 通知时）。
+func (d *DB) ClearUnfriended(ctx context.Context, peerID string) error {
+	if _, err := d.db.ExecContext(ctx, `DELETE FROM unfriended WHERE peer_id = ?`, peerID); err != nil {
+		return fmt.Errorf("peersdb: clear unfriended %s: %w", peerID, err)
+	}
+	return nil
+}
+
+// =================================================================================
 // 待审批请求
 // =================================================================================
 

@@ -118,6 +118,56 @@ func (c *Client) hasKnownPeers() bool {
 	return len(list) > 0
 }
 
+// isUnfriendedPeer 供 serverless 审批门使用：本机是否主动删除过该节点
+// （墓碑）。已删除节点再来握手时，协议层会回明确的 unfriended 拒绝标记，
+// 让对方自动把本机从它的列表同步删除（双向删除的离线自愈路径）。
+func (c *Client) isUnfriendedPeer(peerID string) bool {
+	if c.peers == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ok, err := c.peers.IsUnfriended(ctx, peerID)
+	if err != nil {
+		return false
+	}
+	return ok
+}
+
+// onSeenUntrusted 供 serverless 被动发现使用：发现同群但未信任的节点时
+// 落库到「附近」表，供控制台展示与一键申请连接。
+func (c *Client) onSeenUntrusted(peerID string, addrs []string, source string) {
+	if c.peers == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.peers.UpsertNearby(ctx, peersdb.Nearby{PeerID: peerID, Addrs: addrs, Source: source}); err != nil {
+		c.logf("附近节点落库失败: %v", err)
+	}
+}
+
+// onUnfriendReceived 供 serverless 使用：确认「对端已把本机删除好友」
+// （在线收到 unfriend 推送，或出向握手收到 unfriended 拒绝标记）时，
+// 本机同步移除该节点，完成双向删除。
+//
+// 移除后不记本机墓碑——是对方删的，本机可以重新申请；对方仍持有它的墓碑，
+// 若本机申请连接，对方握手会再次回 unfriended，界面提示「对方已删除你，
+// 需对方主动添加你」。
+func (c *Client) onUnfriendReceived(peerID string) {
+	if c.peers == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = c.peers.SetTrusted(ctx, peerID, false)
+	if err := c.peers.DeletePeer(ctx, peerID); err != nil {
+		c.logf("双向删除：移除节点 %s 失败: %v", shortPeer(peerID), err)
+		return
+	}
+	c.logf("已同步移除节点 %s（对方已将本机删除好友）", shortPeer(peerID))
+}
+
 // rememberPeer 把节点记入地址簿；trusted=true 表示直接标记为已信任。
 func (c *Client) rememberPeer(peerID string, addrs []string, name string, trusted bool) {
 	if c.peers == nil {
@@ -158,6 +208,25 @@ type ConnResult struct {
 	Via string `json:"via,omitempty"`
 }
 
+// clearUnfriendedPeer 供 serverless 协议层使用：墓碑告知送达后消费掉，
+// 避免删除退化成永久拉黑（对方日后的重新申请应能正常进入待审批）。
+func (c *Client) clearUnfriendedPeer(peerID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c.clearUnfriended(ctx, peerID)
+}
+
+// clearUnfriended 清除某节点的删除墓碑（重新建立好友关系时调用）。
+// 单独封装便于在多条「主动添加/同意」路径复用，失败只记日志不阻断流程。
+func (c *Client) clearUnfriended(ctx context.Context, peerID string) {
+	if c.peers == nil {
+		return
+	}
+	if err := c.peers.ClearUnfriended(ctx, peerID); err != nil {
+		c.logf("清除删除墓碑失败（不影响连接）: %v", err)
+	}
+}
+
 // ConnectPeer 按节点 ID 发起连接（控制台统一输入框的后端）。
 //
 // address 可以是：
@@ -191,6 +260,7 @@ func (c *Client) ConnectPeer(ctx context.Context, address string) (*ConnResult, 
 			return nil, fmt.Errorf("这是本机节点 ID，无需连接")
 		}
 		c.rememberPeer(ai.ID.String(), []string{address}, "", true)
+		c.clearUnfriended(ctx, ai.ID.String())
 		id, err := c.disc.DialSeed(ctx, []string{address})
 		if err != nil {
 			if errors.Is(err, serverless.ErrNotApproved) {
@@ -199,6 +269,16 @@ func (c *Client) ConnectPeer(ctx context.Context, address string) (*ConnResult, 
 					Pending: true,
 					Via:     "manual",
 					Message: "已提交连接申请，等待对方在控制台同意后即可连通（同意一次即永久信任）",
+				}, nil
+			}
+			if errors.Is(err, serverless.ErrUnfriended) {
+				// 对方删除过本机（墓碑生效）：本机的同步移除已由协议层回调
+				// 完成，这里给用户明确的下一步指引，而不是一个看不懂的失败。
+				return &ConnResult{
+					PeerID:  ai.ID.String(),
+					Pending: true,
+					Via:     "manual",
+					Message: "对方已把本机删除好友——需要你重新加它：把你的节点 ID 发给对方，让对方在「附近」列表找到本机点「申请连接」，或直接添加本机节点 ID。",
 				}, nil
 			}
 			return nil, err
@@ -251,6 +331,7 @@ func (c *Client) ConnectPeer(ctx context.Context, address string) (*ConnResult, 
 			//      addMember 过审批门时因已信任而直接建连。
 			// 地址簿有记录后 knownPeers 流量门放开，后台查找本来就会执行。
 			c.rememberPeer(id.String(), nil, "", true)
+			c.clearUnfriended(ctx, id.String())
 			// 立刻触发一轮发现（不等 30s 周期）：对方 provider 记录已在
 			// DHT 里时这一轮就能命中并自动建连。
 			c.disc.TriggerDiscover()
@@ -271,9 +352,20 @@ func (c *Client) ConnectPeer(ctx context.Context, address string) (*ConnResult, 
 	//    所以先在本机把对方记为已信任，再由对方审批本机（加好友是双向的）。
 	//    这样避免「我明明点了连接，却被自己的审批门拦住」的荒谬体验。
 	c.rememberPeer(id.String(), toStringAddrs(ai.Addrs), "", true)
+	c.clearUnfriended(ctx, id.String())
 
 	connectedID, cerr := c.disc.RequestConnect(ctx, ai)
 	if cerr != nil {
+		// 对方已把本机删除好友：本机的同步移除已由协议层回调完成，
+		// 这里给出明确下一步指引（需对方主动添加本机）。
+		if errors.Is(cerr, serverless.ErrUnfriended) {
+			return &ConnResult{
+				PeerID:  connectedID,
+				Pending: true,
+				Via:     via,
+				Message: "对方已把本机删除好友——请把本机节点 ID 发给对方，让对方在「附近」列表中找到本机并申请连接（或直接添加本机节点 ID）。",
+			}, nil
+		}
 		// 对方尚未同意本机：这不算失败，是「申请已送达」的正常中间态。
 		if errors.Is(cerr, serverless.ErrNotApproved) || strings.Contains(cerr.Error(), "等待对方同意") {
 			return &ConnResult{
@@ -388,17 +480,104 @@ func (c *Client) TrustedPeers() []peersdb.Peer {
 	return list
 }
 
-// RemovePeer 从地址簿移除节点（同时撤销信任）。
+// RemovePeer 删除节点（控制台「删除好友」入口）——双向语义：
+//  1. 本机立即移除：撤信任、出地址簿、出成员表、记下删除墓碑；
+//  2. 对方在线：经 unfriend 协议即时通知，对方自动把本机从它的列表删除；
+//  3. 对方离线：它下次来握手时收到 rejection=unfriended，自动同步删除
+//     （自愈式，无需双方同时在线）。
+//
+// 被删节点若仍可被发现，会回到双方「附近」列表，可重新申请连接。
 func (c *Client) RemovePeer(peerID string) error {
 	if c.peers == nil {
 		return fmt.Errorf("地址簿未启用")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// 墓碑先行：确保「对方来握手时能拿到明确拒绝」，哪怕本机随后掉线。
+	if err := c.peers.AddUnfriended(ctx, peerID, ""); err != nil {
+		c.logf("删除墓碑写入失败（继续本机移除）: %v", err)
+	}
 	if err := c.peers.SetTrusted(ctx, peerID, false); err != nil {
 		return err
 	}
-	return c.peers.DeletePeer(ctx, peerID)
+	if err := c.peers.DeletePeer(ctx, peerID); err != nil {
+		return err
+	}
+	// 本机成员表立即清除并断开，不等 TTL。
+	if c.disc != nil {
+		c.disc.Forget(peerID)
+	}
+	// 在线即时通知（尽力而为）。送达成功 → 墓碑立即消费（它的使命只是
+	// 补达离线场景的告知，已送达就不该继续拦截对方日后的重新申请）；
+	// 失败 → 保留墓碑，等对方下次握手时自愈送达并被协议层消费。
+	if c.disc != nil {
+		go func() {
+			nctx, ncancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer ncancel()
+			if err := c.disc.NotifyUnfriend(nctx, peerID); err == nil {
+				c.logf("已通知节点 %s：本机已删除好友，对方将同步移除本机", shortPeer(peerID))
+				dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer dcancel()
+				c.clearUnfriended(dctx, peerID)
+			}
+		}()
+	}
+	c.logf("已删除节点 %s（本机移除 + 墓碑生效）", shortPeer(peerID))
+	return nil
+}
+
+// NearbyList 附近节点：同网络密钥内可发现、但尚未成为好友的节点
+// （含被删除过的好友——可重新申请连接）。
+func (c *Client) NearbyList() []peersdb.Nearby {
+	if c.peers == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	list, err := c.peers.ListNearby(ctx)
+	if err != nil {
+		c.logf("读取附近列表失败: %v", err)
+		return nil
+	}
+	return list
+}
+
+// ReconnectPeer 向「附近」列表中的节点重新申请连接（好友被删除后的恢复
+// 入口）。优先用附近记录里缓存的地址直接拨号（免查 DHT、秒发申请），
+// 没有地址则退回纯 ID 查找路径。
+//
+// 结果语义（复用 ConnectPeer 主链路）：
+//   - 已连通 → Connected；
+//   - 对方未审批 → Pending（它的待审批列表会出现本机）；
+//   - 对方墓碑生效（它删过本机）→ Pending + 明确提示「需对方主动添加你」
+//     （本机侧的同步移除已由协议层 OnUnfriendReceived 完成）。
+func (c *Client) ReconnectPeer(ctx context.Context, peerID string) (*ConnResult, error) {
+	peerID = strings.TrimSpace(peerID)
+	addr := peerID
+	if c.peers != nil && !strings.Contains(peerID, "/p2p/") {
+		dbCtx, dbCancel := context.WithTimeout(ctx, 3*time.Second)
+		list, _ := c.peers.ListNearby(dbCtx)
+		dbCancel()
+		for _, n := range list {
+			if n.PeerID != peerID {
+				continue
+			}
+			for _, a := range n.Addrs {
+				full := a
+				if !strings.Contains(full, "/p2p/") {
+					full = strings.TrimSuffix(full, "/") + "/p2p/" + peerID
+				}
+				if m, err := ma.NewMultiaddr(full); err == nil {
+					if _, err := peer.AddrInfoFromP2pAddr(m); err == nil {
+						addr = full
+						break
+					}
+				}
+			}
+			break
+		}
+	}
+	return c.ConnectPeer(ctx, addr)
 }
 
 // ---- 辅助 ----

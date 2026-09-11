@@ -124,6 +124,33 @@ CREATE TABLE IF NOT EXISTS pending_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_requested ON pending_requests(requested_at);`,
 	},
+	{
+		version: 3,
+		name:    "nearby + unfriended: 附近节点观察表与删除好友墓碑",
+		up: `
+-- 附近节点：发现到（DHT/mDNS）但尚未成为好友的同网络密钥节点。
+-- 只存公开可发现的信息（节点 ID + 地址），名称等身份细节因审批隔离拿不到。
+-- 被删除过的好友同样会回到这里（可重新申请连接）。
+CREATE TABLE IF NOT EXISTS nearby (
+	peer_id   TEXT PRIMARY KEY,
+	name      TEXT NOT NULL DEFAULT '',
+	addrs     TEXT NOT NULL DEFAULT '',   -- 逗号分隔（重新申请连接时免查 DHT）
+	source    TEXT NOT NULL DEFAULT '',   -- dht-private / dht / mdns
+	first_seen DATETIME,
+	last_seen  DATETIME
+);
+CREATE INDEX IF NOT EXISTS idx_nearby_last_seen ON nearby(last_seen);
+
+-- 删除好友墓碑：本机主动删除过的节点。对方若仍把本机当好友，它下次来
+-- 握手时本机据此明确回「已被删除好友」（而不是沉默的未审批），对方收到
+-- 后自动把本机也从它的列表删除——删除因此是双向的。对方重新申请连接时
+-- 清除墓碑、重新进入待审批，允许恢复。
+CREATE TABLE IF NOT EXISTS unfriended (
+	peer_id  TEXT PRIMARY KEY,
+	name     TEXT NOT NULL DEFAULT '',
+	at       DATETIME NOT NULL
+);`,
+	},
 }
 
 const schemaMigrationsMeta = `

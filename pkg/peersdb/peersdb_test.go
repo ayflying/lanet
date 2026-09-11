@@ -24,8 +24,8 @@ func TestMigrateVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if v != 2 {
-		t.Fatalf("期望迁移到版本 2，实际 %d", v)
+	if v != 3 {
+		t.Fatalf("期望迁移到版本 3，实际 %d", v)
 	}
 }
 
@@ -284,5 +284,86 @@ func TestNormalizeAddrs(t *testing.T) {
 	got := NormalizeAddrs([]string{"  /ip4/1.1.1.1/tcp/1 ", "", "/ip4/1.1.1.1/tcp/1", "/ip4/2.2.2.2/tcp/2"})
 	if len(got) != 2 || got[0] != "/ip4/1.1.1.1/tcp/1" || got[1] != "/ip4/2.2.2.2/tcp/2" {
 		t.Fatalf("地址清洗结果不符：%v", got)
+	}
+}
+
+// TestNearbyLifecycle 附近节点：发现落库、去重刷新、成为好友后不再进附近。
+func TestNearbyLifecycle(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	if err := d.UpsertNearby(ctx, Nearby{PeerID: "n1", Addrs: []string{"/ip4/4.4.4.4/tcp/4001"}, Source: "dht-private"}); err != nil {
+		t.Fatalf("upsert nearby: %v", err)
+	}
+	list, err := d.ListNearby(ctx)
+	if err != nil || len(list) != 1 || list[0].PeerID != "n1" {
+		t.Fatalf("附近列表应含 n1，实际 %+v（err=%v）", list, err)
+	}
+	// 重复发现刷新地址/来源，不重复插入。
+	if err := d.UpsertNearby(ctx, Nearby{PeerID: "n1", Addrs: []string{"/ip4/5.5.5.5/tcp/4001"}, Source: "mdns"}); err != nil {
+		t.Fatalf("re-upsert nearby: %v", err)
+	}
+	list, _ = d.ListNearby(ctx)
+	if len(list) != 1 {
+		t.Fatalf("重复发现不应产生多条，实际 %d", len(list))
+	}
+	if list[0].Source != "mdns" || len(list[0].Addrs) != 1 || list[0].Addrs[0] != "/ip4/5.5.5.5/tcp/4001" {
+		t.Fatalf("重复发现应刷新来源与地址，实际 %+v", list[0])
+	}
+	// 已成为好友（可信）的节点不该进附近。
+	_ = d.SetTrusted(ctx, "friend", true)
+	if err := d.UpsertNearby(ctx, Nearby{PeerID: "friend"}); err != nil {
+		t.Fatalf("upsert trusted nearby: %v", err)
+	}
+	list, _ = d.ListNearby(ctx)
+	for _, n := range list {
+		if n.PeerID == "friend" {
+			t.Fatal("已信任节点不应出现在附近列表")
+		}
+	}
+	// 移除（成为好友时清理）。
+	if err := d.RemoveNearby(ctx, "n1"); err != nil {
+		t.Fatalf("remove nearby: %v", err)
+	}
+	list, _ = d.ListNearby(ctx)
+	if len(list) != 0 {
+		t.Fatalf("移除后附近应为空，实际 %+v", list)
+	}
+}
+
+// TestUnfriendedLifecycle 删除好友墓碑：记录、查询、清除。
+func TestUnfriendedLifecycle(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	if ok, _ := d.IsUnfriended(ctx, "x"); ok {
+		t.Fatal("初始不应有墓碑")
+	}
+	if err := d.AddUnfriended(ctx, "x", "老张"); err != nil {
+		t.Fatalf("add unfriended: %v", err)
+	}
+	if ok, _ := d.IsUnfriended(ctx, "x"); !ok {
+		t.Fatal("写入后应存在墓碑")
+	}
+	// 墓碑不屏蔽附近可见性（被删好友应能重新申请连接）。
+	if err := d.UpsertNearby(ctx, Nearby{PeerID: "x", Addrs: []string{"/ip4/6.6.6.6/tcp/1"}}); err != nil {
+		t.Fatalf("upsert nearby after unfriend: %v", err)
+	}
+	list, _ := d.ListNearby(ctx)
+	found := false
+	for _, n := range list {
+		if n.PeerID == "x" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("被删除过的好友应仍出现在附近列表（可重新申请）")
+	}
+	// 清除墓碑（重新加回 / 告知送达后消费）。
+	if err := d.ClearUnfriended(ctx, "x"); err != nil {
+		t.Fatalf("clear unfriended: %v", err)
+	}
+	if ok, _ := d.IsUnfriended(ctx, "x"); ok {
+		t.Fatal("清除后不应有墓碑")
 	}
 }

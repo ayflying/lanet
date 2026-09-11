@@ -105,6 +105,8 @@ func (c *Client) startConsole() error {
 	mux.HandleFunc("POST /api/pending", c.apiResolvePending)
 	mux.HandleFunc("GET /api/peers", c.apiPeers)
 	mux.HandleFunc("POST /api/peers", c.apiRemovePeer)
+	mux.HandleFunc("GET /api/nearby", c.apiNearby)
+	mux.HandleFunc("POST /api/nearby", c.apiReconnectPeer)
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		if logo, err := consoleFS.ReadFile("console/logo.png"); err == nil {
@@ -297,6 +299,16 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		}
 		pending = append(pending, item)
 	}
+	// 附近节点：同网络可发现但未成为好友的节点（含被删除过的好友），
+	// 控制台「附近」卡片展示 + 申请连接入口。
+	nearby := []map[string]any{}
+	for _, n := range c.NearbyList() {
+		item := map[string]any{"peer_id": n.PeerID, "name": n.Name, "source": n.Source}
+		if !n.LastSeen.IsZero() {
+			item["last_seen"] = n.LastSeen.Unix()
+		}
+		nearby = append(nearby, item)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"info":                  c.Info(),
 		"members":               members,
@@ -308,6 +320,7 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		"seed_addrs":            c.SeedAddrs(),
 		"pending":               pending,
 		"pending_count":         len(pending),
+		"nearby":                nearby,
 		"trusted_count":         len(c.TrustedPeers()),
 		"auto_accept":           c.cfg.AutoAccept,
 		"require_approval":      c.requireApproval(),
@@ -409,6 +422,41 @@ func (c *Client) apiRemovePeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "peer_id": req.PeerID})
+}
+
+// apiNearby 附近节点列表：同网络密钥内可发现但尚未成为好友的节点
+// （含被删除过的好友）。前端据此展示「申请连接」按钮。
+func (c *Client) apiNearby(w http.ResponseWriter, r *http.Request) {
+	list := []map[string]any{}
+	for _, n := range c.NearbyList() {
+		item := map[string]any{"peer_id": n.PeerID, "name": n.Name, "addrs": n.Addrs, "source": n.Source}
+		if !n.LastSeen.IsZero() {
+			item["last_seen"] = n.LastSeen.Unix()
+		}
+		list = append(list, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"nearby": list})
+}
+
+// apiReconnectPeer 向附近节点重新申请连接（好友被删除后的恢复入口）。
+// 请求体 {"peer_id": "12D3Koo…"}。结果语义同 /api/connect-peer：
+// connected / pending（等待对方同意）/ error。
+func (c *Client) apiReconnectPeer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PeerID string `json:"peer_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PeerID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体需包含 peer_id"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
+	defer cancel()
+	res, err := c.ReconnectPeer(ctx, req.PeerID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // apiConnectSeed 立即按连接种子直连一个同群节点（运行时可调，无需重启）。

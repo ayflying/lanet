@@ -432,6 +432,10 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 			AutoAccept:           c.maybeAutoAccept,
 			OnPending:            c.onPendingRequest,
 			HasKnownPeers:        c.hasKnownPeers,
+			IsUnfriended:         c.isUnfriendedPeer,
+			ClearUnfriended:      c.clearUnfriendedPeer,
+			OnSeenUntrusted:      c.onSeenUntrusted,
+			OnUnfriendReceived:   c.onUnfriendReceived,
 		})
 		if err == nil {
 			err = disc.Start(ctx)

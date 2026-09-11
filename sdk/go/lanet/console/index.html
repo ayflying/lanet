@@ -134,6 +134,19 @@
   </div>
 </div>
 
+<!-- 通用确认弹框（删除好友等危险操作，居中阻塞式） -->
+<div class="overlay" id="confirmOverlay" style="display:none" onclick="if(event.target===this)closeConfirm()">
+  <div class="modal" style="max-width:460px">
+    <h2 id="confirmTitle">确认操作</h2>
+    <div class="modal-body" id="confirmBody" style="white-space:normal"></div>
+    <div class="modal-btns">
+      <button id="confirmOk" class="danger" style="border-color:var(--bad)" onclick="doConfirm()">确认</button>
+      <button class="ghost" onclick="closeConfirm()">取消</button>
+    </div>
+    <div class="msg" id="confirmMsg" style="display:none"></div>
+  </div>
+</div>
+
 <div class="panel active" id="pMembers">
   <div class="card" id="connectCard" style="display:none">
     <h2>连接其他节点 <span class="tag unknown">按节点 ID 直连</span></h2>
@@ -188,6 +201,12 @@
         <div class="sub" style="color:#8a94a6">家庭宽带公网地址变化后旧种子会失效，需重新复制分享。</div>
       </div>
     </details>
+  </div>
+  <div class="card" id="nearbyCard" style="display:none">
+    <h2>附近节点 <span class="tag unknown" id="nearbyBadge">0</span></h2>
+    <div class="sub" style="margin-bottom:8px">同一网络密钥内可发现、但还没有互相连接的节点。点「申请连接」向对方发起好友申请（对方同意后双向连通）；被删除过的好友也会回到这里，可重新添加。</div>
+    <div id="nearbyList"></div>
+    <div class="msg" id="nearbyMsg" style="display:none"></div>
   </div>
   <div class="card">
     <h2>成员与链路 <button class="ghost" style="float:right;font-size:12px;padding:2px 10px" onclick="openInfoModal()">本机信息</button></h2>
@@ -329,10 +348,10 @@ async function loadState() {
   // 防御旧版后端/异常响应返回 null：任何列表字段缺失都兜底为空数组，
   // 保证 loadState 不中断（一处抛错会让后面的 renderConnect 全部失效）。
   S.rules = S.rules || []; S.forwards = S.forwards || [];
-  S.members = S.members || []; S.pending = S.pending || [];
+  S.members = S.members || []; S.pending = S.pending || []; S.nearby = S.nearby || [];
   $('bForwards').textContent = S.forwards.length;
   renderRules(); renderForwards();
-  renderConnect(); renderSeed(); renderPublicDHT();
+  renderConnect(); renderSeed(); renderPublicDHT(); renderNearby();
 }
 
 // ---- 连接其他节点（统一入口：节点 ID 或完整地址，自动识别） ----
@@ -416,6 +435,108 @@ function renderConnect() {
       <button class="ghost danger" style="margin-left:6px" onclick="resolvePending('${esc(p.peer_id)}', false)">拒绝</button>
     </div>`;
   }).join('');
+}
+
+// renderNearby 渲染「附近节点」卡片：同网络可发现但非好友的节点，
+// 每个提供「申请连接」按钮（复用统一连接入口，走双向审批）。
+function renderNearby() {
+  const card = $('nearbyCard');
+  if (!S) { card.style.display = 'none'; return; }
+  const standalone = (S.info && (S.info.group_id === 'standalone' || String(S.info.group || '').startsWith('standalone-')));
+  if (!standalone) { card.style.display = 'none'; return; }
+  const list = S.nearby || [];
+  // 与好友去重：附近里不该出现已在成员表中的节点（防御旧数据）。
+  const friendIDs = new Set((S.members || []).map(m => m.peer_id));
+  const rows = list.filter(n => !friendIDs.has(n.peer_id));
+  $('nearbyBadge').textContent = rows.length;
+  card.style.display = '';
+  if (!rows.length) {
+    $('nearbyList').innerHTML = '<div class="empty" style="margin:8px 0">附近暂无可发现的节点</div>';
+    return;
+  }
+  $('nearbyList').innerHTML = rows.map(n => {
+    const nm = n.name ? `<b>${esc(n.name)}</b> · ` : '';
+    const t = n.last_seen ? relTime(n.last_seen) : '—';
+    const src = n.source === 'mdns' ? '局域网' : (n.source ? '网络发现' : '');
+    // 申请后进入的是「对方」的待审批列表（本机看不到对方审批状态），
+    // 故这里始终提供按钮，重复点击幂等（后端去重，不会刷屏）。
+    return `<div class="listitem" style="align-items:center">
+      <div style="min-width:0;flex:1">
+        <div style="font-size:12.5px;word-break:break-all">${nm}<code style="font-size:11.5px">${esc(n.peer_id)}</code></div>
+        <div class="sub" style="color:#8a94a6;font-size:11.5px">${esc(src)} · 最近发现 ${esc(t)}</div>
+      </div>
+      <button class="ghost" style="margin-left:8px" onclick="reconnectNearby('${esc(n.peer_id)}', this)">申请连接</button>
+    </div>`;
+  }).join('');
+}
+
+// reconnectNearby 从附近列表向某节点发起连接申请。
+async function reconnectNearby(peerID, btn) {
+  if (btn) btn.disabled = true;
+  flash('nearbyMsg', '正在向对方发起连接申请…', true);
+  try {
+    const r = await fetch('/api/nearby', { method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ peer_id: peerID }) });
+    const res = await r.json().catch(() => ({}));
+    if (!r.ok) { flash('nearbyMsg', '申请失败：' + (res.error || ''), false); return; }
+    if (res.pending) {
+      flash('nearbyMsg', res.message || '已提交连接申请，等待对方同意', true);
+    } else if (res.searching) {
+      flash('nearbyMsg', res.message || '已记录，正在查找对方地址，查到后自动连接…', true);
+    } else {
+      flash('nearbyMsg', (res.name ? '已连接「' + esc(res.name) + '」' : '已连接') + (res.virtual_ip ? '（虚拟 IP ' + res.virtual_ip + '）' : ''), true);
+    }
+    loadState();
+  } catch (e) {
+    flash('nearbyMsg', '操作失败：' + e, false);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ---- 删除好友（双向，居中确认） ----
+let _confirmAction = null;
+function askConfirm(title, body, action) {
+  $('confirmTitle').textContent = title;
+  $('confirmBody').innerHTML = body;
+  $('confirmMsg').style.display = 'none';
+  _confirmAction = action;
+  $('confirmOverlay').style.display = 'flex';
+}
+function closeConfirm() { $('confirmOverlay').style.display = 'none'; _confirmAction = null; }
+async function doConfirm() {
+  if (!_confirmAction) { closeConfirm(); return; }
+  const okBtn = $('confirmOk'); okBtn.disabled = true;
+  try {
+    const msg = await _confirmAction();
+    if (msg) {
+      const el = $('confirmMsg'); el.style.display = '';
+      el.textContent = msg; el.className = 'msg bad';
+      okBtn.disabled = false;
+      return; // 失败保留弹框，用户可重试或关闭
+    }
+    closeConfirm();
+    loadState();
+  } finally {
+    okBtn.disabled = false;
+  }
+}
+
+// removeFriend 删除好友（双向）：本机移除 + 通知对方同步删除（在线即时/离线自愈）。
+function removeFriend(peerID, name) {
+  const label = name ? '「' + esc(name) + '」' : ('节点 ' + esc(peerID.slice(0, 10)) + '…');
+  askConfirm('删除好友',
+    `确定删除 ${label} 吗？<br><br>` +
+    `<b>这是双向删除</b>：对方在线会立即收到通知并把它那边的本机也删除；` +
+    `若对方当前离线，下次它连接本机时会自动同步删除。` +
+    `删除后如果还能发现对方，它会回到双方的「附近」列表，可重新申请连接。`,
+    async () => {
+      const r = await fetch('/api/peers', { method: 'POST',
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ peer_id: peerID }) });
+      const res = await r.json().catch(() => ({}));
+      if (!r.ok) return '删除失败：' + (res.error || '');
+      return null;
+    });
 }
 
 // connectSeed 按输入的连接种子立即直连（运行时生效，无需重启）。
@@ -611,7 +732,7 @@ function renderMembers() {
   }
   const page = list.slice((mPage - 1) * M_PAGE_SIZE, mPage * M_PAGE_SIZE);
   $('members').innerHTML =
-    '<table><tr><th>设备</th><th>虚拟地址</th><th>虚拟 IP</th><th>状态</th><th>链路</th><th>版本</th><th>最后活跃</th><th style="width:52px">操作</th></tr>' +
+    '<table><tr><th>设备</th><th>虚拟地址</th><th>虚拟 IP</th><th>状态</th><th>链路</th><th>版本</th><th>最后活跃</th><th style="width:110px">操作</th></tr>' +
     page.map(m => {
       const label = m.name || (m.peer_id ? m.peer_id.slice(0, 10) + '…' : '未知设备');
       const pid = m.name ? '<span class="pid"> (' + esc(m.peer_id.slice(0, 8)) + '…)</span>' : '';
@@ -630,7 +751,8 @@ function renderMembers() {
       return `<tr><td class="mname">${esc(label)}${pid}</td><td>${host}</td><td>${esc(m.virtual_ip)}</td>` +
         `<td><span class="tag ${m.online ? 'online' : 'offline'}"><span class="dot ${m.online ? 'on' : 'off'}"></span>${m.online ? '在线' : '离线'}</span></td>` +
         `<td>${path}</td><td>${ver}</td><td>${esc(last)}</td>` +
-        `<td><button class="ghost mdetail" onclick="openMemberModal('${esc(m.peer_id)}')">详情</button></td></tr>`;
+        `<td><button class="ghost mdetail" onclick="openMemberModal('${esc(m.peer_id)}')">详情</button>` +
+        `<button class="ghost del" style="margin-left:4px" onclick="removeFriend('${esc(m.peer_id)}', '${esc(m.name || '')}')">删除</button></td></tr>`;
     }).join('') +
     '</table>';
   $('mPager').style.display = 'flex';
@@ -692,7 +814,7 @@ async function saveForwards() {
   flash('fwdMsg', r.ok ? '转发映射已保存并生效' : '保存失败', r.ok);
   loadState();
 }
-function flash(id, text, ok) { $(id).textContent = text; $(id).className = 'msg ' + (ok ? 'ok' : 'bad'); }
+function flash(id, text, ok) { const el = $(id); if (!el) return; el.textContent = text; el.className = 'msg ' + (ok ? 'ok' : 'bad'); el.style.display = ''; }
 
 function copyText(text, el) {
   const done = () => { if (!el) return; const old = el.style.color; el.style.color = '#2fa65a';

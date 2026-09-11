@@ -62,6 +62,12 @@ const (
 // ProtocolInfo 节点信息交换协议（建连后校验同群 + 交换名称）。
 const ProtocolInfo = "/lanet/info/1.0.0"
 
+// ProtocolUnfriend 删除好友通知协议（0.5.31 起）：A 删除 B 时若 B 在线，
+// 立刻单向推送本消息，B 收到后自动把 A 从自己的地址簿/成员表移除并记下
+// 「已被 A 删除」墓碑——删除因此是双向的。B 离线时走 info 协议里的
+// rejection=unfriended 标记，在下次通讯时同样完成同步（自愈式）。
+const ProtocolUnfriend = "/lanet/unfriend/1.0.0"
+
 // ErrNotApproved 对端拒绝本次握手：它不是不理你，而是明确告诉你
 // 「本机尚未同意你的连接申请」。上层据此给出「等待对方同意」的提示，
 // 而不是让用户面对一个看不懂的 EOF 错误。
@@ -69,6 +75,11 @@ const ProtocolInfo = "/lanet/info/1.0.0"
 // 注意：拒绝响应里不含名称、版本、主机名等任何身份信息，只有群指纹与
 // 这个标记——未审批节点仍拿不到任何成员信息（完全隔离语义不变）。
 var ErrNotApproved = errors.New("serverless: 对端尚未同意本次连接（需对方在控制台同意）")
+
+// ErrUnfriended 对端已把它本机删除（删除好友墓碑生效中）：它明确告知
+// 「你已被删除，请让它重新添加你」。上层据此把对端从本机地址簿移除，
+// 完成双向删除的自愈闭环。
+var ErrUnfriended = errors.New("serverless: 对方已将本机删除好友，需对方重新添加你")
 
 // DefaultPublicDHTTimeout 公共 DHT 临时引导的默认最长运行时长。
 // 超时无论是否发现同群成员都自动退出（省流量；重启可重新引导）。
@@ -152,6 +163,26 @@ type Config struct {
 	// 让别人能找到我，但自己不产生查询流量。
 	// nil = 不启用该优化（按历史行为每轮查找）。
 	HasKnownPeers func() bool
+	// IsUnfriended 查询本机是否主动删除过该节点（删除好友墓碑）。
+	// 已删除的节点再次来握手时，回明确的「unfriended」拒绝标记（而不是
+	// 沉默的未审批）——对方据此自动把本机从它的列表同步删除，删除因此
+	// 是双向的。nil = 无墓碑概念（按普通未审批处理）。
+	IsUnfriended func(peerID string) bool
+	// ClearUnfriended 消费某节点的删除墓碑。墓碑的使命是「告知对方同步
+	// 移除本机」——告知送达（回完 unfriended 拒绝 / 在线推送成功）后即应
+	// 清除，让对方的再次申请能正常进入待审批。否则删除过对方的一方会被
+	// 自己的墓碑永久屏蔽对方的重新申请，「附近 → 申请连接」的死恢复。
+	// nil = 无墓碑概念。
+	ClearUnfriended func(peerID string)
+	// OnSeenUntrusted 被动发现「未被信任」的同群节点时回调（DHT/mDNS
+	// provider 记录），由上层持久化到「附近」列表并在控制台展示。
+	// 只报公开可发现信息（节点 ID + 地址），无身份泄漏。可能被并发调用。
+	OnSeenUntrusted func(peerID string, addrs []string, source string)
+	// OnUnfriendReceived 删除好友关系被确认时回调，两种触发路径：
+	//   1) 收到对端在线时的 unfriend 协议推送（对端主动删除了本机）；
+	//   2) 本机出向握手收到 rejection=unfriended（对端早已删除本机、此前离线）。
+	// 上层据此把对端从本机地址簿/成员表移除，完成双向删除。可能被并发调用。
+	OnUnfriendReceived func(peerID string)
 }
 
 // Member 成员表中的一项。
@@ -203,6 +234,9 @@ type Discovery struct {
 
 	trigger chan struct{} // 立即触发一轮发现（用户手动添加节点后不等周期）
 
+	nearbySeenMu sync.Mutex           // 附近上报去抖（独立锁，不与 members 混用）
+	nearbySeen   map[string]time.Time // peerID -> 上次上报时间
+
 	onDiscovered []Discovered
 }
 
@@ -247,12 +281,13 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		cfg.MemberTTL = MinMemberTTL
 	}
 	d := &Discovery{
-		host:      h,
-		cfg:       cfg,
-		groupKey:  GroupKey(cfg.Channel, cfg.NetworkKey), // 空密钥按公共网络处理
-		memberTTL: cfg.MemberTTL,
-		members:   make(map[string]*Member),
-		trigger:   make(chan struct{}, 1),
+		host:       h,
+		cfg:        cfg,
+		groupKey:   GroupKey(cfg.Channel, cfg.NetworkKey), // 空密钥按公共网络处理
+		memberTTL:  cfg.MemberTTL,
+		members:    make(map[string]*Member),
+		trigger:    make(chan struct{}, 1),
+		nearbySeen: make(map[string]time.Time),
 	}
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
 
@@ -347,6 +382,7 @@ func (d *Discovery) Start(ctx context.Context) error {
 		d.armPublicDHTTimeout(ctx, pub, d.cfg.PublicDHTTimeout)
 	}
 	d.host.SetStreamHandler(ProtocolInfo, d.handleInfo)
+	d.host.SetStreamHandler(ProtocolUnfriend, d.handleUnfriend)
 	return nil
 }
 
@@ -434,8 +470,8 @@ func (d *Discovery) DialSeed(ctx context.Context, addrs []string) (string, error
 		}
 		// 建连后立刻走 info 协议确认同群（拿到名称、校验渠道与密钥）。
 		if err := d.connectAndIdentify(ai.ID); err != nil {
-			// 对方明确拒绝（未审批）时原样上抛，保留可识别语义。
-			if errors.Is(err, ErrNotApproved) {
+			// 对方明确拒绝（未审批 / 已删除本机）时原样上抛，保留可识别语义。
+			if errors.Is(err, ErrNotApproved) || errors.Is(err, ErrUnfriended) {
 				lastErr = err
 				continue
 			}
@@ -486,6 +522,16 @@ func (d *Discovery) knownPeers() bool {
 		return true
 	}
 	return d.cfg.HasKnownPeers()
+}
+
+// trustedNow 该节点当前是否已被信任（直接问 IsTrusted，不走审批门的
+// AutoAccept/OnPending 副作用）。用于墓碑判定：已重新加好友（trusted）
+// 的节点即使残留墓碑也按正常握手处理。
+func (d *Discovery) trustedNow(peerID string) bool {
+	if d.cfg.IsTrusted == nil {
+		return true
+	}
+	return d.cfg.IsTrusted(peerID)
 }
 
 func shortID(id string) string {
@@ -857,6 +903,9 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 		if len(addrs) > 0 {
 			d.host.Peerstore().AddAddrs(id, addrs, time.Hour)
 		}
+		// 同群可见但未信任 → 上报「附近」列表（上层持久化后在控制台展示，
+		// 用户可一键申请连接）。被动发现不建连、不泄漏身份，语义不变。
+		d.reportNearby(id, addrs, source)
 		return
 	}
 
@@ -911,12 +960,21 @@ func (d *Discovery) connectAndIdentify(id peer.ID) error {
 		d.logf("成员信息交换失败 %s: %v", id.ShortString(), err)
 		return fmt.Errorf("信息交换失败: %w", err)
 	}
-	// 对端明确拒绝：本机尚未被对方审批。返回可识别错误，供上层提示
-	// 「已提交申请，等待对方同意」，而不是笼统的失败。
+	// 对端明确拒绝：区分两种语义。
+	//   - unfriended：本机已被对端删除（对端持有墓碑）→ 触发本机同步移除，
+	//     完成双向删除的离线自愈路径（下次握手自动收敛，无需人工）。
+	//   - not_approved：只是还没被对方审批 → 保持「等待同意」中间态。
 	if info.Rejected != "" {
 		d.mu.Lock()
 		delete(d.members, id.String())
 		d.mu.Unlock()
+		if info.Rejected == rejectionUnfriended {
+			d.logf("节点 %s 已删除本机好友，本机同步移除", id.ShortString())
+			if d.cfg.OnUnfriendReceived != nil {
+				go d.cfg.OnUnfriendReceived(id.String())
+			}
+			return ErrUnfriended
+		}
 		return ErrNotApproved
 	}
 	if info.Group != GroupFingerprint(d.groupKey) {
@@ -974,6 +1032,11 @@ type infoPayload struct {
 // rejectionNotApproved 拒绝原因常量（info 协议内传递）。
 const rejectionNotApproved = "not_approved"
 
+// rejectionUnfriended 拒绝原因常量：本机已主动删除过该节点（墓碑）。
+// 对方收到后应把本机从它的地址簿/成员表同步删除——这使「删除好友」即使
+// 在删除发生时对方离线，也能在下次通讯时自愈式地变成双向删除。
+const rejectionUnfriended = "unfriended"
+
 // handleInfo 入向信息交换。
 // 注意顺序：先回写响应再结束——libp2p 流半关闭（CloseWrite）后写端已关，
 // 提前 CloseWrite 会导致响应丢失（对端读 EOF）。
@@ -987,6 +1050,23 @@ func (d *Discovery) handleInfo(s network.Stream) {
 		return
 	}
 	remote := s.Conn().RemotePeer()
+	// 墓碑优先：本机主动删除过对方 → 回明确的「unfriended」告知，它收到后
+	// 自动把本机从它的列表同步删除（双向删除的离线自愈路径）。
+	// 同时一次性消费墓碑：告知已送达。若不消费，删除会退化成永久拉黑——
+	// 对方之后的任何重新申请（附近列表点按钮 / 它主动添加本机 ID）都会被
+	// 本墓碑无限挡回，永远进不了待审批。消费后对方再来即正常进入待审批，
+	// 由用户决定是否重新同意，闭环交给「附近 → 申请连接」。
+	if d.cfg.IsUnfriended != nil && !d.trustedNow(remote.String()) && d.cfg.IsUnfriended(remote.String()) {
+		d.logf("拒绝节点 %s 的握手：本机已删除该好友（告知送达，墓碑一次性消费）", remote.ShortString())
+		_ = json.NewEncoder(s).Encode(infoPayload{
+			Group:    GroupFingerprint(d.groupKey),
+			Rejected: rejectionUnfriended,
+		})
+		if d.cfg.ClearUnfriended != nil {
+			go d.cfg.ClearUnfriended(remote.String())
+		}
+		return
+	}
 	// 审批门：陌生节点一律不响应 info（不回写名称/版本/主机名，避免身份
 	// 信息与网络拓扑泄漏），不进成员表、不进私有 DHT 路由表。
 	// 但会明确回一个「未同意」标记——对端据此提示「等待对方同意」，
@@ -1084,6 +1164,109 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 		return infoPayload{}, err
 	}
 	return resp, nil
+}
+
+// ---- 双向删除好友（unfriend 协议 + 附近上报） ----
+
+// unfriendPayload 删除好友通知载荷。Group 群指纹防止跨网误删（不同网络
+// 密钥的节点即使端口暴露也拨不进这条协议——校验失败直接丢弃）。
+type unfriendPayload struct {
+	PeerID string `json:"peer_id"` // 发起删除方（显式携带，防伪造：与连接身份比对）
+	Group  string `json:"group"`
+}
+
+// Forget 立即把某节点移出本机成员表并断开其连接（用户主动删除好友时调用），
+// 不等 TTL 回收，避免删完仍显示在线、隧道仍可复用的错觉。
+func (d *Discovery) Forget(peerID string) {
+	id, err := peer.Decode(peerID)
+	if err != nil {
+		return
+	}
+	d.mu.Lock()
+	delete(d.members, id.String())
+	d.mu.Unlock()
+	for _, c := range d.host.Network().ConnsToPeer(id) {
+		_ = c.Close()
+	}
+}
+
+// NotifyUnfriend 主动通知对端「本机已把它删除好友」：对端在线时即时送达，
+// 它收到后自动把本机从它的地址簿/成员表移除，实现双向删除。
+// 对端离线时返回 error，调用方忽略即可——离线场景由下次握手的
+// rejection=unfriended 自愈送达，不阻塞本机删除动作。
+func (d *Discovery) NotifyUnfriend(ctx context.Context, peerID string) error {
+	id, err := peer.Decode(peerID)
+	if err != nil {
+		return fmt.Errorf("节点 ID 格式非法: %w", err)
+	}
+	stream, err := d.host.NewStream(ctx, id, ProtocolUnfriend)
+	if err != nil {
+		return fmt.Errorf("对端不在线或未连通: %w", err)
+	}
+	defer stream.Close()
+	if err = json.NewEncoder(stream).Encode(unfriendPayload{
+		PeerID: d.host.ID().String(),
+		Group:  GroupFingerprint(d.groupKey),
+	}); err != nil {
+		return err
+	}
+	_ = stream.CloseWrite()
+	return nil
+}
+
+// handleUnfriend 入向删除好友通知：校验群指纹与发起方身份（载荷里的
+// PeerID 必须与连接身份一致，防第三方冒名通知拆别人的好友关系），
+// 然后回调上层做本机侧同步移除 + 断开与该节点的连接。
+func (d *Discovery) handleUnfriend(s network.Stream) {
+	defer s.Close()
+	_ = s.SetDeadline(time.Now().Add(10 * time.Second))
+	var req unfriendPayload
+	if err := json.NewDecoder(s).Decode(&req); err != nil {
+		return
+	}
+	if req.Group != GroupFingerprint(d.groupKey) {
+		return // 跨网络误发/探测，静默丢弃
+	}
+	remote := s.Conn().RemotePeer()
+	if req.PeerID != "" && req.PeerID != remote.String() {
+		return // 显式伪造他人身份，丢弃
+	}
+	d.logf("收到节点 %s 的删除好友通知：本机将同步移除该节点", remote.ShortString())
+	// 成员表立即移除（不等上层回调），再断开连接。
+	d.mu.Lock()
+	delete(d.members, remote.String())
+	d.mu.Unlock()
+	if d.cfg.OnUnfriendReceived != nil {
+		go d.cfg.OnUnfriendReceived(remote.String())
+	}
+	for _, c := range d.host.Network().ConnsToPeer(remote) {
+		_ = c.Close()
+	}
+}
+
+// reportNearby 被动发现未信任节点时上报「附近」回调（带去抖：同一节点
+// 最短 30s 上报一次，防每轮发现都刷库）。仅在 Config.OnSeenUntrusted
+// 非 nil 时生效。
+func (d *Discovery) reportNearby(id peer.ID, addrs []ma.Multiaddr, source string) {
+	if d.cfg.OnSeenUntrusted == nil {
+		return
+	}
+	key := id.String()
+	d.nearbySeenMu.Lock()
+	if last, ok := d.nearbySeen[key]; ok && time.Since(last) < 30*time.Second {
+		d.nearbySeenMu.Unlock()
+		return
+	}
+	if len(d.nearbySeen) > 4096 { // 防 map 无界增长（极端大网）
+		for k, t := range d.nearbySeen {
+			if time.Since(t) > time.Hour {
+				delete(d.nearbySeen, k)
+			}
+		}
+	}
+	d.nearbySeen[key] = time.Now()
+	d.nearbySeenMu.Unlock()
+	go d.cfg.OnSeenUntrusted(key, toStrings(addrs), source)
 }
 
 // Resolve 实现 tunnel.GroupNetMap：按虚拟 IP 解析成员。
