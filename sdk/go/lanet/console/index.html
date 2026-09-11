@@ -351,6 +351,10 @@ async function connectPeer() {
     if (r.ok) {
       if (res.pending) {
         flash('peerMsg', res.message || '已提交连接申请，等待对方同意', true);
+      } else if (res.searching) {
+        // DHT 冷启动查不到地址不算失败：已记录并信任，后台发现会自动补连。
+        // 保留输入框内容，提示用户等待即可，不必反复点连接。
+        flash('peerMsg', res.message || '已记录节点，正在网络中查找其地址，查到后自动连接…', true);
       } else {
         const who = res.name ? `「${res.name}」` : '';
         const vip = res.virtual_ip ? `（虚拟 IP ${res.virtual_ip}）` : '';

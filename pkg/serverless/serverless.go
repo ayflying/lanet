@@ -201,6 +201,8 @@ type Discovery struct {
 	publicRetireReason string    // 退出原因（连上同群成员 / 超时），控制台展示用
 	publicStartedAt    time.Time // 公共 DHT 开启时刻（剩余时长展示用）
 
+	trigger chan struct{} // 立即触发一轮发现（用户手动添加节点后不等周期）
+
 	onDiscovered []Discovered
 }
 
@@ -250,6 +252,7 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		groupKey:  GroupKey(cfg.Channel, cfg.NetworkKey), // 空密钥按公共网络处理
 		memberTTL: cfg.MemberTTL,
 		members:   make(map[string]*Member),
+		trigger:   make(chan struct{}, 1),
 	}
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
 
@@ -605,10 +608,25 @@ func (d *Discovery) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-d.trigger:
+			// 用户手动添加节点等场景请求立即查找：不等下一个周期，
+			// 但也不重置 ticker（周期节奏保持不变）。
+			d.advertiseAndDiscover(ctx)
+			d.reapExpired()
 		case <-ticker.C:
 			d.advertiseAndDiscover(ctx)
 			d.reapExpired()
 		}
+	}
+}
+
+// TriggerDiscover 请求发现循环立即执行一轮查找（非阻塞，合并重复请求）。
+// 典型场景：用户按节点 ID 添加陌生节点但 DHT 尚未查到地址——记录之后触发
+// 一轮即时查找，命中即建连，用户不必干等下一个周期或反复点击。
+func (d *Discovery) TriggerDiscover() {
+	select {
+	case d.trigger <- struct{}{}:
+	default: // 已有待处理的触发请求：合并，无需排队
 	}
 }
 

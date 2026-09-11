@@ -116,9 +116,11 @@ func TestConnectPeerByIDRequiresMutualApproval(t *testing.T) {
 	}
 }
 
-// TestConnectPeerUnknownIDFails 连接一个不存在的节点 ID：应给出明确提示，
-// 而不是静默超时——用户需要知道「是对方没启动 / ID 错了 / 密钥不一致」。
-func TestConnectPeerUnknownIDFails(t *testing.T) {
+// TestConnectPeerUnknownIDSearches 连接一个当前查不到的节点 ID：不应报
+// 终局错误——DHT 发现需要时间（冷启动路由表未建立是常态），正确语义是
+// 「已记录、查找中」：节点进地址簿（trusted + manual），返回 Searching=true，
+// 由周期发现自动补连。用户不需要反复点击。
+func TestConnectPeerUnknownIDSearches(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -129,9 +131,22 @@ func TestConnectPeerUnknownIDFails(t *testing.T) {
 	ghostID := ghost.Info().PeerID
 	_ = ghost.Close()
 
-	_, err := a.ConnectPeer(ctx, ghostID)
-	if err == nil {
-		t.Fatalf("连接不存在的节点应返回错误，而不是静默成功")
+	res, err := a.ConnectPeer(ctx, ghostID)
+	if err != nil {
+		t.Fatalf("查不到地址不应报错（应转入后台查找），实际: %v", err)
+	}
+	if !res.Searching {
+		t.Fatalf("应返回 Searching=true，实际 %+v", res)
+	}
+	if res.PeerID != ghostID {
+		t.Fatalf("PeerID 应为 %s，实际 %s", ghostID, res.PeerID)
+	}
+	// 已记入地址簿并信任（对方上线后 addMember 过审批门直接建连）。
+	if !a.hasKnownPeers() {
+		t.Fatalf("查找中的节点应已记入地址簿（放开后续 DHT 查找流量门）")
+	}
+	if trusted, err := a.peers.IsTrusted(ctx, ghostID); err != nil || !trusted {
+		t.Fatalf("用户主动添加 = 本机已同意，应标记 trusted（err=%v）", err)
 	}
 }
 

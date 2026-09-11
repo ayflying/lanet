@@ -144,6 +144,10 @@ type ConnResult struct {
 	PeerID string `json:"peer_id"`
 	// Pending 为 true 表示已提交连接申请、等待对端同意（尚未连通）。
 	Pending bool `json:"pending"`
+	// Searching 为 true 表示本机已记录并信任该节点，但当前还没在私有 DHT
+	// 里查到它的地址（冷启动路由表未建立 / 对方暂未在线）。这不是失败：
+	// 周期发现会在 DHT 就绪后自动完成连接，无需用户反复点击。
+	Searching bool `json:"searching,omitempty"`
 	// Message 面向用户的结果说明。
 	Message string `json:"message"`
 	// Name 对端名称（已连通且交换过 info 时填充）。
@@ -230,10 +234,33 @@ func (c *Client) ConnectPeer(ctx context.Context, address string) (*ConnResult, 
 		}
 	}
 	// 2.2 地址簿未命中或地址失效：走私有 DHT 查找（仅同密钥内可见）。
+	//     同步查找只给 6s「快速探测」：命中即走完整建连流程；未命中不硬等
+	//     DHT 的 20s 超时——转入后台查找，UI 立刻得到「查找中」反馈。
 	if len(ai.Addrs) == 0 {
-		found, ferr := c.disc.FindPeer(ctx, id.String())
+		probeCtx, probeCancel := context.WithTimeout(ctx, 6*time.Second)
+		found, ferr := c.disc.FindPeer(probeCtx, id.String())
+		probeCancel()
 		if ferr != nil {
-			return nil, fmt.Errorf("未找到节点 %s：请确认对方已启动、节点 ID 正确，且与本机在同一网络密钥内（本地地址簿与私有 DHT 均无记录）", shortPeer(id.String()))
+			// 查不到 ≠ 连不上：私有 DHT 冷启动时路由表还没建立，对方的
+			// provider 记录也可能尚未传播到本节点附近——一次查询失败是
+			// 常态，不该当终局错误抛给用户（否则只能反复点「连接」碰运气）。
+			// 正确姿势：
+			//   1) 把对方记入地址簿并标记已信任（用户主动填 ID = 本机已同意，
+			//      与建连成功路径同一语义）；
+			//   2) 交给周期发现（每轮 FindProviders 群 provider key）自动补连，
+			//      addMember 过审批门时因已信任而直接建连。
+			// 地址簿有记录后 knownPeers 流量门放开，后台查找本来就会执行。
+			c.rememberPeer(id.String(), nil, "", true)
+			// 立刻触发一轮发现（不等 30s 周期）：对方 provider 记录已在
+			// DHT 里时这一轮就能命中并自动建连。
+			c.disc.TriggerDiscover()
+			return &ConnResult{
+				PeerID:    id.String(),
+				Searching: true,
+				Message: "已记录节点 " + shortPeer(id.String()) +
+					"，正在网络中查找其地址（DHT 发现需要一点时间），查到后会自动连接，无需重复点击。" +
+					"若长时间未连上：核对节点 ID 与网络密钥是否一致，或向对方索取「连接种子」直连。",
+			}, nil
 		}
 		ai = found
 		via = "dht"
