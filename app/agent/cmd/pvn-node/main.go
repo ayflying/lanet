@@ -784,6 +784,10 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				"config_path":        path,
 				"name":               nc.Name,
 				"network_key":        nc.NetworkKey,
+				// network_key_env 标记当前进程的网络密钥来自环境变量
+				// LANET_NETWORK_KEY（容器编排常见）：lanet.json 里可能没有该值，
+				// 前端据此把输入框回填为实际生效值，避免「容器里填了密钥、页面上是空的」。
+				"network_key_env":    os.Getenv("LANET_NETWORK_KEY") != "",
 				"bootstrap":          nc.Bootstrap,
 				"console":            nc.Console,
 				"has_password":       nc.ConsolePassword != "",

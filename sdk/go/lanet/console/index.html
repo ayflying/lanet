@@ -259,7 +259,9 @@
     <div class="sub" style="margin-bottom:8px">写入程序同目录 lanet.json，保存后重启程序生效。控制台默认仅本机可访问（127.0.0.1）；改为 0.0.0.0:8900 允许远程时，请务必同时设置控制台密码。</div>
     <div class="sub" id="cRuntime" style="display:none;margin-bottom:8px;padding:8px 10px;border:1px solid #d8dee9;border-radius:6px;background:#f6f8fa"></div>
     <div class="kv"><b>节点名称</b><input type="text" id="cName"></div>
-    <div class="kv"><b>网络密钥</b><input type="text" id="cKey" placeholder="留空 = 公共网络；相同密钥 = 同一私有网络"></div>
+    <div class="kv"><b>网络密钥</b><input type="text" id="cKey" placeholder="留空 = 本机专属默认网络（按节点 ID 派生，不与他人互通）；填写相同密钥才能互相连通">
+      <div class="sub" id="cKeyEnvHint" style="display:none;color:#c0392b;margin-top:4px"></div>
+    </div>
     <div class="kv"><b>控制台</b><input type="text" id="cConsole" placeholder="127.0.0.1:8900 = 仅本机，0.0.0.0:8900 = 允许远程，- = 关闭"></div>
     <div class="kv"><b>控制台密码</b><input type="password" id="cPassword" placeholder="未设置；远程访问时务必设置"></div>
     <div class="kv"><b>监听地址</b><input type="text" id="cListen" placeholder="留空 = tcp/ws/quic 随机端口"></div>
@@ -719,7 +721,20 @@ async function loadNodeConfig() {
     const c = await r.json();
     $('tabConfig').style.display = '';
     $('cName').value = c.name || '';
-    $('cKey').value = c.network_key || '';
+    // 网络密钥：容器/命令行常用环境变量 LANET_NETWORK_KEY 传入，此时文件里是空的，
+    // 页面若只读文件值就会出现「编排里填了密钥、网页上却是空的」。
+    // 生效值来自环境变量时，输入框回填实际运行值并给出来源提示。
+    const fileKey = c.network_key || '';
+    const rtKey = (c.runtime && c.runtime.network_key) || '';
+    if (c.network_key_env && rtKey !== fileKey) {
+      $('cKey').value = rtKey;
+      const hint = $('cKeyEnvHint');
+      hint.style.display = '';
+      hint.innerHTML = '⚠ 当前生效密钥来自环境变量 LANET_NETWORK_KEY（容器编排），未写入 lanet.json。此处显示的是实际运行值；在此保存会写进配置文件，但启动时环境变量仍优先。要改密钥请改 docker-compose 的 LANET_NETWORK_KEY 后重启容器。';
+    } else {
+      $('cKey').value = fileKey;
+      $('cKeyEnvHint').style.display = 'none';
+    }
     $('cConsole').value = c.console || '';
     $('cPassword').value = '';
     $('cPassword').placeholder = c.has_password ? '已设置（输入新值可覆盖）' : '未设置；远程访问时务必设置';
@@ -746,11 +761,16 @@ function renderRuntimeBanner(c) {
   const banner = $('cRuntime');
   const rt = c.runtime;
   if (!rt) { banner.style.display = 'none'; return; }
-  const keyDesc = rt.network_key ? '私有密钥 <b>' + esc(rt.network_key) + '</b>' : '公共网络（未设密钥）';
-  const sameKey = (rt.network_key || '') === (c.network_key || '');
-  const diffWarn = sameKey
-    ? '与下方保存值一致。'
-    : '<b style="color:#c0392b">与下方保存的网络密钥不一致</b>——当前仍运行在上方所示网络，修改保存并重启程序后才会切换。';
+  const keyDesc = rt.network_key ? '私有密钥 <b>' + esc(rt.network_key) + '</b>' : '本机专属默认网络（未设密钥，按节点 ID 派生）';
+  let diffWarn;
+  if (c.network_key_env) {
+    diffWarn = '网络密钥由环境变量 LANET_NETWORK_KEY 指定（优先级高于配置文件）。';
+  } else {
+    const sameKey = (rt.network_key || '') === (c.network_key || '');
+    diffWarn = sameKey
+      ? '与下方保存值一致。'
+      : '<b style="color:#c0392b">与下方保存的网络密钥不一致</b>——当前仍运行在上方所示网络，修改保存并重启程序后才会切换。';
+  }
   banner.innerHTML = '<b>当前进程运行中：</b>网络 <b>' + esc(rt.network_id || '') + '</b>（' + keyDesc + '）。' + diffWarn;
 }
 async function saveNodeConfig() {
