@@ -71,6 +71,12 @@ func StartP2PUpdate(ctx context.Context, c *lanet.Client, version string, exeDir
 		Platform:       runtime.GOOS + "/" + runtime.GOARCH,
 		ExePath:        exePath,
 		ManifestPath:   filepath.Join(exeDir, "update-manifest.json"),
+		// 巡检节奏：「发现新版本立即升级」——启动 30 秒后先比一轮版本，
+		// 之后每 5 分钟一轮。巡检只读本地成员表，不发网络请求，真正的网络
+		// 开销只在自己落后时才发生，所以周期可以压得很短（历史 30 分钟/轮
+		// 且首轮也要等满一个周期，平均延迟一刻钟）。
+		InitialDelay:  30 * time.Second,
+		CheckInterval: 5 * time.Minute,
 		// 0.5.34 私有协议加固：更新协议 ID 按群派生——公网扫描器与异群
 		// 节点协商不上协议，再也拉不走二进制（此前是公网节点最大流量放大器）。
 		// 混版本过渡：新节点仍注册固定 ID 分发入口（老版本好友靠它升级），
@@ -82,7 +88,7 @@ func StartP2PUpdate(ctx context.Context, c *lanet.Client, version string, exeDir
 		applyP2PUpdate(newPath, m, exePath)
 	})
 	coord.Start(ctx)
-	log.Printf("[p2p-update] 已启动：巡检 30 分钟/轮，发现更高版本即征询下载（验签通过才升级）")
+	log.Printf("[p2p-update] 已启动：启动 30s 首轮、之后 5 分钟/轮巡检，发现更高版本即征询下载（验签通过才升级）")
 	return ""
 }
 

@@ -34,6 +34,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ayflying/pvn/pkg/selfupdate"
 )
 
 const updateRepoAPI = "https://api.github.com/repos/ayflying/lanet/releases/latest"
@@ -436,12 +438,19 @@ func extractFromZip(path, destExe, exeDir string) error {
 	}
 	defer r.Close()
 	var wintunDone bool
+	var distManifest []byte
 	for _, f := range r.File {
 		base := filepath.Base(f.Name)
 		switch {
 		case base == zipName("lanet"):
 			if err = copyZipEntry(f, destExe); err != nil {
 				return err
+			}
+		case base == selfupdate.DistManifestName && distManifest == nil:
+			// 包内签名清单先暂存：它要与「刚解出的新程序」比对 sha256，
+			// 而 zip 内条目顺序不定，只能等循环结束后再落盘。
+			if raw, err := readZipEntry(f); err == nil {
+				distManifest = raw
 			}
 		case base == "wintun.dll" && !wintunDone:
 			// 正在运行的进程可能锁定 dll：失败忽略（dll 极少随版本变化）。
@@ -453,7 +462,37 @@ func extractFromZip(path, destExe, exeDir string) error {
 	if _, err := os.Stat(destExe); err != nil {
 		return fmt.Errorf("包内未找到 %s", zipName("lanet"))
 	}
+	installDistManifest(distManifest, exeDir, destExe)
 	return nil
+}
+
+// readZipEntry 读出一个 zip 条目的全部内容（清单只有几百字节）。
+func readZipEntry(f *zip.File) ([]byte, error) {
+	rc, err := f.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return io.ReadAll(rc)
+}
+
+// distManifestInstaller 落盘包内签名清单的实现（测试注入点：真实实现要求
+// 清单出自发布私钥，而私钥只在 CI 里，测试无从构造合法凭证）。
+var distManifestInstaller = selfupdate.InstallDistManifest
+
+// installDistManifest 把发行包内的签名清单落盘为运行期分发凭证
+// （update-manifest.json），使本节点重启后能作为 P2P 种子对外分发新版本。
+// 失败不算更新失败：程序已经换好了，只是本节点暂时只做升级请求方。
+func installDistManifest(raw []byte, exeDir, destExe string) {
+	if len(raw) == 0 {
+		return
+	}
+	if err := distManifestInstaller(raw,
+		filepath.Join(exeDir, "update-manifest.json"), destExe); err != nil {
+		log.Printf("[update] 包内分发清单不可用（%v）：本节点暂不作为 P2P 分发源", err)
+		return
+	}
+	log.Printf("[update] 分发凭证已落盘：重启后本节点可作为 P2P 新版本种子")
 }
 
 func copyZipEntry(f *zip.File, dest string) error {
@@ -477,6 +516,8 @@ func extractFromTarGz(path, destExe, exeDir string) error {
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
+	found := false
+	var distManifest []byte
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -485,11 +526,24 @@ func extractFromTarGz(path, destExe, exeDir string) error {
 		if err != nil {
 			return err
 		}
-		if filepath.Base(hdr.Name) == zipName("lanet") {
-			return writeAtomic(destExe, tr)
+		switch base := filepath.Base(hdr.Name); {
+		case base == zipName("lanet"):
+			// 不提前 return：同一个包里还有签名清单要落盘。
+			if err := writeAtomic(destExe, tr); err != nil {
+				return err
+			}
+			found = true
+		case base == selfupdate.DistManifestName && distManifest == nil:
+			if raw, err := io.ReadAll(tr); err == nil {
+				distManifest = raw
+			}
 		}
 	}
-	return fmt.Errorf("包内未找到 %s", zipName("lanet"))
+	if !found {
+		return fmt.Errorf("包内未找到 %s", zipName("lanet"))
+	}
+	installDistManifest(distManifest, exeDir, destExe)
+	return nil
 }
 
 func writeAtomic(dest string, r io.Reader) error {

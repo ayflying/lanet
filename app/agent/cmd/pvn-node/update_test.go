@@ -1,10 +1,18 @@
 package main
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/ayflying/pvn/pkg/selfupdate"
 )
 
 // TestUpdateCacheStale 覆盖 /api/update 的缓存新鲜度判定：
@@ -153,5 +161,161 @@ func TestFailKeepsPreviousVersionInfo(t *testing.T) {
 	}
 	if errMsg != "临时超时" {
 		t.Errorf("errMsg=%q, want %q", errMsg, "临时超时")
+	}
+}
+
+// ---- 解包时落盘分发凭证 ----
+//
+// 背景：GitHub 更新路径只解出可执行文件，历史上从不落盘签名清单，于是
+// 每个「走 GitHub 升级过」的节点都会丢掉 P2P 分发能力（本机实测：
+// update-manifest.json 停在 0.5.8、程序已 0.5.42），整条 P2P 升级链断掉。
+// 这两个测试锁住「解包时把包内 manifest.json 取出来落盘」的行为。
+
+const testDistManifest = `{"version":"0.5.43","platform":"windows/amd64",` +
+	`"size":12,"sha256":"aa","signature":"bb"}`
+
+// installerRec 记录一次落盘调用（真实实现要求清单出自发布私钥，测试
+// 自造的清单必然验签失败，故用注入点只验证「取到了、传对了」）。
+type installerRec struct {
+	calls        int
+	raw          []byte
+	manifestPath string
+	exePath      string
+}
+
+func captureInstaller(t *testing.T) *installerRec {
+	t.Helper()
+	rec := &installerRec{}
+	orig := distManifestInstaller
+	t.Cleanup(func() { distManifestInstaller = orig })
+	distManifestInstaller = func(raw []byte, manifestPath, exePath string) error {
+		rec.calls++
+		rec.raw = append([]byte(nil), raw...)
+		rec.manifestPath = manifestPath
+		rec.exePath = exePath
+		return nil
+	}
+	return rec
+}
+
+func writeTestZip(t *testing.T, path string, entries [][2]string) {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, e := range entries {
+		w, err := zw.Create(e[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = w.Write([]byte(e[1])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeTestTarGz(t *testing.T, path string, entries [][2]string) {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, e := range entries {
+		body := []byte(e[1])
+		if err := tw.WriteHeader(&tar.Header{
+			Name: e[0], Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestExtractFromZipInstallsDistManifest 清单条目排在程序之前也要能落盘：
+// 凭证要与新解出的程序比对 sha256，实现必须等 exe 就绪后再处理。
+func TestExtractFromZipInstallsDistManifest(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "lanet-0.5.43-windows-amd64.zip")
+	writeTestZip(t, archive, [][2]string{
+		{"lanet-windows-amd64/" + selfupdate.DistManifestName, testDistManifest},
+		{"lanet-windows-amd64/" + zipName("lanet"), "new-exe-bytes"},
+	})
+	dest := filepath.Join(dir, "lanet-new"+extOf())
+	rec := captureInstaller(t)
+
+	if err := extractFromZip(archive, dest, dir); err != nil {
+		t.Fatalf("解包失败: %v", err)
+	}
+	if rec.calls != 1 {
+		t.Fatalf("包内清单未被落盘（调用 %d 次）", rec.calls)
+	}
+	if string(rec.raw) != testDistManifest {
+		t.Errorf("落盘内容不是包内清单: %s", rec.raw)
+	}
+	if rec.exePath != dest {
+		t.Errorf("凭证未与刚解出的程序比对: got %s want %s", rec.exePath, dest)
+	}
+	if rec.manifestPath != filepath.Join(dir, "update-manifest.json") {
+		t.Errorf("凭证落盘路径错误: %s", rec.manifestPath)
+	}
+	if b, err := os.ReadFile(dest); err != nil || string(b) != "new-exe-bytes" {
+		t.Fatalf("程序未正常解出: %q err=%v", b, err)
+	}
+}
+
+// TestExtractFromTarGzInstallsDistManifest tar.gz 的清单排在程序之后也要能
+// 落盘：旧实现一读到可执行文件就 return，包内清单永远没机会被处理。
+func TestExtractFromTarGzInstallsDistManifest(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "lanet-0.5.43-linux-amd64.tar.gz")
+	writeTestTarGz(t, archive, [][2]string{
+		{"lanet-linux-amd64/" + zipName("lanet"), "new-exe-bytes"},
+		{"lanet-linux-amd64/" + selfupdate.DistManifestName, testDistManifest},
+	})
+	dest := filepath.Join(dir, "lanet-new"+extOf())
+	rec := captureInstaller(t)
+
+	if err := extractFromTarGz(archive, dest, dir); err != nil {
+		t.Fatalf("解包失败: %v", err)
+	}
+	if rec.calls != 1 || string(rec.raw) != testDistManifest {
+		t.Fatalf("包内清单未被落盘: calls=%d raw=%s", rec.calls, rec.raw)
+	}
+	if b, err := os.ReadFile(dest); err != nil || string(b) != "new-exe-bytes" {
+		t.Fatalf("程序未正常解出: %q err=%v", b, err)
+	}
+}
+
+// TestExtractWithoutDistManifestIsClean 未配置签名密钥时发行包不含清单
+// （见 release.yml 的跳过分支），此时不应报错、也不应尝试落盘。
+func TestExtractWithoutDistManifestIsClean(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "no-manifest.zip")
+	writeTestZip(t, archive, [][2]string{
+		{"lanet-windows-amd64/" + zipName("lanet"), "new-exe-bytes"},
+	})
+	dest := filepath.Join(dir, "lanet-new"+extOf())
+	rec := captureInstaller(t)
+
+	if err := extractFromZip(archive, dest, dir); err != nil {
+		t.Fatalf("无清单的包不应解包失败: %v", err)
+	}
+	if rec.calls != 0 {
+		t.Fatalf("包内无清单却调用了落盘（%d 次）", rec.calls)
 	}
 }

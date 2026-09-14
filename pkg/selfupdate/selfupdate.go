@@ -60,6 +60,12 @@ const (
 // 所有字段（含 Size）都入签——测试曾发现仅漏签 Size 时可被篡改。
 const signPrefix = "lanet-update-v1:"
 
+// DistManifestName 发行包内自带的签名清单文件名。CI 把单平台签名分片放进
+// 压缩包（release.yml），解压即得分发凭证；运行期落盘的凭证则叫
+// update-manifest.json（ManifestPath 默认值）。两个名字都要认——历史上只认
+// 后者，「解压即种子」的设计意图因此完全落空（首装节点永远不是分发源）。
+const DistManifestName = "manifest.json"
+
 // ReleasePublicKey 发布签名公钥（base64 Ed25519）。私钥只存在于
 // GitHub Actions Secrets（SELFUPDATE_SIGNING_KEY），用于 CI 发版时签名；
 // 换钥 = 全网失去旧版本分发能力，需随代码更新重新发版。
@@ -167,8 +173,13 @@ type Config struct {
 	ManifestPath string
 	// PublicKey 发布公钥 base64，默认 ReleasePublicKey。
 	PublicKey string
-	// CheckInterval 版本巡检周期，默认 30 分钟。
+	// CheckInterval 版本巡检周期，默认 5 分钟。巡检本身只读本地成员表
+	// （不发网络请求），只有确认自己落后时才征询清单，因此周期可以很短
+	// ——历史默认 30 分钟会让「发现新版本」平均延迟一刻钟。
 	CheckInterval time.Duration
+	// InitialDelay 启动后首次巡检的延迟，默认 30 秒（负数 = 启动即巡）。
+	// 成员表填充只需秒级，没必要等满一个周期才第一次比较版本。
+	InitialDelay time.Duration
 	// MinNewPeers 触发征询所需的更高版本同平台成员数，默认 1。
 	// 发现 1 个更高版本成员即征询其清单；验签通过即可信（签名信任锚
 	// 保证清单出自发布私钥，无需多票灰度），多份时要求完全一致。
@@ -201,7 +212,10 @@ func (c *Config) fillDefaults() {
 		c.PublicKey = ReleasePublicKey
 	}
 	if c.CheckInterval <= 0 {
-		c.CheckInterval = 30 * time.Minute
+		c.CheckInterval = 5 * time.Minute
+	}
+	if c.InitialDelay == 0 {
+		c.InitialDelay = 30 * time.Second
 	}
 	if c.MinNewPeers <= 0 {
 		c.MinNewPeers = 1
@@ -427,19 +441,45 @@ func consensus(heads []Manifest, pubB64 string, need int) (Manifest, bool) {
 
 // loadSelfManifest 启动时从 ManifestPath 加载分发凭证：必须验签通过，
 // 且与本地 exe 的实际 sha256 一致（防止清单指向被篡改的二进制）。
+// selfManifestPaths 本地分发凭证的候选路径。首选运行期落盘的
+// update-manifest.json（P2P 下载成功或 GitHub 更新解包时写入），兜底读发行
+// 包自带的 manifest.json —— CI 把签名分片打进压缩包（release.yml 的
+// 「解压即有分发凭证」），但那个文件叫 manifest.json，与运行期落盘名不同；
+// 只认后者会让「解压即种子」的设计意图完全落空（首装节点永远不是分发源）。
+func (c *Coordinator) selfManifestPaths() []string {
+	primary := c.cfg.ManifestPath
+	if primary == "" {
+		return nil
+	}
+	out := []string{primary}
+	alt := filepath.Join(filepath.Dir(primary), DistManifestName)
+	if alt != primary {
+		out = append(out, alt)
+	}
+	return out
+}
+
 func (c *Coordinator) loadSelfManifest() *Manifest {
-	m, err := readManifest(c.cfg.ManifestPath)
+	// 本地程序指纹只算一次：凭证必须与当前 exe 逐字节对应，否则不得对外
+	// 分发（替换失败/旧凭证残留时自动失效，绝不传播假凭证）。
+	sum, err := FileSHA256(c.cfg.ExePath)
 	if err != nil {
 		return nil
 	}
-	if !m.Verify(c.cfg.PublicKey) {
-		return nil
+	for _, path := range c.selfManifestPaths() {
+		m, err := readManifest(path)
+		if err != nil {
+			continue
+		}
+		if !m.Verify(c.cfg.PublicKey) {
+			continue
+		}
+		if m.SHA256 != sum {
+			continue
+		}
+		return &m
 	}
-	sum, err := FileSHA256(c.cfg.ExePath)
-	if err != nil || sum != m.SHA256 {
-		return nil
-	}
-	return &m
+	return nil
 }
 
 // ---- 分发源侧（handler） ----
@@ -678,6 +718,46 @@ func readManifest(path string) (Manifest, error) {
 func saveManifest(path string, m Manifest) error {
 	data, _ := json.MarshalIndent(m, "", "  ")
 	return os.WriteFile(path, data, 0o600)
+}
+
+// InstallDistManifest 校验并落盘发行包内自带的签名清单，使其成为运行期
+// 分发凭证——本节点重启后即可作为 P2P 种子。raw 为包内 manifest.json 的
+// 原始字节，exePath 是刚解出的新程序（校验清单与该程序逐字节一致）。
+//
+// 三道校验缺一不可：平台匹配（防止把别的平台的分片当自己的凭证）、
+// 发布私钥验签（信任锚）、sha256 与本地程序一致（凭证只对得上自己才算数）。
+// 任何一项不符都返回错误且不落盘——宁可不做种子，也不传播假凭证。
+//
+// 为什么必须在这里做：GitHub 更新路径只解出可执行文件，历史上从不落盘
+// 凭证，于是每个「走 GitHub 升级过」的节点都会丢掉分发能力，P2P 升级链
+// 随之整体断掉（本机实测 update-manifest.json 停在 0.5.8、程序已 0.5.42）。
+func InstallDistManifest(raw []byte, manifestPath, exePath string) error {
+	return InstallDistManifestWith(raw, manifestPath, exePath, ReleasePublicKey)
+}
+
+// InstallDistManifestWith 同 InstallDistManifest，但显式指定验签公钥。
+// 生产一律用 ReleasePublicKey；单独暴露是为了单测能自造密钥对（私钥只在
+// CI Secrets 里，测试拿不到，否则正向路径无从覆盖）。
+func InstallDistManifestWith(raw []byte, manifestPath, exePath, pubB64 string) error {
+	var m Manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return fmt.Errorf("清单解析失败: %w", err)
+	}
+	want := runtime.GOOS + "/" + runtime.GOARCH
+	if m.Platform != want {
+		return fmt.Errorf("清单平台不符（凭证 %s，本机 %s）", m.Platform, want)
+	}
+	if !m.Verify(pubB64) {
+		return errors.New("清单验签失败")
+	}
+	sum, err := FileSHA256(exePath)
+	if err != nil {
+		return err
+	}
+	if sum != m.SHA256 {
+		return errors.New("清单 sha256 与包内程序不一致")
+	}
+	return saveManifest(manifestPath, m)
 }
 
 func (c *Coordinator) logf(format string, args ...any) {
