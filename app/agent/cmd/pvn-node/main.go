@@ -172,9 +172,11 @@ func runNode(parent context.Context, serviceMode bool) {
 	// 历史行为默认 "public"：公共 DHT 关闭时该地址本就会被剔除（等价 none），
 	// 但字面值会误导用户以为「默认挂了公共网络」，故改为显式 none。
 	effBootstrap := firstNonEmpty(*bootstrap, nc.Bootstrap, "none")
-	// 身份文件路径固定：exe 同目录 node.key（Windows）/ /data/node.key（其他平台），
-	// 不读配置、不暴露到控制台；文件不存在即新用户，SDK 自动创建新身份。
-	effIdentity := defaultIdentityPath(exeDir)
+	// 身份文件路径固定：配置文件同目录 node.key（Windows）/ /data/node.key
+	// （其他平台），不读配置、不暴露到控制台；文件不存在即新用户，SDK 自动
+	// 创建新身份。锚点必须是配置目录的绝对路径：服务/计划任务的 CWD 不是
+	// 程序目录，相对路径会让节点在 CWD 下新建身份（详见 defaultIdentityPath）。
+	effIdentity := defaultIdentityPath(*config)
 	effConsole := firstNonEmpty(*console, nc.Console, "127.0.0.1:8900")
 	effConsolePW := firstNonEmpty(*consolePW, nc.ConsolePassword)
 	effFW := firstNonEmpty(*fw, nc.Firewall, "allow-all")
@@ -239,8 +241,8 @@ func runNode(parent context.Context, serviceMode bool) {
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s publicDHT=%v(%dm) tun=%v version=%s config=%s",
-		effName, effKey, effFW, effConsole, effPublic, effPublicMin, effTun, version, *config)
+	log.Printf("[node] 启动 name=%s key=%q fw=%s console=%s publicDHT=%v(%dm) tun=%v version=%s config=%s identity=%s",
+		effName, effKey, effFW, effConsole, effPublic, effPublicMin, effTun, version, *config, effIdentity)
 	log.Printf("[node] 连接审批：require=%v autoAccept=%v db=%s",
 		effRequireApproval, effAutoAccept, effDBPath)
 
@@ -654,15 +656,25 @@ func exeDir() string {
 	return filepath.Dir(exe)
 }
 
-// defaultIdentityPath 身份密钥固定路径：Windows 存裸文件名 node.key
-// （按配置文件所在目录解析，整个文件夹移动/改名都不断链），
+// defaultIdentityPath 身份密钥固定路径：Windows 放**配置文件同目录**的
+// node.key（与 lanet.db / lanet.log 同锚点，整个文件夹移动/改名都不断链），
 // 其他平台维持容器约定 /data/node.key。路径不写入配置、不对外展示，
 // 文件不存在即视为新用户，由 SDK 自动创建新身份。
-func defaultIdentityPath(exeDir string) string {
-	if runtime.GOOS == "windows" {
-		return "node.key"
+//
+// 必须返回**绝对路径**：Windows 服务（SCM 拉起，CWD=System32）、计划任务、
+// 以及一切从别的目录启动 exe 的场景，进程 CWD 都不是程序目录。返回裸相对名
+// "node.key" 会让节点在 CWD 下新建一个全新身份——PeerID 与虚拟 IP 双双漂移，
+// 成员表 / 防火墙 / 转发规则 / 已审批信任全部对不上。0.5.39 及以前的服务模式
+// 实测如此：身份落到了 C:\Windows\System32\node.key。
+func defaultIdentityPath(configPath string) string {
+	if runtime.GOOS != "windows" {
+		return "/data/node.key"
 	}
-	return "/data/node.key"
+	dir := filepath.Dir(configPath)
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	return filepath.Join(dir, "node.key")
 }
 
 // nodeConfig lanet.json 配置文件结构（字段与命令行参数一一对应）。

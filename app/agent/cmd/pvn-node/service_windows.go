@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -55,14 +56,22 @@ func handleWindowsServiceCommand() (bool, error) {
 	if len(os.Args) != 2 || !strings.EqualFold(os.Args[1], "-service-restart") {
 		return false, nil
 	}
+	// 辅助进程由服务以 DETACHED_PROCESS 派生、无 stdio（Go 默认接到
+	// os.DevNull），不重定向日志的话它的失败原因会彻底消失——现场表现
+	// 就是「更新后没重启，日志里一条线索都没有，只能靠猜」。
+	setupServiceHelperLog()
+	log.Printf("[service-restart] 收到重启请求（pid=%d），通过服务管理器 stop/start", os.Getpid())
 	m, s, err := openService()
 	if err != nil {
+		log.Printf("[service-restart] 打开服务失败: %v", err)
 		return true, err
 	}
 	defer m.Disconnect()
 	defer s.Close()
 	if status, qerr := s.Query(); qerr == nil && status.State != svc.Stopped {
+		log.Printf("[service-restart] 停止服务（当前状态=0x%x）", status.State)
 		if _, err = s.Control(svc.Stop); err != nil {
+			log.Printf("[service-restart] 停止服务失败: %v", err)
 			return true, fmt.Errorf("停止服务失败: %w", err)
 		}
 		deadline := time.Now().Add(20 * time.Second)
@@ -74,13 +83,35 @@ func handleWindowsServiceCommand() (bool, error) {
 			time.Sleep(300 * time.Millisecond)
 		}
 		if status.State != svc.Stopped {
+			log.Printf("[service-restart] 等待服务停止超时（状态=0x%x）", status.State)
 			return true, errors.New("等待服务停止超时")
 		}
 	}
 	if err = s.Start(); err != nil {
+		log.Printf("[service-restart] 启动服务失败: %v", err)
 		return true, fmt.Errorf("启动服务失败: %w", err)
 	}
+	log.Printf("[service-restart] 服务已重新启动")
 	return true, nil
+}
+
+// setupServiceHelperLog 把辅助进程的标准日志接到节点日志文件，锚点与主进程
+// 一致（配置文件目录；无 -config 参数时退回 exe 目录——服务场景下二者相同）。
+func setupServiceHelperLog() {
+	dir := filepath.Dir(selfExe())
+	for i, a := range os.Args[1:] {
+		if v, ok := strings.CutPrefix(a, "-config="); ok {
+			dir = filepath.Dir(v)
+			break
+		}
+		if (a == "-config" || a == "--config") && i+2 <= len(os.Args[1:]) {
+			dir = filepath.Dir(os.Args[1:][i+1])
+			break
+		}
+	}
+	if lf, err := newRotatingFile(filepath.Join(dir, "lanet.log"), logMaxSize, logMaxBackups); err == nil {
+		log.SetOutput(tolerantWriter{[]io.Writer{lf}})
+	}
 }
 
 func isServiceProcess() bool { return os.Getenv("LANET_SERVICE") == "1" }

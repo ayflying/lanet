@@ -63,7 +63,10 @@ func (d *DNSServer) listenAndServe(ctx context.Context, addr string) error {
 	}
 	udp, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		return fmt.Errorf("lanet: DNS 监听 %s 失败（需要管理员/root 权限）: %w", addr, err)
+		// 两种常见成因合并提示：低端口（53）需要特权，以及已有实例占着端口。
+		// 早期只写「需要管理员权限」，让「端口被另一个 lanet 实例占用」这种
+		// 真实原因被误导成权限问题（双实例共存时实测踩到）。
+		return fmt.Errorf("lanet: DNS 监听 %s 失败（原因可能是需要管理员/root 权限，或该端口已被占用——例如已有一个 lanet 实例在运行）: %w", addr, err)
 	}
 	d.mu.Lock()
 	d.udp = udp
