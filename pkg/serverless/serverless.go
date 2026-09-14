@@ -603,6 +603,28 @@ func (d *Discovery) trustPolicy(peerID string, addrs []string, name string) (tru
 	return false, false
 }
 
+// trustPolicyPassive 判定「被动发现」到的节点能否放行，语义与 trustPolicy
+// 的放行分支完全一致（信任 / auto_accept），但**不产生 OnPending 副作用**。
+//
+// 为什么需要单独一个：被动发现（DHT provider 记录、mDNS）只说明「同群里有
+// 这么个节点」，不代表对方申请连接——把它记进待审批会让控制台出现没人申请
+// 过的条目，而且发现是周期性的，同一节点会被反复上报。真正的申请只有两条
+// 来源：入向握手（handleInfo）和用户主动添加（RequestConnect），它们走
+// trustPolicy，保留上报。
+func (d *Discovery) trustPolicyPassive(peerID string, addrs []string, name string) bool {
+	if d.cfg.IsTrusted == nil {
+		return true
+	}
+	if d.cfg.IsTrusted(peerID) {
+		return true
+	}
+	if d.cfg.AutoAccept != nil && d.cfg.AutoAccept(peerID, addrs, name) {
+		d.logf("已自动同意陌生节点 %s 的连接申请（auto_accept 开启）", shortID(peerID))
+		return true
+	}
+	return false
+}
+
 // knownPeers 地址簿是否有已知节点（决定是否值得发起 DHT 查找）。
 // HasKnownPeers 为 nil 时返回 true（保持历史行为：每轮都查找）。
 func (d *Discovery) knownPeers() bool {
@@ -1007,7 +1029,13 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 	// 不必等下一轮发现。这里**不**上报待审批：被动发现只是「知道有这个人」，
 	// 不代表对方申请连接，记入待审批只会让列表被同网段无关节点刷屏。
 	// 真正的申请由入向握手（handleInfo）或用户主动添加（RequestConnect）产生。
-	if trusted, _ := d.trustPolicy(id.String(), toStrings(addrs), ""); !trusted {
+	//
+	// 必须用 trustPolicyPassive 而非 trustPolicy：后者会调用 OnPending
+	// 产生「收到陌生节点…的连接申请」的副作用。被动发现（DHT provider
+	// 记录 / mDNS）每轮都会重新发现同一批节点，用 trustPolicy 会让同一句
+	// 假「连接申请」按发现周期刷屏，并在控制台「待审批」里堆出根本没人
+	// 申请过的条目（含已下线节点留下的陈旧 provider 记录）。
+	if !d.trustPolicyPassive(id.String(), toStrings(addrs), "") {
 		if len(addrs) > 0 {
 			d.host.Peerstore().AddAddrs(id, addrs, time.Hour)
 		}

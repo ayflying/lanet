@@ -152,6 +152,7 @@ func TestUnfriendOfflineSelfHeal(t *testing.T) {
 
 // TestNearbyReportOnPassiveDiscover 被动发现未信任节点时应触发
 // OnSeenUntrusted 上报（附近列表的来源），且不进成员表。
+// 同时断言**不得**产生待审批：被动发现 ≠ 对方申请连接。
 func TestNearbyReportOnPassiveDiscover(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -161,11 +162,16 @@ func TestNearbyReportOnPassiveDiscover(t *testing.T) {
 
 	var mu sync.Mutex
 	var seen []string
+	var pending []string
 	da, err := New(ctx, ha, Config{
 		NetworkKey: "grp-nearby",
 		Name:       "node-a",
 		IsTrusted:  func(string) bool { return false }, // 谁都不信任
-		OnPending:  func(string, []string, string) {},  // 被动发现不上报待审批，提供空实现避免 nil 差异
+		OnPending: func(peerID string, _ []string, _ string) {
+			mu.Lock()
+			pending = append(pending, peerID)
+			mu.Unlock()
+		},
 		OnSeenUntrusted: func(peerID string, _ []string, _ string) {
 			mu.Lock()
 			seen = append(seen, peerID)
@@ -196,8 +202,59 @@ func TestNearbyReportOnPassiveDiscover(t *testing.T) {
 	if len(seen) == 0 || seen[0] != hb.ID().String() {
 		t.Fatalf("被动发现未信任节点应上报附近，实际 %v", seen)
 	}
+	if len(pending) != 0 {
+		t.Fatalf("被动发现不得上报待审批（发现≠申请），实际 %v", pending)
+	}
 	if _, ok := memberOf(da, hb.ID().String()); ok {
 		t.Fatalf("未信任节点不得进入成员表")
+	}
+}
+
+// TestPassiveDiscoverRepeatedStaysQuiet 被动发现是周期性的：同一节点被反复
+// 发现（DHT 每轮 provider 查询）时，既不该重复堆「附近」，更不该每次刷一条
+// 假的「连接申请」——这正是 0.5.40 及以前控制台待审批被刷屏、日志每轮
+// 一条「收到陌生节点…的连接申请」的成因。
+func TestPassiveDiscoverRepeatedStaysQuiet(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	ha := testHost(t, false)
+	hb := testHost(t, false)
+
+	var mu sync.Mutex
+	var pendingCount, nearbyCount int
+	da, err := New(ctx, ha, Config{
+		NetworkKey: "grp-nearby-rep",
+		IsTrusted:  func(string) bool { return false },
+		OnPending: func(string, []string, string) {
+			mu.Lock()
+			pendingCount++
+			mu.Unlock()
+		},
+		OnSeenUntrusted: func(string, []string, string) {
+			mu.Lock()
+			nearbyCount++
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("new A: %v", err)
+	}
+	if err = da.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		da.addMember(hb.ID(), hb.Addrs(), "dht-private")
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if pendingCount != 0 {
+		t.Fatalf("重复被动发现不得产生任何待审批，实际 %d 条", pendingCount)
+	}
+	if nearbyCount == 0 {
+		t.Fatalf("重复被动发现仍应上报附近（至少一次）")
 	}
 }
 
