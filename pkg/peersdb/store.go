@@ -62,6 +62,17 @@ VALUES (?, ?, 1, 1, ?, ?)`, peerID, boolInt(trusted), time.Now(), time.Now()); e
 	if _, err := d.db.ExecContext(ctx, `DELETE FROM pending_requests WHERE peer_id = ?`, peerID); err != nil {
 		return fmt.Errorf("peersdb: clear pending %s: %w", peerID, err)
 	}
+	// 授予信任后该节点也不再属于「附近」：nearby 的语义是「同网络密钥内
+	// 可发现、但尚未成为好友」。历史缺陷——这里只清了 pending 没清 nearby，
+	// 于是「先被被动发现写进 nearby、紧接着审批通过」的节点会永久滞留在
+	// 附近列表（用户看到一堆其实已经是好友的节点）。
+	// 注意只在 trusted=true 时清：撤销信任/删除好友后，该节点**应该**重新
+	// 出现在附近（下一轮发现会重新写回），这是「申请连接」的恢复入口。
+	if trusted {
+		if _, err := d.db.ExecContext(ctx, `DELETE FROM nearby WHERE peer_id = ?`, peerID); err != nil {
+			return fmt.Errorf("peersdb: clear nearby %s: %w", peerID, err)
+		}
+	}
 	return nil
 }
 
@@ -236,6 +247,10 @@ func (d *DB) UpsertNearby(ctx context.Context, n Nearby) error {
 		return err
 	}
 	if trusted {
+		// 已信任节点不该出现在附近：顺手清掉可能残留的历史观察。这同时
+		// 覆盖「发现时读到未信任 → 审批并发完成 → 本次 INSERT 才落地」的
+		// 竞态窗口（若只 return 而不删，这条记录会永久滞留）。
+		_, _ = d.db.ExecContext(ctx, `DELETE FROM nearby WHERE peer_id = ?`, n.PeerID)
 		return nil
 	}
 	now := time.Now()
@@ -289,6 +304,24 @@ func (d *DB) RemoveNearby(ctx context.Context, peerID string) error {
 		return fmt.Errorf("peersdb: remove nearby %s: %w", peerID, err)
 	}
 	return nil
+}
+
+// PruneTrustedNearby 清理 nearby 表里「其实已经是好友」的残留行，返回删除条数。
+//
+// 用于修复存量脏数据：旧版本 SetTrusted 只清 pending_requests、不清 nearby，
+// 于是「被动发现先写进附近 → 同一秒审批通过」的节点会永久留在附近列表；
+// 又因为 nearby 表不含网络密钥字段（ListNearby 全表返回），用户切换
+// network_key 之后这些陈旧行依然会显示，看起来像「换了密钥还能看到对方」。
+// 幂等，可在每次打开库时调用。
+func (d *DB) PruneTrustedNearby(ctx context.Context) (int64, error) {
+	res, err := d.db.ExecContext(ctx, `
+DELETE FROM nearby WHERE peer_id IN (
+	SELECT peer_id FROM peers WHERE trusted = 1)`)
+	if err != nil {
+		return 0, fmt.Errorf("peersdb: prune trusted nearby: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // =================================================================================

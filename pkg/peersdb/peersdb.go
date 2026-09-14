@@ -57,6 +57,11 @@ func Open(ctx context.Context, path string) (*DB, error) {
 		_ = sqldb.Close()
 		return nil, err
 	}
+	// 启动自愈：旧版本授予信任时不清理 nearby，导致「先被被动发现写进附近、
+	// 紧接着审批通过」的节点永久滞留在附近列表（且 nearby 不区分网络密钥，
+	// 换 network_key 后陈旧行照旧显示）。这里每次打开库做一次幂等清理，
+	// 无需追加迁移即可修好存量脏数据。尽力而为——清理失败不阻塞启动。
+	_, _ = d.PruneTrustedNearby(ctx)
 	return d, nil
 }
 

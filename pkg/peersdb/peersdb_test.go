@@ -331,6 +331,103 @@ func TestNearbyLifecycle(t *testing.T) {
 	}
 }
 
+// TestSetTrustedClearsNearby 「先被被动发现写进附近 → 紧接着审批通过」的节点
+// 必须从附近列表消失。历史缺陷：SetTrusted 只清了 pending_requests、没清
+// nearby，导致已加好友的节点长期滞留在附近，用户看到一堆其实已是好友的节点
+// （切换 network_key 后也不消失，因为 nearby 不区分网络密钥）。
+func TestSetTrustedClearsNearby(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	if err := d.UpsertNearby(ctx, Nearby{PeerID: "p1", Addrs: []string{"/ip4/7.7.7.7/tcp/4001"}, Source: "dht-private"}); err != nil {
+		t.Fatalf("upsert nearby: %v", err)
+	}
+	if list, _ := d.ListNearby(ctx); len(list) != 1 {
+		t.Fatalf("附近应含 p1，实际 %+v", list)
+	}
+	if err := d.SetTrusted(ctx, "p1", true); err != nil {
+		t.Fatalf("set trusted: %v", err)
+	}
+	if list, _ := d.ListNearby(ctx); len(list) != 0 {
+		t.Fatalf("审批通过后附近应被清空，实际 %+v", list)
+	}
+
+	// 撤销信任（删除好友）不反向清附近：删除后该节点本就应该回到附近
+	// 供重新申请连接（下一轮发现会重新写回）。
+	if err := d.UpsertNearby(ctx, Nearby{PeerID: "p2"}); err != nil {
+		t.Fatalf("upsert nearby p2: %v", err)
+	}
+	if err := d.SetTrusted(ctx, "p2", false); err != nil {
+		t.Fatalf("untrust p2: %v", err)
+	}
+	list, _ := d.ListNearby(ctx)
+	if len(list) != 1 || list[0].PeerID != "p2" {
+		t.Fatalf("撤销信任后 p2 应仍在附近，实际 %+v", list)
+	}
+}
+
+// TestUpsertNearbyHealsTrustedRace 竞态兜底：发现侧读到「未信任」后、INSERT
+// 落地前对方被审批通过时，这次写入不该留下记录。
+func TestUpsertNearbyHealsTrustedRace(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	if err := d.UpsertNearby(ctx, Nearby{PeerID: "r1", Source: "dht-private"}); err != nil {
+		t.Fatalf("upsert nearby: %v", err)
+	}
+	// 模拟审批先落地（此时附近里已有 r1）。
+	if err := d.SetTrusted(ctx, "r1", true); err != nil {
+		t.Fatalf("set trusted: %v", err)
+	}
+	// 发现侧的这次写入随后才执行 —— 必须顺手清掉而不是留下。
+	if err := d.UpsertNearby(ctx, Nearby{PeerID: "r1", Source: "dht-private"}); err != nil {
+		t.Fatalf("upsert nearby after trust: %v", err)
+	}
+	if list, _ := d.ListNearby(ctx); len(list) != 0 {
+		t.Fatalf("已信任节点的附近行不应复活，实际 %+v", list)
+	}
+}
+
+// TestOpenPrunesTrustedNearby 存量脏数据自愈：模拟旧版本留下的「已是好友却
+// 还在附近」的行，重新打开库（等价升级后首次启动）应被自动清掉。
+func TestOpenPrunesTrustedNearby(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "lanet.db")
+
+	d, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// 绕过新逻辑直接造脏数据：先写 nearby（此刻未信任），再把 peers 标成已信任。
+	if err := d.UpsertNearby(ctx, Nearby{PeerID: "ghost", Addrs: []string{"/ip4/8.8.8.8/tcp/4001"}, Source: "dht-private"}); err != nil {
+		t.Fatalf("upsert nearby: %v", err)
+	}
+	if _, err := d.db.ExecContext(ctx, `
+INSERT INTO peers (peer_id, trusted, approved, first_seen, last_seen) VALUES ('ghost', 1, 1, ?, ?)`,
+		time.Now(), time.Now()); err != nil {
+		t.Fatalf("seed trusted peer: %v", err)
+	}
+	if list, _ := d.ListNearby(ctx); len(list) != 1 {
+		t.Fatalf("构造脏数据失败：附近应含 ghost，实际 %+v", list)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	d2, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = d2.Close() }()
+	list, err := d2.ListNearby(ctx)
+	if err != nil {
+		t.Fatalf("list nearby: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("打开库应自愈清掉「已是好友」的附近行，实际 %+v", list)
+	}
+}
+
 // TestUnfriendedLifecycle 删除好友墓碑：记录、查询、清除。
 func TestUnfriendedLifecycle(t *testing.T) {
 	d := openTest(t)
