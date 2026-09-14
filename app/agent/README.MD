@@ -28,7 +28,7 @@ ID 互连 + 连接审批**模型：把对方节点 ID 填进控制台并点连�
 | `-config` | `LANET_CONFIG` | 配置路径；默认可执行文件同目录 `lanet.json` |
 | `-name` | `LANET_NAME` | 节点名称 |
 | `-key` | `LANET_NETWORK_KEY` | 网络密钥；留空 = 按本机身份派生的专属默认网络 |
-| `-bootstrap` | `LANET_BOOTSTRAP` | `public`、`none` 或逗号分隔的成员 multiaddr（连接种子） |
+| `-bootstrap` | `LANET_BOOTSTRAP` | `none`（默认，纯私有、不接触任何公共设施）、`public`（需同时开启公共 DHT，否则被忽略）或逗号分隔的成员 multiaddr（连接种子） |
 | `-listen` | `LANET_LISTEN` | 逗号分隔的 libp2p 监听地址 |
 | `-console` | `LANET_CONSOLE` | 控制台地址；默认 `127.0.0.1:8900`，`-` 为关闭 |
 | `-console-password` | `LANET_CONSOLE_PASSWORD` | 控制台密码 |
@@ -40,8 +40,6 @@ ID 互连 + 连接审批**模型：把对方节点 ID 填进控制台并点连�
 | `-public-dht-minutes` | `LANET_PUBLIC_DHT_MINUTES` | 公共 DHT 最长运行分钟数（默认 10；连上同网络成员或超时即自动退出） |
 | `-tun` | `LANET_TUN` | 虚拟网卡 TUN（`true`/`false`，默认 `true`）；容器/无权限环境自动降级 |
 | `-probe` | `LANET_PROBE` | 成员探测间隔（Go duration，如 `20s`/`1m`；默认 20s） |
-| `-tun true/false` | - | 是否启用 TUN；默认读取配置，缺省为 `true` |
-| `-probe` | - | 成员探测间隔 |
 
 优先级是“显式命令行 > 环境变量 > `lanet.json` > 内置默认值”。节点配置保存后
 重启生效，防火墙和端口转发在控制台中热更新。
@@ -68,7 +66,11 @@ ID 互连 + 连接审批**模型：把对方节点 ID 填进控制台并点连�
 ```
 
 Windows 的 `node.key` 与程序目录一起迁移；其他平台身份路径固定为
-`/data/node.key`。`lanet.db`（地址簿）、`state.json` 和 `lanet.log` 位于配置文件目录。
+`/data/node.key`。`lanet.db`（地址簿）、`state.json` 和 `lanet.log` 位于配置文件目录；
+`lanet.log` 单文件超 10MB 自动轮转，保留 `.1`–`.3`（0.5.38 起）。
+
+TUN 数据面具备读循环容错（0.5.37 起）：单包级瞬时读错误（如容器内 GSO 分段超限）
+只丢弃该包并继续转发，不会因一个坏包停掉整条数据面；设备被关闭才正常退出读循环。
 
 Windows 裸机版可在 Web 控制台“节点配置”开启“Windows 服务自启”。启用后注册
 LocalSystem 自动启动服务，机器启动后无需登录账号即可运行；服务模式不创建托盘、

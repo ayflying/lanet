@@ -18,7 +18,7 @@
 
 | 模式 | 适用场景 | 成员发现与地址分配 | 数据路径 |
 |---|---|---|---|
-| **Standalone（推荐）** | 官方 `lanet` 单程序、Go SDK 自组网 | mDNS + 私有 DHT，公共 DHT 可用于跨网冷启动；虚拟 IP 由网络身份与 PeerID 确定性派生 | 直连优先，网络内可达成员中继兜底 |
+| **Standalone（推荐）** | 官方 `lanet` 单程序、Go SDK 自组网 | mDNS + 私有 DHT（公共 DHT 默认关闭，仅显式开启时作限时跨网冷启动）；虚拟 IP 由网络身份与 PeerID 确定性派生 | 直连优先，网络内可达成员中继兜底 |
 | **托管模式** | 需要邀请码、群主权限、中心成员目录的 SDK/旧 agent 场景 | `ctl` 管理群组、邀请码、NetMap 和 `/24` 子网；独立 `relay` 提供兜底 | 直连优先，指定 relay 兜底 |
 
 官方桌面程序固定使用 Standalone 模式，不需要部署 `ctl` 或独立 `relay`。
@@ -56,11 +56,13 @@
 - **流量友好**：地址簿为空（首次启动）时只广播自身、不发起任何主动查找，
   不为「可能有谁在线」付查询流量。
 - **零中心组网**：相同网络密钥才能互相查找到地址；局域网走 mDNS，
-  跨网络走双 DHT。
+  跨网络走私有 DHT（公共 DHT 默认关闭，需显式开启）。
 - **直连优先**：TCP、QUIC、WebSocket、webrtc-direct、DCUtR 打洞与
   Circuit Relay v2 组合使用，链路自动降级。
 - **真实虚拟网卡**：Windows 使用 Wintun，Linux/macOS 使用系统 TUN；
   `10.7.0.0/16` 全网段均路由到虚拟网卡。
+- **数据面自愈**：TUN 读取遇到单包级瞬时错误（如容器内内核 GSO 分段超限）时
+  只丢弃该包、继续转发，不会因为一个坏包停掉整条虚拟网数据面（0.5.37 起）。
 - **稳定身份与地址**：`node.key` 固定 PeerID；虚拟 IP 随身份稳定，成员还可用
   `<节点名>.lanet`、短名或原始成员名连接。
 - **统一入向防火墙**：同一套规则覆盖 TUN TCP/UDP、PortFWD 与应用协议流。
@@ -121,7 +123,8 @@ TUN 虚拟 IP 可达，虚拟 IP 上的端口没有进程监听，群内成员�
 （ping 通但 TCP 连不上）；现在控制台添加转发 `7860 → 192.168.50.217:7860` 即可
 让 `http://<虚拟IP>:7860` 直接可用。转发映射热更新，监听随映射增删同步启停。
 
-命令行参数会覆盖 `lanet.json`：
+命令行参数会覆盖 `lanet.json`。`bootstrap` 默认 `none`（不接触任何公共设施）；
+跨网互通需显式填成员连接种子，或临时开启公共 DHT：
 
 ```powershell
 ./lanet.exe -name pc1 -key "our-network-key"
@@ -146,7 +149,8 @@ sudo ./lanet -name server-1 -key 'our-network-key'
 ```
 
 `lanet.json`、`state.json` 和 `lanet.log` 位于配置文件目录；Linux 身份文件默认是
-`/data/node.key`。长期运行建议使用 systemd，并持久化这些文件。
+`/data/node.key`。长期运行建议使用 systemd，并持久化这些文件。`lanet.log` 会按
+大小自动轮转（见下「稳定性与自愈」），容器/长期运行场景不必额外接 logrotate。
 
 ### 公网节点容器
 
@@ -207,7 +211,7 @@ go run ./app/agent/cmd/pvn-agent \
 - [`app/agent/README.MD`](./app/agent/README.MD)：官方节点、托管 agent 与联调工具
 - [`app/ctl/README.MD`](./app/ctl/README.MD)：控制面 API、持久化与运维命令
 - [`app/relay/README.MD`](./app/relay/README.MD)：独立 relay 的部署与通告
-- [`docs/virtual-network-connectivity-fix.md`](./docs/virtual-network-connectivity-fix.md)：虚拟局域网互通问题排障复盘、修复步骤与验证证据
+- [`docs/virtual-network-connectivity-fix.md`](./docs/virtual-network-connectivity-fix.md)：虚拟局域网互通问题排障复盘、修复步骤与验证证据（含容器端口转发与 TUN 读循环容错两轮后续修复）
 
 ## 配置与安全
 
@@ -219,7 +223,7 @@ go run ./app/agent/cmd/pvn-agent \
 | `node.key` | Ed25519 节点身份，决定 PeerID 和稳定虚拟 IP | 不应删除或在多个在线节点间共用 |
 | `lanet.db` | 本地地址簿：已知节点、可用地址、信任关系与待审批记录（SQLite/WAL） | 即时写入，可安全删除（只失去「记得对方」的能力） |
 | `state.json` | 防火墙规则与局域网端口转发映射 | 控制台保存后立即生效 |
-| `lanet.log` | 运行日志和链路探测结果 | 实时写入 |
+| `lanet.log` | 运行日志和链路探测结果 | 实时写入；单文件超 10MB 自动轮转，保留 `.1`–`.3`（最多约 40MB） |
 | `manifest.json` | 官方签名更新清单种子 | 随发行包提供 |
 
 Windows 上这些文件位于 `lanet.exe`/配置文件目录；`node.key` 也随整个目录迁移。
@@ -314,6 +318,9 @@ Windows 上这些文件位于 `lanet.exe`/配置文件目录；`node.key` 也随
 
 - **公共 DHT 默认关闭（0.5.16 起）**：`enable_public_dht=true` 或 `-public-dht`
   显式开启。关闭时跨网首次牵线需用方式 ②。
+- **引导默认纯私有（0.5.38 起）**：`bootstrap` 的默认值由 `public` 改为 `none`，
+  默认不接触任何公共设施；显式写 `public` 但未开启公共 DHT 时，该引导地址会被
+  忽略并打印一条提示，节点只走私有 DHT + mDNS。
 - **公共 DHT 临时引导（0.5.18 起）**：即使开启，公共 DHT 也是「限时介绍人」——
   连上第一个同网络成员立即自动退出；到时限（`-public-dht-minutes`，
   配置项 `public_dht_minutes`，默认 **10 分钟**）仍未连上也自动退出。
@@ -337,6 +344,19 @@ Windows 为每个已发现成员维护 `/32` on-link 路由及邻居项；Linux 
 
 ICMP 没有端口：`deny-all` 或没有匹配协议规则的 `allow-list` 会使 `ping` 被丢弃。
 远程开放控制台时，应同时设置密码并在主机防火墙限制来源。
+
+### 稳定性与自愈
+
+- **TUN 读循环容错（0.5.37 起）**：早先 `Router.Run` 把任何 TUN 读错误都当致命
+  错误 `return`，而 wireguard-go 的 `tun.ErrTooManySegments` 其实只是**单个包**
+  的问题（Linux 容器 MTU 1400 下，内核发出的 64KB GSO 包算出 47 段 > 上限 40，
+  会稳定复现）。一次触发就让该节点对所有群成员**永久不可达**，且特征极其误导：
+  **只杀数据面、不杀控制面**——控制台一直显示成员在线、直连、rtt 正常，但 `ping`
+  与所有 TCP 端口全超时。现改为容错读循环：单包级瞬时错误丢弃该包继续读取，
+  设备关闭才正常退出，其余错误退避重试且连续 100 次才判定设备失效。
+- **日志自动轮转（0.5.38 起）**：`lanet.log` 单文件超过 10MB 即轮转为 `lanet.log.1`、
+  `.2`、`.3`，最旧的一份删除（最多约 40MB）。为避免「一启动就写爆」，启动时若
+  历史日志已超限会先轮转一次——升级后首次启动即会把遗留的巨型日志挪走。
 
 ### P2P 自动更新
 
@@ -427,6 +447,7 @@ Lanet SDK 在成员表内解析，当前不会自动注册到 Windows/Linux 系�
 | 2026-09-04 | 2 台 Linux + 1 台 Windows | 托管模式建群/入组/NetMap、6 个方向直连、relay 兜底、权限边界、SQLite 重启恢复 |
 | 2026-09-05 | 不同物理网络的 Standalone 节点 | 公共 DHT 冷启动、私有 DHT 发现、DCUtR/QUIC 打洞，双向 direct RTT 7-13ms |
 | 2026-09-08 | Windows + Linux | TUN 双向回包、跨 `/24` 虚拟 IP、Windows 单播路由与邻居处理 |
+| 2026-09-14 | Windows + 公网 VPS（Linux 容器） | 修复 TUN 读循环遇错即退（0.5.37）；容器端口转发把虚拟网端口接到宿主服务；私有种子冷启动重连；日志自动轮转（0.5.38） |
 
 以上是对应日期的验证记录，不替代当前提交的自动化测试结果。
 
@@ -481,9 +502,10 @@ packaging/                  发行包说明、图标与 Windows 清单
 
 ## Roadmap
 
-- [x] Standalone 零中心组网、双 DHT、mDNS、打洞与成员中继
+- [x] Standalone 零中心组网、私有 DHT（公共 DHT 可显式开启）、mDNS、打洞与成员中继
 - [x] Windows/Linux TUN 虚拟 IP 双向通信与跨 `/24` 路由
 - [x] 稳定身份、`<节点名>.lanet`、控制台、防火墙与局域网端口转发
+- [x] TUN 数据面读循环容错（单包错误不拖垮数据面）与 `lanet.log` 自动轮转
 - [x] 签名 P2P 自动更新与多平台发行流水线
 - [x] Go、Web、C#、uniapp SDK 与 ws-gateway
 - [ ] 真实跨机吞吐与长时间稳定性基准

@@ -1,6 +1,6 @@
 # 虚拟局域网互通问题排障复盘
 
-本文记录 Lanet 虚拟局域网从“节点能发现、应用流能通，但系统层虚拟 IP 互相 ping 不通或偶发丢包”到 0.5.8 稳定验证通过的完整排障过程。重点覆盖 Windows Wintun、Linux TUN、libp2p 隧道、离线成员隔离和节点重启。
+本文记录 Lanet 虚拟局域网从“节点能发现、应用流能通，但系统层虚拟 IP 互相 ping 不通或偶发丢包”到 0.5.8 稳定验证通过的完整排障过程。重点覆盖 Windows Wintun、Linux TUN、libp2p 隧道、离线成员隔离和节点重启。第 7 章补充此后出现的两类新“虚拟 IP 不通”（容器命名空间与 TUN 读循环）。
 
 ## 1. 问题现象
 
@@ -163,9 +163,70 @@ go run ./app/agent/cmd/pvn-identity-check
 
 1. 两端 `/api/state` 是否看到相同网络、正确虚拟 IP 和 `online=true`；
 2. 日志确认直连或 relay 是否建立；
-3. Windows 检查 TUN `/32` 路由、永久邻居、MTU；Linux 检查 `ip addr` 和 `ip link` 是否为 `UP`；
-4. 检查目标 IP 是否在 `10.7.0.0/16`，以及 libp2p 通告地址中是否混入 overlay 地址；
-5. 用应用流 echo、TCP、UDP、ICMP 依次定位是隧道、传输层还是系统 TUN 层；
-6. 同时压测在线和离线目标，确认是否是单个慢拨号造成全局阻塞；
-7. 检查日志是否出现 `invalid offset`、邻居 `Unreachable`、递归拨号或重复页签相关信息；
-8. 最后检查代理、公共 DHT、relay 候选和外部网络策略。外网连接失败时使用本机代理 `HTTP_PROXY/HTTPS_PROXY=http://127.0.0.1:10808` 重试。
+3. **先分清控制面与数据面**：应用流 echo / probe 成功只证明 libp2p 隧道通，不代表系统层
+   数据面通。若控制台显示成员在线、直连、rtt 正常，但 `ping` 与所有端口全超时，
+   优先看日志有无 `[router] tun read error`——很可能读循环已退出（见 7.2）；
+4. Windows 检查 TUN `/32` 路由、永久邻居、MTU；Linux 检查 `ip addr` 和 `ip link` 是否为 `UP`；
+5. 检查目标 IP 是否在 `10.7.0.0/16`，以及 libp2p 通告地址中是否混入 overlay 地址；
+6. 用应用流 echo、TCP、UDP、ICMP 依次定位是隧道、传输层还是系统 TUN 层；
+7. `ping` 通虚拟 IP 但某个 TCP 端口 `ConnectionRefused`：说明落点命名空间内该端口无进程
+   监听（容器 bridge 模式下访问宿主服务即此情况），用端口转发解决（见 7.1）；
+8. 同时压测在线和离线目标，确认是否是单个慢拨号造成全局阻塞；
+9. 检查日志是否出现 `invalid offset`、邻居 `Unreachable`、递归拨号或重复页签相关信息；
+10. 最后检查代理、公共 DHT、relay 候选和外部网络策略。外网连接失败时使用本机代理 `HTTP_PROXY/HTTPS_PROXY=http://127.0.0.1:10808` 重试。
+
+## 7. 后续修复补充（0.5.13 / 0.5.37）
+
+前 6 章记录的是 0.5.8 一轮。此后又出现两类新的“虚拟 IP 不通”，根因与前面完全不同，单列于此。
+
+### 7.1 容器 bridge 模式下虚拟 IP 到不了宿主服务（端口转发）
+
+**现象**：公网 VPS 上用 docker **bridge** 模式跑 lanet 节点时，群内成员能 `ping` 通容器节点的虚拟 IP，但访问该虚拟 IP 上的某个 TCP 端口被内核直接拒绝（`ConnectionRefused`），而同一端口在宿主机公网上是通的。
+
+**根因**：bridge 模式下 TUN 与虚拟 IP 都在**容器私有网络命名空间**内。宿主机的 nginx、数据库等进程根本不在这个命名空间里，虚拟 IP 上的该端口没有进程监听，内核对无人监听的端口直接回 RST。这与防火墙无关，纯粹是命名空间归属问题。（对照：用 `--net host` 的同类工具把 TUN 建在宿主上，虚拟 IP 即宿主地址，因此能直连宿主端口。）
+
+**解法**：用节点自带的**端口转发**。`state.json` 的 `LANForward{Listen, Target}`（控制台「端口转发」页，或 `PUT /api/forwards`）会在 `:Listen` 上真实监听并代理到 `Target`。容器内访问宿主的地址就是容器所在 bridge 的默认网关（`ip route` 的默认网关，VPS 上为 `172.21.0.1`）。例：把宿主 8888 暴露给群内成员：
+
+```json
+{"forwards":[{"listen":8888,"target":"172.21.0.1:8888"}]}
+```
+
+转发映射持久化在 `state.json`，随数据卷保留、重建容器后自动恢复（日志 `端口转发监听已启动：:8888 → 172.21.0.1:8888`）。
+
+> 也可把容器改为 `network_mode: host`（仓库 compose 默认即 host），让宿主所有端口一次性可达；前提是宿主防火墙已放行对应端口。某 VPS 上实测 host 模式因宿主 INPUT 链白名单拦截 8900/4001 而导致节点哑掉，故该环境继续使用 bridge + 端口转发。
+
+### 7.2 TUN 读循环遇错即退，数据面永久停摆（0.5.37 修复）
+
+**现象**：控制台一切正常——成员在线、显示直连、rtt 约 42ms——但该节点对群内成员**全天不可达**：`ping` 与所有 TCP 端口全部超时。重启进程后短暂恢复，之后又复发。
+
+**根因**：`Router.Run` 把**任何** TUN 读错误都当致命错误 `return`，读循环一退，整条数据面就永久停摆。而 wireguard-go 的 `tun.ErrTooManySegments` 其实只是**单个包**的问题——Linux 容器 MTU 1400 时，内核发出的 64KB GSO 包会被算成 47 段，超过库上限 40，该错误因此稳定复现。日志特征：
+
+```text
+[router] tun read error: too many segments
+```
+
+之后不再有任何转发日志。它的迷惑性在于**只杀数据面、不杀控制面**：libp2p 应用层（probe、控制台状态）走的是另一条纯隧道，完全不经过内核 TUN，所以看起来一切正常。
+
+**判别方法**：`ping` 一个**在系统路由表内、但不是同群成员**的 `10.7.x.x` 地址——若日志出现 `not in group netmap`，说明 TUN 读循环仍在正常把包送到 router，问题在别处；若连这条日志都没有，则读循环很可能已退出。（注意不要用不在路由表里的地址测——那样的包直接走物理网卡，根本不进 TUN。）
+
+**修复**（`pkg/tundevice/router.go` + `pkg/tundevice/tun.go`）：
+
+- 单包级瞬时错误（`IsRecoverableReadError`，即 `tun.ErrTooManySegments`）丢弃该包、继续读取，**绝不终止读循环**；
+- 设备被关闭（`IsDeviceClosed`：`net.ErrClosed` / `os.ErrClosed` / `io.ErrClosedPipe`）才正常退出；
+- 其余错误退避重试，连续达到 `maxConsecutiveReadErrors`（100）次才判定设备失效并退出。
+
+回归测试 `pkg/tundevice/router_readerr_test.go` 覆盖「读循环挺过瞬时错误继续工作」与「设备关闭时正常退出」两条路径。
+
+### 7.3 验证证据（2026-09-14）
+
+Windows 节点 → 公网 VPS（Linux 容器，虚拟 IP `10.7.204.166`）：
+
+| 项目 | 结果 |
+|---|---|
+| `ping 10.7.204.166` | 4/4，丢包 0%，RTT 约 41ms |
+| 虚拟网 8888 TCP | 连接成功，约 42ms |
+| 虚拟网 8888 HTTP | `404`，`Server: nginx`（与公网 `43.136.124.167:8888` 返回一致，同一服务） |
+| 虚拟网 8900 控制台 | 可达 |
+| 容器内日志 | 无 `too many segments` / `tun read error`；转发监听已启动 |
+
+同轮还验证了两个配套改动：`bootstrap` 默认值由 `public` 改为 `none`（默认不接触公共 DHT，跨网需显式配私有种子），以及 `lanet.log` 按大小自动轮转（升级后首次启动即把遗留的 766MB 日志轮转为 `lanet.log.1`）。
