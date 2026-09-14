@@ -46,6 +46,11 @@ func (c *Client) openPeersDB(ctx context.Context) (*peersdb.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 自愈：清理指向本机自己的残留行（身份漂移的历史遗留，见 PruneSelf 注释）。
+	// c.peerID 在本函数调用前已就绪。失败不阻塞启动。
+	if n, err := db.PruneSelf(ctx, c.peerID); err == nil && n > 0 {
+		c.logf("地址簿自愈：清理了 %d 条指向本机自己的残留记录", n)
+	}
 	known, _ := db.ListPeers(ctx, false)
 	c.logf("地址簿已打开：%s（已知节点 %d 个）", db.Path(), len(known))
 	return db, nil
@@ -483,7 +488,16 @@ func (c *Client) PendingList() []peersdb.PendingRequest {
 		c.logf("读取待审批列表失败: %v", err)
 		return nil
 	}
-	return list
+	// 同 NearbyList：待审批同样是持久化观察表，身份漂移会留下指向自己的行。
+	// 展示给自己看既无意义，点「同意」还会把自己写进信任名单。
+	out := list[:0]
+	for _, p := range list {
+		if p.PeerID == c.peerID {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // ApprovePeer 同意某个节点的连接申请（首次审批，永久信任）。
@@ -590,6 +604,10 @@ func (c *Client) RemovePeer(peerID string) error {
 
 // NearbyList 附近节点：同网络密钥内可发现、但尚未成为好友的节点
 // （含被删除过的好友——可重新申请连接）。
+//
+// 过滤掉本机自己的 PeerID：nearby 是持久化观察表、不随身份变化刷新，历史
+// 身份漂移会在表里留下「现在等于自己」的行（PruneSelf 已做启动清理，这里
+// 再兜一层，保证任何时刻都不会把本机当成陌生节点展示给用户）。
 func (c *Client) NearbyList() []peersdb.Nearby {
 	if c.peers == nil {
 		return nil
@@ -601,7 +619,22 @@ func (c *Client) NearbyList() []peersdb.Nearby {
 		c.logf("读取附近列表失败: %v", err)
 		return nil
 	}
-	return list
+	return dropSelfNearby(list, c.peerID)
+}
+
+// dropSelfNearby 剔除附近列表里指向本机自己的条目（保留原顺序）。
+func dropSelfNearby(list []peersdb.Nearby, selfPeerID string) []peersdb.Nearby {
+	if selfPeerID == "" {
+		return list
+	}
+	out := list[:0]
+	for _, n := range list {
+		if n.PeerID == selfPeerID {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
 }
 
 // ReconnectPeer 向「附近」列表中的节点重新申请连接（好友被删除后的恢复

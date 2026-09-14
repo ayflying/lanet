@@ -68,6 +68,29 @@
   .msg { font-size:12px; margin-top:8px; min-height:18px; }
   .msg.ok { color:var(--ok); } .msg.bad { color:var(--bad); }
   .empty { color:var(--muted); font-size:13px; }
+  /* 附近 / 待审批：一行一个节点的卡片式列表。
+     ⚠️ 这组类必须有定义：早期版本只写 class="listitem" 却没给样式，
+     于是这些行是裸 div（连 align-items 都因为没有 flex 容器而失效），
+     长 PeerID 直接把行撑成两截，是「列表不好看」的根因。 */
+  .listitem { display:flex; align-items:center; gap:10px; padding:10px 12px;
+              border:1px solid var(--line); border-radius:8px; background:#fafbfc;
+              margin-bottom:8px; transition:background .15s, border-color .15s, box-shadow .15s; }
+  .listitem:last-child { margin-bottom:0; }
+  .listitem:hover { background:#f4f7fe; border-color:#cfdcf7; box-shadow:0 1px 4px rgba(47,111,237,.07); }
+  .listitem .li-main { flex:1; min-width:0; }
+  .listitem .li-avatar { width:30px; height:30px; border-radius:50%; flex-shrink:0; display:flex;
+                         align-items:center; justify-content:center; background:#e8eefc;
+                         color:var(--accent); font-size:13px; font-weight:600; user-select:none; }
+  .listitem .li-avatar.anon { background:#eef0f3; color:#9aa1ab; }
+  .listitem .li-name { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:13px; }
+  .listitem .li-name b { font-weight:600; }
+  .listitem .li-pid { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11.5px;
+                      color:var(--muted); cursor:pointer; border-bottom:1px dashed var(--line);
+                      white-space:nowrap; }
+  .listitem .li-pid:hover { color:var(--accent); border-bottom-color:var(--accent); }
+  .listitem .li-meta { font-size:11.5px; color:#8a94a6; margin-top:3px; }
+  .listitem .li-acts { display:flex; gap:6px; flex-shrink:0; }
+  .listitem .li-acts button { padding:5px 12px; font-size:12px; white-space:nowrap; }
   @media (max-width: 720px) {
     body { padding:12px; }
     h1 { font-size:16px; }
@@ -80,6 +103,10 @@
     .kv { flex-wrap:wrap; }
     .kv b { min-width:100%; }
     th,td { padding:5px 6px; }
+    /* 窄屏：操作按钮整行铺开，避免把设备名挤成两行 */
+    .listitem { flex-wrap:wrap; }
+    .listitem .li-acts { width:100%; }
+    .listitem .li-acts button { flex:1; }
   }
 </style>
 </head>
@@ -326,6 +353,16 @@
 let S = null;
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// shortPeerID 列表展示用的短节点 ID。完整 PeerID 长达 52 字符，直接铺在行里
+// 会把窄屏折成两截、也挤掉真正有信息量的名字与状态；列表里只保留「头 12 位 +
+// 尾 4 位」——前 8 位 12D3KooW 是所有节点共有的固定前缀，截得更短就没有区分度，
+// 唯一的随机部分在尾部所以必须带上。完整 ID 仍可通过 title / 点击复制拿到。
+const shortPeerID = id => (!id ? '' : (id.length > 20 ? id.slice(0, 12) + '…' + id.slice(-4) : id));
+// avatarOf 列表行首的圆形首字母标（有名字取首字符、英文转大写，无名用 ?）。
+// 未审批 / 未握手的节点拿不到名字，占位符保证行首不会塌成一截空白。
+const avatarOf = name => { const n = String(name || '').trim(); return n ? n.slice(0, 1).toUpperCase() : '?'; };
+// listAvatar 生成头像元素，anon 标记控制「未知设备」的灰底样式。
+const listAvatar = name => `<div class="li-avatar${String(name || '').trim() ? '' : ' anon'}">${esc(avatarOf(name))}</div>`;
 
 async function loadState() {
   const r = await fetch('/api/state');
@@ -416,8 +453,9 @@ function renderConnect() {
   card.style.display = '';
   // 连接码 = 节点 ID + 直拨地址合一串（lanet://ID@ip:port）；后端未返回时回退纯节点 ID。
   $('myNodeID').value = S.invite_code || (S.info && S.info.peer_id) || '';
-  // 待审批列表
-  const pending = S.pending || [];
+  // 待审批列表（过滤掉本机自己：身份文件换过之后，历史观察表里可能留下
+  // 指向当前身份的残留行，展示成「陌生节点申请连接」是纯误导）。
+  const pending = (S.pending || []).filter(p => p.peer_id && p.peer_id !== selfPeerID());
   const box = $('pendingBox');
   $('pendingBadge').textContent = pending.length;
   if (!pending.length) {
@@ -426,18 +464,26 @@ function renderConnect() {
   }
   box.style.display = '';
   $('pendingList').innerHTML = pending.map(p => {
-    const nm = p.name ? `<b>${esc(p.name)}</b> · ` : '';
-    const t = p.created_at ? new Date(p.created_at * 1000).toLocaleString() : '';
-    return `<div class="listitem" style="align-items:center">
-      <div style="min-width:0;flex:1">
-        <div style="font-size:12.5px;word-break:break-all">${nm}<code style="font-size:11.5px">${esc(p.peer_id)}</code></div>
-        <div class="sub" style="color:#8a94a6;font-size:11.5px">申请时间 ${esc(t)}</div>
+    const pid = esc(p.peer_id);
+    const nm = p.name ? `<b>${esc(p.name)}</b>` : '';
+    const t = p.created_at ? new Date(p.created_at * 1000).toLocaleString() : '—';
+    return `<div class="listitem">
+      ${listAvatar(p.name)}
+      <div class="li-main">
+        <div class="li-name">${nm}<span class="li-pid" title="点击复制完整节点 ID：${pid}"
+             onclick="copyText('${pid}', this)">${esc(shortPeerID(p.peer_id))}</span></div>
+        <div class="li-meta">申请时间 ${esc(t)}</div>
       </div>
-      <button style="margin-left:8px" onclick="resolvePending('${esc(p.peer_id)}', true)">同意</button>
-      <button class="ghost danger" style="margin-left:6px" onclick="resolvePending('${esc(p.peer_id)}', false)">拒绝</button>
+      <div class="li-acts">
+        <button onclick="resolvePending('${pid}', true)">同意</button>
+        <button class="ghost danger" onclick="resolvePending('${pid}', false)">拒绝</button>
+      </div>
     </div>`;
   }).join('');
 }
+
+// selfPeerID 本机节点 ID（列表渲染统一用它排除「自己」）。
+function selfPeerID() { return (S && S.info && S.info.peer_id) || ''; }
 
 // renderNearby 渲染「附近节点」卡片：同网络可发现但非好友的节点，
 // 每个提供「申请连接」按钮（复用统一连接入口，走双向审批）。
@@ -446,10 +492,19 @@ function renderNearby() {
   if (!S) { card.style.display = 'none'; return; }
   const standalone = (S.info && (S.info.group_id === 'standalone' || String(S.info.group || '').startsWith('standalone-')));
   if (!standalone) { card.style.display = 'none'; return; }
-  const list = S.nearby || [];
-  // 与好友去重：附近里不该出现已在成员表中的节点（防御旧数据）。
+  // 三重过滤：① 本机自己——nearby 是持久化观察表，身份漂移（node.key 换过）
+  // 会留下指向当前身份的行，点「申请连接」会被后端拒绝并报「这就是本机节点
+  // ID」，列表里根本就不该出现自己；② 已在成员表里的好友；③ 重复行防御。
+  const selfID = selfPeerID();
   const friendIDs = new Set((S.members || []).map(m => m.peer_id));
-  const rows = list.filter(n => !friendIDs.has(n.peer_id));
+  const seen = new Set();
+  const rows = (S.nearby || []).filter(n => {
+    if (!n.peer_id || n.peer_id === selfID) return false;
+    if (friendIDs.has(n.peer_id)) return false;
+    if (seen.has(n.peer_id)) return false;
+    seen.add(n.peer_id);
+    return true;
+  });
   $('nearbyBadge').textContent = rows.length;
   card.style.display = '';
   if (!rows.length) {
@@ -457,17 +512,22 @@ function renderNearby() {
     return;
   }
   $('nearbyList').innerHTML = rows.map(n => {
-    const nm = n.name ? `<b>${esc(n.name)}</b> · ` : '';
+    const pid = esc(n.peer_id);
+    const nm = n.name ? `<b>${esc(n.name)}</b>` : '';
     const t = n.last_seen ? relTime(n.last_seen) : '—';
-    const src = n.source === 'mdns' ? '局域网' : (n.source ? '网络发现' : '');
+    const src = n.source === 'mdns' ? '局域网发现' : (n.source === 'dht-private' ? '同密钥网络发现' : (n.source ? '网络发现' : ''));
     // 申请后进入的是「对方」的待审批列表（本机看不到对方审批状态），
     // 故这里始终提供按钮，重复点击幂等（后端去重，不会刷屏）。
-    return `<div class="listitem" style="align-items:center">
-      <div style="min-width:0;flex:1">
-        <div style="font-size:12.5px;word-break:break-all">${nm}<code style="font-size:11.5px">${esc(n.peer_id)}</code></div>
-        <div class="sub" style="color:#8a94a6;font-size:11.5px">${esc(src)} · 最近发现 ${esc(t)}</div>
+    return `<div class="listitem">
+      ${listAvatar(n.name)}
+      <div class="li-main">
+        <div class="li-name">${nm}<span class="li-pid" title="点击复制完整节点 ID：${pid}"
+             onclick="copyText('${pid}', this)">${esc(shortPeerID(n.peer_id))}</span></div>
+        <div class="li-meta">${esc(src)} · 最近发现 ${esc(t)}</div>
       </div>
-      <button class="ghost" style="margin-left:8px" onclick="reconnectNearby('${esc(n.peer_id)}', this)">申请连接</button>
+      <div class="li-acts">
+        <button class="ghost" onclick="reconnectNearby('${pid}', this)">申请连接</button>
+      </div>
     </div>`;
   }).join('');
 }

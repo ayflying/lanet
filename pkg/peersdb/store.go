@@ -324,6 +324,40 @@ DELETE FROM nearby WHERE peer_id IN (
 	return n, nil
 }
 
+// PruneSelf 清理地址簿里「指向本机自己」的残留行，返回删除条数。
+//
+// 为什么会出现指向自己的行：nearby / pending_requests 是**持久化观察表**，
+// 与「当前身份」没有任何绑定关系。当 node.key 发生变化时（历史版本在
+// Windows 服务模式下把身份文件路径解析到了 CWD，于是 SCM 在 System32 里
+// 建了一个全新身份，PeerID 与虚拟 IP 双双漂移），身份 A 运行期间会把身份 B
+// 写进同一张表；身份切回 B 之后，那几行就变成了「自己」。控制台据此把它当成
+// 陌生节点展示，用户点「申请连接」又会被自我保护拦下，报一句看不懂的
+// 「这就是本机节点 ID，无需连接」。
+//
+// 与 PruneTrustedNearby 同理：每次打开库做一次幂等清理，无需追加迁移即可
+// 修好存量脏数据。peer_addrs 由 peers 的外键 ON DELETE CASCADE 级联清理；
+// unfriended（墓碑）指向自己同样有害——本机会拒绝自己的握手。
+func (d *DB) PruneSelf(ctx context.Context, selfPeerID string) (int64, error) {
+	if selfPeerID == "" {
+		return 0, nil
+	}
+	var total int64
+	for _, q := range []string{
+		`DELETE FROM nearby WHERE peer_id = ?`,
+		`DELETE FROM pending_requests WHERE peer_id = ?`,
+		`DELETE FROM unfriended WHERE peer_id = ?`,
+		`DELETE FROM peers WHERE peer_id = ?`,
+	} {
+		res, err := d.db.ExecContext(ctx, q, selfPeerID)
+		if err != nil {
+			return total, fmt.Errorf("peersdb: prune self: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	return total, nil
+}
+
 // =================================================================================
 // 删除好友墓碑（unfriended）
 // =================================================================================

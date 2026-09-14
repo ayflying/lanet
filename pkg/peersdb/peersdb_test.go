@@ -428,6 +428,85 @@ INSERT INTO peers (peer_id, trusted, approved, first_seen, last_seen) VALUES ('g
 	}
 }
 
+// TestPruneSelf 地址簿里指向「本机自己」的残留行必须被清理。
+//
+// 场景来源：身份文件路径曾解析到进程 CWD（Windows 服务模式下 SCM 把工作目录
+// 设为 System32，节点在那里建了一个全新身份），PeerID 与虚拟 IP 双双漂移；
+// 漂移前后两个身份共用同一个 lanet.db，于是 nearby / pending_requests /
+// unfriended 里留下了「现在等于自己」的行。控制台据此把它当陌生节点展示，
+// 用户点「申请连接」又被自我保护拦下，报一句看不懂的「这就是本机节点 ID」。
+func TestPruneSelf(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	const self = "12D3KooWSELFTEST00000000000000000000000000000"
+	const other = "12D3KooWOTHERTEST0000000000000000000000000"
+
+	// 造脏数据：自己与正常节点各一条，覆盖四张表。
+	if err := d.UpsertNearby(ctx, Nearby{PeerID: self, Addrs: []string{"/ip4/1.1.1.1/tcp/4001"}, Source: "dht-private"}); err != nil {
+		t.Fatalf("upsert nearby self: %v", err)
+	}
+	if err := d.AddPending(ctx, PendingRequest{PeerID: self, Name: "漂移前的本机身份", Reason: "DHT 发现"}); err != nil {
+		t.Fatalf("add pending self: %v", err)
+	}
+	if err := d.AddUnfriended(ctx, self, ""); err != nil {
+		t.Fatalf("add unfriended self: %v", err)
+	}
+	if err := d.UpsertNearby(ctx, Nearby{PeerID: other, Source: "mdns"}); err != nil {
+		t.Fatalf("upsert nearby other: %v", err)
+	}
+	if err := d.AddPending(ctx, PendingRequest{PeerID: other}); err != nil {
+		t.Fatalf("add pending other: %v", err)
+	}
+	// peers / peer_addrs 直接写库：SetTrusted 会顺手清 nearby，会把要验证的
+	// 脏数据擦掉，构造不出「自己残留在附近」的现场。
+	if _, err := d.db.ExecContext(ctx, `
+INSERT INTO peers (peer_id, trusted, approved, first_seen, last_seen) VALUES (?, 1, 1, ?, ?)`,
+		self, time.Now(), time.Now()); err != nil {
+		t.Fatalf("seed self peer: %v", err)
+	}
+	if _, err := d.db.ExecContext(ctx, `INSERT INTO peer_addrs (peer_id, addr) VALUES (?, ?)`,
+		self, "/ip4/2.2.2.2/tcp/4001"); err != nil {
+		t.Fatalf("seed self peer_addr: %v", err)
+	}
+
+	n, err := d.PruneSelf(ctx, self)
+	if err != nil {
+		t.Fatalf("prune self: %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("应清掉 nearby/pending_requests/unfriended/peers 各一行，实际 %d", n)
+	}
+
+	// 自己：四张表全无痕迹。
+	if list, _ := d.ListNearby(ctx); len(list) != 1 || list[0].PeerID != other {
+		t.Fatalf("附近应只剩 other，实际 %+v", list)
+	}
+	if list, _ := d.ListPending(ctx); len(list) != 1 || list[0].PeerID != other {
+		t.Fatalf("待审批应只剩 other，实际 %+v", list)
+	}
+	if ok, _ := d.IsUnfriended(ctx, self); ok {
+		t.Fatal("指向自己的墓碑应被清除（否则本机会拒绝自己的握手）")
+	}
+	if p, _ := d.GetPeer(ctx, self); p != nil {
+		t.Fatalf("指向自己的地址簿条目应被删除，实际 %+v", p)
+	}
+	if addrs, _ := d.Addrs(ctx, self); len(addrs) != 0 {
+		t.Fatalf("peer_addrs 应随 peers 级联删除，实际 %+v", addrs)
+	}
+	// 正常节点不受影响。
+	if list, _ := d.ListPending(ctx); len(list) != 1 {
+		t.Fatalf("正常节点的待审批不应被误删，实际 %+v", list)
+	}
+
+	// 空自身 ID 必须是 no-op——否则一次误传空串会清空整个地址簿。
+	if n, err := d.PruneSelf(ctx, ""); err != nil || n != 0 {
+		t.Fatalf("空自身 ID 应为 no-op，实际 n=%d err=%v", n, err)
+	}
+	if list, _ := d.ListNearby(ctx); len(list) != 1 {
+		t.Fatalf("no-op 调用不应删任何行，实际 %+v", list)
+	}
+}
+
 // TestUnfriendedLifecycle 删除好友墓碑：记录、查询、清除。
 func TestUnfriendedLifecycle(t *testing.T) {
 	d := openTest(t)
