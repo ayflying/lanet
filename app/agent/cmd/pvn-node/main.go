@@ -87,7 +87,8 @@ func runNode(parent context.Context, serviceMode bool) {
 			"网络密钥：留空 = 按本机身份派生的专属默认网络（开箱即用但默认不与他人同网）；"+
 				"填相同值才能与对方互通；不传则读配置文件")
 		bootstrap = flag.String("bootstrap", envOr("LANET_BOOTSTRAP", ""),
-			"引导节点：public = 公共 DHT / none = 仅 mDNS / 成员 multiaddr；不传则读配置文件")
+			"引导节点：none（默认，仅私有 DHT + mDNS，不接触公共设施）/ 成员 multiaddr（私有种子）/ "+
+				"public（公共引导，须同时开启公共 DHT 才生效）；不传则读配置文件")
 		console = flag.String("console", envOr("LANET_CONSOLE", ""),
 			"控制台监听地址；不传则读配置文件（默认 127.0.0.1:8900 仅本机，0.0.0.0:8900 = 允许远程）")
 		consolePW = flag.String("console-password", envOr("LANET_CONSOLE_PASSWORD", ""),
@@ -137,8 +138,9 @@ func runNode(parent context.Context, serviceMode bool) {
 	// ---- 日志：stderr + exe 同目录 lanet.log 双写（windowsgui 无黑框时靠文件看日志）----
 	// 注意：不能用 io.MultiWriter(os.Stderr, lf)——windowsgui 下 stderr 是无效句柄，
 	// 写入报错后 MultiWriter 提前返回，文件永远写不进。这里逐个写、忽略单点错误。
-	if lf, err := os.OpenFile(filepath.Join(filepath.Dir(*config), "lanet.log"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+	// 日志文件按大小轮转（10MB × 保留 3 份），避免长期运行无限增长。
+	if lf, err := newRotatingFile(filepath.Join(filepath.Dir(*config), "lanet.log"),
+		logMaxSize, logMaxBackups); err == nil {
 		log.SetOutput(tolerantWriter{[]io.Writer{os.Stderr, lf}})
 	}
 
@@ -164,7 +166,12 @@ func runNode(parent context.Context, serviceMode bool) {
 		}
 	}
 	effKey, effLegacyKey := resolveNetworkKey(*key, nc.NetworkKey)
-	effBootstrap := firstNonEmpty(*bootstrap, nc.Bootstrap, "public")
+	// 引导默认「none」：不接触任何公共设施（公共 DHT 默认关闭，跨网冷启动
+	// 靠成员引导种子 / 控制台「连接种子」）。要临时用公共 DHT 兜底，需同时
+	// 显式 bootstrap=public 且开启公共 DHT —— 二者缺一，公共引导都会被忽略。
+	// 历史行为默认 "public"：公共 DHT 关闭时该地址本就会被剔除（等价 none），
+	// 但字面值会误导用户以为「默认挂了公共网络」，故改为显式 none。
+	effBootstrap := firstNonEmpty(*bootstrap, nc.Bootstrap, "none")
 	// 身份文件路径固定：exe 同目录 node.key（Windows）/ /data/node.key（其他平台），
 	// 不读配置、不暴露到控制台；文件不存在即新用户，SDK 自动创建新身份。
 	effIdentity := defaultIdentityPath(exeDir)
@@ -241,7 +248,12 @@ func runNode(parent context.Context, serviceMode bool) {
 	case "", "none":
 		// 无引导节点（默认）：私有 DHT + mDNS 发现，不接触任何公共设施。
 	case "public":
+		// 显式选择公共引导：仅当公共 DHT 开启时才真正参与连接
+		// （关闭公共 DHT 时该地址会在 serverless 初始化被剔除）。
 		nc.bootstrapAddrs = []string{serverless.DefaultBootstrap}
+		if !effPublic {
+			log.Printf("[node] bootstrap=public 但公共 DHT 未开启：公共引导地址将被忽略，节点只走私有 DHT + mDNS")
+		}
 	default:
 		for _, a := range strings.Split(effBootstrap, ",") {
 			if a = strings.TrimSpace(a); a != "" {
