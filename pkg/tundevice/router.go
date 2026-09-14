@@ -26,6 +26,9 @@ const (
 	outboundQueueSize  = 256
 	maxOutboundWorkers = 1024
 	outboundWorkerIdle = time.Minute
+	// maxConsecutiveReadErrors 连续「非瞬时」读错误上限：达到即判定设备
+	// 已失效并退出读循环。单包级瞬时错误（IsRecoverableReadError）不计入。
+	maxConsecutiveReadErrors = 100
 )
 
 // packetWriteOffset 返回向 TUN 写包时数据在缓冲区中的起始偏移。
@@ -112,6 +115,10 @@ func (r *Router) Run(ctx context.Context) {
 	defer cancelWorkers()
 	bufs := [][]byte{make([]byte, maxPacketSize)}
 	sizes := make([]int, 1)
+	// consecutiveErrs / transientErrs 区分「偶发单包错误」与「设备失效」，
+	// 避免任何一次读取失败都终止整个数据面（见下方错误分支注释）。
+	consecutiveErrs := 0
+	transientErrs := 0
 	for {
 		if ctx.Err() != nil {
 			return
@@ -123,9 +130,36 @@ func (r *Router) Run(ctx context.Context) {
 				return
 			default:
 			}
-			log.Printf("[router] tun read error: %v", err)
-			return
+			// 设备已被显式关闭：正常退出。
+			if IsDeviceClosed(err) {
+				log.Printf("[router] TUN 已关闭，读循环退出: %v", err)
+				return
+			}
+			// 单包级瞬时错误（如 wireguard tun 的 ErrTooManySegments）：
+			// 只丢弃这一个包，必须继续读。老实现此处直接 return，会让
+			// 虚拟网数据面永久停摆，而控制面（libp2p/probe/控制台状态）
+			// 完全正常——对外表现为「控制台显示成员在线、直连、rtt 正常，
+			// 但 ping 与所有 TCP 端口全部超时」。Read 自身阻塞，且每个
+			// 错误都对应一个真实到达的包，因此这里不存在空转风险。
+			// 该错误可能频繁出现，只按次汇总打印，避免刷爆日志。
+			if IsRecoverableReadError(err) {
+				transientErrs++
+				if transientErrs == 1 || transientErrs%1000 == 0 {
+					log.Printf("[router] tun 读取跳过瞬时错误 %d 次（读循环继续）: %v", transientErrs, err)
+				}
+				continue
+			}
+			// 其余错误：退避重试，连续超限才判定设备失效。
+			consecutiveErrs++
+			if consecutiveErrs >= maxConsecutiveReadErrors {
+				log.Printf("[router] TUN 连续读取失败 %d 次，退出读循环: %v", consecutiveErrs, err)
+				return
+			}
+			log.Printf("[router] tun read error (%d/%d，重试): %v", consecutiveErrs, maxConsecutiveReadErrors, err)
+			time.Sleep(time.Duration(consecutiveErrs) * 20 * time.Millisecond)
+			continue
 		}
+		consecutiveErrs = 0
 		if n == 0 || sizes[0] == 0 {
 			continue
 		}

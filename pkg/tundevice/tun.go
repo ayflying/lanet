@@ -2,8 +2,11 @@
 package tundevice
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"net"
+	"os"
 
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -101,4 +104,27 @@ func (m *memoryDevice) Close() error {
 		close(m.closed)
 	}
 	return nil
+}
+
+// IsRecoverableReadError 判断 TUN 读取错误是否为「单包级、可忽略」的瞬时错误。
+//
+// 回归背景（2026-09-14 生产实测）：wireguard-go 的 tun 在解析 virtio 头 /
+// GSO 分段时，若单个包的分段数超过其内部上限（MaxSegments=40），会返回
+// ErrTooManySegments。这是**某一个包**的问题，下一个包完全可能正常；
+// 但 router.Run 的老实现把它当成致命错误直接 return，于是整个 TUN 读循环
+// 永久退出——虚拟网数据面彻底停摆，而控制面（libp2p / probe / 控制台状态）
+// 完全正常，对外表现为「控制台显示成员在线、直连、rtt 42ms，但 ping 与所有
+// TCP 端口全部超时」。Container 里 MTU 1400 时，内核发出的 64KB GSO 包
+// 会算出 47 段 > 40，因此该错误会稳定复现。
+//
+// 判定为可恢复时，调用方应丢弃该包并继续读取，绝不能终止读循环。
+func IsRecoverableReadError(err error) bool {
+	return errors.Is(err, tun.ErrTooManySegments)
+}
+
+// IsDeviceClosed 判断读错误是否表示设备已被关闭（此时应正常退出读循环）。
+func IsDeviceClosed(err error) bool {
+	return errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrClosed) ||
+		errors.Is(err, io.ErrClosedPipe)
 }
