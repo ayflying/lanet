@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -142,6 +143,23 @@ func runNode(parent context.Context, serviceMode bool) {
 	if lf, err := newRotatingFile(filepath.Join(filepath.Dir(*config), "lanet.log"),
 		logMaxSize, logMaxBackups); err == nil {
 		log.SetOutput(tolerantWriter{[]io.Writer{os.Stderr, lf}})
+	}
+
+	// ---- 单实例：同一配置目录只允许一个节点进程（见 singleton.go）----
+	// 必须放在开库、建 TUN、抢控制台端口之前：双开的两个进程会共用同一份
+	// node.key / lanet.db / state.json / TUN 网卡，并在 8900 被占时静默回退到
+	// 8901，表现为「控制台上凭空多出一个端口」而毫无报错。
+	instLock, holder, lockErr := acquireSingleton(*config)
+	switch {
+	case lockErr == nil:
+		defer instLock.release()
+	case errors.Is(lockErr, errSingletonBusy):
+		refuseSecondInstance(holder, serviceMode)
+		return
+	default:
+		// 锁文件不可用（目录只读等）只降级警告，不阻断启动：单实例是保护性
+		// 措施，不该因为权限/文件系统异常把节点彻底挡死。
+		log.Printf("[node] 单实例锁不可用（继续启动，存在双开风险）: %v", lockErr)
 	}
 
 	// ---- 配置文件：不存在则生成默认模板（双击启动的场景），存在则加载 ----
@@ -319,6 +337,9 @@ func runNode(parent context.Context, serviceMode bool) {
 	info := node.Info()
 	log.Printf("[node] 已入网 name=%s peerID=%s virtualIP=%s network=%s",
 		effName, info.PeerID, info.VirtualIP, networkLabel(effKey))
+	// 控制台端口可能向后回退，把**实际**地址补写进锁文件：后面被拒绝启动的
+	// 实例靠它把用户直接送到正在跑的那份控制台上。
+	instLock.refresh(effName, node.ConsoleURL())
 
 	// ---- .lanet DNS 的系统路由（Windows NRPT 规则）----
 	// 节点以管理员运行，把 *.lanet 查询定向到内置 DNS（127.0.0.1:53）。

@@ -613,6 +613,11 @@ func restartSelf(delay time.Duration) {
 		}
 		exe := selfExe()
 		log.Printf("[node] 重启程序: %s %v", exe, os.Args[1:])
+		// 必须先放单实例锁再拉起新进程：spawnSelf 是 Start 后立刻返回、本进程
+		// 紧接着 os.Exit，新进程起来时旧进程往往还活着几十毫秒，不提前释放会
+		// 让新进程把自己判成「双开」而拒绝启动——重启直接变成彻底停服。
+		// （服务模式走 SCM stop/start，SCM 会等本进程完全退出，无需手动放锁。）
+		activeSingleton.release()
 		if err := spawnSelf(); err != nil {
 			log.Printf("[node] 重启失败: %v", err)
 			os.Exit(1)
