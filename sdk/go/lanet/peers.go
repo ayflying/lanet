@@ -602,6 +602,21 @@ func (c *Client) RemovePeer(peerID string) error {
 	return nil
 }
 
+// DHTRoutingPeers 私有 DHT 路由表里的其他节点 ID（不含本机，可能为空）。
+//
+// 私有 DHT 前缀自 0.5.48 起全网共享，所以这张路由表覆盖整个 lanet 私有 DHT
+// 网络——不同网络密钥、未加好友、也未与本机建连的节点都在其中。
+//
+// P2P 自更新用它做候选来源（「只要在 DHT 网络里发现有新版本就更新」）：被动
+// 发现到的节点既不建连也不进成员表，只看成员表永远覆盖不到它们。纯本地内存
+// 读取，零网络开销。
+func (c *Client) DHTRoutingPeers() []string {
+	if c.disc == nil {
+		return nil
+	}
+	return c.disc.DHTRoutingPeers()
+}
+
 // NearbyList 附近节点：同网络密钥内可发现、但尚未成为好友的节点
 // （含被删除过的好友——可重新申请连接）。
 //

@@ -1,6 +1,15 @@
 package selfupdate
 
-// 私有协议加固（0.5.34）测试：更新协议 ID 按群派生 + 固定 ID 成员门。
+// 更新协议可达性与分发限流测试。
+//
+// 语义沿革：
+//   - 0.5.34~0.5.48：出向默认按群密钥派生协议 ID + 固定 ID 挂「同群好友」成员门，
+//     异群节点与公网扫描器拉不走任何字节。
+//   - 0.5.49 起：用户要求「P2P 更新不一定需要在自己的网络密钥下面，是整个 DHT
+//     网络，发现新版本就更新」，因此固定 ID 对全网 lanet 节点开放，防滥用手段
+//     从「身份门（是否好友）」换成「流量门（限流）」。
+//
+// 本文件两侧都守：异群节点能拿到清单（全域互传），但拿不到无限次（限流）。
 
 import (
 	"context"
@@ -16,11 +25,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // makeProvider 构造一个持有有效分发 head 的协调器（签名 + exe sha256 一致）。
-func makeProvider(t *testing.T, dir string, gk []byte, isMember func(string) bool) (*Coordinator, string, string) {
+// perPeer 为 0 时使用默认限流间隔。
+func makeProvider(t *testing.T, dir string, gk []byte, perPeer time.Duration) (*Coordinator, string, string) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -49,7 +60,7 @@ func makeProvider(t *testing.T, dir string, gk []byte, isMember func(string) boo
 	c := New(hp, staticPeers{}, Config{
 		CurrentVersion: "9.9.9", Platform: "windows/amd64", ExePath: srcExe,
 		ManifestPath: mp, PublicKey: pubB64, CheckInterval: time.Hour, Quiet: true,
-		GroupKey: gk, IsMember: isMember,
+		GroupKey: gk, PerPeerMinInterval: perPeer,
 	}, nil)
 	if _, ok := c.SelfManifest(); !ok {
 		t.Fatal("提供方 head 加载失败")
@@ -68,12 +79,35 @@ func newRequester(t *testing.T, dir string, gk []byte, pubB64 string) *Coordinat
 	}, nil)
 }
 
-// TestUpdateProtoDerivedSameGroup 同群（相同群密钥）两节点：派生协议 ID
-// 一致，manifest 征询 + 文件下载全流程正常。
+// fixedIDManifest 走全域固定 ID 通道征询一次清单（模拟老版本客户端 / 异群节点）。
+// 被限流 Reset 或对端静默关闭时返回 error。
+func fixedIDManifest(ctx context.Context, h host.Host, target peer.ID) (Manifest, error) {
+	s, err := h.NewStream(ctx, target, ProtocolManifest)
+	if err != nil {
+		return Manifest{}, err
+	}
+	defer s.Close()
+	if _, err = s.Write([]byte(`{"current":"0.1.0"}`)); err != nil {
+		_ = s.Reset()
+		return Manifest{}, err
+	}
+	if err = s.CloseWrite(); err != nil {
+		return Manifest{}, err
+	}
+	s.SetDeadline(time.Now().Add(4 * time.Second))
+	var m Manifest
+	if err = json.NewDecoder(s).Decode(&m); err != nil {
+		return Manifest{}, err
+	}
+	return m, nil
+}
+
+// TestUpdateProtoDerivedSameGroup 同群（相同群密钥）两节点：走派生协议 ID
+// 的 manifest 征询 + 文件下载全流程正常（同群快路径，少一跳）。
 func TestUpdateProtoDerivedSameGroup(t *testing.T) {
 	dir := t.TempDir()
 	gk := []byte("0123456789abcdef0123456789abcdef")
-	cProvider, shaHex, pubB64 := makeProvider(t, dir, gk, nil)
+	cProvider, shaHex, pubB64 := makeProvider(t, dir, gk, 0)
 	cReq := newRequester(t, dir, gk, pubB64)
 
 	if cReq.protoManifest == ProtocolManifest || !strings.HasPrefix(string(cReq.protoManifest), "/lanet/") {
@@ -107,80 +141,131 @@ func TestUpdateProtoDerivedSameGroup(t *testing.T) {
 	}
 }
 
-// TestUpdateProtoCrossGroupRejected 异群节点（不同群密钥）：派生 ID 不同，
-// 直接拨更新协议必须协商失败——公网扫描器与陌生网络拉不走任何字节。
-// 同时验证派生模式下的固定 ID 兼容入口有成员门：异群对端 IsMember
-// 判定不通过（对方不是本机好友），固定通道同样被重置。
-func TestUpdateProtoCrossGroupRejected(t *testing.T) {
+// TestUpdateFixedIDCrossGroupAllowed 异群节点（不同网络密钥、素未加好友）：
+// 派生 ID 仍协商不上（同群快路径保持私有），但**全域固定 ID 通道必须放行**——
+// 这正是用户要的「整个 DHT 网络里发现新版本就互传」。它可以拿到清单，
+// 拿不到清单才叫升级链断裂（升级后跨网络密钥的节点再也拉不到包）。
+func TestUpdateFixedIDCrossGroupAllowed(t *testing.T) {
 	dir := t.TempDir()
 	gkA := []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	gkB := []byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-	// provider 的信任名单里没有任何人。
-	cProvider, _, pubB64 := makeProvider(t, dir, gkA, func(string) bool { return false })
+	cProvider, shaHex, pubB64 := makeProvider(t, dir, gkA, 0)
 	cStranger := newRequester(t, dir, gkB, pubB64)
 
 	if cStranger.protoManifest == cProvider.protoManifest {
 		t.Fatal("异群派生 ID 不应相同")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := cStranger.host.Connect(ctx, peer.AddrInfo{ID: cProvider.host.ID(), Addrs: cProvider.host.Addrs()}); err != nil {
 		t.Fatal(err)
 	}
-	// 派生 ID 通道：协商不上。
-	if _, err := cStranger.requestManifest(ctx, cProvider.host.ID().String()); err == nil {
-		t.Fatal("异群派生协议征询不应成功")
-	}
-	// 固定 ID 兼容通道：协商得上，但成员门必须掐流（读不到清单）。
-	s, err := cStranger.host.NewStream(ctx, cProvider.host.ID(), ProtocolManifest)
-	if err != nil {
-		t.Fatalf("固定 ID 协商失败（兼容入口应存在）: %v", err)
-	}
-	defer s.Close()
-	if _, werr := s.Write([]byte(`{"current":"0.1.0"}`)); werr != nil {
+	// 派生 ID 通道：异群直接协商不上（同群隐私快路径保持不变）。
+	if s, err := cStranger.host.NewStream(ctx, cProvider.host.ID(), cStranger.protoManifest); err == nil {
 		_ = s.Reset()
-		return // 已被门禁 Reset：符合预期
+		t.Fatal("异群直接协商派生协议 ID 不应成功")
 	}
-	_ = s.CloseWrite()
-	s.SetDeadline(time.Now().Add(3 * time.Second))
-	var m Manifest
-	if derr := json.NewDecoder(s).Decode(&m); derr == nil && m.SHA256 != "" {
-		t.Fatal("非成员不应从固定 ID 通道拿到清单")
+	if cStranger.protoManifestAlt != ProtocolManifest {
+		t.Fatalf("出向应保留全域固定 ID 兜底: %s", cStranger.protoManifestAlt)
+	}
+	// 全域固定 ID 通道：必须能拿到清单（只此一次请求——限流下同一对端的
+	// manifest 名额一轮只有一个）。
+	m, err := fixedIDManifest(ctx, cStranger.host, cProvider.host.ID())
+	if err != nil {
+		t.Fatalf("全域固定 ID 通道应放行异群节点: %v", err)
+	}
+	if m.SHA256 != shaHex || m.Version != "9.9.9" {
+		t.Fatalf("异群节点拿到的清单不符: %+v", m)
 	}
 }
 
-// TestUpdateLegacyGateAllowsFriend 混版本过渡的正向断言：固定 ID 兼容
-// 通道对「已确认好友」放行——老版本好友能正常征询到清单并升级（升级链
-// 不断）；非好友（见上例）则被挡。
-func TestUpdateLegacyGateAllowsFriend(t *testing.T) {
+// TestUpdateFixedIDRateLimited 全域通道的防滥用：同一对端在 PerPeerMinInterval
+// 内只能征询一次（第一次放行、紧接着第二次被重置），超过间隔后恢复放行
+// ——限流是节流，不是封禁。
+func TestUpdateFixedIDRateLimited(t *testing.T) {
 	dir := t.TempDir()
 	gk := []byte("cccccccccccccccccccccccccccccccc")
-	hr := newTestHost(t)
-	cProvider, shaHex, _ := makeProvider(t, dir, gk, func(id string) bool { return id == hr.ID().String() })
+	cProvider, shaHex, pubB64 := makeProvider(t, dir, gk, 2*time.Second)
+	cReq := newRequester(t, dir, []byte("dddddddddddddddddddddddddddddddd"), pubB64)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if err := hr.Connect(ctx, peer.AddrInfo{ID: cProvider.host.ID(), Addrs: cProvider.host.Addrs()}); err != nil {
+	if err := cReq.host.Connect(ctx, peer.AddrInfo{ID: cProvider.host.ID(), Addrs: cProvider.host.Addrs()}); err != nil {
 		t.Fatal(err)
 	}
-	// hr 在门名单里：走固定 ID 通道（模拟老版本客户端）应拿到清单。
-	s, err := hr.NewStream(ctx, cProvider.host.ID(), ProtocolManifest)
+	// 第一次：放行。
+	first, err := fixedIDManifest(ctx, cReq.host, cProvider.host.ID())
 	if err != nil {
-		t.Fatalf("固定 ID 协商失败: %v", err)
+		t.Fatalf("首次征询应放行: %v", err)
 	}
-	defer s.Close()
-	if _, werr := s.Write([]byte(`{"current":"0.1.0"}`)); werr != nil {
-		t.Fatalf("写入请求失败: %v", werr)
+	if first.SHA256 != shaHex {
+		t.Fatalf("首次清单不符: %+v", first)
 	}
-	if werr := s.CloseWrite(); werr != nil {
-		t.Fatalf("半关闭失败: %v", werr)
+	// 第二次（同一 2s 窗口内）：必须被限流。
+	if m, err := fixedIDManifest(ctx, cReq.host, cProvider.host.ID()); err == nil && m.SHA256 != "" {
+		t.Fatal("同一对端在最小间隔内不应再次拿到清单（限流未生效）")
 	}
-	s.SetDeadline(time.Now().Add(5 * time.Second))
-	var m Manifest
-	if derr := json.NewDecoder(s).Decode(&m); derr != nil {
-		t.Fatalf("好友走固定 ID 通道应成功: %v", derr)
+	// 越过窗口：恢复放行。
+	time.Sleep(2200 * time.Millisecond)
+	again, err := fixedIDManifest(ctx, cReq.host, cProvider.host.ID())
+	if err != nil {
+		t.Fatalf("超过最小间隔后应恢复放行: %v", err)
 	}
-	if m.SHA256 != shaHex || m.Version != "9.9.9" {
-		t.Fatalf("好友拿到的清单不符: %+v", m)
+	if again.SHA256 != shaHex {
+		t.Fatalf("恢复后的清单不符: %+v", again)
+	}
+}
+
+// TestRateLimiterPerPeerAndInflight 限流器单元语义：同桶同对端最小间隔、
+// 全局在途上限、释放归零、窗口过期恢复，以及 manifest/file 分桶互不影响。
+func TestRateLimiterPerPeerAndInflight(t *testing.T) {
+	r := newRateLimiter(50*time.Millisecond, 200*time.Millisecond, 3)
+	if !r.allow(bucketManifest, "a") {
+		t.Fatal("首次应放行")
+	}
+	if r.allow(bucketManifest, "a") {
+		t.Fatal("同对端最小间隔内不应再放行")
+	}
+	// 分桶：manifest 与 file 各自独立计数，一次升级「征询 + 下载」才能都放行。
+	if !r.allow(bucketFile, "a") {
+		t.Fatal("file 桶应与 manifest 桶分开计数（否则升级链被自己掐死）")
+	}
+	if !r.allow(bucketManifest, "b") {
+		t.Fatal("不同对端应放行")
+	}
+	if r.allow(bucketManifest, "c") {
+		t.Fatal("在途达上限时不应放行")
+	}
+	r.release() // b 完成
+	if !r.allow(bucketManifest, "c") {
+		t.Fatal("释放出名额后应放行")
+	}
+	r.release()
+	r.release()
+	r.release()
+	if r.inflight != 0 {
+		t.Fatalf("in-flight 计数应归零，实际 %d", r.inflight)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if !r.allow(bucketManifest, "a") {
+		t.Fatal("超过最小间隔后应恢复放行")
+	}
+	r.release()
+	// file 桶冷却更长：50ms 后 manifest 恢复，200ms 内 file 仍应被挡。
+	if r.allow(bucketFile, "a") {
+		t.Fatal("file 桶冷却未生效")
+	}
+	time.Sleep(160 * time.Millisecond)
+	if !r.allow(bucketFile, "a") {
+		t.Fatal("超过 file 冷却后应恢复放行")
+	}
+	r.release()
+}
+
+// TestRateLimiterDefaults 参数归一化：0 值走默认，避免误配成「不设限」。
+func TestRateLimiterDefaults(t *testing.T) {
+	r := newRateLimiter(0, 0, 0)
+	if r.per != 30*time.Second || r.filePer != 5*time.Minute || r.maxIn != 4 {
+		t.Fatalf("默认参数应为 30s/5min/4，实际 %v/%v/%d", r.per, r.filePer, r.maxIn)
 	}
 }

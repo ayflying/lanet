@@ -182,6 +182,11 @@ func TestP2PFileTransfer(t *testing.T) {
 		PublicKey:      pubB64,
 		CheckInterval:  time.Hour, // 不触发自动巡检
 		Quiet:          true,
+		// 本测试聚焦「传输 + sha256 校验」，不测限流：把两个间隔压到最小，
+		// 否则同一对端的第二次请求（假 sha256 那次）会被限流 Reset 挡住，
+		// 测试就测不到真正的校验逻辑了。
+		PerPeerMinInterval:   time.Nanosecond,
+		FileDownloadCooldown: time.Nanosecond,
 	}
 	cProvider := New(hProvider, staticPeers{}, cfgP, nil)
 	if _, ok := cProvider.SelfManifest(); !ok {

@@ -46,11 +46,18 @@ import (
 
 // 节点间更新协议：manifest = 版本清单征询；file = 文件分发。
 //
-// 0.5.34 起为「历史固定 ID」：默认协议 ID 已按群密钥派生
-// （pkg/protocol.GroupProtoID）——未入网的扫描器和异群节点协商不上这两个
-// 协议，就再也拉不走任何字节（此前任何能拨通端口的人都能下载完整二进制，
-// 是公网节点最大的流量放大器）。保留常量仅供 LegacyProtocols 逃生开关
-// 与出向「老版本兜底」使用。
+// 这两个是「全域固定 ID」。协议 ID 的用法在三代里变过：
+//   - ≤0.5.33：只有固定 ID。任何能拨通端口的人都能拉走完整二进制，公网
+//     节点因此成为流量放大器。
+//   - 0.5.34~0.5.48：默认按群密钥派生 ID（pkg/protocol.GroupProtoID），
+//     异群节点与扫描器在 multistream 阶段即被拒；固定 ID 仅作老版本兜底，
+//     且入向挂了「只放行同群好友」的成员门。
+//   - 0.5.49 起：需求是「整个私有 DHT 网络里任何节点发现新版本都能互传，
+//     不要求同网络密钥、不要求加过好友」，所以固定 ID 重新成为主力入口
+//     （派生 ID 仍注册，同群走它更省一跳）。防滥用手段随之从「协议隔离 +
+//     好友门」换成**分发限流**（rateLimiter：单对端最小间隔 + 全局并发上限），
+//     否则会退回 0.5.33 前的老问题。二进制本身不是机密（release 公开可下载），
+//     限流要保证的是「不被当成免费 CDN」，而不是保密。
 const (
 	ProtocolManifest libprotocol.ID = "/lanet/update-manifest/1.0.0"
 	ProtocolFile     libprotocol.ID = "/lanet/update-file/1.0.0"
@@ -151,11 +158,17 @@ func parseSemver(v string) [3]int {
 // PeerInfo 决策所需的成员版本视图（由成员发现层提供）。
 type PeerInfo struct {
 	ID       string // libp2p peer.ID 字符串
-	Version  string
-	Platform string
+	Version  string // 空 = 版本未知（见 PeerSource 文档）
+	Platform string // 空 = 平台未知
 }
 
-// PeerSource 成员版本视图来源（serverless.Peers 的适配）。
+// PeerSource 更新候选视图来源（宿主把「成员表 ∪ 私有 DHT 网络节点」适配进来）。
+//
+// 候选允许带未知字段：
+//   - Version 为空表示宿主拿不到对端版本（私有 DHT 路由表里的节点只有 ID，
+//     被动发现的「附近」节点也没有版本字段）。这类候选不会被本地比较筛掉，
+//     而是留到 round 里向它们征询清单——版本信息只能从对端清单获取。
+//   - Platform 为空同理，最终以清单里的 Platform 字段为准（round 会二次把关）。
 type PeerSource interface {
 	Peers() []PeerInfo
 }
@@ -193,13 +206,28 @@ type Config struct {
 	// 对端互通）。默认 false。无论真假，出向都会在派生 ID 协商失败后自动
 	// 兜底尝试固定 ID，因此通常无需开启。
 	LegacyProtocols bool
-	// IsMember 判定某个节点是否为「本机已确认的同群成员」（好友）。仅在
-	// 派生模式下有意义：派生协议 ID 本身已按群隔离，但为了让「尚未升级的
-	// 老版本同群成员」仍能从我这里拉取新二进制（升级不能卡住），入向会
-	// 同时注册一个历史固定 ID 的 handler；固定 ID 谁都能协商，故用它时必须
-	// 经此成员门校验——只放行同群好友，挡住公网扫描器与异群节点拉包。
-	// nil = 不做成员门（单测/无成员视图时按老行为放行）。
-	IsMember func(peerID string) bool
+	// PerPeerMinInterval 分发限流：同一对端两次请求的最小间隔（manifest 与
+	// file 合算），默认 30 秒。0.5.49 起更新协议对整个私有 DHT 网络开放
+	// （不再要求同群/好友），限流就是取代旧「成员门」的防滥用手段——保证
+	// 本机不会因为协议对全网可达而被当成免费 CDN。
+	PerPeerMinInterval time.Duration
+	// MaxInflightStreams 分发限流：同时在处理的入向请求上限，默认 4。
+	// 一次文件分发可能持续数分钟（数十 MB），上限太低会让「多个节点同时
+	// 升级」互相饿死；太高则失去防放大意义。
+	MaxInflightStreams int
+	// FileDownloadCooldown 分发限流：同一对端两次**文件下载**的最小间隔，
+	// 默认 5 分钟。与 PerPeerMinInterval（清单征询）分开计数——一次正常
+	// 升级需要「1 次征询 + 1 次下载」，合算会把升级链自己掐死。
+	FileDownloadCooldown time.Duration
+	// UpdateInFlight 宿主的更新锁查询：返回 true 表示「已有一轮更新在途」
+	// （已下载校验完成、等待重启；或 GitHub 在线更新正在执行）。巡检每轮
+	// 开头先查这一门：更新一旦启动就锁到进程重启为止，期间即便又发现更高
+	// 版本也不再重复下载/替换/排重启。
+	// 为什么必须要有它：替换完成后进程仍在跑旧代码，CurrentVersion 是编译期
+	// 常量，下一轮巡检仍会把自己判成落后，于是再次下载、再次替换、再排一次
+	// 重启——1~8 分钟的错峰重启窗口里可以反复发生（0.5.49 前实测存在）。
+	// nil = 不做此门（单测）。
+	UpdateInFlight func() bool
 	// Quiet 关闭日志。
 	Quiet bool
 }
@@ -223,6 +251,15 @@ func (c *Config) fillDefaults() {
 	if c.ManifestPath == "" {
 		c.ManifestPath = filepath.Join(filepath.Dir(c.ExePath), "update-manifest.json")
 	}
+	if c.PerPeerMinInterval <= 0 {
+		c.PerPeerMinInterval = 30 * time.Second
+	}
+	if c.MaxInflightStreams <= 0 {
+		c.MaxInflightStreams = 4
+	}
+	if c.FileDownloadCooldown <= 0 {
+		c.FileDownloadCooldown = 5 * time.Minute
+	}
 }
 
 // Coordinator P2P 更新协调器：既是分发源（持有有效 head 后对外提供
@@ -245,6 +282,9 @@ type Coordinator struct {
 	self *Manifest // 本地有效 head：验签通过且与本地 exe sha256 一致
 
 	attempts map[string]bool // 已尝试过下载的 sha256（进程内防重）
+
+	// limiter 入向分发限流（取代 0.5.34~0.5.48 的「同群好友门」）。
+	limiter *rateLimiter
 }
 
 // New 创建协调器并注册流协议 handler。启动巡检用 Start。
@@ -257,6 +297,7 @@ func New(h host.Host, src PeerSource, cfg Config, onUpdate func(path string, m M
 		cfg:      cfg,
 		onUpdate: onUpdate,
 		attempts: make(map[string]bool),
+		limiter:  newRateLimiter(cfg.PerPeerMinInterval, cfg.FileDownloadCooldown, cfg.MaxInflightStreams),
 	}
 	// 协议 ID：有群密钥时按群派生（异群/未入网者在 multistream 协商阶段
 	// 即被拒，拉不走任何字节）；出向保留固定 ID 作老版本兜底。
@@ -272,15 +313,22 @@ func New(h host.Host, src PeerSource, cfg Config, onUpdate func(path string, m M
 		c.protoFile = ProtocolFile
 	}
 	c.self = c.loadSelfManifest()
-	h.SetStreamHandler(c.protoManifest, c.handleManifest)
-	h.SetStreamHandler(c.protoFile, c.handleFile)
+	// 固定 ID 谁都能协商 → 一律过限流器（主 ID 本身就是固定 ID 时同样如此）。
+	gateFixed := func(id libprotocol.ID, bucket string, h func(network.Stream)) func(network.Stream) {
+		if id == ProtocolManifest || id == ProtocolFile {
+			return c.gateRate(bucket, h)
+		}
+		return h
+	}
+	h.SetStreamHandler(c.protoManifest, gateFixed(c.protoManifest, bucketManifest, c.handleManifest))
+	h.SetStreamHandler(c.protoFile, gateFixed(c.protoFile, bucketFile, c.handleFile))
 	if derived {
-		// 混版本过渡：老版本（≤0.5.33）只认固定 ID，若不额外注册，
-		// 已升级节点无法给未升级好友分发新二进制——P2P 升级链恰在最需要
-		// 它的时候断掉。固定 ID handler 带成员门：只应答「本机已确认的
-		// 同群成员」，公网扫描器与异群节点协商得上也拿不到任何字节。
-		h.SetStreamHandler(ProtocolManifest, c.gateMember(c.handleManifest))
-		h.SetStreamHandler(ProtocolFile, c.gateMember(c.handleFile))
+		// 全域兼容入口（0.5.49）：更新分发不再要求「同群 + 好友」——用户要的
+		// 是整个私有 DHT 网络内任何节点发现新版本都能互传，所以固定 ID 对
+		// 所有 lanet 节点开放。旧的 gateMember（IsMember=是否好友）因此换成
+		// gateRate：单对端最小间隔 + 全局并发上限，挡的是流量放大，而不是人。
+		h.SetStreamHandler(ProtocolManifest, c.gateRate(bucketManifest, c.handleManifest))
+		h.SetStreamHandler(ProtocolFile, c.gateRate(bucketFile, c.handleFile))
 	}
 	if c.self != nil {
 		c.logf("分发源就绪：v%s %s sha256=%s…", c.self.Version, c.self.Platform, c.self.SHA256[:12])
@@ -324,16 +372,15 @@ func (c *Coordinator) round(ctx context.Context) {
 	if cur == "" || cur == "dev" {
 		return // dev 构建版本号不可比，不参与
 	}
-	peers := c.src.Peers()
-	var newer []PeerInfo
-	for _, p := range peers {
-		if p.Platform != c.cfg.Platform || p.ID == "" {
-			continue
-		}
-		if CompareVersions(cur, p.Version) < 0 { // 对端比本端新
-			newer = append(newer, p)
-		}
+	// 更新锁（宿主提供）：已有一轮更新在途就别再开第二轮。替换完成后进程
+	// 跑的仍是旧代码、CurrentVersion 是编译期常量不会变，不拦就会在 1~8
+	// 分钟的错峰重启窗口里反复下载、反复替换、反复排重启。
+	if c.cfg.UpdateInFlight != nil && c.cfg.UpdateInFlight() {
+		c.logf("已有一轮更新在途（等待重启），跳过本轮巡检")
+		return
 	}
+	peers := c.src.Peers()
+	newer := c.selectCandidates(cur, peers)
 	if len(newer) < c.cfg.MinNewPeers {
 		return
 	}
@@ -376,6 +423,12 @@ func (c *Coordinator) round(ctx context.Context) {
 	if CompareVersions(cur, target.Version) >= 0 {
 		return
 	}
+	// 平台二次把关：候选的平台可能未知（DHT 网络里的陌生节点），清单才是
+	// 权威依据——绝不能把别的平台的二进制替换到本机 exe 上。
+	if target.Platform != c.cfg.Platform {
+		c.logf("发现新版本 v%s 但平台是 %s（本机 %s），跳过", target.Version, target.Platform, c.cfg.Platform)
+		return
+	}
 	c.mu.Lock()
 	if c.attempts[target.SHA256] { // 本进程内同一版本只尝试一次
 		c.mu.Unlock()
@@ -399,6 +452,46 @@ func (c *Coordinator) round(ctx context.Context) {
 	if c.onUpdate != nil {
 		c.onUpdate(path, target)
 	}
+}
+
+// selectCandidates 从候选视图里挑出「值得征询清单」的节点，分两层：
+//
+//	第一层：版本已知且比自己新的节点 —— 本地比较即可判定，零网络开销；
+//	第二层：版本未知的节点 —— 私有 DHT 网络里未加好友、未建连的节点只有 ID
+//	        （被动发现不建连、附近表也没有版本字段），本地无从比较，只能问。
+//
+// 只有第一层为空时才发第二层，且一轮抽样上限 3 个：既保证「DHT 网络里任何
+// 节点有新版本都能被发现」，又不至于每 5 分钟把整张路由表问一遍。
+// 平台已知但与本机不同的候选直接丢弃（二进制装不上本机）。
+func (c *Coordinator) selectCandidates(cur string, peers []PeerInfo) []PeerInfo {
+	var knownNewer, unknown []PeerInfo
+	for _, p := range peers {
+		if p.ID == "" {
+			continue
+		}
+		if p.Platform != "" && p.Platform != c.cfg.Platform {
+			continue
+		}
+		if p.Version == "" {
+			unknown = append(unknown, p)
+			continue
+		}
+		if CompareVersions(cur, p.Version) < 0 { // 对端比本端新
+			knownNewer = append(knownNewer, p)
+		}
+	}
+	if len(knownNewer) > 0 {
+		return knownNewer
+	}
+	rand.Shuffle(len(unknown), func(i, j int) { unknown[i], unknown[j] = unknown[j], unknown[i] })
+	maxProbe := c.cfg.MinNewPeers
+	if maxProbe < 3 {
+		maxProbe = 3
+	}
+	if len(unknown) > maxProbe {
+		unknown = unknown[:maxProbe]
+	}
+	return unknown
 }
 
 // consensus 要求 heads 中验签通过的份数 >= need。份数达标时返回验签通过
@@ -484,20 +577,100 @@ func (c *Coordinator) loadSelfManifest() *Manifest {
 
 // ---- 分发源侧（handler） ----
 
-// gateMember 给固定协议 ID 的 handler 包一层成员门（0.5.34 混版本过渡用）：
-// 派生模式下额外注册固定 ID handler 是为了让未升级的老版本好友仍能拉取
-// 新二进制（P2P 升级链不断），但固定 ID 任何节点都能协商成功——公网扫描
-// 器与异群节点必须被挡在门外。IsMember 未配置时直接放行（单测/无成员
-// 视图的旧集成）。
-func (c *Coordinator) gateMember(next func(network.Stream)) func(network.Stream) {
-	return func(s network.Stream) {
-		if c.cfg.IsMember != nil {
-			remote := s.Conn().RemotePeer()
-			if !c.cfg.IsMember(remote.String()) {
-				_ = s.Reset() // 非好友：立即重置，零字节分发
-				return
+// ---- 入向分发限流 ----
+//
+// 0.5.49 起更新协议对整个私有 DHT 网络可达（不再要求同群，更不要求好友），
+// 于是「谁能拉」从身份判定变成了流量控制：任何能拨通的 lanet 节点都能征询
+// 清单/下载二进制，不设限就成了免费 CDN。规则两条：
+//   - 同一对端两次请求至少间隔 PerPeerMinInterval（默认 30s，manifest 与
+//     file 合算）——一次正常升级只征询一轮、只拉一次文件，完全够用；
+//   - 同时在传的请求不超过 MaxInflightStreams（默认 4）。file 传输可能持续
+//     几分钟，这个上限防的是并发放大。
+//
+// 二进制不是机密（GitHub release 公开可下载），所以限流目标是「不被滥用」，
+// 不是「防泄漏」。
+const (
+	// 限流桶：manifest 与 file 分开计数。一次正常升级天然需要「1 次清单征询 +
+	// 1 次文件下载」，合算成一个名额会把升级链自己掐死（开发中实测：file 请求
+	// 紧跟在 manifest 之后发出，被同一个窗口 Reset，升级永远走不完）。
+	bucketManifest = "manifest"
+	bucketFile     = "file"
+)
+
+type rateLimiter struct {
+	mu       sync.Mutex
+	last     map[string]time.Time // "bucket|remote" -> 上次放行时刻
+	inflight int
+	per      time.Duration // manifest 桶：单对端最小间隔
+	filePer  time.Duration // file 桶：单对端最小间隔（文件大，间隔更长）
+	maxIn    int
+}
+
+func newRateLimiter(per, filePer time.Duration, maxIn int) *rateLimiter {
+	if per <= 0 {
+		per = 30 * time.Second
+	}
+	if filePer <= 0 {
+		filePer = 5 * time.Minute
+	}
+	if maxIn <= 0 {
+		maxIn = 4
+	}
+	return &rateLimiter{
+		last:    make(map[string]time.Time),
+		per:     per,
+		filePer: filePer,
+		maxIn:   maxIn,
+	}
+}
+
+// allow 申请一次分发名额（bucket = bucketManifest / bucketFile）；
+// 返回 true 时调用方必须配对 release。
+func (r *rateLimiter) allow(bucket, remote string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inflight >= r.maxIn {
+		return false
+	}
+	per := r.per
+	if bucket == bucketFile {
+		per = r.filePer
+	}
+	key := bucket + "|" + remote
+	now := time.Now()
+	if t, ok := r.last[key]; ok && now.Sub(t) < per {
+		return false
+	}
+	r.last[key] = now
+	r.inflight++
+	if len(r.last) > 4096 {
+		// 防 map 无界增长：仅在超阈值时做一次惰性清理。
+		for k, t := range r.last {
+			if now.Sub(t) > 4*r.filePer {
+				delete(r.last, k)
 			}
 		}
+	}
+	return true
+}
+
+func (r *rateLimiter) release() {
+	r.mu.Lock()
+	if r.inflight > 0 {
+		r.inflight--
+	}
+	r.mu.Unlock()
+}
+
+// gateRate 给「对全网可达」的 handler 包一层限流（固定协议 ID 入口）。
+func (c *Coordinator) gateRate(bucket string, next func(network.Stream)) func(network.Stream) {
+	return func(s network.Stream) {
+		remote := s.Conn().RemotePeer().String()
+		if !c.limiter.allow(bucket, remote) {
+			_ = s.Reset() // 超限：立即重置，零字节分发
+			return
+		}
+		defer c.limiter.release()
 		next(s)
 	}
 }

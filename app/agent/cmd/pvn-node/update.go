@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -124,7 +125,13 @@ func updateRoutes(cancel context.CancelFunc) map[string]http.HandlerFunc {
 		"POST /api/update/apply": func(w http.ResponseWriter, r *http.Request) {
 			if err := applyUpdate(); err != nil {
 				log.Printf("[update] 应用更新失败: %v", err)
-				writeJSONLocal(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				status := http.StatusInternalServerError
+				if errors.Is(err, errUpdateInFlight) {
+					// 已有更新在途（另一条路径/上一轮还没重启）：这是并发拒绝，
+					// 不是服务故障，回 409 让前端提示「更新进行中」而不是报错。
+					status = http.StatusConflict
+				}
+				writeJSONLocal(w, status, map[string]string{"error": err.Error()})
 				return
 			}
 			writeJSONLocal(w, http.StatusOK, map[string]any{"restarting": true})
@@ -301,7 +308,20 @@ func (u *updateState) snapshot() (checked, hasUpdate, needToken bool, latest, no
 }
 
 // applyUpdate 下载发行包并校验，替换自身后重启。失败返回错误信息给页面。
-func applyUpdate() error {
+//
+// 与 P2P 自动更新共用 updateGate（见 p2pupdate.go）：两条路径不会同时替换
+// 同一个 exe；已有一轮更新在途时直接拒绝——避免「升级窗口里又点一次」造成
+// 重复下载、重复替换、反复重启。
+func applyUpdate() (err error) {
+	if !acquireUpdate() {
+		return errUpdateInFlight
+	}
+	landed := false
+	defer func() {
+		if !landed {
+			releaseUpdate() // 没落地：释放闸门，允许用户重试
+		}
+	}()
 	_, hasUpdate, _, _, _, _, _, _ := upd.snapshot()
 	if !hasUpdate {
 		return fmt.Errorf("没有可应用的更新")
@@ -349,6 +369,8 @@ func applyUpdate() error {
 		_ = os.Rename(oldPath, exePath) // 回滚
 		return fmt.Errorf("写入新程序失败: %w", err)
 	}
+	// 磁盘上已是新程序：保持闸门占住，直到进程重启（重启后版本号才更新）。
+	landed = true
 	return nil
 }
 

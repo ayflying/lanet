@@ -1501,6 +1501,38 @@ func (d *Discovery) providerKey() cid.Cid {
 	return cid.NewCidV1(cid.Raw, mhash)
 }
 
+// DHTRoutingPeers 私有 DHT 路由表里的其他节点 ID（不含本机）。
+//
+// 0.5.48 起私有 DHT 前缀全网共享（PrivateDHTPrefix），所有 lanet 节点维护
+// 同一张路由表——因此这个列表天然覆盖**整个 lanet 私有 DHT 网络**：不同
+// 网络密钥的节点、没加过好友的节点、只是被 DHT 路由过的节点都在里面。
+//
+// P2P 自更新用它做候选来源：用户要求「只要在 DHT 网络里发现有新版本就获取，
+// 不一定需要加过好友、也不一定同网络密钥」。被动发现到的节点既不建连也不进
+// 成员表（见 trustPolicyPassive 注释），只靠成员表永远发现不了它们。
+//
+// 只返回节点 ID，不返回地址：建流时由 libp2p 从路由表/DHT 自行解析地址。
+// 纯本地内存读取，零网络开销。
+func (d *Discovery) DHTRoutingPeers() []string {
+	if d == nil || d.dhtPrivate == nil || d.host == nil {
+		return nil
+	}
+	rt := d.dhtPrivate.RoutingTable()
+	if rt == nil {
+		return nil
+	}
+	self := d.host.ID()
+	list := rt.ListPeers()
+	out := make([]string, 0, len(list))
+	for _, p := range list {
+		if p == self {
+			continue
+		}
+		out = append(out, p.String())
+	}
+	return out
+}
+
 func (d *Discovery) emit(m Member) {
 	for _, cb := range d.onDiscovered {
 		func() {
