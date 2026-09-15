@@ -63,6 +63,15 @@ func main() {
 		}
 		return
 	}
+	// 托盘伴侣进程（-tray）：由「用户登录时」计划任务拉起，跑在用户会话里，
+	// 只画图标 + 读控制台状态，不创建节点（见 tray_mode_windows.go）。必须挡在
+	// 服务接管与节点初始化之前——它既不建 TUN、也不该去抢单实例锁。
+	if handled, err := runTrayCompanion(); handled {
+		if err != nil {
+			log.Printf("[tray] 托盘启动失败: %v", err)
+		}
+		return
+	}
 	// Windows 服务模式必须在解析普通命令行参数之前接管进程：SCM 启动
 	// lanet.exe -service 后，由服务控制管理器负责 Start/Stop 生命周期。
 	// 普通双击/命令行启动则直接进入交互模式。

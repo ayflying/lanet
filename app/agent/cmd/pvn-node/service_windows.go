@@ -212,9 +212,30 @@ func isWindowsServiceInstalled() bool {
 	return err == nil && cfg.StartType == mgr.StartAutomatic
 }
 
-// installWindowsService 注册 LocalSystem 自动启动服务。当前交互实例继续运行，
-// 不立即启动第二份服务实例，避免两个节点抢占 TUN、控制台端口和数据库。
+// installWindowsService 注册 LocalSystem 自动启动服务，并配套注册「用户登录时
+// 启动托盘图标」的任务。
+//
+// 两者是一套：服务保证**不登录也组网**（开机即跑），而服务跑在 Session 0，
+// 那边没有任务栏、图标画不出来（详见 tray_mode_windows.go），所以用户会话里
+// 的托盘必须由登录时任务补上。当前交互实例继续运行，不立即启动第二份服务实例，
+// 避免两个节点抢占 TUN、控制台端口和数据库。
 func installWindowsService() error {
+	if err := upsertWindowsService(); err != nil {
+		return err
+	}
+	// 托盘任务注册失败不算自启失败：节点已经能开机自启了，坏的只是那个图标。
+	// 这里若返回错误，控制台会显示「开机自启设置失败」，反而让人误以为要重来。
+	if err := installTrayAutostart(); err != nil {
+		log.Printf("[tray] 托盘任务注册失败（服务已装好，开机自启不受影响；登录后不会有托盘图标）: %v", err)
+		return nil
+	}
+	startTrayTaskNow()
+	return nil
+}
+
+// upsertWindowsService 只做服务注册本身：已存在则更新配置（含 exe/config 路径
+// 变化），不存在则创建。
+func upsertWindowsService() error {
 	m, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("连接 Windows 服务管理器失败（请以管理员权限运行）: %w", err)
@@ -253,6 +274,11 @@ func installWindowsService() error {
 // removeWindowsService 删除服务注册。若当前进程本身由该服务启动，Windows 会
 // 将服务标记为删除，当前节点继续运行；本进程退出后注册消失，下次开机不再启动。
 func removeWindowsService() error {
+	// 托盘任务与「开机自启」同生命周期：先拆掉它，否则关了自启之后重新登录
+	// 还会冒出一个图标（节点却没在跑），比没有图标更让人困惑。
+	if err := removeTrayAutostart(); err != nil {
+		log.Printf("[tray] %v", err)
+	}
 	m, s, err := openService()
 	if err != nil {
 		// 服务本来就不存在视为成功，保证开关操作幂等。
