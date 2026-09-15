@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ayflying/pvn/pkg/invitecode"
@@ -53,7 +54,224 @@ func (c *Client) openPeersDB(ctx context.Context) (*peersdb.DB, error) {
 	}
 	known, _ := db.ListPeers(ctx, false)
 	c.logf("地址簿已打开：%s（已知节点 %d 个）", db.Path(), len(known))
+	// 冷启动预热：地址簿里存着上次真正拨通过的地址，入网就绪后主动重连，
+	// 不必干等 DHT 把成员表慢慢填回来（用户存地址簿的初衷就是「启动快速
+	// 连接」）。异步、有界、一次性，不阻塞启动。
+	c.startWarmup(ctx, db)
 	return db, nil
+}
+
+// ---- 冷启动预热（0.5.49）----
+//
+// 冷启动时若只靠 DHT/种子发现，成员表要几十秒到几分钟才回满（DHT 路由表重建
+// + provider 记录传播），这段时间控制台是空的——正是用户反馈的「冷启动列表
+// 空」。而 peer_addrs 里就存着上次拨通过的地址（KnownAddrs 按 ok_count DESC /
+// last_ok DESC 排序），直接拨它们基本是秒连。所以入网就绪后按「已信任好友 →
+// 有历史地址 → 最近见过优先」取前若干个错峰重连；成功路径回写 ok_count /
+// last_ok，下一轮排序更准。
+const (
+	// warmupReadyWait 等「入网就绪」（c.disc 就位）的上限。
+	warmupReadyWait = 2 * time.Minute
+	// warmupInitialDelay 入网就绪后再等一会儿，避开启动期 DHT 广播/中继预约。
+	warmupInitialDelay = 8 * time.Second
+	// warmupMaxPeers 单次预热的节点数上限（地址簿很大时不做全量重连）。
+	warmupMaxPeers = 12
+	// warmupConcurrency 同时进行的拨号数上限。
+	warmupConcurrency = 3
+	// warmupStagger 相邻两次拨号之间的错峰间隔。
+	warmupStagger = 250 * time.Millisecond
+	// warmupDialTimeout 单个节点的拨号预算。
+	warmupDialTimeout = 15 * time.Second
+)
+
+// warmupTarget 一个预热目标：节点标识 + 地址簿里记录的地址（已排序）。
+type warmupTarget struct {
+	PeerID string
+	Name   string
+	Addrs  []string
+}
+
+// pickWarmupTargets 选出冷启动预热对象：
+//   - 只取已信任节点（未审批的拨过去只会给对方制造待审批噪音）；
+//   - 必须有历史地址（纯 ID 记录没有可直拨地址，交给 DHT 发现即可）；
+//   - peers 已按 last_seen DESC 排序（ListPeers 的排序），故「最近见到的好友」
+//     优先；最多 max 个。
+//
+// addrsOf 注入地址查询，便于单测不依赖 SQLite。
+func pickWarmupTargets(peers []peersdb.Peer, addrsOf func(string) []string, max int) []warmupTarget {
+	if max <= 0 || addrsOf == nil {
+		return nil
+	}
+	out := make([]warmupTarget, 0, max)
+	for _, p := range peers {
+		if !p.Trusted || p.PeerID == "" {
+			continue
+		}
+		addrs := addrsOf(p.PeerID)
+		if len(addrs) == 0 {
+			continue
+		}
+		out = append(out, warmupTarget{PeerID: p.PeerID, Name: p.Name, Addrs: addrs})
+		if len(out) >= max {
+			break
+		}
+	}
+	return out
+}
+
+// waitReady 阻塞直到入网就绪（c.disc 就位）。返回 false 表示超时或 ctx 取消。
+func (c *Client) waitReady(ctx context.Context, limit time.Duration) bool {
+	deadline := time.Now().Add(limit)
+	for {
+		if c.disc != nil {
+			return true
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// startWarmup 冷启动预热重连（一次性任务，非周期巡检）。
+//
+// db 显式传入而不读 c.peers：openPeersDB 返回后调用方才赋值 c.peers，直接用
+// 入参可避免依赖这段时序。
+func (c *Client) startWarmup(ctx context.Context, db *peersdb.DB) {
+	if db == nil {
+		return
+	}
+	go func() {
+		if !c.waitReady(ctx, warmupReadyWait) {
+			return // 启动失败或被取消：不预热
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(warmupInitialDelay):
+		}
+
+		listCtx, listCancel := context.WithTimeout(ctx, 10*time.Second)
+		peers, err := db.ListPeers(listCtx, true)
+		listCancel()
+		if err != nil {
+			c.logf("冷启动预热：读取地址簿失败: %v", err)
+			return
+		}
+		targets := pickWarmupTargets(peers, func(id string) []string {
+			aCtx, aCancel := context.WithTimeout(ctx, 3*time.Second)
+			defer aCancel()
+			addrs, aerr := db.KnownAddrs(aCtx, id)
+			if aerr != nil {
+				return nil
+			}
+			return addrs
+		}, warmupMaxPeers)
+		if len(targets) == 0 {
+			return
+		}
+		c.logf("冷启动预热：从地址簿取 %d 个好友优先重连（不等 DHT 发现）", len(targets))
+
+		var (
+			wg   sync.WaitGroup
+			mu   sync.Mutex
+			good int
+			bad  int
+		)
+		sem := make(chan struct{}, warmupConcurrency)
+		for _, t := range targets {
+			if ctx.Err() != nil {
+				break
+			}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			wg.Add(1)
+			go func(t warmupTarget) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				pid, perr := peer.Decode(t.PeerID)
+				parsed := parseAddrs(t.Addrs)
+				if perr != nil || len(parsed) == 0 {
+					return
+				}
+				dCtx, dCancel := context.WithTimeout(ctx, warmupDialTimeout)
+				defer dCancel()
+				_, cerr := c.disc.RequestConnect(dCtx, peer.AddrInfo{ID: pid, Addrs: parsed})
+				mu.Lock()
+				if cerr == nil {
+					good++
+				} else {
+					bad++
+				}
+				mu.Unlock()
+				if cerr == nil {
+					// 回写「真正用上的」那条地址（ok_count+1 / last_ok=now）。
+					c.recordDialedAddr(dCtx, pid)
+				}
+			}(t)
+			select {
+			case <-ctx.Done():
+			case <-time.After(warmupStagger):
+			}
+		}
+		wg.Wait()
+		mu.Lock()
+		g, b := good, bad
+		mu.Unlock()
+		c.logf("冷启动预热完成：已连上 %d，未连上 %d（共 %d 个好友）", g, b, len(targets))
+	}()
+}
+
+// recordDialedAddr 记录一次成功连接的「实际对端地址」到地址簿拨号统计，
+// 让下一轮排序更准。取真实连接的对端 multiaddr 而非猜测列表首项（首项可能
+// 已失效，把失效地址记成成功会永久带偏优先级）。中继地址（p2p-circuit）
+// 不入库：它是经第三方的路径，不是该节点自身的可直拨地址。
+func (c *Client) recordDialedAddr(ctx context.Context, pid peer.ID) {
+	if c.peers == nil || c.node == nil {
+		return
+	}
+	for _, conn := range c.node.Network().ConnsToPeer(pid) {
+		raw := conn.RemoteMultiaddr()
+		if strings.Contains(raw.String(), "p2p-circuit") {
+			continue
+		}
+		if host := stripPeerSuffix(raw); host != nil {
+			c.noteDialSuccess(ctx, pid.String(), []ma.Multiaddr{host})
+		}
+		return
+	}
+}
+
+// stripPeerSuffix 去掉 multiaddr 尾部的 /p2p/<id>，只留传输地址本体（与地址
+// 簿既有条目格式一致）。尾部不是 /p2p 时原样返回；只剩 /p2p 段（无传输地址）
+// 时返回 nil。
+//
+// 走 Component 字节切片而不是字符串拼接：字符串法会把无值协议（quic-v1、ws）
+// 拼成 ".../quic-v1/" 这种多出斜杠的非法形式，StringCast 直接 panic。
+func stripPeerSuffix(m ma.Multiaddr) ma.Multiaddr {
+	rest, last := ma.SplitLast(m)
+	if last == nil {
+		return nil
+	}
+	if last.Protocol().Code == ma.P_P2P {
+		if len(rest) == 0 {
+			return nil
+		}
+		return rest
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 // requireApproval 是否要求连接审批（默认 true；显式 false 时退回旧行为）。
