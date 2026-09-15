@@ -5,10 +5,16 @@
 //     同网络成员通过 FindProviders 互相找到。
 //     key 由网络密钥（NetworkKey）派生，不知道密钥就无法定位网络（弱隐私边界）。
 //   - 双 DHT（私有优先 + 公共兜底）：私有网络（NetworkKey 非空）在同一张
-//     Host 上同时运行两张 DHT——私有 DHT 使用独立协议前缀（/lanet/kad/1.0.0）
-//     与公共 /ipfs DHT 完全隔离，只有本网络节点参与，路由表小、发现快；
-//     公共 DHT 作为兜底（私有引导节点全不可达时仍能经公共网络找到成员）。
+//     Host 上同时运行两张 DHT——私有 DHT 用固定前缀 /lanet（协议 /lanet/kad/1.0.0），
+//     只有 lanet 节点参与；公共 /ipfs DHT 是全公网共享网络，仅作兜底
+//     （私有引导节点全不可达时仍能经公共网络找到成员）。
 //     发现顺序私有优先；同群成员一经确认即注入私有 DHT 路由表（互为种子）。
+//   - 私有 DHT 全网共享（0.5.48 起）：所有 lanet 节点不分网络密钥，共维护同一张
+//     私有 DHT 路由表——任何在线节点都能替彼此路由，所以「跨群冷启动」不再押在
+//     某单个种子上，整网活性由全网共同维持。网络密钥仍然只决定 provider key
+//     （rendezvous 记录，见 providerKey）与控制面协议 ID（GroupProtoID）：异群节点
+//     查不到你的记录、也协商不上私有协议。共享 DHT ≠ 共享网络，代价是异群节点
+//     可见你的节点 ID 与地址、并替你承担少量路由应答流量。
 //   - mDNS：局域网零配置发现（service tag 派生自网络密钥，同网络才互见）。
 //   - 节点即服务端：每个节点默认运行 relay service 与 DHT server 模式，
 //     公网可达的成员自然成为网络内的引导与中继节点。
@@ -51,13 +57,15 @@ import (
 // 已在网成员的 multiaddr（每台节点都是潜在种子）。
 const DefaultBootstrap = "/dnsaddr/bootstrap.libp2p.io"
 
-// PrivateDHTPrefix 私有 DHT 的「历史」协议前缀（固定值）。
+// PrivateDHTPrefix 私有 DHT 的协议前缀（固定值，全网共享）。
 // 私有 DHT 的协议为 /lanet/kad/1.0.0（ProtocolPrefix 补全），与公共 /ipfs/kad/1.0.0
-// 完全隔离：只有本网络节点互相参与路由与 provider 记录。
+// 完全隔离——公共 DHT 是全公网共享网络（实测空载上行 ~4MB/分钟），
+// /lanet 上只有 lanet 节点，规模小若干数量级。
 //
-// 0.5.34 起默认不再使用此固定前缀——改用按群派生的 protocol.DHTPrefixFor
-// （每个网络一张独立 DHT，跨群路由/查询流量归零）。保留此常量仅供
-// Config.LegacyProtocols 逃生开关回退到老行为。
+// 历史：0.5.34~0.5.47 默认改用按群派生的 protocol.DHTPrefixFor，让每个网络一张
+// 独立 DHT、跨群流量归零；代价是孤立小群的 DHT 路由表里只有自己那几台机器，
+// 唯一种子一挂就无人可查，冷启动极不可靠。0.5.48 起改回本固定前缀，全网共维护
+// 一张路由表（可用 Config.LegacyGroupDHT 临时切回按群派生做过渡）。
 const PrivateDHTPrefix = "/lanet"
 
 // 默认成员回收时限与下限。过小会误删 NAT 重连慢的成员。
@@ -125,6 +133,13 @@ type Config struct {
 	// 成员的 multiaddr 即可加速入网；填 DefaultBootstrap 会被识别为公共
 	// 引导（不作为私有种子）。公共网络下即公共 DHT 引导列表。
 	Bootstrap []string
+	// LegacyGroupDHT 过渡开关：私有 DHT 退回 0.5.34~0.5.47 的「按群密钥派生前缀」
+	// （protocol.DHTPrefixFor），即每个网络一张独立 DHT，只与本群老版本节点同网。
+	// 默认 false = 使用全网共享的固定前缀 /lanet（见 PrivateDHTPrefix），推荐值：
+	// 共享路由表让任何在线节点都能替彼此路由，跨群冷启动不再依赖单个种子，
+	// 孤立小群也不会因为「路由表里只有自己人」而整体失联。
+	// 仅在「必须靠 DHT 找到一批尚未升级的老版本节点」时临时置 true。
+	LegacyGroupDHT bool
 	// EnablePublicFallback 启用公共 DHT 兜底（默认关闭）。默认关闭的
 	// 原因：公共 DHT 是全公网共享网络，作为 server 节点要持续应答全网
 	// 随机查询（实测空载上行 ~4MB/分钟），且国内连 bootstrap.libp2p.io
@@ -344,7 +359,7 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
 
 	// 1. DHT：每台节点都是 server（客户端即服务端）。
-	//    双 DHT：私有（/lanet 前缀，只有本网络节点）优先发现，
+	//    双 DHT：私有（/lanet 前缀，全网 lanet 节点共享一张路由表）优先发现，
 	//    公共（/ipfs 前缀）兜底——负责跨网冷启动时找到第一个「自己人」。
 	//    密钥留空的节点已在上方归一化为公共网络密钥，同样走此路径。
 	privSeeds := make([]string, 0, len(cfg.Bootstrap))
@@ -357,10 +372,8 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	if err != nil {
 		return nil, err
 	}
-	privPrefix := lproto.DHTPrefixFor(d.groupKey)
-	if cfg.LegacyProtocols {
-		privPrefix = PrivateDHTPrefix // 逃生：退回全局固定 /lanet/kad（与老版本对端同网）
-	}
+	// 私有 DHT 前缀：默认用全网共享的固定 /lanet（见 privateDHTPrefix）。
+	privPrefix := privateDHTPrefix(cfg.LegacyGroupDHT, d.groupKey)
 	d.dhtPrivate, err = kaddht.New(h,
 		kaddht.Mode(kaddht.ModeAutoServer),
 		kaddht.BootstrapPeers(privParsed...),
@@ -383,6 +396,26 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		d.mdnsSvc = mdns.NewMdnsService(h, tag, &mdnsNotifee{d: d})
 	}
 	return d, nil
+}
+
+// privateDHTPrefix 选择私有 DHT 的协议前缀。
+//
+// 默认（legacyGroupDHT=false）用全网共享的固定前缀 /lanet —— 所有 lanet 节点
+// 共维护一张路由表，路由帮助不再局限在本群之内，孤立小群不会因为「路由表里
+// 只有自己人、唯一种子一挂就无人可查」而失联。隐私边界不在这里，而在 provider
+// key（RendezvousKey(群密钥)，见 providerKey）与控制面协议 ID（GroupProtoID）上：
+// 异群节点查不到你的 provider 记录、也协商不上私有协议，只是替你承担少量路由应答。
+//
+// legacyGroupDHT=true 是过渡开关，退回 0.5.34~0.5.47 的按群派生前缀
+// （protocol.DHTPrefixFor），即只与本群老版本节点同网。
+//
+// 注：LegacyProtocols（历史协议 ID 逃生开关）对应年代的 DHT 前缀本就是本固定值，
+// 因此无需再为它单独分支。
+func privateDHTPrefix(legacyGroupDHT bool, groupKey []byte) string {
+	if legacyGroupDHT {
+		return lproto.DHTPrefixFor(groupKey)
+	}
+	return PrivateDHTPrefix
 }
 
 // newPublicDHT 创建公共 IPFS DHT 实例（/ipfs 协议前缀）。

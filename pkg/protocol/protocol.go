@@ -77,6 +77,11 @@ const DHTNamespace = "lanet-private-dht-v1:"
 // 派生值域安全：前缀经 CID 编码，必须落在合法多链接命名空间。这里统一以
 // "/lanet/" 为根再拼一段 8 位 hex 子标签，既与公共 DHT 的 /ipfs 隔离，
 // 也保证任意密钥都得到稳定、合法、可复现的前缀。
+//
+// 0.5.48 起本函数不再是默认取值：完全隔离的代价是「小群没人可查」——独立 DHT
+// 的路由表里只有本群那几台机器，唯一的种子一挂就无人可问，跨群冷启动极不可靠。
+// 现默认回到全网共享的固定前缀 /lanet（见 serverless.PrivateDHTPrefix），
+// 本函数保留给 serverless.Config.LegacyGroupDHT 过渡开关使用。
 func DHTPrefixFor(groupKey []byte) string {
 	h := sha256.Sum256(append([]byte(DHTNamespace), groupKey...))
 	return "/lanet/" + hex.EncodeToString(h[:4])

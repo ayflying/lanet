@@ -101,7 +101,8 @@ func DeriveVirtualIP(groupKey []byte, peerID string) string {
 // GroupFingerprint 群组指纹短串（展示/日志用，8 hex）。
 // 协议 ID 与私有 DHT 前缀的派生统一走 pkg/protocol（叶子包，避免
 // serverless ↔ selfupdate 循环依赖）：控制面协议 ID 见 protocol.GroupProtoID，
-// 私有 DHT 前缀见 protocol.DHTPrefixFor。
+// 私有 DHT 前缀默认是全网共享的 serverless.PrivateDHTPrefix（按群派生版本
+// 见 protocol.DHTPrefixFor，仅 LegacyGroupDHT 过渡开关使用）。
 func GroupFingerprint(groupKey []byte) string {
 	return hex.EncodeToString(groupKey[:4])
 }
