@@ -55,8 +55,13 @@
                 font-size:13px; white-space:pre-wrap; word-break:break-word; background:#fafbfc;
                 max-height:46vh; margin:10px 0 12px; }
   .modal-btns { display:flex; gap:8px; }
-  select, input[type=text], input[type=number] {
-    padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:13px; width:100%; }
+  select, input[type=text], input[type=number], textarea {
+    padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:13px; width:100%;
+    font-family:inherit; background:var(--card); color:var(--txt); }
+  /* 只读的多地址框（连接码 / 连接种子）：内容可能很长，允许纵向拉伸，
+     用等宽字体便于核对地址，并保持点击即复制的交互。 */
+  textarea.readonly-addr { resize:vertical; line-height:1.45; cursor:pointer;
+    font-family:ui-monospace,Consolas,"Courier New",monospace; font-size:12px; }
   .row { display:flex; gap:8px; margin:8px 0; align-items:center; }
   .row input, .row select { flex:1; }
   button { padding:7px 14px; border:0; border-radius:6px; background:var(--accent); color:#fff;
@@ -179,15 +184,14 @@
     <h2>连接其他节点 <span class="tag unknown">连接码直连</span></h2>
     <div class="sub" style="margin-bottom:8px">把对方发来的<b>连接码</b>（lanet://… 开头）粘贴进去点连接即可；也支持纯节点 ID 或完整连接地址。首次连接需对方在控制台<b>同意</b>，同意一次即永久信任，之后自动重连。</div>
     <div class="kv"><b>我的连接码</b>
-      <div class="row" style="margin:0">
-        <input type="text" id="myNodeID" readonly
-               onclick="copyText($('myNodeID').value, $('myNodeID'))"
-               title="点击即复制"
-               style="cursor:pointer"
-               placeholder="加载中…">
+      <div class="row" style="margin:0;align-items:flex-start">
+        <textarea id="myNodeID" class="readonly-addr" rows="2" readonly
+                  onclick="copyText($('myNodeID').value, $('myNodeID'))"
+                  title="点击即复制"
+                  placeholder="加载中…"></textarea>
         <button class="ghost" id="myNodeIDBtn" onclick="copyText($('myNodeID').value, $('myNodeIDBtn'))">复制</button>
       </div>
-      <div class="sub" style="color:#8a94a6;margin-top:4px">连接码 = 节点 ID + 直拨地址合一串，对方粘贴这一串即可发起连接（一串顶过去两串）。地址变化后需重新复制分享。</div>
+      <div class="sub" id="myNodeIDHint" style="color:#8a94a6;margin-top:4px">连接码 = 节点 ID + 直拨地址合一串，对方粘贴这一串即可发起连接（一串顶过去两串）。地址变化后需重新复制分享。</div>
     </div>
     <div class="kv"><b>添加节点</b>
       <div class="row" style="margin:0">
@@ -206,14 +210,14 @@
       <summary class="sub" style="cursor:pointer;color:#8a94a6">高级：使用连接种子（不经任何查询直接拨号）</summary>
       <div style="margin-top:10px">
         <div class="kv"><b>我的连接种子</b>
-          <div class="row" style="margin:0">
-            <input type="text" id="seedMine" readonly
-                   onclick="copyText($('seedMine').value, $('seedMine'))"
-                   title="点击即复制"
-                   style="cursor:pointer"
-                   placeholder="加载中…">
-            <button class="ghost" id="seedMineBtn" onclick="copySeedMine()">复制</button>
+          <div class="row" style="margin:0;align-items:flex-start">
+            <textarea id="seedMine" class="readonly-addr" rows="6" readonly
+                      onclick="copyText($('seedMine').value, $('seedMine'))"
+                      title="点击即复制"
+                      placeholder="加载中…"></textarea>
+            <button class="ghost" id="seedMineBtn" onclick="copySeedMine()">复制全部</button>
           </div>
+          <div class="sub" id="seedMineHint" style="color:#8a94a6;margin-top:4px"></div>
         </div>
         <div class="kv"><b>按种子连接</b>
           <div class="row" style="margin:0">
@@ -451,8 +455,19 @@ function renderConnect() {
   const standalone = (S.info && (S.info.group_id === 'standalone' || String(S.info.group || '').startsWith('standalone-')));
   if (!standalone) { card.style.display = 'none'; return; }
   card.style.display = '';
-  // 连接码 = 节点 ID + 直拨地址合一串（lanet://ID@ip:port）；后端未返回时回退纯节点 ID。
-  $('myNodeID').value = S.invite_code || (S.info && S.info.peer_id) || '';
+  // 连接码 = 节点 ID + 直拨地址合一串（lanet://ID@ip1:port1,ip2:port2,…）；
+  // 后端未返回时回退纯节点 ID。地址是按可达性排好序的**多块网卡**，
+  // 故这里同时把「带上几块网卡」讲清楚，避免用户以为只分享了某一块。
+  const code = S.invite_code || (S.info && S.info.peer_id) || '';
+  $('myNodeID').value = code;
+  const codeHint = $('myNodeIDHint');
+  if (codeHint) {
+    const at = code.indexOf('@');
+    const n = at >= 0 ? code.slice(at + 1).split(',').filter(Boolean).length : 0;
+    codeHint.textContent = n > 1
+      ? `已带上本机 ${n} 个网卡地址（公网 IPv6 / 局域网等按可达性排序），对方会逐个尝试，任一可达即连通。地址变化后需重新复制分享。`
+      : '连接码 = 节点 ID + 直拨地址合一串，对方粘贴这一串即可发起连接（一串顶过去两串）。地址变化后需重新复制分享。';
+  }
   // 待审批列表（过滤掉本机自己：身份文件换过之后，历史观察表里可能留下
   // 指向当前身份的残留行，展示成「陌生节点申请连接」是纯误导）。
   const pending = (S.pending || []).filter(p => p.peer_id && p.peer_id !== selfPeerID());
@@ -675,11 +690,13 @@ function copySeedMine() {
     return;
   }
   copyText(addrs.join('\n'), $('seedMineBtn'));
-  flash('seedMsg', '已复制连接种子，发给对方即可。', true);
+  flash('seedMsg', `已复制 ${addrs.length} 条连接种子（覆盖本机全部网卡），发给对方即可。`, true);
 }
 
 // ---- 连接种子（高级）：本机可分享的 multiaddr ----
 // 主流路径已是「添加节点 ID」（见 connectPeer），种子输入是备选高级用法。
+// 列表中每块网卡的每种传输各一条，已按可达性排序并折叠同网卡的重复地址；
+// 把「每类网卡的条数」显示出来，用户一眼能确认所有网卡都带上了。
 function renderSeed() {
   const addrs = (S && S.seed_addrs) || [];
   const el = $('seedMine');
@@ -688,6 +705,25 @@ function renderSeed() {
   el.placeholder = addrs.length
     ? ''
     : '暂无可用地址（节点可能只绑定了回环地址，或尚未就绪）';
+  const hint = $('seedMineHint');
+  if (!hint) return;
+  if (!addrs.length) {
+    hint.textContent = '';
+    return;
+  }
+  // 按地址族分类计数，让「都分享出去了」这件事可核对。
+  let v6 = 0, v4 = 0, ll = 0;
+  addrs.forEach(a => {
+    if (a.indexOf('/ip6/fe80') >= 0 || a.indexOf('/ip4/169.254') >= 0) ll++;
+    else if (a.indexOf('/ip6/') >= 0) v6++;
+    else v4++;
+  });
+  const parts = [];
+  if (v6) parts.push(`IPv6 ${v6}`);
+  if (v4) parts.push(`IPv4 ${v4}`);
+  if (ll) parts.push(`链路本地 ${ll}（排最后，通常不可达）`);
+  hint.textContent = `共 ${addrs.length} 条（${parts.join('，')}）：本机每块网卡的每种传输各一条，`
+    + `已按可达性排序（公网 IPv6 → 局域网 → VPN → 链路本地），并折叠了同一网卡的重复地址（如 Windows 隐私扩展地址）。`;
 }
 
 // ---- 公共 DHT 临时引导状态：徽标显示「实时运行状态」，复选框只表示「配置意图」 ----

@@ -3,6 +3,7 @@ package p2pkit
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -230,4 +231,46 @@ func EnsureRelayReservation(ctx context.Context, h host.Host, source autorelay.P
 		// 记录但不中断：继续尝试下一个候选。
 	}
 	return fmt.Errorf("no relay reservation succeeded")
+}
+
+// IPv6ListenAvailable 探测本机能否监听 IPv6。
+//
+// 用真实监听试探，而不是只查网卡上有没有 IPv6 地址：某些环境明明有 IPv6
+// 地址却禁止绑定（系统策略、宿主未放行、容器网络命名空间限制），只看地址
+// 会得出错误结论，进而让 libp2p 监听失败、整个节点起不来。
+// 探测用端口 0（内核自动分配）并立即关闭，无副作用、成本极低。
+func IPv6ListenAvailable() bool {
+	ln, err := net.Listen("tcp6", "[::]:0")
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
+
+// HasIPv6Listen 判断监听地址列表里是否含 IPv6 项。
+func HasIPv6Listen(addrs []string) bool {
+	for _, raw := range addrs {
+		if a, err := ma.NewMultiaddr(raw); err == nil {
+			if _, ipErr := a.ValueForProtocol(ma.P_IP6); ipErr == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// StripIPv6Listen 去掉监听地址里的 IPv6 项，保留其余项与原顺序。
+// 用途：IPv6 监听失败时降级重试（宁可只跑 IPv4，也不能让节点起不来）。
+func StripIPv6Listen(addrs []string) []string {
+	out := make([]string, 0, len(addrs))
+	for _, raw := range addrs {
+		if a, err := ma.NewMultiaddr(raw); err == nil {
+			if _, ipErr := a.ValueForProtocol(ma.P_IP6); ipErr == nil {
+				continue
+			}
+		}
+		out = append(out, raw)
+	}
+	return out
 }

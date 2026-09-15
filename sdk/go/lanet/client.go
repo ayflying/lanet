@@ -36,7 +36,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -374,12 +373,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	// 1. libp2p Host。
 	listenAddrs := cfg.ListenAddrs
 	if len(listenAddrs) == 0 {
-		// tcp + ws（浏览器可直连）+ quic；webrtc-direct 由 WebRTC 选项追加。
-		listenAddrs = []string{
-			"/ip4/0.0.0.0/tcp/0",
-			"/ip4/0.0.0.0/tcp/0/ws",
-			"/ip4/0.0.0.0/udp/0/quic-v1",
-		}
+		listenAddrs = defaultListenAddrs()
 	}
 	spec := p2pkit.HostSpec{
 		UserAgent:   "lanet-sdk-go/1.1.0",
@@ -404,6 +398,19 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		spec.RelaySource = c.peerSource.AutoRelayPeerSource()
 	}
 	node, err := p2pkit.NewHost(ctx, spec)
+	if err != nil && p2pkit.HasIPv6Listen(spec.ListenAddrs) {
+		// IPv6 监听失败不应拖垮整个节点：摘掉 IPv6 项重试一次，成功则按
+		// 仅 IPv4 继续（记日志说明降级）。探测过「能监听」也可能因端口占用、
+		// 宿主策略变化而失败，这层兜底保证「加了 IPv6 支持」不会变成
+		// 「节点起不来」——这比多一条地址重要得多。
+		// 若降级后仍失败，则上报**首次**错误：它更可能指向真正的根因。
+		c.logf("IPv6 监听失败，回退为仅 IPv4 继续启动: %v", err)
+		fallback := spec
+		fallback.ListenAddrs = p2pkit.StripIPv6Listen(spec.ListenAddrs)
+		if node2, err2 := p2pkit.NewHost(ctx, fallback); err2 == nil {
+			node, err = node2, nil
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("lanet: create host: %w", err)
 	}
@@ -555,6 +562,32 @@ func (c *Client) memberRefs() []serverless.MemberRef {
 	return members
 }
 
+// defaultListenAddrs 默认监听地址：IPv4 上开 tcp + ws（浏览器可直连）+ quic，
+// 若本机支持监听 IPv6 再补一组 IPv6 监听。webrtc-direct 由 WebRTC 选项追加。
+//
+// 为什么要 IPv6：跨网场景下双方若都有公网 IPv6 即可直连，不需要 VPS 中继
+// 也不需要打洞——是成功率与延迟都最好的路径。此前只绑 /ip4/0.0.0.0，本机
+// 已拿到的公网 IPv6 完全没被利用（实测本机同时有 2408:824e::/32 段的公网
+// 地址，而分享出去的连接种子里一条 IPv6 都没有，跨网只能绕中继）。
+// 探测不支持（系统禁用 IPv6、容器网络限制等）则不加，保持仅 IPv4 的历史行为。
+//
+// 监听 /ip6/::/... 而非具体地址：libp2p 会把通配地址展开为本机所有 IPv6
+// 网卡地址，网卡变动（插网线、连 VPN）无需改配置。
+func defaultListenAddrs() []string {
+	addrs := []string{
+		"/ip4/0.0.0.0/tcp/0",
+		"/ip4/0.0.0.0/tcp/0/ws",
+		"/ip4/0.0.0.0/udp/0/quic-v1",
+	}
+	if p2pkit.IPv6ListenAvailable() {
+		addrs = append(addrs,
+			"/ip6/::/tcp/0",
+			"/ip6/::/udp/0/quic-v1",
+		)
+	}
+	return addrs
+}
+
 // Info 返回节点身份信息。
 func (c *Client) Info() Info {
 	return Info{
@@ -568,49 +601,101 @@ func (c *Client) Info() Info {
 }
 
 // SeedAddrs 本节点的连接种子：可分享给同群成员作为引导地址的 multiaddr
-// 列表（已剔除回环与 TUN overlay 地址，均带 /p2p/<ID> 后缀）。对端把它
-// 填入 Bootstrap（或 Web 控制台「连接种子」）即可不经任何公共 DHT 直接入网。
-// 同群成员在控制台填入后重启生效；家庭宽带 IP 变化后需重新复制分享。
+// 列表（已剔除回环、未指定与 TUN overlay 地址，均带 /p2p/<ID> 后缀）。
+// 对端把它填入 Bootstrap（或 Web 控制台「连接种子」）即可不经任何公共 DHT
+// 直接入网。同群成员在控制台填入后重启生效；家庭宽带 IP 变化后需重新复制分享。
+//
+// 覆盖本机**全部网卡**，即「每块网卡 × 每种传输」各一条，并按可达性排序：
+// 公网 IPv6 → 私有 IPv4 → 公网 IPv4 → ULA IPv6 → 链路本地。两点值得说明：
+//   - 顺序有实际意义：拨号侧逐个尝试且共享总超时预算（见 serverless.DialSeed
+//     的 15 秒），排在前面却不可达的地址会先把预算吃掉。
+//   - 同一块网卡的多个地址会被折叠（见 p2pkit.CollapseRedundant）：Windows
+//     隐私扩展地址会让同一 IPv6 前缀下出现七八个地址、同一端口重复七八遍，
+//     它们走的是同一条链路，留着只会挤占名额。
 func (c *Client) SeedAddrs() []string {
-	out := make([]string, 0, 4)
-	for _, a := range p2pkit.FilterUnderlayAddrs(c.node.Addrs()) {
-		if isLoopbackMultiaddr(a) {
-			continue
-		}
+	addrs := p2pkit.ShareableAddrs(c.node.Addrs())
+	out := make([]string, 0, len(addrs))
+	for _, a := range addrs {
 		out = append(out, a.String()+"/p2p/"+c.peerID)
 	}
 	return out
 }
 
 // InviteCode 本节点的连接码：把「节点 ID + 直拨地址」合并成一串短字符串
-// （lanet://<ID>@<ip>:<port>），用户复制粘贴一串即可完成连接。
-// 取首个可用地址生成；无可用地址时回退为仅身份形式 lanet://<ID>
-// （对端识别后自动退回按 ID 查找）。连接码与连接种子语义等价，但更短、
-// 可读、不易复制出错。
+// （lanet://<ID>@ip1:port1,ip2:port2,…），用户复制粘贴一串即可完成连接。
+//
+// 携带**多个地址**：一台机器常有多块网卡（物理网卡、公网 IPv6、VPN、
+// 虚拟网卡），究竟哪条路能从对端到达、只有试过才知道。早先只取首个可用地址，
+// 等于把成功率押在随机选中的那一块网卡上——实测本机首个地址恰是 ZeroTier
+// 虚拟网卡的 10.70.38.92，对端若在同一物理局域网反而连不上。
+// 现在按可达性排序后为每块网卡取一个代表端口，最多 invitecode.MaxAddrs 个；
+// 无可用地址时回退仅身份形式 lanet://<ID>（对端识别后自动退回按 ID 查找）。
+// 连接码与连接种子语义等价，但更短、可读、不易复制出错。
 func (c *Client) InviteCode() string {
 	if c.peerID == "" {
 		return ""
 	}
-	for _, a := range p2pkit.FilterUnderlayAddrs(c.node.Addrs()) {
-		if isLoopbackMultiaddr(a) {
-			continue
-		}
-		if code := invitecode.EncodeFromMultiaddr(a.String() + "/p2p/" + c.peerID); code != "" {
-			return code
-		}
-	}
-	return invitecode.Encode(c.peerID, "")
+	return invitecode.EncodeList(c.peerID, c.inviteHostPorts())
 }
 
-// isLoopbackMultiaddr 判断 multiaddr 是否为回环地址（127.0.0.0/8、::1）。
-func isLoopbackMultiaddr(a ma.Multiaddr) bool {
-	if v, err := a.ValueForProtocol(ma.P_IP4); err == nil {
-		return net.ParseIP(v).IsLoopback()
+// inviteHostPorts 按可达性顺序为每块网卡挑一个代表「IP:端口」。
+func (c *Client) inviteHostPorts() []string {
+	return pickInviteHostPorts(p2pkit.ShareableAddrs(c.node.Addrs()))
+}
+
+// pickInviteHostPorts 从（已按可达性排序的）地址列表中，为每块网卡挑一个
+// 代表「IP:端口」。纯函数，便于单测覆盖挑选与去重规则。
+//
+// 同一块网卡只取一个端口：对端拿到后会据它同时展开 TCP 与 QUIC 两条地址，
+// 若把该网卡的 TCP 端口与 QUIC 端口都塞进连接码，反而会拼出「TCP 端口配
+// QUIC 传输」这类拨不通的组合，白白占用拨号预算。优先裸 TCP（国内网络
+// 普遍比 UDP 更易通过），该网卡没有裸 TCP 监听时才退回 QUIC 端口。
+// /ws、/webrtc-direct 这类需要额外协议协商的端口会被跳过（见
+// p2pkit.DialableHostPort）。
+func pickInviteHostPorts(addrs []ma.Multiaddr) []string {
+	type ports struct{ tcp, quic string }
+	byIP := make(map[string]*ports, 4)
+	var order []string
+	for _, a := range addrs {
+		hp, transport, ok := p2pkit.DialableHostPort(a)
+		if !ok {
+			continue
+		}
+		ip, ok := p2pkit.AddrIP(a)
+		if !ok {
+			continue
+		}
+		key := ip.String()
+		p, seen := byIP[key]
+		if !seen {
+			p = &ports{}
+			byIP[key] = p
+			order = append(order, key) // order 保持传入的可达性顺序
+		}
+		if transport == "tcp" {
+			if p.tcp == "" {
+				p.tcp = hp
+			}
+		} else if p.quic == "" {
+			p.quic = hp
+		}
 	}
-	if v, err := a.ValueForProtocol(ma.P_IP6); err == nil {
-		return net.ParseIP(strings.SplitN(v, "%", 2)[0]).IsLoopback()
+	out := make([]string, 0, len(order))
+	for _, key := range order {
+		p := byIP[key]
+		hp := p.tcp
+		if hp == "" {
+			hp = p.quic
+		}
+		if hp == "" {
+			continue
+		}
+		out = append(out, hp)
+		if len(out) >= invitecode.MaxAddrs {
+			break
+		}
 	}
-	return false
+	return out
 }
 
 // PublicDHTStatus 公共 DHT 临时引导的运行状态（仅 Standalone 模式有值）。
