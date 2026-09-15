@@ -58,12 +58,27 @@
   select, input[type=text], input[type=number], textarea {
     padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:13px; width:100%;
     font-family:inherit; background:var(--card); color:var(--txt); }
-  /* 只读的多地址框（连接码 / 连接种子）：内容可能很长，允许纵向拉伸，
-     用等宽字体便于核对地址，并保持点击即复制的交互。 */
-  textarea.readonly-addr { resize:vertical; line-height:1.45; cursor:pointer;
+  /* 只读的多地址框（连接码 / 连接种子）：内容可能很长（1~4 块网卡），
+     高度交给 autoGrow() 按内容自适应。⚠️ 这里必须显式 resize:none —— textarea
+     的 UA 默认是 resize:both，而状态每 10s 轮询重渲染一次，留着拖拽把手的话
+     用户刚拉高就被打回原形，比没有把手更迷惑。 */
+  textarea.readonly-addr { resize:none; line-height:1.5; cursor:pointer; min-height:50px;
+    max-height:260px; overflow-y:auto;
+    font-family:ui-monospace,Consolas,"Courier New",monospace; font-size:12px; }
+  /* 可编辑的多行地址框（连接码 / 连接种子输入）：同样等宽、同样自适应高度。 */
+  textarea.addr-input { resize:none; line-height:1.5; min-height:50px;
+    max-height:260px; overflow-y:auto;
     font-family:ui-monospace,Consolas,"Courier New",monospace; font-size:12px; }
   .row { display:flex; gap:8px; margin:8px 0; align-items:center; }
-  .row input, .row select { flex:1; }
+  .row input, .row select, .row textarea { flex:1; min-width:0; }
+  /* 长内容输入块（连接码 / 连接种子）：标签独占一行、输入区铺满整行。
+     ⚠️ 别用 .kv —— 它是不换行的横向 flex，而块里有「标签 + 输入行 + 说明」三个
+     兄弟节点，全挤在一条线上会把输入框压成窄条（连接码 4 个地址根本看不全，
+     正是「界面丑」的根因）。纵向堆叠让输入框吃满卡片宽度。 */
+  .kvstack { margin:12px 0; font-size:13px; }
+  .kvstack > b { display:block; font-weight:500; color:var(--muted); margin-bottom:6px; }
+  .kvstack .row { margin:0; }
+  .kvstack .sub { margin:6px 0 0; }
   button { padding:7px 14px; border:0; border-radius:6px; background:var(--accent); color:#fff;
            font-size:13px; cursor:pointer; }
   button.ghost { background:#eef0f3; color:var(--txt); }
@@ -183,20 +198,23 @@
   <div class="card" id="connectCard" style="display:none">
     <h2>连接其他节点 <span class="tag unknown">连接码直连</span></h2>
     <div class="sub" style="margin-bottom:8px">把对方发来的<b>连接码</b>（lanet://… 开头）粘贴进去点连接即可；也支持纯节点 ID 或完整连接地址。首次连接需对方在控制台<b>同意</b>，同意一次即永久信任，之后自动重连。</div>
-    <div class="kv"><b>我的连接码</b>
-      <div class="row" style="margin:0;align-items:flex-start">
+    <div class="kvstack"><b>我的连接码</b>
+      <div class="row">
         <textarea id="myNodeID" class="readonly-addr" rows="2" readonly
                   onclick="copyText($('myNodeID').value, $('myNodeID'))"
                   title="点击即复制"
                   placeholder="加载中…"></textarea>
         <button class="ghost" id="myNodeIDBtn" onclick="copyText($('myNodeID').value, $('myNodeIDBtn'))">复制</button>
       </div>
-      <div class="sub" id="myNodeIDHint" style="color:#8a94a6;margin-top:4px">连接码 = 节点 ID + 直拨地址合一串，对方粘贴这一串即可发起连接（一串顶过去两串）。地址变化后需重新复制分享。</div>
+      <div class="sub" id="myNodeIDHint" style="color:#8a94a6">连接码 = 节点 ID + 直拨地址合一串，对方粘贴这一串即可发起连接（一串顶过去两串）。地址变化后需重新复制分享。</div>
     </div>
-    <div class="kv"><b>添加节点</b>
-      <div class="row" style="margin:0">
-        <input type="text" id="peerInput" placeholder="粘贴对方连接码（lanet://…）、节点 ID 或完整连接地址"
-               onkeydown="if(event.key==='Enter')connectPeer()">
+    <div class="kvstack"><b>添加节点</b>
+      <div class="row">
+        <textarea id="peerInput" class="addr-input" rows="2"
+                  placeholder="粘贴对方连接码（lanet://…）、节点 ID 或完整连接地址"
+                  title="Enter 直接连接，Shift+Enter 换行"
+                  oninput="autoGrow(this)"
+                  onkeydown="if(event.key==='Enter'&amp;&amp;!event.shiftKey){event.preventDefault();connectPeer()}"></textarea>
         <button onclick="connectPeer()">连接</button>
       </div>
       <div class="msg" id="peerMsg" style="display:none"></div>
@@ -209,21 +227,24 @@
     <details style="margin-top:14px">
       <summary class="sub" style="cursor:pointer;color:#8a94a6">高级：使用连接种子（不经任何查询直接拨号）</summary>
       <div style="margin-top:10px">
-        <div class="kv"><b>我的连接种子</b>
-          <div class="row" style="margin:0;align-items:flex-start">
+        <div class="kvstack"><b>我的连接种子</b>
+          <div class="row">
             <textarea id="seedMine" class="readonly-addr" rows="6" readonly
                       onclick="copyText($('seedMine').value, $('seedMine'))"
                       title="点击即复制"
                       placeholder="加载中…"></textarea>
             <button class="ghost" id="seedMineBtn" onclick="copySeedMine()">复制全部</button>
           </div>
-          <div class="sub" id="seedMineHint" style="color:#8a94a6;margin-top:4px"></div>
+          <div class="sub" id="seedMineHint" style="color:#8a94a6"></div>
         </div>
-        <div class="kv"><b>按种子连接</b>
-          <div class="row" style="margin:0">
-            <input type="text" id="seedInput" placeholder="粘贴对方的连接种子（multiaddr，可含多个，逗号/换行分隔）"
-                   onkeydown="if(event.key==='Enter')connectSeed()"
-                   onpaste="setTimeout(seedPasteHint, 0)">
+        <div class="kvstack"><b>按种子连接</b>
+          <div class="row">
+            <textarea id="seedInput" class="addr-input" rows="2"
+                      placeholder="粘贴对方的连接种子（multiaddr，可含多个，逗号/换行分隔）"
+                      title="Enter 换行，Ctrl+Enter 直接连接"
+                      oninput="autoGrow(this)"
+                      onkeydown="if(event.key==='Enter'&amp;&amp;(event.ctrlKey||event.metaKey)){event.preventDefault();connectSeed()}"
+                      onpaste="setTimeout(seedPasteHint, 0)"></textarea>
             <button onclick="connectSeed()">连接</button>
           </div>
           <div class="msg" id="seedHint" style="display:none"></div>
@@ -368,6 +389,27 @@ const avatarOf = name => { const n = String(name || '').trim(); return n ? n.sli
 // listAvatar 生成头像元素，anon 标记控制「未知设备」的灰底样式。
 const listAvatar = name => `<div class="li-avatar${String(name || '').trim() ? '' : ' anon'}">${esc(avatarOf(name))}</div>`;
 
+// autoGrow 让多行地址框按内容贴合高度。
+// 连接码 / 连接种子的长度差别极大（1~4 块网卡，每块又可能有 tcp+quic 两条），
+// 固定 rows 要么留一大片空白、要么把内容截成滚动条。这里按 scrollHeight 精确
+// 贴合，下限交给 CSS 的 min-height、上限交给 max-height。
+// ⚠️ 两个坑都出在 box-sizing:border-box 上：
+//   ① 高度必须先压到 0px 再读 scrollHeight —— textarea 的 height:auto 不等于
+//      「内容高度」，它回落成 rows 默认高度；而 scrollHeight 又不会小于自身内容盒
+//      高度，于是变成「只增不减」：内容变短时框还停在旧的 rows 高度上。
+//   ② 写回时补上上下边框，否则永远差 2px，每个框都会挂一条假的滚动条。
+function autoGrow(el) {
+  if (!el || el.tagName !== 'TEXTAREA') return;
+  const border = el.offsetHeight - el.clientHeight;
+  el.style.height = '0px';
+  el.style.height = (el.scrollHeight + border) + 'px';
+}
+// autoGrowAddrs 刷新卡片里四个地址框的高度。状态每 10s 轮询重渲染一次，
+// 渲染完必须跟着调一次，否则内容变了高度还是旧的。
+function autoGrowAddrs() {
+  ['myNodeID', 'peerInput', 'seedMine', 'seedInput'].forEach(id => autoGrow($(id)));
+}
+
 async function loadState() {
   const r = await fetch('/api/state');
   S = await r.json();
@@ -423,6 +465,7 @@ async function connectPeer() {
         const how = res.via === 'local' ? '本地地址簿' : (res.via === 'dht' ? '私有 DHT' : '直接拨号');
         flash('peerMsg', `已连接 ${who}${vip} · 地址来源：${how}`, true);
         $('peerInput').value = '';
+        autoGrow($('peerInput'));   // 清空后把框收回去，别留一大片空白
       }
       loadState();
     } else {
@@ -460,6 +503,7 @@ function renderConnect() {
   // 故这里同时把「带上几块网卡」讲清楚，避免用户以为只分享了某一块。
   const code = S.invite_code || (S.info && S.info.peer_id) || '';
   $('myNodeID').value = code;
+  autoGrow($('myNodeID'));
   const codeHint = $('myNodeIDHint');
   if (codeHint) {
     const at = code.indexOf('@');
@@ -634,6 +678,7 @@ async function connectSeed() {
       const who = res.virtual_ip ? `（虚拟 IP ${res.virtual_ip}）` : '';
       flash('seedMsg', '已连接成员 ' + (res.peer_id ? res.peer_id.slice(0, 16) + '…' : '') + who, true);
       $('seedInput').value = '';
+      autoGrow($('seedInput'));   // 同上：清空后收回高度
       $('seedHint').style.display = 'none';
       loadState();
     } else {
@@ -705,6 +750,7 @@ function renderSeed() {
   el.placeholder = addrs.length
     ? ''
     : '暂无可用地址（节点可能只绑定了回环地址，或尚未就绪）';
+  autoGrow(el);
   const hint = $('seedMineHint');
   if (!hint) return;
   if (!addrs.length) {
@@ -1268,6 +1314,12 @@ function pollAndReload() {
 }
 
 loadState(); loadNodeConfig(); initTopActions(); setInterval(loadState, 10000);
+// 窗口尺寸变化会让地址框的换行数变化 → 重算高度。
+window.addEventListener('resize', autoGrowAddrs);
+// ⚠️ 「高级」折叠块收起时内部没有布局，scrollHeight 恒为 0（高度会被压成最小），
+// 所以展开那一刻必须重算一次，否则连接种子框停在两行、内容全塞进滚动条。
+const seedDetails = document.querySelector('#connectCard details');
+if (seedDetails) seedDetails.addEventListener('toggle', autoGrowAddrs);
 </script>
 </body>
 </html>
