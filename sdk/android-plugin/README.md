@@ -89,6 +89,21 @@ python build.py --verify-only  # 只做交付包校验
 
 3. 用**云打包**或**自定义调试基座**出包 —— 原生插件不能靠标准基座生效。
 
+### 最快路径：直接拿示例工程打包
+
+本仓库的 `sdk/uniapp-demo/` 就是一份可直接打包的完整工程：
+
+```powershell
+cd sdk/android-plugin
+python build.py --skip-aar     # 把插件包同步进 sdk/uniapp-demo/nativeplugins/
+```
+
+然后用 HBuilderX「文件 → 打开目录」选中 `sdk/uniapp-demo`，确认 `manifest.json` 的
+「App 原生插件配置」里已勾选 `lanet-vpn`，再走「发行 → 原生App-云打包」：
+平台选 Android、证书用云端证书（或自备），提交后约 5–15 分钟出 APK。
+
+首次启动会弹系统 VPN 授权框，同意后在页面上填节点名 / 网络密钥 / 种子地址即可入网。
+
 ## 三、JS 调用
 
 `utils/lanet.js` 是把原生方法包成 Promise 的一层，建议直接拷进项目：
