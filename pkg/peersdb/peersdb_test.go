@@ -24,8 +24,8 @@ func TestMigrateVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if v != 3 {
-		t.Fatalf("期望迁移到版本 3，实际 %d", v)
+	if v != 4 {
+		t.Fatalf("期望迁移到版本 4，实际 %d", v)
 	}
 }
 

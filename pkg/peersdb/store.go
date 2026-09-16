@@ -347,6 +347,10 @@ func (d *DB) PruneSelf(ctx context.Context, selfPeerID string) (int64, error) {
 		`DELETE FROM pending_requests WHERE peer_id = ?`,
 		`DELETE FROM unfriended WHERE peer_id = ?`,
 		`DELETE FROM peers WHERE peer_id = ?`,
+		// 种子表同样会因身份漂移残留「自己」的行：控制台会把它显示成一个
+		// 可用的公网入口，本机却永远拨不通（其实是自己）。
+		`DELETE FROM group_seeds WHERE peer_id = ?`,
+		`DELETE FROM global_seeds WHERE peer_id = ?`,
 	} {
 		res, err := d.db.ExecContext(ctx, q, selfPeerID)
 		if err != nil {

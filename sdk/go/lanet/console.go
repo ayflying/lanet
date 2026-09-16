@@ -107,6 +107,8 @@ func (c *Client) startConsole() error {
 	mux.HandleFunc("POST /api/peers", c.apiRemovePeer)
 	mux.HandleFunc("GET /api/nearby", c.apiNearby)
 	mux.HandleFunc("POST /api/nearby", c.apiReconnectPeer)
+	// 种子表接口（实现在 console_seeds.go，避免与内嵌 UI 的改动面重叠）。
+	c.registerSeedRoutes(mux)
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		if logo, err := consoleFS.ReadFile("console/logo.png"); err == nil {

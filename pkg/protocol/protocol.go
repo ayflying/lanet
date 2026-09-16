@@ -41,6 +41,11 @@ const (
 	BaseEcho        = "echo"
 	BaseUpdManifest = "update-manifest"
 	BaseUpdFile     = "update-file"
+	// BaseSeeds 群内种子交换（免好友共享「已验证公网入口」）。
+	// 派生后异群在 multistream 阶段就协商不上，天然满足「群内种子与全域种子
+	// 隔离」；全域范围的种子交换走固定 ID（见 serverless.ProtocolSeedsGlobal），
+	// 因为它本来就要跨网络密钥互联。
+	BaseSeeds = "seeds"
 )
 
 // GroupFingerprint 群组指纹短串（8 位 hex，展示/日志/协议 ID 派生共用）。

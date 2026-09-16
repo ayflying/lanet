@@ -444,10 +444,61 @@ func AddrIP(a ma.Multiaddr) (netip.Addr, bool) {
 	return ip.Unmap(), true
 }
 
-// ShareableAddrs 整理出「可供分享」的地址列表：过滤 → 去重 → 按可达性排序
-// → 按链路前缀折叠冗余。连接种子与连接码统一走这里，保证两者口径一致。
+// ShareableAddrs 整理出「可供分享」的地址列表：剔除容器内网地址 → 去重 →
+// 按可达性排序 → 按链路前缀折叠冗余 → 把显式声明的对外地址顶到最前。
+// 连接种子与连接码统一走这里，保证两者口径一致。
 func ShareableAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
-	return CollapseRedundant(SortByReachability(addrs))
+	var drop map[string]bool
+	if InContainer() {
+		drop = collectContainerInternalAddrs()
+	}
+	return shareableAddrsWith(addrs, drop, AdvertiseAddrs())
+}
+
+// shareableAddrsWith 是 ShareableAddrs 的实现体：剔除集合与自声明地址由参数
+// 注入，从而单测不依赖「跑测试的机器是不是容器」、也不依赖环境变量。
+// drop 为 nil 即裸机语义（不剔除任何地址）。
+func shareableAddrsWith(addrs []ma.Multiaddr, drop map[string]bool, adv []ma.Multiaddr) []ma.Multiaddr {
+	// 自声明地址置顶（CollapseRedundant 保首条，故它优先于同链路的自动枚举结果）。
+	return CollapseRedundant(MergeAddrsFirst(adv, SortByReachability(DropAddrSet(addrs, drop))))
+}
+
+// DropAddrSet 剔除「IP 落在 drop 集合里」的地址。drop 为空时原样返回。
+//
+// 与「降级」的区别很关键：降级只改排序，名额有余量时脏地址照样会被分享、
+// 照样扩散；这里是从分享列表里**直接拿掉**。
+func DropAddrSet(addrs []ma.Multiaddr, drop map[string]bool) []ma.Multiaddr {
+	if len(drop) == 0 {
+		return addrs
+	}
+	out := make([]ma.Multiaddr, 0, len(addrs))
+	for _, a := range addrs {
+		if ip, ok := AddrIP(a); ok && drop[ip.String()] {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// MergeAddrsFirst 把 first 置于 base 之前并整体去重（保留首次出现的位置）。
+func MergeAddrsFirst(first, base []ma.Multiaddr) []ma.Multiaddr {
+	if len(first) == 0 {
+		return base
+	}
+	seen := make(map[string]bool, len(first)+len(base))
+	out := make([]ma.Multiaddr, 0, len(first)+len(base))
+	for _, group := range [][]ma.Multiaddr{first, base} {
+		for _, a := range group {
+			key := a.String()
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // CollapseRedundant 折叠「同一条链路」上的冗余地址，保留每个组合的首条。

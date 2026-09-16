@@ -32,12 +32,31 @@ func TestUnfriendNotifyOnline(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var unfriended []string
+	// B 侧对 A 的信任状态：初始互信任（模拟已是好友），收到删除通知后立刻
+	// 不再信任——与生产一致（上层 OnUnfriendReceived 会把对端移出地址簿，
+	// 此后 IsTrusted 对该对端返回 false）。
+	//
+	// 不补这一步测试就是**竞态**的：B 删除 A 的同时，双方的信息握手可能还在
+	// 往返，晚到的那次握手会再次把 A 写回成员表，于是断言时而通过时而失败
+	// （实测在整包运行时概率性失败、单跑必过）。生产代码没这个问题，
+	// 因为那次握手会被 IsTrusted=false 挡在待审批之外、不会 addMember。
+	trustA := true
 	db, err := New(ctx, hb, Config{
 		NetworkKey: "grp-uf",
 		Name:       "node-b",
-		IsTrusted:  func(string) bool { return true },
+		IsTrusted: func(peerID string) bool {
+			mu.Lock()
+			defer mu.Unlock()
+			if peerID == ha.ID().String() {
+				return trustA
+			}
+			return true
+		},
 		OnUnfriendReceived: func(peerID string) {
 			mu.Lock()
+			if peerID == ha.ID().String() {
+				trustA = false
+			}
 			unfriended = append(unfriended, peerID)
 			mu.Unlock()
 		},
@@ -89,6 +108,15 @@ func TestUnfriendNotifyOnline(t *testing.T) {
 	defer mu.Unlock()
 	if len(unfriended) == 0 || unfriended[0] != ha.ID().String() {
 		t.Fatalf("B 应收到删除好友通知并回调本机 ID，实际 %v", unfriended)
+	}
+	// 等移除生效；再留一小段时间确认「在途握手」不会把 A 写回来（见上面
+	// trustA 的注释）。写成有界轮询而不是一次性断言，避免依赖调度时序。
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := memberOf(db, ha.ID().String()); !ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if _, ok := memberOf(db, ha.ID().String()); ok {
 		t.Fatalf("B 收到通知后应立即把 A 移出成员表")

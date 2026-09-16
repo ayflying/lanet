@@ -220,6 +220,42 @@ type Config struct {
 	//   2) 本机出向握手收到 rejection=unfriended（对端早已删除本机、此前离线）。
 	// 上层据此把对端从本机地址簿/成员表移除，完成双向删除。可能被并发调用。
 	OnUnfriendReceived func(peerID string)
+
+	// ---- 种子表（免好友共享的中继 / 发现入口）----
+
+	// SeedCandidates 返回「已验证可达」的种子节点，用于中继候选与发现加速。
+	//
+	// 由上层从种子表（pkg/peersdb 的 group_seeds / global_seeds）读取：
+	// 种子不要求同群、不要求加过好友——这正是「群里有公网设备，就不用一个个
+	// 加好友」的落点。实现方必须只返回**通过验证门**（至少拨通过一次）的记录，
+	// 否则会把 NAT 后的节点与死地址也当成入口，反而制造拨号空耗。
+	//
+	// 纯本地内存/数据库读，不得发起网络请求：autorelay 每次要候选都会调用它。
+	// nil = 不用种子（退回只按成员表挑候选）。
+	SeedCandidates func(ctx context.Context, number int) []peer.AddrInfo
+
+	// GlobalSeedsLimit 全域种子表容量上限（0 = 用 DefaultGlobalSeedLimit）。
+	GlobalSeedsLimit int
+
+	// ---- 种子交换（免好友共享「已验证公网入口」）----
+	// 详见 seedex.go 文件头：两条隔离通道 + 硬性流量天花板。
+
+	// GroupSeedsEnabled 群内种子交换开关。开启后：注册按群密钥派生的种子协议、
+	// 周期与同群成员交换「已验证的公网入口」。默认关，由上层显式打开。
+	GroupSeedsEnabled bool
+	// GlobalSeedsEnabled 全域种子交换开关。开启后：额外注册固定 ID 的全域种子
+	// 协议，从而与**其他网络密钥**的节点互见并交换种子。这是显式的隐私让渡
+	// （异群可见你的节点 ID 与地址），默认关。
+	GlobalSeedsEnabled bool
+	// SeedSource 返回本机愿意分享的种子。**必须只返回通过验证门（至少拨通过
+	// 一次）的记录**：未验证的地址分享出去只会让别人空耗拨号。纯本地读。
+	SeedSource func(scope string, max int) []SeedRecord
+	// SeedMerge 合并对端送来的记录。实现方必须把这些记录按**未验证**
+	// （ok_count=0）入库——「对端能拨通」不等于「本机能拨通」，自报不可采信。
+	SeedMerge func(scope string, from string, records []SeedRecord)
+	// SeedPeers 返回该范围下额外的交换对象（全域范围通常来自私有 DHT 路由表）。
+	// 这是「跨网络密钥打通」的入口。纯本地读。nil = 只用成员表。
+	SeedPeers func(scope string, max int) []string
 }
 
 // Member 成员表中的一项。
@@ -291,6 +327,32 @@ type Discovery struct {
 	advFailCount int        // 连续「路由表空」失败次数
 
 	onDiscovered []Discovered
+
+	// relayOnce 保证常驻中继预约循环只启动一次（Run 可能被多次调用）。
+	relayOnce sync.Once
+
+	// protoSeedsGroup 群内种子交换协议 ID（按群密钥派生，异群协商不上）。
+	protoSeedsGroup libprotocol.ID
+	// seedGate 种子交换限流（出入向共用：同对端冷却 + 全局并发上限）。
+	seedGate *seedRateLimiter
+	// seedOnce 保证种子交换循环只启动一次。
+	seedOnce sync.Once
+
+	// 种子交换的**运行期**配置。
+	//
+	// 为什么不直接用 cfg：开关值存在地址簿的设置表里（用户可改），构造
+	// Discovery 时上层还不一定读完；而且 cfg 是值字段、被多处无锁读取，
+	// 构造后再写它会引入数据竞争。故这里单列一组受 seedMu 保护的字段，
+	// 由 EnableSeedExchange 在运行期设置（Config 里的同名项只作初值）。
+	seedMu       sync.RWMutex
+	seedGroupOn  bool
+	seedGlobalOn bool
+	seedLimit    int
+	seedSourceFn func(scope string, max int) []SeedRecord
+	seedMergeFn  func(scope, from string, records []SeedRecord)
+	seedPeersFn  func(scope string, max int) []string
+	seedCandFn   func(ctx context.Context, number int) []peer.AddrInfo
+	seedHandlers bool // handler 是否已注册（避免重复注册/重复日志）
 }
 
 // New 创建并启动发现服务：连引导节点、初始化 DHT、启动 mDNS。
@@ -342,6 +404,8 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		trigger:    make(chan struct{}, 1),
 		nearbySeen: make(map[string]time.Time),
 	}
+	// 种子交换的运行期字段在此统一初始化（Config 同名项只作初值）。
+	d.initSeedRuntime(cfg)
 	// 控制面协议 ID：默认按群密钥派生（异群 multistream 协商即失败，
 	// 从传输层过滤跨群噪音）；LegacyProtocols 逃生开关退回历史固定 ID。
 	// 派生模式下保留固定 ID 作为「出向兜底」：同群混版本过渡期（对端还是
@@ -355,6 +419,9 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		d.protoUnfriend = lproto.GroupProtoID(lproto.BaseUnfriend, d.groupKey)
 		d.protoInfoAlt = ProtocolInfo
 		d.protoUnfriendAlt = ProtocolUnfriend
+		// 群内种子交换同样按群密钥派生：异群在 multistream 阶段即失败，
+		// 与「群内种子表 / 全域种子表物理隔离」在协议层一一对应。
+		d.protoSeedsGroup = lproto.GroupProtoID(lproto.BaseSeeds, d.groupKey)
 	}
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
 
@@ -481,6 +548,12 @@ func (d *Discovery) Start(ctx context.Context) error {
 		// 指纹，在审批门之前就被静默丢弃，零待审批污染。
 		d.host.SetStreamHandler(d.protoInfoAlt, d.handleInfo)
 		d.host.SetStreamHandler(d.protoUnfriendAlt, d.handleUnfriend)
+	}
+	// 种子交换：构造时若已开启就注册 handler；未开启的范围连 handler 都
+	// 不存在（对端拨过来直接协商失败，无法强制本机产生处理开销）。
+	// 运行期改开关走 EnableSeedExchange（控制台改了设置立即生效）。
+	if d.seedAnyScopeEnabled() {
+		d.registerSeedHandlers()
 	}
 	return nil
 }
@@ -789,6 +862,11 @@ func (d *Discovery) Peers() []Member {
 // 每轮结束执行一次成员回收：超期无真实通讯的成员移出成员表，
 // 其虚拟 IP 派生占用随之释放（Roadmap：虚拟 IP 成员下线回收）。
 func (d *Discovery) Run(ctx context.Context) {
+	// 无服务器模式下唯一会建立中继预约的地方（见 relay.go 文件头）：
+	// 不补这一步，纯 NAT 群永远既连不上也打不了洞。
+	d.startRelayReservation(ctx)
+	// 种子交换循环（开关没开时内部直接返回）。
+	d.startSeedExchange(ctx)
 	ticker := time.NewTicker(d.cfg.Interval)
 	defer ticker.Stop()
 	d.advertiseAndDiscover(ctx)
@@ -1467,30 +1545,22 @@ func (d *Discovery) Resolve(virtualIP string) (netmapclient.Route, bool) {
 	return netmapclient.Route{}, false
 }
 
-// Candidates 实现 tunnel.RelaySource：成员表作为中继候选
-// （每个 standalone 节点默认运行 relay service；不支持中继的候选会被
-// tunnel 层 Reserve 失败后自动跳过）。
+// Candidates 实现 tunnel.RelaySource 与 autorelay 候选来源：返回中继候选。
+//
+// 候选顺序与筛选规则见 relay.go 文件头——简言之：已验证种子优先，
+// 其次成员表里「未超期 + 有可用地址」的节点；地址会剔掉 link-local 与
+// /p2p-circuit；顺序稳定（同一输入必得同一输出），避免 autorelay 每次
+// 对着不同的随机候选反复重试。
 func (d *Discovery) Candidates(ctx context.Context, number int) ([]peer.AddrInfo, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	out := make([]peer.AddrInfo, 0, number)
-	for _, m := range d.members {
-		if m.PeerID == d.host.ID().String() {
-			continue
-		}
-		id, err := peer.Decode(m.PeerID)
-		if err != nil {
-			continue
-		}
-		addrs := d.host.Peerstore().Addrs(id)
-		if len(addrs) == 0 {
-			continue
-		}
-		out = append(out, peer.AddrInfo{ID: id, Addrs: addrs})
-		if len(out) >= number {
-			break
-		}
+	if d == nil || d.host == nil || number <= 0 {
+		return nil, nil
 	}
+	if number > relayCandidatesMax {
+		number = relayCandidatesMax
+	}
+	d.mu.RLock()
+	out := d.collectRelayCandidates(ctx, number)
+	d.mu.RUnlock()
 	return out, nil
 }
 

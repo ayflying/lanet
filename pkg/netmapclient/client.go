@@ -8,6 +8,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	ma "github.com/multiformats/go-multiaddr"
+
+	"github.com/ayflying/pvn/pkg/p2pkit"
 )
 
 // 群组 NetMap 客户端：
@@ -151,7 +155,15 @@ func (c *Client) Resolve(virtualIP string) (Route, bool) {
 }
 
 // Announce 向控制面通告本节点可达地址（multiaddr）。
+// Announce 把自己的可达地址通告给控制面，供同群成员按需直拨。
+//
+// 通告前统一清洗（见 FilterAnnounceAddrs）：历史实现是把 libp2p 的原始监听地址
+// 整份发上去，于是回环（127.0.0.1）、未指定（0.0.0.0）、lanet overlay（10.7/16）
+// 以及容器内网地址全被写进 netmap；同群节点拿到这些地址去拨，轻则必然超时
+// （对端拨回环＝拨它自己），重则形成拨号风暴。真机实证：VPS 容器通告了
+// 192.168.64.2:4001，其它成员冷启动预热反复拨它，每轮空耗 30~45 秒。
 func (c *Client) Announce(ctx context.Context, addrs []string) error {
+	addrs = FilterAnnounceAddrs(addrs)
 	payload := map[string]any{"peer_id": c.peerID, "addrs": addrs}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -179,6 +191,40 @@ func (c *Client) Announce(ctx context.Context, addrs []string) error {
 		return fmt.Errorf("announce addresses: %s", envelope.Message)
 	}
 	return nil
+}
+
+// FilterAnnounceAddrs 清洗要对外通告的地址列表：
+//   - 剔除回环（127/8、::1）、未指定（0.0.0.0、::）、lanet overlay（10.7/16）——
+//     对端拨这些地址只会打到它自己的机器；
+//   - 本机在容器里时剔除容器内网地址（外部永远不可达，见 p2pkit.InContainer）；
+//   - 去重、按可达性排序、折叠同一链路的冗余（Windows 隐私 IPv6 会刷出七八条）；
+//   - 把 LANET_ADVERTISE 显式声明的对外地址顶到最前。
+//
+// 无法解析为 multiaddr 的字符串**原样保留**：一条畸形成员地址不该让整份通告
+// 消失。清洗后为空就通告空列表——这比通告一堆必然失败的地址更有价值。
+func FilterAnnounceAddrs(addrs []string) []string {
+	if len(addrs) == 0 {
+		return addrs
+	}
+	parsed := make([]ma.Multiaddr, 0, len(addrs))
+	var unparsed []string
+	for _, s := range addrs {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		a, err := ma.NewMultiaddr(s)
+		if err != nil {
+			unparsed = append(unparsed, s)
+			continue
+		}
+		parsed = append(parsed, a)
+	}
+	out := make([]string, 0, len(parsed)+len(unparsed))
+	for _, a := range p2pkit.ShareableAddrs(parsed) {
+		out = append(out, a.String())
+	}
+	return append(out, unparsed...)
 }
 
 // RunLoop 周期性刷新 NetMap，直到 ctx 取消。

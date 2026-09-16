@@ -156,6 +156,63 @@ CREATE TABLE IF NOT EXISTS unfriended (
 	at       DATETIME NOT NULL
 );`,
 	},
+	{
+		version: 4,
+		name:    "seeds(群内/全域两张隔离表) + app_settings 设置存储",
+		up: `
+-- 种子表：记录「不需要加好友、直接可用」的公网可达节点。
+--
+-- 为什么单独建表而不复用 nearby：nearby 是「被动发现到的同密钥节点」，
+-- 语义是「可选好友候选」，且不区分网络密钥、没有可达性验证字段；种子表要的是
+-- 「实测能直拨的中转/发现入口」，必须有 ok_count / last_ok 作验证门、必须有
+-- 容量上限与淘汰顺序，两者语义与生命周期都不同，混用会互相污染。
+--
+-- 两张表**物理隔离**而非用 scope 列：请求方是不同开关下的两套逻辑
+-- （群内种子默认可用；全域种子只在「全域开关」打开时才参与），
+-- 分表能让「跨范围串数据」在 SQL 层面就不可能发生。
+-- 两表结构完全一致，见 seeds.go 的 seedColumns。
+CREATE TABLE IF NOT EXISTS group_seeds (
+	peer_id          TEXT PRIMARY KEY,
+	name             TEXT NOT NULL DEFAULT '',
+	addrs            TEXT NOT NULL DEFAULT '',   -- 逗号分隔的 multiaddr 快照
+	public_reachable INTEGER NOT NULL DEFAULT 0, -- 1 = 实测公网可达（免好友共享的前提）
+	ok_count         INTEGER NOT NULL DEFAULT 0, -- 累计拨通成功次数（验证门）
+	last_ok          DATETIME,                   -- 最近一次拨通成功（NULL = 从未成功）
+	first_seen       DATETIME NOT NULL,
+	last_seen        DATETIME NOT NULL,
+	source           TEXT NOT NULL DEFAULT '',   -- direct / exchange / gossip
+	updated_at       DATETIME NOT NULL           -- 记录版本，防旧数据覆盖新数据
+);
+CREATE INDEX IF NOT EXISTS idx_group_seeds_entry ON group_seeds(public_reachable, last_ok);
+CREATE INDEX IF NOT EXISTS idx_group_seeds_seen ON group_seeds(last_seen);
+
+-- 全域种子：只在「全域开关」打开的本机上收集与使用，需要存整个私有 DHT 网络
+-- 的入口节点，故容量上限（默认 1000，可配）比群内大得多，淘汰也更激进
+-- （长期不上线的优先剔）。
+CREATE TABLE IF NOT EXISTS global_seeds (
+	peer_id          TEXT PRIMARY KEY,
+	name             TEXT NOT NULL DEFAULT '',
+	addrs            TEXT NOT NULL DEFAULT '',
+	public_reachable INTEGER NOT NULL DEFAULT 0,
+	ok_count         INTEGER NOT NULL DEFAULT 0,
+	last_ok          DATETIME,
+	first_seen       DATETIME NOT NULL,
+	last_seen        DATETIME NOT NULL,
+	source           TEXT NOT NULL DEFAULT '',
+	updated_at       DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_global_seeds_entry ON global_seeds(public_reachable, last_ok);
+CREATE INDEX IF NOT EXISTS idx_global_seeds_seen ON global_seeds(last_seen);
+
+-- 键值设置表：存节点级运行配置（如全域开关与容量上限）。
+-- 放数据库而不是只读环境变量，是为了让控制台能在线改、且重启后仍生效；
+-- 环境变量仍作后备（见 SDK 侧配置面）。
+CREATE TABLE IF NOT EXISTS app_settings (
+	key        TEXT PRIMARY KEY,
+	value      TEXT NOT NULL DEFAULT '',
+	updated_at DATETIME NOT NULL
+);`,
+	},
 }
 
 const schemaMigrationsMeta = `

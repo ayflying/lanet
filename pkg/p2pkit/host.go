@@ -209,6 +209,46 @@ func AddrInfo(h host.Host) peer.AddrInfo {
 	}
 }
 
+// CandidateSource 一次返回一批中继候选（serverless.Discovery.Candidates 即此形状）。
+type CandidateSource func(ctx context.Context, number int) ([]peer.AddrInfo, error)
+
+// PeerSourceFromCandidates 把「一次返回候选列表」的函数适配成 autorelay 需要的
+// 流式 PeerSource。
+//
+// 为什么需要这层适配：autorelay.PeerSource 是 `func(ctx, n) <-chan peer.AddrInfo`，
+// 而发现服务天然提供的是「同步取一批」的 Candidates。中间这层薄适配让候选
+// 逻辑（限流、去幽灵、地址筛选）只写一遍，不必为接口形态再实现一次。
+//
+// 不做缓存：autorelay 需要候选时就现取，避免拿着过期的离线节点反复重试
+// （候选筛选本身是纯本地内存读，开销可忽略）。
+func PeerSourceFromCandidates(src CandidateSource, fallbackNumber int) autorelay.PeerSource {
+	return func(ctx context.Context, number int) <-chan peer.AddrInfo {
+		out := make(chan peer.AddrInfo)
+		if src == nil {
+			close(out)
+			return out
+		}
+		if number <= 0 {
+			number = fallbackNumber
+		}
+		go func() {
+			defer close(out)
+			candidates, err := src(ctx, number)
+			if err != nil {
+				return
+			}
+			for _, candidate := range candidates {
+				select {
+				case <-ctx.Done():
+					return
+				case out <- candidate:
+				}
+			}
+		}()
+		return out
+	}
+}
+
 // EnsureRelayReservation 向候选中继逐个发起预约，成功一次即返回。
 // 用途：agent 入网后主动在 relay 上留下预约（Reservation），
 // 使任意其他成员都能经中继访问本节点——AutoRelay 只在节点
