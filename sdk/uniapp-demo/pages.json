@@ -1,0 +1,16 @@
+{
+    "pages": [
+        {
+            "path": "pages/index/index",
+            "style": {
+                "navigationBarTitleText": "lanet"
+            }
+        }
+    ],
+    "globalStyle": {
+        "navigationBarTextStyle": "white",
+        "navigationBarTitleText": "lanet",
+        "navigationBarBackgroundColor": "#1f2937",
+        "backgroundColor": "#f5f6f8"
+    }
+}

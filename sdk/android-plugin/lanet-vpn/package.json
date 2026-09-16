@@ -1,0 +1,37 @@
+{
+	"name": "lanet-vpn",
+	"id": "lanet-vpn",
+	"version": "0.1.0",
+	"description": "lanet P2P 虚拟局域网：让 App 成为组网成员，可直接访问 10.7.0.0/16 内的任意地址（ping / TCP / UDP），无需服务端。",
+	"_dp_type": "nativeplugin",
+	"_dp_nativeplugin": {
+		"android": {
+			"plugins": [
+				{
+					"type": "module",
+					"name": "lanet-vpn",
+					"class": "com.lanet.plugin.LanetVpnModule"
+				}
+			],
+			"integrateType": "aar",
+			"minSdkVersion": "21",
+			"abis": [
+				"armeabi-v7a",
+				"arm64-v8a",
+				"x86"
+			],
+			"permissions": [
+				"android.permission.INTERNET",
+				"android.permission.ACCESS_NETWORK_STATE",
+				"android.permission.ACCESS_WIFI_STATE",
+				"android.permission.CHANGE_WIFI_MULTICAST_STATE",
+				"android.permission.WAKE_LOCK",
+				"android.permission.FOREGROUND_SERVICE",
+				"android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+				"android.permission.POST_NOTIFICATIONS",
+				"android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+				"android.permission.ACCESS_FINE_LOCATION"
+			]
+		}
+	}
+}

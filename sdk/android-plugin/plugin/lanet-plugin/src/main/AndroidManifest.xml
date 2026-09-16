@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  插件自带的 AndroidManifest。
+
+  library 模块的 manifest 会被宿主（uni-app 云打包 / 离线打包）用 AGP 合并进最终
+  APK，所以这里只需声明「宿主本来没有的外部组件 + 权限」，**不要**写
+  <application> 上的 label/icon/theme 之类的属性 —— 那会覆盖宿主自身的取值。
+
+  组件名全部用全限定名：相对名（.LanetVpnService）在 library manifest 里要按
+  该 manifest 的 package 解析，历史上多次因 namespace 与 package 不一致而出错，
+  写全名没有歧义。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 组网本身只需要 INTERNET；其余都是为「常驻 + 局域网发现 + 稳定后台」服务 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- mDNS 局域网自动发现：Android 默认过滤组播包，需要显式持锁 -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- VPN 必须前台服务常驻，否则退到后台就被系统冻结 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!--
+      Android 14（API 34）起，前台服务声明 foregroundServiceType="specialUse" 时
+      必须同时持有本权限，否则 startForeground 直接抛 SecurityException。
+      targetSdk ≥ 34 时这是硬要求，不是可选优化。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 读取当前 WiFi 名用于展示（可选，缺了不影响组网） -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <application>
+
+        <!--
+          虚拟网卡由 VpnService 建立 —— 非 root 应用无法自行打开 /dev/net/tun，
+          VpnService.establish() 是唯一合法途径；它返回的 fd 交给 Go 侧的
+          wireguard 接管（tundevice.NewFromFD）。
+
+          android:permission="android.permission.BIND_VPN_SERVICE" 是系统要求，
+          少了 establish() 会直接失败。
+        -->
+        <service
+            android:name="com.lanet.plugin.LanetVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="lanet_p2p_vpn" />
+        </service>
+
+        <!--
+          授权代理：VpnService.prepare() 弹的系统授权框，结果只回给发起方的
+          onActivityResult。uni-app 的宿主 Activity 不会把 onActivityResult 让给
+          插件，所以插件自己起一个透明 Activity 承接「弹窗 → 拿结果 → 启服务」。
+
+          对用户不可见：Translucent.NoTitleBar + noHistory + excludeFromRecents。
+        -->
+        <activity
+            android:name="com.lanet.plugin.VpnAuthProxyActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+    </application>
+</manifest>

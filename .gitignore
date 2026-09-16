@@ -35,3 +35,15 @@ sdk/android/app/libs/*.aar
 sdk/android/dist/
 sdk/android-plugin/**/build/
 sdk/android-plugin/**/.gradle/
+sdk/android-plugin/plugin/local.properties
+# uni-app 插件交付包里的 aar 都是现场编译产物，合计 40MB+，不入库：
+#   lanet.aar        ← sdk/go/mobile 用 gomobile 产出
+#   lanet-plugin.aar ← sdk/android-plugin/plugin 编译产出
+# 构建方式见 sdk/android-plugin/README.md
+sdk/android-plugin/lanet-vpn/android/*.aar
+# 从 lanet.aar 抽出的 classes.jar（library 模块不能直接依赖本地 aar，故抽出来编）
+sdk/android-plugin/plugin/lanet-plugin/libs/*.jar
+# uni-app 示例工程：插件包由 build.py 自动同步进来（39MB，不入库），
+# unpackage/ 是 HBuilderX 的构建产物
+sdk/uniapp-demo/nativeplugins/
+sdk/uniapp-demo/unpackage/

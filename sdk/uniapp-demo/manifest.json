@@ -1,0 +1,72 @@
+{
+    "name": "lanet-demo",
+    "appid": "",
+    "description": "lanet P2P 虚拟局域网 uni-app 示例",
+    "versionName": "0.1.0",
+    "versionCode": "100",
+    "transformPx": false,
+    "vueVersion": "3",
+    "app-plus": {
+        "usingComponents": true,
+        "nvueStyleCompiler": "uni-app",
+        "compilerVersion": 3,
+        "splashscreen": {
+            "alwaysShowBeforeRender": true,
+            "waiting": true,
+            "autoclose": true,
+            "delay": 0
+        },
+        "modules": {},
+        "distribute": {
+            "android": {
+                "minSdkVersion": 21,
+                "targetSdkVersion": 35,
+                "abiFilters": [
+                    "armeabi-v7a",
+                    "arm64-v8a"
+                ],
+                "permissions": [
+                    "<uses-permission android:name=\"android.permission.INTERNET\"/>",
+                    "<uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\"/>",
+                    "<uses-permission android:name=\"android.permission.ACCESS_WIFI_STATE\"/>",
+                    "<uses-permission android:name=\"android.permission.CHANGE_WIFI_MULTICAST_STATE\"/>",
+                    "<uses-permission android:name=\"android.permission.WAKE_LOCK\"/>",
+                    "<uses-permission android:name=\"android.permission.FOREGROUND_SERVICE\"/>",
+                    "<uses-permission android:name=\"android.permission.FOREGROUND_SERVICE_SPECIAL_USE\"/>",
+                    "<uses-permission android:name=\"android.permission.POST_NOTIFICATIONS\"/>",
+                    "<uses-permission android:name=\"android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS\"/>",
+                    "<uses-permission android:name=\"android.permission.ACCESS_FINE_LOCATION\"/>"
+                ]
+            },
+            "sdkConfigs": {}
+        },
+        "nativePlugins": {
+            "lanet-vpn": {
+                "__plugin_info__": {
+                    "name": "lanet P2P 虚拟局域网",
+                    "description": "让 App 成为组网成员，可直接访问 10.7.0.0/16 内的任意地址",
+                    "platforms": "Android",
+                    "android_package_name": "",
+                    "ios_bundle_id": "",
+                    "isCloud": false,
+                    "bought": 1,
+                    "pid": "",
+                    "parameters": {}
+                }
+            }
+        }
+    },
+    "quickapp": {},
+    "mp-weixin": {
+        "appid": "",
+        "setting": {
+            "urlCheck": false
+        },
+        "usingComponents": true
+    },
+    "h5": {
+        "router": {
+            "mode": "hash"
+        }
+    }
+}
