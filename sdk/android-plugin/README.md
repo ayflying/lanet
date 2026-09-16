@@ -8,13 +8,20 @@
 `LanetVpnService`（Android VpnService 两阶段建卡），插件层只做「取 Context → 转发调用 →
 回 JS 回调」这一件事。
 
+**同一份 `lanet-plugin.aar` 也服务 Unity**（见 [`sdk/unity`](../unity/README.md)）：
+所有行为都在**宿主无关门面** `com.lanet.plugin.LanetNode` 里，本目录的
+`LanetVpnModule` 只是 DCloud 专属薄壳，Unity 侧用 `AndroidJavaClass.CallStatic` 直接
+调门面的静态方法。改行为改 `LanetNode.kt`，两边同时生效。
+
 ```
 sdk/android-plugin/                 插件工程（构建侧）
-├─ build.py                         统一构建入口（五步全自动）
+├─ build.py                         统一构建入口（六步全自动）
 ├─ plugin/                          Gradle 工程
 │  └─ lanet-plugin/                 插件 module（Kotlin，产出 lanet-plugin.aar）
 │     ├─ src/main/java/com/lanet/plugin/
-│     │  ├─ LanetVpnModule.kt       插件入口（JS 调用的就是这个类）
+│     │  ├─ LanetNode.kt            宿主无关门面（Unity/原生 Android 直接用）
+│     │  ├─ LanetInitProvider.kt    进程启动注入 ApplicationContext（Unity 无 Context 可用）
+│     │  ├─ LanetVpnModule.kt       DCloud 薄壳（JS 调用的就是这个类）
 │     │  ├─ LanetVpnService.kt      VpnService：建立 tun、持有会话
 │     │  ├─ VpnAuthProxyActivity.kt 透明代理：拉系统 VPN 授权框
 │     │  └─ LanetCore.kt            对 gomobile 库的薄封装
@@ -24,23 +31,26 @@ sdk/android-plugin/                 插件工程（构建侧）
    ├─ package.json                  插件描述（id / class / abi / 权限）
    └─ android/
       ├─ lanet.aar                  gomobile 编译产物（三 ABI，约 38MB）
-      └─ lanet-plugin.aar           插件本体（约 32KB）
+      └─ lanet-plugin.aar           插件本体（约 37KB）
 
 sdk/uniapp-demo/                    uni-app 示例工程（Vue3）
 ├─ utils/lanet.js                   插件 JS 封装（Promise 化 + 降级）
 └─ pages/index/index.vue            完整 UI：启动/停止/成员/审批/连接
+
+sdk/unity/                          Unity UPM 包（复用同一份 aar）
+└─ Runtime/Plugins/Android/         build.py 第 ⑥ 步同步进来的两个 aar
 ```
 
 ## 一、构建插件
 
 ```powershell
 cd sdk/android-plugin
-python build.py                # 全流程：编 AAR + 编插件 + 校验 + 同步示例工程
-python build.py --skip-aar     # 跳过 gomobile（沿用已有 lanet.aar），约 15s
+python build.py                # 全流程：编 AAR + 编插件 + 校验 + 同步示例工程与 Unity 包
+python build.py --skip-aar     # 跳过 gomobile（沿用已有 lanet.aar），约 20s
 python build.py --verify-only  # 只做交付包校验
 ```
 
-五个步骤：
+六个步骤：
 
 | 步骤 | 动作 | 关键点 |
 | --- | --- | --- |
@@ -49,6 +59,11 @@ python build.py --verify-only  # 只做交付包校验
 | ③ | Gradle 编插件 module | 末尾跑 `verifyNoLeak`，确认没有宿主类混进产物 |
 | ④ | 校验交付包 | package.json 合法 / id 与注册名一致 / abis 与 aar 内一致 / 无宿主类泄漏 |
 | ⑤ | 同步到 `sdk/uniapp-demo/nativeplugins/` | 示例工程开箱即可打包 |
+| ⑥ | 同步两个 aar 到 `sdk/unity/Runtime/Plugins/Android/` | 并用 `javap` 校验 `LanetNode` 的 16 个入口**齐全且都是 public static** |
+
+第 ⑥ 步的 `javap` 校验是必要的保险：Unity 侧 `AndroidJavaClass.CallStatic` **只能命中
+真·静态方法**，漏一个 `@JvmStatic` 或被 R8 裁掉，编辑器里毫无征兆、真机上直接
+「no such method」。让构建期就红掉，比装到手机再查便宜得多。
 
 前置依赖：JDK（`JAVA_HOME` 指向 17+）、Android SDK + NDK、`gomobile` 在 PATH。
 脚本里的 `build_env()` 已经把本机路径写死，换机器要改这一段。
@@ -158,6 +173,8 @@ await lanet.stop()
 | `status()` 里没有 `virtual_ip` | 还没握手成功：核对 `network_key`、种子地址是否可达 |
 | 列表能看到成员但 ping 不通 | 检查是否真拿到虚拟 IP；纯应用层模式（`want_tun:false`）不可 ping |
 | 打包报找不到 `com.lanet.plugin.LanetVpnModule` | `package.json` 的 class 与 `_dp_nativeplugin` 注册不一致 → 跑 `build.py --verify-only` |
+| Unity 真机报 `no such method ... LanetNode` | 门面方法漏了 `@JvmStatic` 或被 R8 裁掉 → 跑 `build.py`，第 ⑥ 步的 javap 校验会指出是哪一个 |
+| Kotlin 报 `Returns are prohibited for functions with an expression body` | 表达式体函数里用了 `return` → 改成块体 `{ }` |
 
 宿主若是自己配混淆，务必带上 `lanet-plugin/consumer-rules.pro` 里的规则：插件类继承
 `UniModule` 并靠注解反射枚举，被裁掉就会「插件静默不生效」。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""把 lanet 编成 uni-app 原生插件（nativeplugin）包。
+"""把 lanet 编成 uni-app 原生插件（nativeplugin）包，顺带同步给 Unity 包。
 
 一条命令走完全程：
 
@@ -13,6 +13,9 @@
   2. 从 lanet.aar 抽出 classes.jar —— library 模块不能直接依赖本地 .aar
   3. gradle 编插件 module 并自检（verifyNoLeak：插件 aar 里不能有宿主类）
   4. 校验交付包完整性
+  5. 把交付包同步进 sdk/uniapp-demo/nativeplugins/
+  6. 把两个 aar 同步进 sdk/unity/Runtime/Plugins/Android/，并用 javap 校验
+     宿主无关门面 com.lanet.plugin.LanetNode 的静态入口齐全（Unity 只能调静态方法）
 
 改插件 Kotlin 代码时用 `--skip-aar` 跳过第 1 步，能省两分钟。
 """
@@ -26,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -49,6 +53,20 @@ EXPECTED_ABIS = ["armeabi-v7a", "arm64-v8a", "x86"]
 
 # 原生插件 API 的所属包名，出现在插件 aar 里就说明宿主类被误打进去了
 FORBIDDEN_PREFIXES = ("io/dcloud/", "com/taobao/weex/", "com/lanet/mobile/")
+
+# Unity 包（UPM）里放原生库的位置
+UNITY_ROOT = REPO_ROOT / "sdk" / "unity"
+UNITY_PLUGINS = UNITY_ROOT / "Runtime" / "Plugins" / "Android"
+
+# Unity 走 AndroidJavaClass.CallStatic，只能命中真·public static 方法。
+# 少一个（比如忘了 @JvmStatic、或被 R8 裁掉）就会在真机上以
+# 「no such method」炸掉，而编辑器里毫无征兆——所以构建时用 javap 钉死。
+REQUIRED_UNITY_METHODS = [
+    "startAuto", "stopAuto", "isAuthorizedAuto",
+    "status", "isRunning", "members", "pending", "peers", "nearby",
+    "seedAddrs", "inviteCode", "lastError", "version",
+    "connect", "approve", "remove",
+]
 
 
 def log(msg: str = "") -> None:
@@ -293,6 +311,85 @@ def sync_demo() -> None:
             log(f"      {f.relative_to(target)}  {f.stat().st_size / 1024:.0f}KB")
 
 
+def javap_public_api(env: dict, class_name: str) -> str:
+    """把插件 aar 里的 classes.jar 抽出来，用 javap 打印某个类的公开成员。
+
+    为什么不是「读常量池」：javap 的输出就是 JVM 眼里的真实签名，能同时验证
+    「方法存在」「是 static 的」「参数类型对不对」，比自己解析 dex/字节码可靠。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        jar = Path(td) / "classes.jar"
+        with zipfile.ZipFile(PLUGIN_AAR) as z:
+            try:
+                jar.write_bytes(z.read("classes.jar"))
+            except KeyError:
+                die("插件 aar 里没有 classes.jar（产物异常）")
+        javap = Path(env["JAVA_HOME"]) / "bin" / ("javap.exe" if os.name == "nt" else "javap")
+        if not javap.is_file():
+            # 兼容只有无扩展名可执行文件的 JDK 布局
+            javap = Path(env["JAVA_HOME"]) / "bin" / "javap"
+        if not javap.is_file():
+            javap = Path(shutil.which("javap") or "javap")
+        rc, out = run([str(javap), "-classpath", str(jar), class_name],
+                      PLUGIN_SRC, env, tail=120)
+        if rc != 0:
+            die(f"javap 读不到 {class_name} —— 类不存在或字节码异常")
+        return out
+
+
+def sync_unity(env: dict) -> None:
+    """把两个 aar 同步进 Unity 包，并校验 Unity 侧的调用契约。
+
+    为什么 aar 不入库：`lanet.aar` 38MB，每次改 Go 都变；UPM 包只提交源码与
+    README，aar 由本脚本构建后填充，clone 下来跑一次 build.py 即可。
+    """
+    step("⑥ 同步 aar 到 Unity 包并校验门面 API")
+    if not UNITY_ROOT.is_dir():
+        log("   （没有 sdk/unity，跳过）")
+        return
+    UNITY_PLUGINS.mkdir(parents=True, exist_ok=True)
+    for src in (AAR_DST, PLUGIN_AAR):
+        if not src.is_file():
+            die(f"缺少 {src.name}，无法同步到 Unity 包")
+        dst = UNITY_PLUGINS / src.name
+        shutil.copy2(src, dst)
+        log(f"   {dst.relative_to(REPO_ROOT)}  {human_size(dst)}  sha256={sha16(dst)}")
+
+    out = javap_public_api(env, "com.lanet.plugin.LanetNode")
+    missing = [m for m in REQUIRED_UNITY_METHODS if f" {m}(" not in out]
+    if missing:
+        die(f"LanetNode 缺少 Unity 需要的静态入口 {missing}"
+            "（漏了 @JvmStatic，或被 R8 裁掉——检查 consumer-rules.pro）")
+    # 必须都是 public static —— 只是 public 也不够，CallStatic 命中不了实例方法
+    not_static = [m for m in REQUIRED_UNITY_METHODS
+                  if "static final" not in _line_of(out, m)]
+    if not_static:
+        die(f"这些入口不是 static：{not_static} —— Unity 的 CallStatic 调不到，"
+            "检查方法上是否漏了 @JvmStatic")
+
+    # CallStatic 拿不到 Context，全靠 LanetInitProvider 在进程启动时注入
+    provider = javap_public_api(env, "com.lanet.plugin.LanetInitProvider")
+    if "android.content.ContentProvider" not in provider or "onCreate()" not in provider:
+        die("LanetInitProvider 不是可用的 ContentProvider"
+            " —— startAuto/stopAuto 会拿不到 Context")
+    log(f"   javap 校验：{len(REQUIRED_UNITY_METHODS)} 个静态入口齐全且均为 "
+        f"public static，ContentProvider 就位")
+    log(f"   Unity 包就绪：把 {UNITY_ROOT.relative_to(REPO_ROOT)} 作为本地包引入即可")
+
+
+def _line_of(javap_output: str, method: str) -> str:
+    """从 javap 输出里取出声明了某个方法的那一行（找不到就给空串）。"""
+    for line in javap_output.splitlines():
+        if f" {method}(" in line:
+            return line
+    return ""
+
+
+def human_size(p: Path) -> str:
+    n = p.stat().st_size
+    return f"{n / 1048576:.1f}MB" if n >= 1048576 else f"{n / 1024:.0f}KB"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="构建 lanet 的 uni-app 原生插件包")
     ap.add_argument("--skip-aar", action="store_true",
@@ -320,6 +417,7 @@ def main() -> None:
     build_plugin(env)
     verify_package()
     sync_demo()
+    sync_unity(env)
 
 
 if __name__ == "__main__":

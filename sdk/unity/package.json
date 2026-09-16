@@ -1,0 +1,27 @@
+{
+  "name": "com.lanet.unity",
+  "version": "0.1.0",
+  "displayName": "Lanet P2P Networking",
+  "description": "Lanet 群组制 P2P 虚拟局域网的 Unity 接入包。提供两条链路：(1) ws-gateway 网关客户端，跨平台（Windows/macOS/Linux/Android/iOS）经 WebSocket 帧协议访问网格内任意节点的 TCP 服务；(2) Android 本地节点，复用 lanet-plugin.aar 让手机成为真正的网络成员（可 ping 虚拟 IP、被 mDNS 发现）。含主线程调度器、Inspector 友好的 Manager 组件与 Android 依赖自检工具。",
+  "unity": "2021.3",
+  "keywords": [
+    "lanet",
+    "p2p",
+    "vpn",
+    "networking",
+    "libp2p",
+    "websocket"
+  ],
+  "author": {
+    "name": "Lanet",
+    "url": "https://github.com/ayflying/lanet"
+  },
+  "dependencies": {},
+  "samples": [
+    {
+      "displayName": "Lanet Demo",
+      "description": "演示两种链路：经 ws-gateway 开流做请求-响应，以及在 Android 上启动本地节点成为网络成员。",
+      "path": "Samples~/LanetDemo"
+    }
+  ]
+}

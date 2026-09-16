@@ -1,8 +1,13 @@
 # Lanet.Sdk — C# SDK
 
-Lanet ws-gateway 客户端：让 **Unity / .NET 8 / MAUI** 接入 Lanet 群组网格。
+Lanet ws-gateway 客户端：让 **.NET 8 / MAUI / 任意 .NET 环境** 接入 Lanet 群组网格。
 零外部依赖（基于 `System.Net.WebSockets.ClientWebSocket`），双目标打包
-`netstandard2.1`（Unity 2021+）+ `net8.0`，`LangVersion 9`。
+`netstandard2.1`（兼容 Unity 2021+ 的 .NET Standard 档位）+ `net8.0`，`LangVersion 9`。
+
+> **在 Unity 里请用 [`sdk/unity`](../unity/README.md)**（UPM 包 `com.lanet.unity`），不要直接引本工程：
+> 那个包逐字内含本 SDK 的源码（`Frames.cs` / `GatewayStream.cs` / `LanetGatewayClient.cs`），
+> 另加了主线程调度器、`LanetManager` 组件、Editor 自检与 **Android 本地节点**能力
+> （让 App 自己成为网络成员，而不是只经网关中转）。两个包命名空间相同，**同时导入会撞类型**。
 
 ## 接入方式说明
 
@@ -23,13 +28,15 @@ C# 客户端 ──(WebSocket 帧协议 :8700)──→ ws-gateway ──(libp2p
 - ✅ service 模式接收入向流（网关同一时刻允许**一个** service 连接）
 - ✅ 心跳保活（`PingAsync`，网关回 Pong）
 - ❌ TUN 内核组网、ping 虚拟 IP（网关是转发节点，非端到端）
+  —— 想要真入网用 [`sdk/unity`](../unity/README.md) 的 Android 链路或 [`sdk/android-plugin`](../android-plugin/README.md)
 
 ## 安装
 
 - .NET 8 项目：引用 `sdk/csharp/Lanet.Sdk/Lanet.Sdk.csproj` 或打包后的 NuGet；
-- Unity：拷贝 `Lanet.Sdk/bin/Release/netstandard2.1/Lanet.Sdk.dll` 到 `Assets/Plugins/`
-  （或用 NuForUnity / 源码工程直接引用）；
-- Unity WebGL 平台不支持 `ClientWebSocket`，其余平台（Android/iOS/桌面）可用。
+- **Unity 项目：用 [`sdk/unity`](../unity/README.md) 这个 UPM 包**，它已内含本 SDK 源码 +
+  Unity 专用组件（若只想手工引 DLL，则拷 `Lanet.Sdk/bin/Release/netstandard2.1/Lanet.Sdk.dll`
+  到 `Assets/Plugins/`）；
+- WebGL 平台不支持 `ClientWebSocket`，其余平台（Android/iOS/桌面）可用。
 
 ## 快速开始
 
@@ -195,4 +202,5 @@ PortFWD TCP 回显往返 25ms → 心跳，全链路 PASS。
 当前版本单网关连接，不内置重连——监听 `Closed` 后自行重建 `ConnectAsync` 并重开业务流。
 
 **Q：Unity WebGL？**
-不支持（无 `ClientWebSocket`）。WebGL 场景改用 Web SDK 或 js 移植。
+不支持（无 `ClientWebSocket`）。WebGL 场景改用 Web SDK 或 js 移植；
+在 Unity 里接网关请用 [`sdk/unity`](../unity/README.md)（它的 Editor 自检会直接提示这条）。

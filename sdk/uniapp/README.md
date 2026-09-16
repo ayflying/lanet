@@ -13,7 +13,8 @@ Lanet ws-gateway 客户端：让 **uniapp / 微信小程序 / H5 / App / Node** 
 | uniapp 端 | 能否真 P2P | 原因 |
 |---|---|---|
 | **小程序**（微信/支付宝等） | ❌ 不能 | 小程序没有 `RTCPeerConnection`/WebTransport，只有受限的 `wx.connectSocket`（还要求 wss+备案域名），跑不了 libp2p 协议栈 |
-| **App**（Android/iOS 原生打包） | ❌ 不能（本 SDK 内） | JS 运行在独立引擎（非浏览器），同样没有 WebRTC 数据通道；要用 P2P 需原生插件嵌 libp2p（roadmap） |
+| **App - Android** | ✅ 可以（**用原生插件**） | JS 引擎本身跑不了 libp2p，但 Android App 可挂 [lanet 原生插件](../android-plugin/README.md)：插件内是 gomobile 编的 Go 核心 + VpnService，App **自己成为网络成员**（可 ping 虚拟 IP、被 mDNS 发现），JS 层经 `requireNativePlugin` 调用 |
+| **App - iOS** | ❌ 尚未支持 | 需要 NetworkExtension 实现，当前没有对应原生插件 |
 | **H5** | ✅ 可以 | H5 就是浏览器，直接改用 [@lanet/sdk-web](../web/README.md) 走真 P2P（webrtc-direct 直连 Go 节点 + relay 兜底） |
 
 **本 SDK 的定位**：小程序/App 这类「跑不了 libp2p 的端」，经 **ws-gateway** 接入群组：
@@ -26,12 +27,17 @@ Lanet ws-gateway 客户端：让 **uniapp / 微信小程序 / H5 / App / Node** 
 - 网关本身是群内一个 Go 节点，网格内其他成员看到的是「网关节点 + 若干客户端」；
 - 对业务代码透明：API 与 C# SDK 完全同构，dial 的目标仍是对端节点虚拟 IP。
 
+> **Android App 想要真入网（不经网关、可 ping 虚拟 IP）**：换用
+> [uni-app 原生插件 `lanet-vpn`](../android-plugin/README.md)，它走 VpnService，
+> 与上面的网关链路互不冲突，可同时使用。
+
 ## 能力边界
 
 - ✅ 按虚拟 IP 开流、访问网格内成员的 TCP 服务（经网关 PortFWD）
 - ✅ 自定义协议直开流（对端节点注册了对应协议处理器）
 - ✅ service 模式接收入向流（网关同一时刻允许**一个** service 连接）
 - ❌ TUN 内核组网、ping 虚拟 IP（网关是转发节点，非端到端）
+  —— Android App 想要这个能力，用 [uni-app 原生插件](../android-plugin/README.md)
 - ❌ 网页节点之间直连（小程序端无此能力）
 
 ## 安装

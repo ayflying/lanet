@@ -22,7 +22,7 @@
 | **托管模式** | 需要邀请码、群主权限、中心成员目录的 SDK/旧 agent 场景 | `ctl` 管理群组、邀请码、NetMap 和 `/24` 子网；独立 `relay` 提供兜底 | 直连优先，指定 relay 兜底 |
 
 官方桌面程序固定使用 Standalone 模式，不需要部署 `ctl` 或独立 `relay`。
-托管模式仍保留，主要供 Web、C#、uniapp SDK 及需要中心化群组管理的系统使用。
+托管模式仍保留，主要供 Web、C#、unity、uniapp SDK 及需要中心化群组管理的系统使用。
 
 ## Standalone 架构
 
@@ -469,17 +469,20 @@ ICMP 没有端口：`deny-all` 或没有匹配协议规则的 `allow-list` 会�
 
 ## SDK
 
-Lanet 提供四套 SDK：
+Lanet 提供六套 SDK / 接入形态：
 
 | SDK | 接入方式 | TUN | 典型场景 |
 |---|---|:---:|---|
 | [Go SDK](./sdk/go/lanet/README.md) | libp2p 直连；支持 Standalone 或托管模式 | 可选 | Go 服务、原生节点、端口转发 |
 | [Web SDK](./sdk/web/README.md) | 浏览器/Node 直接运行 js-libp2p | 否 | 网页与 Go 节点互开流 |
-| [C# SDK](./sdk/csharp/README.md) | 经 ws-gateway 接入 | 否 | Unity、.NET、MAUI |
+| [Unity SDK](./sdk/unity/README.md) | ws-gateway 网关（跨平台）；或 AAR 直接入群（仅 Android） | Android 是 | Unity 游戏客户端、手机联机 |
+| [C# SDK](./sdk/csharp/README.md) | 经 ws-gateway 接入 | 否 | .NET、MAUI、桌面应用 |
 | [uniapp SDK](./sdk/uniapp/README.md) | 经 ws-gateway 接入 | 否 | 小程序、H5、跨端应用 |
+| [Android 原生插件](./sdk/android-plugin/README.md) | AAR 直接入群（VpnService + gomobile） | 是 | 手机成为网络成员、uni-app 云打包 |
 
-选择指南和两种接入链路见 [`sdk/README.md`](./sdk/README.md)。浏览器、C# 和
-uniapp 当前使用托管模式；Go SDK 可直接创建与官方节点同能力的 Standalone 节点。
+选择指南和三种接入链路见 [`sdk/README.md`](./sdk/README.md)。浏览器、C# 和
+uniapp 当前使用托管模式；Go SDK 可直接创建与官方节点同能力的 Standalone 节点；
+Android 插件与 Unity 的 Android 链路复用同一份 `lanet-plugin.aar`，**无需任何服务端组件**。
 
 ## 托管模式运维
 
@@ -580,12 +583,16 @@ app/
   agent/cmd/*-check/        端到端与专项联调工具
   ctl/                      GoFrame v2 控制面
   relay/                    独立 Circuit Relay v2 服务
-  gateway/                  C#/uniapp 的 WebSocket 网关
+  gateway/                  C#/uniapp 的 WebSocket 网关（Unity 链路 1 也用它）
 sdk/
   go/lanet/                 Go SDK
   web/                      浏览器/Node SDK
-  csharp/                   Unity/.NET/MAUI SDK
-  uniapp/                   uniapp/小程序 SDK
+  csharp/                   .NET/MAUI SDK（ws-gateway 客户端）
+  uniapp/                   uniapp/小程序 SDK（ws-gateway 客户端）
+  android/                  gomobile 绑定层（com.lanet.mobile.Node）
+  android-plugin/           uni-app 原生插件工程（AAR 交付，VpnService 真入网）
+  unity/                    Unity UPM 包（网关客户端 + Android 本地节点）
+  uniapp-demo/              uni-app 示例工程
 pkg/
   serverless/               Standalone 发现、网络身份、虚拟地址
   p2pkit/                   libp2p Host、打洞与 relay 封装

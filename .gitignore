@@ -47,3 +47,10 @@ sdk/android-plugin/plugin/lanet-plugin/libs/*.jar
 # unpackage/ 是 HBuilderX 的构建产物
 sdk/uniapp-demo/nativeplugins/
 sdk/uniapp-demo/unpackage/
+# Unity 包：两个 aar 同理由 build.py 第 ⑥ 步同步进来（39MB，不入库）
+sdk/unity/Runtime/Plugins/Android/*.aar
+# Unity 生成的 meta：交给使用方项目自行生成，避免与他们的 GUID 冲突
+sdk/unity/**/*.meta
+sdk/unity/**/*.meta.meta
+# Python 构建脚本产生的字节码缓存
+sdk/android-plugin/__pycache__/

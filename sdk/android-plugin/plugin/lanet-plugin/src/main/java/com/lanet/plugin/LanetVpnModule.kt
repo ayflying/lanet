@@ -8,7 +8,13 @@ import io.dcloud.feature.uniapp.common.UniModule
 import org.json.JSONObject
 
 /**
- * uni-app 侧的原生插件入口。
+ * uni-app 侧的原生插件入口（DCloud 专属薄壳）。
+ *
+ * 本类**只做两件事**：把 JS 传来的参数翻译成 [LanetNode] 的调用，再把
+ * `{"ok","stage","data","error"}` JSON 转成 Map 回给 JS。所有行为都在
+ * [LanetNode] 里实现——这样同一份 `lanet-plugin.aar` 能同时服务 uni-app
+ * 与 Unity（Unity 用 `AndroidJavaClass("com.lanet.plugin.LanetNode")` 直接
+ * 调静态方法），不必维护两套逻辑。改动行为请改 [LanetNode]。
  *
  * 协议约定（刻意全部走 String，不碰 fastjson）：
  *  - **入参**一律是 JSON 文本或纯字符串，不用 `com.alibaba.fastjson.JSONObject`。
@@ -25,6 +31,8 @@ class LanetVpnModule : UniModule() {
 
     companion object {
         private const val TAG = "LanetPlugin"
+
+        /** 与 [LanetNode.VERSION] 同源，供 JS 侧 `version()` 读取。 */
         const val PLUGIN_VERSION = "0.1.0"
 
         /**
@@ -43,43 +51,40 @@ class LanetVpnModule : UniModule() {
     // ------------------------------------------------------------------
 
     @UniJSMethod(uiThread = false)
-    fun status(): String = LanetCore.status().toString()
+    fun status(): String = LanetNode.status()
 
     @UniJSMethod(uiThread = false)
-    fun isRunning(): Boolean = LanetCore.isRunning()
+    fun isRunning(): Boolean = LanetNode.isRunning()
 
     @UniJSMethod(uiThread = false)
-    fun members(): String = LanetCore.members().toString()
+    fun members(): String = LanetNode.members()
 
     @UniJSMethod(uiThread = false)
-    fun pending(): String = LanetCore.pending().toString()
+    fun pending(): String = LanetNode.pending()
 
     @UniJSMethod(uiThread = false)
-    fun peers(): String = LanetCore.peers().toString()
+    fun peers(): String = LanetNode.peers()
 
     @UniJSMethod(uiThread = false)
-    fun nearby(): String = LanetCore.nearby().toString()
+    fun nearby(): String = LanetNode.nearby()
 
     @UniJSMethod(uiThread = false)
-    fun seedAddrs(): String = LanetCore.seedAddrs().toString()
+    fun seedAddrs(): String = LanetNode.seedAddrs()
 
     /** 本机连接码（`lanet://<PeerID>@<addr>,…`），发给别人即可让对端连进来。 */
     @UniJSMethod(uiThread = false)
-    fun inviteCode(): String = LanetCore.inviteCode()
+    fun inviteCode(): String = LanetNode.inviteCode()
 
     /** 是否已获得系统 VPN 授权。未授权时 [start] 会先弹一次系统授权框。 */
     @UniJSMethod(uiThread = false)
-    fun isAuthorized(): Boolean {
-        val c = ctx() ?: return false
-        return VpnAuthProxyActivity.isAuthorized(c)
-    }
+    fun isAuthorized(): Boolean = LanetNode.isAuthorized(ctx())
 
     /** 最近一次失败原因；无错误时返回空串。 */
     @UniJSMethod(uiThread = false)
-    fun lastError(): String = LanetVpnService.lastError ?: ""
+    fun lastError(): String = LanetNode.lastError()
 
     @UniJSMethod(uiThread = false)
-    fun version(): String = PLUGIN_VERSION
+    fun version(): String = LanetNode.VERSION
 
     // ------------------------------------------------------------------
     // 异步操作：结果经 UniJSCallback 回传
@@ -96,57 +101,15 @@ class LanetVpnModule : UniModule() {
      *  - `awaiting_permission` —— 已弹出系统 VPN 授权框，用户同意后服务会自动起来，
      *    JS 侧应继续轮询 [status] 直到 `running = true`；
      *  - `starting` —— 已直接启动服务（原先就授权过），同样轮询 [status]。
-     *
-     * 之所以不能在这里阻塞等「连上」再回调：授权弹窗是异步的，而 uni-app 的
-     * 回调对象无法可靠地跨 Activity 生命周期保存，所以把「等就绪」交给 JS 轮询。
      */
     @UniJSMethod(uiThread = true)
-    fun start(optionsJson: String, callback: UniJSCallback?) {
-        val c = ctx()
-        if (c == null) {
-            reply(callback, ok = false, error = "拿不到 Android Context，无法启动")
-            return
-        }
-        try {
-            val o = VpnAuthProxyActivity.Options.parse(optionsJson)
-            if (o.networkKey.isBlank()) {
-                reply(callback, ok = false, error = "network_key 不能为空（留空会按 PeerID 派生本机专属网）")
-                return
-            }
-            if (o.wantTun && !VpnAuthProxyActivity.isAuthorized(c)) {
-                Log.i(TAG, "未获 VPN 授权，拉起授权代理 Activity")
-                VpnAuthProxyActivity.request(
-                    c, o.name, o.networkKey, o.bootstrap, o.wantTun, o.autoAccept, o.version,
-                )
-                reply(callback, ok = true, stage = "awaiting_permission")
-                return
-            }
-            LanetVpnService.start(
-                c, o.name, o.networkKey, o.bootstrap, o.wantTun, o.autoAccept, o.version,
-            )
-            reply(callback, ok = true, stage = "starting")
-        } catch (t: Throwable) {
-            Log.e(TAG, "启动失败", t)
-            reply(callback, ok = false, error = t.message ?: t.toString())
-        }
+    fun start(optionsJson: String?, callback: UniJSCallback?) {
+        forward(callback, LanetNode.start(ctx(), optionsJson))
     }
 
     @UniJSMethod(uiThread = true)
     fun stop(callback: UniJSCallback?) {
-        val c = ctx()
-        if (c == null) {
-            reply(callback, ok = false, error = "拿不到 Android Context，无法停止")
-            return
-        }
-        try {
-            LanetVpnService.stop(c)
-            // Service 的 onDestroy 不保证立刻走完，这里先清标记让 UI 状态即时正确。
-            LanetVpnService.resetRunning()
-            reply(callback, ok = true, stage = "stopping")
-        } catch (t: Throwable) {
-            Log.e(TAG, "停止失败", t)
-            reply(callback, ok = false, error = t.message ?: t.toString())
-        }
+        forward(callback, LanetNode.stop(ctx()))
     }
 
     /**
@@ -159,44 +122,31 @@ class LanetVpnModule : UniModule() {
      * 干等是等不到入网的。
      */
     @UniJSMethod(uiThread = false)
-    fun connect(address: String, callback: UniJSCallback?) {
-        try {
-            val r = LanetCore.connect(address)
-            reply(callback, ok = true, data = r.toString())
-        } catch (t: Throwable) {
-            Log.e(TAG, "连接失败", t)
-            reply(callback, ok = false, error = t.message ?: t.toString())
-        }
+    fun connect(address: String?, callback: UniJSCallback?) {
+        forward(callback, LanetNode.connect(address))
     }
 
     /** options JSON：`{peer_id, approve}`；approve 为 false 时即拒绝并清理该节点。 */
     @UniJSMethod(uiThread = false)
-    fun approve(optionsJson: String, callback: UniJSCallback?) {
-        try {
-            val o = JSONObject(optionsJson)
-            val peerId = o.optString("peer_id", "")
-            if (peerId.isBlank()) {
-                reply(callback, ok = false, error = "peer_id 不能为空")
-                return
-            }
-            LanetCore.approve(peerId, o.optBoolean("approve", true))
-            reply(callback, ok = true)
+    fun approve(optionsJson: String?, callback: UniJSCallback?) {
+        val peerId = try {
+            JSONObject(optionsJson ?: "{}").optString("peer_id", "")
         } catch (t: Throwable) {
-            Log.e(TAG, "审批失败", t)
-            reply(callback, ok = false, error = t.message ?: t.toString())
+            reply(callback, ok = false, error = "options 不是合法 JSON: ${t.message}")
+            return
         }
+        val approve = try {
+            JSONObject(optionsJson ?: "{}").optBoolean("approve", true)
+        } catch (t: Throwable) {
+            true
+        }
+        forward(callback, LanetNode.approve(peerId, approve))
     }
 
     /** 移除一个成员（撤信任 + 出地址簿 + 记墓碑）。 */
     @UniJSMethod(uiThread = false)
-    fun remove(peerId: String, callback: UniJSCallback?) {
-        try {
-            LanetCore.remove(peerId)
-            reply(callback, ok = true)
-        } catch (t: Throwable) {
-            Log.e(TAG, "移除失败", t)
-            reply(callback, ok = false, error = t.message ?: t.toString())
-        }
+    fun remove(peerId: String?, callback: UniJSCallback?) {
+        forward(callback, LanetNode.remove(peerId))
     }
 
     // ------------------------------------------------------------------
@@ -213,6 +163,22 @@ class LanetVpnModule : UniModule() {
             return c
         }
         return cachedApp
+    }
+
+    /** 把 [LanetNode] 返回的统一 JSON 拆成 JS 侧习惯的 Map 回调。 */
+    private fun forward(cb: UniJSCallback?, json: String) {
+        try {
+            val o = JSONObject(json)
+            reply(
+                cb,
+                ok = o.optBoolean("ok", false),
+                stage = o.optString("stage", ""),
+                data = o.optString("data", ""),
+                error = o.optString("error", ""),
+            )
+        } catch (t: Throwable) {
+            reply(cb, ok = false, error = "解析门面返回失败: ${t.message}")
+        }
     }
 
     private fun reply(

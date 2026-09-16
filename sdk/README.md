@@ -1,15 +1,21 @@
 # Lanet SDK 总览
 
-Lanet（群组制 P2P 虚拟局域网）对外提供四套 SDK，按运行环境选择：
+Lanet（群组制 P2P 虚拟局域网）对外提供六套 SDK / 接入形态，按运行环境选择：
 
 | SDK | 运行环境 | 接入方式 | 是否真 P2P | 典型场景 |
 |---|---|---|---|---|
 | [Go SDK](./go/lanet/README.md) | Go 程序 / 服务器 | **libp2p 直接入群**（Standalone 或托管模式） | ✅ 端到端 | 后端服务互联、可选 TUN、端口转发节点 |
 | [Web SDK](./web/README.md) | 浏览器 / Node ≥20 | **libp2p 直接入群**（js-libp2p） | ✅ 端到端 | 网页与后端服务直接互开流 |
-| [C# SDK](./csharp/README.md) | Unity / .NET 8 / MAUI | **经 ws-gateway 接入**（WebSocket 帧协议） | ⚠️ 网关中转 | 游戏客户端、桌面应用 |
+| [Unity SDK](./unity/README.md) | Unity 2021.3+ | **ws-gateway 网关**（跨平台）／**AAR 直接入群**（仅 Android） | ⚠️ 网关中转 ／ ✅ Android 端到端 | 游戏客户端、桌面应用、手机联机 |
+| [C# SDK](./csharp/README.md) | .NET 8 / MAUI / 任意 .NET | **经 ws-gateway 接入**（WebSocket 帧协议） | ⚠️ 网关中转 | 桌面 / 服务端 .NET 应用 |
 | [uniapp SDK](./uniapp/README.md) | uniapp / 微信小程序 / H5 / App | **经 ws-gateway 接入**（WebSocket 帧协议） | ⚠️ 网关中转 | 小程序、跨端移动应用 |
+| [Android 原生插件](./android-plugin/README.md) | uniapp 原生插件 / 任意 Android（AAR） | **AAR 直接入群**（VpnService + gomobile） | ✅ 端到端 | 手机成为网络成员：可 ping 虚拟 IP、被 mDNS 发现 |
 
-## 两种接入链路
+> Unity 包（`sdk/unity`）与 Android 插件包（`sdk/android-plugin`）**共用同一份
+> `lanet-plugin.aar`**：宿主无关逻辑在 `com.lanet.plugin.LanetNode`，uni-app 侧只是
+> DCloud 薄壳，Unity 侧直接 `CallStatic`。改行为只需改一处。
+
+## 三种接入链路
 
 ### 1. libp2p 直连（Go / Web SDK）
 
@@ -31,7 +37,7 @@ DHT server 与中继（客户端即服务端），经 mDNS + 双 DHT（私有优
 显式设置相同 `Channel` 时二者才互通。
 详见 [Go SDK → 无服务器模式](./go/lanet/README.md)。
 
-### 2. ws-gateway 网关中转（C# / uniapp SDK）
+### 2. ws-gateway 网关中转（C# / uniapp / Unity 链路 1）
 
 ```
 小程序 / Unity ──(WebSocket 帧协议)──→ ws-gateway ──(libp2p 隧道)──→ 目标节点
@@ -43,15 +49,30 @@ DHT server 与中继（客户端即服务端），经 mDNS + 双 DHT（私有优
 - 网关把客户端的 dial/data/close 翻译成 libp2p 流操作；数据实时转发、不落盘；
 - 代价是数据路径多一跳（客户端→网关→目标），延迟与带宽受网关位置影响。
 
+### 3. Android 本地节点（真入网，不经网关）
+
+```
+Android / Unity App ──(VpnService + gomobile 绑定)──→ 直接成为 lanet 网络成员
+```
+
+- Go 核心经 gomobile 编成 `lanet.aar`，App **自己就是节点**：可 `ping` 虚拟 IP、
+  被 mDNS 发现、跑任意 TCP/UDP，端到端不经中转；
+- 两种交付形态共用同一份 AAR：
+  - **uni-app 原生插件**（[sdk/android-plugin](./android-plugin/README.md)）——HBuilderX 云打包即可；
+  - **Unity 包**（[sdk/unity](./unity/README.md)）——UPM 引入，仅 Android 平台生效；
+- 需要系统 VPN 授权（首次启动弹窗）；**不需要 ctl / relay / ws-gateway**；
+- 已知边界：AAR 只编了 `armeabi-v7a / arm64-v8a / x86`，没有 x86_64（64 位 x86 模拟器跑不了）。
+
 ## 服务端部署要求
 
-| 组件 | 作用 | Go SDK | Web SDK | C# SDK | uniapp SDK |
-|---|---|:---:|:---:|:---:|:---:|
-| ctl（控制面） | 群组/邀请码/NetMap/中继目录 | 仅托管模式 | ✅ 必需 | ✅ 必需 | ✅ 必需 |
-| relay（中继） | 打洞失败兜底 | 仅托管模式 | ✅ 必需 | —（网关持有） | —（网关持有） |
-| ws-gateway | 帧协议网关 | — | — | ✅ 必需 | ✅ 必需 |
+| 组件 | 作用 | Go SDK | Web SDK | Unity SDK | C# SDK | uniapp SDK | Android 插件 |
+|---|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| ctl（控制面） | 群组/邀请码/NetMap/中继目录 | 仅托管模式 | ✅ 必需 | 仅链路 1 | ✅ 必需 | ✅ 必需 | — |
+| relay（中继） | 打洞失败兜底 | 仅托管模式 | ✅ 必需 | —（网关持有） | —（网关持有） | —（网关持有） | 节点自兼 |
+| ws-gateway | 帧协议网关 | — | — | 仅链路 1 | ✅ 必需 | ✅ 必需 | — |
 
 Go SDK 的 Standalone 模式三项都不需要；节点自身提供 DHT 和 relay service。
+Android 本地节点（`sdk/android-plugin`、`sdk/unity` 的链路 2）同样三项都不需要。
 
 - 组件启动示例见仓库根 `app/*/cmd`；网关入口 `go run ./app/gateway/cmd/pvn-gateway`。
 - 小程序场景网关必须走 **wss + 备案域名**（微信平台要求），并在小程序后台配置 socket 合法域名。
@@ -84,5 +105,8 @@ Go SDK 的 Standalone 模式三项都不需要；节点自身提供 DHT 和 rela
 |---|---|
 | Go 后端互开流 / 做 TCP 桥接节点 | [sdk/go/lanet/README.md](./go/lanet/README.md) |
 | 网页直连 P2P | [sdk/web/README.md](./web/README.md) |
-| Unity / .NET 接入 | [sdk/csharp/README.md](./csharp/README.md) |
+| Unity 接入（网关或 Android 本地节点） | [sdk/unity/README.md](./unity/README.md) |
+| .NET 程序接入 | [sdk/csharp/README.md](./csharp/README.md) |
 | 小程序 / uniapp 接入 | [sdk/uniapp/README.md](./uniapp/README.md) |
+| 让 Android App 真入网（uni-app 原生插件） | [sdk/android-plugin/README.md](./android-plugin/README.md) |
+| gomobile 绑定层本身 | [sdk/android/README.md](./android/README.md) |

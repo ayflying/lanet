@@ -69,5 +69,22 @@
             android:noHistory="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+        <!--
+          初始化 Provider：系统在 Application.onCreate 之前就会创建它，借这个时机
+          把 applicationContext 交给 LanetNode（详见 LanetInitProvider 的注释）。
+
+          存在意义是为 Unity：C# 侧 CallStatic 传入 UnityPlayerActivity 会让参数
+          签名推成 Activity 而非 Context，JNI 找不到带 Context 形参的静态方法；
+          有了本 Provider，C# 只调零参/单 String 参数的 *Auto 方法即可。
+
+          authorities 用 ${applicationId} 占位符（AndroidX Startup 同款写法），
+          在宿主打包时由 AGP 替换成宿主包名，避免多 App 安装冲突。
+        -->
+        <provider
+            android:name="com.lanet.plugin.LanetInitProvider"
+            android:authorities="${applicationId}.lanet-init"
+            android:exported="false"
+            android:initOrder="100" />
+
     </application>
 </manifest>

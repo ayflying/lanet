@@ -16,6 +16,13 @@
 # 由 AndroidManifest 直接引用的组件
 -keep class com.lanet.plugin.LanetVpnService { *; }
 -keep class com.lanet.plugin.VpnAuthProxyActivity { *; }
+# 初始化 Provider：系统按 manifest 里的全限定名实例化它，改名即启动期崩溃
+-keep class com.lanet.plugin.LanetInitProvider { *; }
 
 # 插件与 Go 核心之间的桥接类按名字调用
 -keep class com.lanet.plugin.LanetCore { *; }
+
+# 宿主无关门面：Unity 侧用 AndroidJavaClass("com.lanet.plugin.LanetNode")
+# + CallStatic 按**类名与方法名**调用，R8 一旦改名或删方法就会在运行期抛
+# NoSuchMethodError（编译期完全无感）。整类保留，方法签名也不许动。
+-keep class com.lanet.plugin.LanetNode { *; }
