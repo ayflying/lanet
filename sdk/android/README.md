@@ -133,9 +133,17 @@ ping -n 4 10.7.144.45
 5. 覆盖安装保留 `files/` 目录，身份密钥与地址簿都在里面，所以 PeerID 与虚拟 IP 不变，
    不必重新审批。
 
-## 六、下一步：接进 uni-app
+## 六、下一步：接进你的 App
 
-本工程是可独立安装的验证 APK。要让 uni-app 拥有同样的能力，路线是把它封装成
-**uni-app 原生插件**（`sdk/android-plugin/`）：插件层只暴露一个 `start/stop/status`
-接口，内部复用同一份 AAR 与 `LanetVpnService`。地基（Go 核在 Android 上跑通、TUN 接管、
-双向数据面）已在本工程验证，插件只是换一层调用方。
+本工程是可独立安装的验证 APK（也是这套能力的地基验证）。要让别的宿主拥有同样的能力，
+把 `LanetVpnService` + gomobile 库封进 AAR 复用即可，仓库里已经有两条现成的宿主链路：
+
+| 宿主 | 用哪个 | 说明 |
+| --- | --- | --- |
+| uni-app | [`sdk/android-plugin`](../android-plugin/README.md) | 原生插件（nativeplugin），HBuilderX 云打包出 APK |
+| Unity | [`sdk/unity`](../unity/README.md) | UPM 包 `com.lanet.unity`，Android 平台生效 |
+| 任意 Android 原生工程 | 直接用 `lanet-plugin.aar` | 调宿主无关门面 `com.lanet.plugin.LanetNode` 的静态方法 |
+
+两条宿主链路**共用同一份 `lanet-plugin.aar`**：所有行为都在宿主无关门面
+`com.lanet.plugin.LanetNode` 里，uni-app 侧的 `LanetVpnModule` 只是 DCloud 薄壳，
+Unity 侧直接 `AndroidJavaClass.CallStatic`。因此改行为只需改门面一处，两边同时生效。
