@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- mDNS 局域网发现：Android 默认过滤组播，需要显式申请并在运行时持锁 -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- VPN 常驻必须前台服务；Android 13+ 还要 POST_NOTIFICATIONS 才能显示通知 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!--
+      Android 14（API 34）起，前台服务声明了 foregroundServiceType="specialUse"
+      就必须同时持有这个权限，否则 startForeground 直接抛 SecurityException。
+      targetSdk 35 时这条是硬要求，不是可选优化。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 入网后读取当前 WiFi 名用于展示（可选，缺了不影响组网） -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault.DayNight">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          虚拟网卡由 VpnService 建立（非 root 设备唯一合法途径），建好后把
+          ParcelFileDescriptor 的 fd 交给 Go 核心接管。
+          android:permission="android.permission.BIND_VPN_SERVICE" 是系统要求，
+          缺了 establish() 会直接失败。
+        -->
+        <service
+            android:name=".LanetVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="lanet_p2p_vpn" />
+        </service>
+
+        <!-- 授权代理：uni-app 等框架无法覆写宿主 Activity 的 onActivityResult，
+             用透明 Activity 承接 VpnService.prepare() 的授权结果。 -->
+        <activity
+            android:name=".VpnAuthProxyActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+    </application>
+</manifest>

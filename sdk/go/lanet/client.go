@@ -216,6 +216,12 @@ type Config struct {
 	Tun bool
 	// TunName TUN 网卡名，默认 "lanet"。
 	TunName string
+	// TunFD Android 外部 TUN：由宿主 VpnService 建立虚拟网卡后交出的文件
+	// 描述符（>0 生效；需同时置 Tun=true）。置位时启用 IP 数据面，但**跳过**
+	// NewNative 建卡与 ConfigureTUN 配地址/路由——这两件事已由
+	// VpnService.Builder 在 Java 侧完成，Android 上重复配置会直接失败。
+	// 桌面端（Windows/Linux/macOS）不支持，恒为 0。
+	TunFD int
 	// .lanet DNS 强制开启（无开关）：入网即启动内置 DNS 应答器，把
 	// <成员名>.lanet 的 A 查询按成员表实时解析为虚拟 IP，成员重启换 IP
 	// 时名字解析自动跟随。绑定 53 端口需要特权；启动失败仅记日志
@@ -932,15 +938,34 @@ func (c *Client) startTUN(ctx context.Context) {
 	if name == "" {
 		name = "lanet"
 	}
-	device, err := tundevice.NewNative(name, 1400)
-	if err != nil {
-		c.logf("TUN 网卡创建失败（自动降级为仅应用层，虚拟 IP 不支持 ping；Windows 需管理员权限运行）: %v", err)
-		return
-	}
-	if err = tundevice.ConfigureTUN(name, c.myIP, 24); err != nil {
-		_ = device.Close()
-		c.logf("TUN 网卡地址配置失败（自动降级为仅应用层）: %v", err)
-		return
+	// 建卡分两条路：
+	//   - Android（TunFD>0）：网卡由宿主 VpnService 建立，本进程只接管它交出的
+	//     fd；地址与路由已由 VpnService.Builder 配好，绝不能重复调 ConfigureTUN
+	//     （Android 会落到它的 default 分支，直接报 unsupported OS）。
+	//   - 桌面端：本进程经 Wintun / /dev/net/tun 自行建卡并配地址与路由。
+	var device tundevice.Device
+	var err error
+	if c.cfg.TunFD > 0 {
+		device, err = tundevice.NewFromFD(c.cfg.TunFD)
+		if err != nil {
+			c.logf("接管宿主 TUN 网卡失败（自动降级为仅应用层，虚拟 IP 不支持 ping）: %v", err)
+			return
+		}
+		// 以内核报告的真实网卡名为准，后续日志按它显示。
+		if actual, nameErr := device.Name(); nameErr == nil && actual != "" {
+			name = actual
+		}
+	} else {
+		device, err = tundevice.NewNative(name, 1400)
+		if err != nil {
+			c.logf("TUN 网卡创建失败（自动降级为仅应用层，虚拟 IP 不支持 ping；Windows 需管理员权限运行）: %v", err)
+			return
+		}
+		if err = tundevice.ConfigureTUN(name, c.myIP, 24); err != nil {
+			_ = device.Close()
+			c.logf("TUN 网卡地址配置失败（自动降级为仅应用层）: %v", err)
+			return
+		}
 	}
 	c.tunMu.Lock()
 	c.tunDevice = device

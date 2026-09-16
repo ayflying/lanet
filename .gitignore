@@ -22,3 +22,16 @@ lanet.log
 sdk/csharp/**/bin/
 sdk/csharp/**/obj/
 *.user
+# Android 移动端：AAR 由 sdk/go/mobile 现场编译产出（体积 20MB+，不入库），
+# 构建方式见该目录包注释与 sdk/android/README.md
+sdk/go/mobile/*.aar
+sdk/go/mobile/*-src.jar
+sdk/go/mobile/*-sources.jar
+sdk/android/.gradle/
+sdk/android/build/
+sdk/android/app/build/
+sdk/android/local.properties
+sdk/android/app/libs/*.aar
+sdk/android/dist/
+sdk/android-plugin/**/build/
+sdk/android-plugin/**/.gradle/
