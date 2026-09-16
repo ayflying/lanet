@@ -69,20 +69,20 @@ func ValidSeedScope(scope SeedScope) bool {
 
 // Seed 一条种子记录。
 type Seed struct {
-	PeerID string
-	Name   string
-	Addrs  []string
+	PeerID string   `json:"peer_id"`
+	Name   string   `json:"name"`
+	Addrs  []string `json:"addrs"`
 	// PublicReachable 是否**实测**公网可达（有公网地址且被外部拨通过）。
 	// 注意：这是本机观测到的结论，不接受对端自报——「我能被你拨通」
 	// 与「我能被所有人拨通」是两件事，自报会把 NAT 后的节点误判成种子。
-	PublicReachable bool
+	PublicReachable bool `json:"public_reachable"`
 	// OKCount 累计拨通成功次数；**验证门**：0 表示从未成功，不能作为种子分发出去。
-	OKCount   int
-	LastOK    time.Time
-	FirstSeen time.Time
-	LastSeen  time.Time
-	Source    string // direct / exchange / self
-	UpdatedAt time.Time
+	OKCount   int       `json:"ok_count"`
+	LastOK    time.Time `json:"last_ok"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+	Source    string    `json:"source"` // direct / exchange / self
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Verified 是否通过验证门（至少拨通过一次）。

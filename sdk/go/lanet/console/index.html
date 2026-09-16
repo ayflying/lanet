@@ -150,6 +150,7 @@
   <button class="tab active" data-panel="pMembers" onclick="switchTab(this)">成员与链路 <span class="badge" id="bMembers">0</span></button>
   <button class="tab" data-panel="pFirewall" onclick="switchTab(this)">入向防火墙 <span class="badge" id="bRules">0</span></button>
   <button class="tab" data-panel="pForwards" onclick="switchTab(this)">端口转发 <span class="badge" id="bForwards">0</span></button>
+  <button class="tab" data-panel="pEntry" onclick="switchTab(this)">公网入口 <span class="badge" id="bEntries">0</span></button>
   <button class="tab" data-panel="pConfig" id="tabConfig" onclick="switchTab(this)" style="display:none">节点配置</button>
 </div>
 
@@ -321,6 +322,51 @@
     <button onclick="saveForwards()">保存转发映射</button>
     <button class="ghost" onclick="loadState()">刷新</button>
     <div class="msg" id="fwdMsg"></div>
+  </div>
+</div>
+
+<div class="panel" id="pEntry">
+  <div class="card">
+    <h2>公网入口共享 <span class="tag unknown">种子表</span></h2>
+    <div class="sub" style="margin-bottom:8px">
+      让「有公网地址、能被直连」的节点把入口列出来共享给别人：当你拨不通对方时，可以改拨这些入口。
+      与上面的<b>「连接种子」不是一回事</b> —— 连接种子是你手动粘贴的一条 multiaddr；这里的种子表是节点之间<b>自动交换</b>的入口清单。
+    </div>
+    <div class="row" style="flex-wrap:wrap;gap:14px;align-items:center">
+      <label style="display:flex;gap:6px;align-items:center">
+        <input type="checkbox" id="sGroup"> 群内共享（同网络密钥的成员之间）
+      </label>
+      <label style="display:flex;gap:6px;align-items:center">
+        <input type="checkbox" id="sGlobal"> 全域共享（跨网络密钥打通）
+      </label>
+      <span style="display:flex;gap:4px;align-items:center;font-size:12px">全域上限
+        <input type="number" id="sLimit" min="1" max="20000" style="width:92px">
+      </span>
+      <button onclick="saveSeedSettings()">保存</button>
+      <button class="ghost" onclick="refreshEntry()">刷新</button>
+    </div>
+    <div class="sub" id="sRisk" style="display:none;color:var(--bad);margin:8px 0 0">
+      ⚠ 全域共享已开启：会把本机实测拨通过的公网入口分享给<b>任意网络密钥</b>的节点，同时也会接收它们的入口。
+      这是跨网络打通的通道，请自行评估暴露面。默认关闭。
+    </div>
+    <div class="sub" style="margin:8px 0 0">
+      只有<b>本机实测拨通过</b>的入口才会外发（别人转发来的一律按未验证入库，不采信对端自报）。
+      本机<b>不做周期性主动探测</b>，验证靠「正好连上」时本地核对 —— 所以空载流量为 0。
+      未验证 7 天、已验证 30 天不上线会被自动清理；表满时按「未验证优先、其次最久没动」淘汰。
+    </div>
+    <div class="msg" id="sMsg"></div>
+  </div>
+  <div class="card" style="margin-top:12px">
+    <h2>种子表内容</h2>
+    <div class="row" style="flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:8px">
+      <select id="sScope" onchange="loadSeeds()" style="flex:.35">
+        <option value="group">群内表</option>
+        <option value="global">全域表</option>
+      </select>
+      <button class="ghost" onclick="loadSeeds()">刷新</button>
+      <span class="sub" id="sStats" style="margin:0"></span>
+    </div>
+    <div id="seedList"></div>
   </div>
 </div>
 
@@ -1313,7 +1359,105 @@ function pollAndReload() {
   }, 2000);
 }
 
+// ================= 公网入口共享（种子表）=================
+// ⚠️ 术语区分：上面那个「连接种子」是 bootstrap —— 用户手动粘贴的一条 multiaddr；
+// 这里管的是「种子表」—— 节点之间**自动交换**的公网入口清单。两回事，别混。
+let seedScope = 'group';
+let seedOverview = [];
+// seedAgo 相对时间（种子表的「最后联通」看的是「多久以前」而不是绝对时刻）。
+const seedAgo = iso => {
+  if (!iso) return '—';
+  const t = Date.parse(iso);
+  if (!t) return '—';
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return '刚刚';
+  if (s < 3600) return Math.floor(s / 60) + ' 分钟前';
+  if (s < 86400) return Math.floor(s / 3600) + ' 小时前';
+  return Math.floor(s / 86400) + ' 天前';
+};
+async function loadSeedSettings(force) {
+  try {
+    const r = await fetch('/api/seed-settings', { cache: 'no-store' });
+    if (!r.ok) return;
+    const d = await r.json();
+    const st = d.settings || {};
+    $('sGroup').checked = !!st.group_enabled;
+    $('sGlobal').checked = !!st.global_enabled;
+    $('sLimit').value = st.global_limit || 1000;
+    $('sRisk').style.display = st.global_enabled ? '' : 'none';
+    seedOverview = d.scopes || [];
+    $('bEntries').textContent = String(seedOverview.reduce((a, o) => a + (o.total || 0), 0));
+    await loadSeeds();
+  } catch (e) { /* 控制台暂不可用时静默，不打断其它页 */ }
+}
+async function saveSeedSettings() {
+  const body = {
+    group_enabled: $('sGroup').checked,
+    global_enabled: $('sGlobal').checked,
+    global_limit: Number($('sLimit').value) || 1000,
+  };
+  try {
+    const r = await fetch('/api/seed-settings', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { flash('sMsg', (d && d.error) || '保存失败', false); return; }
+    flash('sMsg', '已保存并立即生效（无需重启）', true);
+    await loadSeedSettings(true);
+  } catch (e) { flash('sMsg', '保存失败：' + e, false); }
+}
+async function loadSeeds() {
+  seedScope = $('sScope').value;
+  try {
+    const r = await fetch('/api/seeds?scope=' + encodeURIComponent(seedScope), { cache: 'no-store' });
+    if (!r.ok) return;
+    const d = await r.json();
+    seedScope = $('sScope').value;
+    renderSeeds(d.seeds || []);
+  } catch (e) { /* 静默 */ }
+}
+function renderSeeds(list) {
+  const ov = seedOverview.find(o => o.scope === seedScope) || { limit: 0, verified: 0, public_reachable: 0, enabled: false };
+  $('sStats').textContent = `共 ${ov.total || list.length} 条 · 已验证 ${ov.verified || 0} · 实测公网可达 ${ov.public_reachable || 0} · 上限 ${ov.limit || 0}`
+    + (ov.enabled ? '' : '（该范围已关闭，不再交换）');
+  if (!list.length) {
+    $('seedList').innerHTML = '<div class="empty" style="margin:8px 0">表里还没有条目。等「种子自举」把当前已连的公网对端收进来，或由别人交换过来。</div>';
+    return;
+  }
+  $('seedList').innerHTML = '<table><tr><th>节点</th><th>地址</th><th>来源</th><th>状态</th><th>最后联通</th><th></th></tr>'
+    + list.map(s => {
+      const id = s.peer_id || '';
+      const verified = (s.ok_count || 0) > 0;
+      return `<tr><td title="${esc(id)}">${s.name ? esc(s.name) : esc(shortPeerID(id))}</td>`
+        + `<td>${(s.addrs || []).length} 条</td>`
+        + `<td>${esc(s.source || '')}</td>`
+        + `<td>${verified ? '<b style="color:var(--ok)">已验证</b>' : '未验证'}${s.public_reachable ? ' · 公网' : ''}</td>`
+        + `<td>${verified ? esc(seedAgo(s.last_ok)) : '—'}</td>`
+        + `<td><button class="del" onclick="deleteSeed('${seedScope}','${esc(id)}')">删除</button></td></tr>`;
+    }).join('') + '</table>';
+}
+async function deleteSeed(scope, peerID) {
+  try {
+    const r = await fetch('/api/seeds', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: scope, peer_id: peerID }),
+    });
+    if (!r.ok) { flash('sMsg', '删除失败', false); return; }
+    flash('sMsg', '已删除该条目', true);
+    await loadSeedSettings(true);
+  } catch (e) { flash('sMsg', '删除失败：' + e, false); }
+}
+function refreshEntry() { loadSeedSettings(true); }
+// 只有用户真的停在这一页时才周期刷新，切走即停 —— 不给后台白添查询。
+function refreshEntryIfVisible() {
+  const p = $('pEntry');
+  if (p && p.classList.contains('active')) loadSeedSettings(false);
+}
+// ================= 公网入口共享 结束 =================
 loadState(); loadNodeConfig(); initTopActions(); setInterval(loadState, 10000);
+// 公网入口共享（种子表）：进页面加载一次；之后只在「公网入口」页处于激活状态时才刷新。
+loadSeedSettings();
+setInterval(refreshEntryIfVisible, 10000);
 // 窗口尺寸变化会让地址框的换行数变化 → 重算高度。
 window.addEventListener('resize', autoGrowAddrs);
 // ⚠️ 「高级」折叠块收起时内部没有布局，scrollHeight 恒为 0（高度会被压成最小），

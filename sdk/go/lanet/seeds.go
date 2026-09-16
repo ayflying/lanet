@@ -38,6 +38,8 @@ const (
 	seedVerifyInterval = 2 * time.Minute
 	// seedVerifyBatch 单轮每张表最多核对多少条（种子表可达 1000 条，不必全查）。
 	seedVerifyBatch = 64
+	// seedHarvestBatch 单轮最多新收多少条种子候选（有界，避免一次性写爆）。
+	seedHarvestBatch = 16
 	// seedStaleSweepRounds 每 N 轮做一次陈旧清理（N × seedVerifyInterval）。
 	seedStaleSweepRounds = 15 // ≈30 分钟
 	// seedIdleUnverified 未验证种子的容忍期：从没拨通过，给一周机会。
@@ -446,6 +448,7 @@ func (c *Client) verifySeedsOnce(ctx context.Context, db *peersdb.DB) {
 		return
 	}
 	verified := 0
+	harvested := 0
 	for _, scope := range []string{serverless.SeedScopeGroup, serverless.SeedScopeGlobal} {
 		if !settings.enabledFor(scope) {
 			continue
@@ -477,10 +480,89 @@ func (c *Client) verifySeedsOnce(ctx context.Context, db *peersdb.DB) {
 			ncancel()
 			verified++
 		}
+
+		// 自举采集：把「当前已连上的公网对端」收进种子表。
+		hctx, hcancel := context.WithTimeout(ctx, 8*time.Second)
+		harvested += c.harvestSeedCandidates(hctx, db, settings, pScope)
+		hcancel()
 	}
 	if verified > 0 {
 		c.logf("种子核对：%d 条种子由「已连接」升级为已验证", verified)
 	}
+	if harvested > 0 {
+		c.logf("种子自举：从当前已连对端收进 %d 个公网入口", harvested)
+	}
+}
+
+// harvestSeedCandidates 从「当前确实连上的对端」里挑出可当入口的**公网设备**，
+// 落进种子表并标记为已验证。
+//
+// 为什么必须有这条路径：交换协议只能互相转发**已有的**条目，它不产生新条目。
+// 没有自举，两张表会永远是空的、功能等于没做。
+//
+// 判据刻意收紧，宁可少收也不污染：
+//   - 只认**当前已连上**的对端（不是猜、不是别人自报的）；
+//   - 只认**带公网地址**的对端 —— NAT 后的私网地址对别人没用，收进来只会占名额；
+//   - **群内范围只允许成员表里的对端**（成员表 = 同网络密钥，天然满足群隔离），
+//     全域范围才允许任意已连对端（它本来就是跨密钥通道）。
+func (c *Client) harvestSeedCandidates(ctx context.Context, db *peersdb.DB, settings SeedSettings, scope peersdb.SeedScope) int {
+	if c.node == nil || !settings.enabledFor(string(scope)) {
+		return 0
+	}
+	ids := make([]peer.ID, 0, seedHarvestBatch)
+	if scope == peersdb.SeedScopeGroup {
+		if c.disc == nil {
+			return 0
+		}
+		for _, m := range c.disc.Peers() {
+			if m.PeerID == "" || m.PeerID == c.peerID {
+				continue
+			}
+			if id, err := peer.Decode(m.PeerID); err == nil {
+				ids = append(ids, id)
+			}
+		}
+	} else {
+		ids = append(ids, c.node.Network().Peers()...)
+	}
+
+	added := 0
+	for _, id := range ids {
+		if added >= seedHarvestBatch {
+			break
+		}
+		if id.String() == c.peerID {
+			continue
+		}
+		if c.node.Network().Connectedness(id) != network.Connected {
+			continue
+		}
+		addrs := c.node.Peerstore().Addrs(id)
+		raw := make([]string, 0, len(addrs))
+		for _, a := range addrs {
+			if s := a.String(); s != "" {
+				raw = append(raw, s)
+			}
+		}
+		if len(raw) == 0 || !hasPublicAddr(raw) {
+			continue // 没有公网地址：当不了别人的入口
+		}
+		sort.Strings(raw)
+		wrote, err := db.UpsertSeed(ctx, scope, peersdb.Seed{
+			PeerID: id.String(), Addrs: raw, PublicReachable: true, Source: "self",
+		})
+		if err != nil {
+			continue
+		}
+		// 已经连上了，就是「本机实测拨通过」——直接过验证门。
+		if err := db.NoteSeedDialResult(ctx, scope, id.String(), true); err != nil {
+			continue
+		}
+		if wrote {
+			added++
+		}
+	}
+	return added
 }
 
 // refreshSeedAddrs 用 peerstore 里真正生效的地址覆盖种子地址。

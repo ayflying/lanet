@@ -284,3 +284,69 @@ func TestSeedWiringEndToEnd(t *testing.T) {
 		t.Fatalf("设置未生效：%+v", got)
 	}
 }
+
+// TestHasPublicAddr 公网地址判定：只认真正的全局单播地址。
+//
+// 这条判据决定「谁能进种子表」，宽松一点就会把 NAT 后的私网地址收进来，
+// 占满名额却谁也拨不通。
+func TestHasPublicAddr(t *testing.T) {
+	yes := []string{
+		"/ip4/9.9.9.9/tcp/4001",
+		"/ip4/43.136.124.167/tcp/4001",
+		"/ip6/2408:824e:1592:7d80::2b1/tcp/4001",
+	}
+	for _, a := range yes {
+		if !hasPublicAddr([]string{a}) {
+			t.Errorf("%s 应判为含公网地址", a)
+		}
+	}
+	// 列表里掺着私网地址也算（Addrs 是 []string，逐条独立判定）。
+	if !hasPublicAddr([]string{"/ip4/192.168.50.176/tcp/4001", "/ip4/9.9.9.9/tcp/4001"}) {
+		t.Error("列表含公网地址时应判为 true")
+	}
+	no := []string{
+		"",
+		"不是地址",
+		"/ip4/127.0.0.1/tcp/4001",
+		"/ip6/::1/tcp/4001",
+		"/ip4/169.254.1.2/tcp/4001",
+		"/ip4/0.0.0.0/tcp/4001",
+		"/ip4/192.168.64.2/tcp/4001", // docker 内网
+		"/ip4/10.7.204.166/tcp/4001", // 虚拟网
+		"/ip4/172.17.0.2/tcp/4001",   // 容器网桥
+		"/ip6/fd00::1/tcp/4001",      // ULA
+		"/dns4/example.com/tcp/4001", // 非 ip4/ip6 形态一律不算
+	}
+	for _, a := range no {
+		if hasPublicAddr([]string{a}) {
+			t.Errorf("%s 不该判为公网地址", a)
+		}
+	}
+}
+
+// TestHarvestSeedCandidatesGuards 自举采集的边界：范围关闭 / 无对端时不写任何东西。
+//
+// 空库 + 未连任何公网对端的情形下必须安静返回 0（不能 panic、不能凭空造记录）。
+func TestHarvestSeedCandidatesGuards(t *testing.T) {
+	c := newStandaloneClient(t, "harvest", "grp-harvest", filepath.Join(t.TempDir(), "h.db"))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// 范围关闭 → 0，且库里仍然为空。
+	n := c.harvestSeedCandidates(ctx, c.peers, SeedSettings{}, peersdb.SeedScopeGroup)
+	if n != 0 {
+		t.Errorf("范围关闭时应收 0 条，实际 %d", n)
+	}
+	// 范围开启但没有「已连上且带公网地址」的对端 → 仍然是 0。
+	n = c.harvestSeedCandidates(ctx, c.peers, SeedSettings{GroupEnabled: true}, peersdb.SeedScopeGroup)
+	if n != 0 {
+		t.Errorf("没有合格对端时应收 0 条，实际 %d", n)
+	}
+	total, err := c.peers.CountSeeds(ctx, peersdb.SeedScopeGroup)
+	if err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if total != 0 {
+		t.Errorf("不该凭空写入记录，实际 %d 条", total)
+	}
+}
