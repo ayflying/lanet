@@ -62,8 +62,15 @@ func TestConnectPeerByIDRequiresMutualApproval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("A 添加 B 节点 ID 失败: %v", err)
 	}
+	if res.AlreadyMember {
+		t.Fatal("首次添加不能误报为重复成员")
+	}
 	if !res.Pending {
 		t.Fatalf("B 尚未同意，A 应得到 Pending（申请已送达），实际 %+v", res)
+	}
+	repeated, repeatErr := a.ConnectPeer(ctx, b.Info().PeerID)
+	if repeatErr != nil || repeated == nil || !repeated.AlreadyMember {
+		t.Fatalf("再次添加应提示重复：结果=%+v，错误=%v", repeated, repeatErr)
 	}
 	if res.PeerID != b.Info().PeerID {
 		t.Fatalf("Pending 结果应带回对端节点 ID，实际 %q", res.PeerID)

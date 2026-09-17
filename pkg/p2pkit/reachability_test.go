@@ -39,8 +39,44 @@ func TestAddrReachabilityRank(t *testing.T) {
 	}
 }
 
-// TestSortByReachabilityOrdersAndFilters 排序把公网 IPv6 与局域网顶到前面，
-// 同时剔除 overlay / 回环 / 未指定地址——它们是「拨了必然失败」的噪声。
+// TestShareableAddrsDropsDiscouragedAddrs 隧道 / 宿主虚拟网卡上的地址会被
+// **直接从分享列表里剔除**（而不是仅降级）。
+//
+// 为什么必须剔除而不是降级：降级只改排序，名额有余量时脏地址照样被分享、
+// 照样扩散。而连接码只有 4 个名额——真机实测本机连接码里混进了 ZeroTier 的
+// 10.70.38.92 与 NodeBabyLink 的 10.222.222.1，对端拿去逐条拨号，时间预算
+// 全耗在「只对同一台宿主上的虚拟机」或「同一个第三方 VPN 网络内」可达的
+// 地址上，真正可达的那条反而没机会试。
+//
+// 这里用 shareableAddrsWith 显式注入剔除集合：真实判据来自本机网卡枚举
+// （DiscouragedShareAddrs），依赖跑测试的机器上有哪些网卡，不适合进单测。
+func TestShareableAddrsDropsDiscouragedAddrs(t *testing.T) {
+	addrs := []ma.Multiaddr{
+		ma.StringCast("/ip4/192.168.50.170/tcp/49709"),
+		ma.StringCast("/ip4/10.70.38.92/tcp/52000"),
+		ma.StringCast("/ip4/10.222.222.1/tcp/4001"),
+	}
+	drop := map[string]bool{"10.70.38.92": true, "10.222.222.1": true}
+	got := shareableAddrsWith(addrs, drop, nil)
+	if len(got) != 1 {
+		t.Fatalf("隧道 / 虚拟网卡地址应被剔除，只留物理网卡，got %v", got)
+	}
+	if !strings.Contains(got[0].String(), "192.168.50.170") {
+		t.Fatalf("留下的应是物理网卡地址，got %v", got)
+	}
+}
+
+// TestShareableAddrsKeepsAddrsWhenAllDiscouraged 保底：整机只挂着隧道 / 虚拟
+// 网卡时（例如只能靠 ZeroTier 出网），不能因为治理策略把分享列表清空——
+// 连接码 / 种子列表为空对用户完全不可用，宁可分享一条弱地址。
+func TestShareableAddrsKeepsAddrsWhenAllDiscouraged(t *testing.T) {
+	got := ShareableAddrs([]ma.Multiaddr{
+		ma.StringCast("/ip4/10.70.38.92/tcp/52000"),
+	})
+	if len(got) == 0 {
+		t.Fatal("过滤后为空时应退回未过滤结果，而不是返回空列表")
+	}
+}
 func TestSortByReachabilityOrdersAndFilters(t *testing.T) {
 	input := []ma.Multiaddr{
 		ma.StringCast("/ip4/169.254.122.160/tcp/4001"),          // link-local：最后

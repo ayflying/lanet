@@ -10,12 +10,19 @@ import (
 
 // 本机真实形态的地址样本：一块物理网卡监听 tcp+ws+quic，一块 VPN 网卡只有 quic，
 // 一条公网 IPv6，另加一条 link-local 与 overlay（后两者应被排序层剔除）。
+//
+// ️ 这里刻意用 10.99.99.99 而不是本机 ZeroTier 真实的 10.70.38.92：分享层会
+// 把「本机识别出来的隧道 / 宿主虚拟网卡地址」直接剔除（见
+// p2pkit.DiscouragedShareAddrs），用真实地址会让断言随「跑测试的机器上有没有
+// ZeroTier」而变。这个 IP 不属于本机任何网卡，故稳定地落在「普通私有 IPv4」，
+// 只用于验证排序与链路折叠。隧道剔除语义由 p2pkit 的
+// TestShareableAddrsDropsDiscouragedAddrs 单独覆盖。
 func localAddrFixture() []ma.Multiaddr {
 	return []ma.Multiaddr{
 		ma.StringCast("/ip4/192.168.50.170/tcp/49709"),
 		ma.StringCast("/ip4/192.168.50.170/tcp/49710/ws"),
 		ma.StringCast("/ip4/192.168.50.170/udp/53500/quic-v1"),
-		ma.StringCast("/ip4/10.70.38.92/udp/52000/quic-v1"),
+		ma.StringCast("/ip4/10.99.99.99/udp/52000/quic-v1"),
 		ma.StringCast("/ip6/2408:824e:1592:7d80::577/tcp/4001"),
 		ma.StringCast("/ip4/169.254.122.160/tcp/49709"),
 		ma.StringCast("/ip4/10.7.207.102/tcp/49709"),
@@ -29,7 +36,7 @@ func TestPickInviteHostPortsOrdersByReachability(t *testing.T) {
 	want := []string{
 		"[2408:824e:1592:7d80::577]:4001", // 公网 IPv6 最优
 		"192.168.50.170:49709",            // 局域网（取裸 TCP，跳过 ws 的 49710）
-		"10.70.38.92:52000",               // VPN：无裸 TCP，退回 QUIC 端口
+		"10.99.99.99:52000",               // VPN：无裸 TCP，退回 QUIC 端口
 		"169.254.122.160:49709",           // link-local 垫底，但仍带上
 	}
 	if len(got) != len(want) {
@@ -125,6 +132,9 @@ func TestInviteCodeRoundTripViaPick(t *testing.T) {
 // Windows 隐私扩展会让同一块 IPv6 网卡在同一前缀下有多个地址，若按 IP 去重
 // 而不按链路前缀折叠，连接码的 4 个名额会被这一块网卡占满，局域网 IPv4 与
 // VPN 网卡全都挤不进去——与「把所有网卡都分享出去」的目标正好相反。
+//
+// 同 localAddrFixture：第二块网卡用 10.99.99.99 而非本机真实的 ZeroTier
+// 地址，避免断言随机器网卡枚举结果变化。
 func TestInviteCodeCoversAllNICsNotPrivacyAddrs(t *testing.T) {
 	// 同一 /64 前缀下的三个地址（主地址 + 两个隐私临时地址，真实形态）。
 	const p = "2408:824e:1592:7d80"
@@ -133,13 +143,13 @@ func TestInviteCodeCoversAllNICsNotPrivacyAddrs(t *testing.T) {
 		ma.StringCast("/ip6/" + p + ":1076:c2a9:e3c6:e71d/tcp/4001"),
 		ma.StringCast("/ip6/" + p + ":7619:3a83:f518:d970/tcp/4001"),
 		ma.StringCast("/ip4/192.168.50.170/tcp/49709"),
-		ma.StringCast("/ip4/10.70.38.92/udp/52000/quic-v1"),
+		ma.StringCast("/ip4/10.99.99.99/udp/52000/quic-v1"),
 	}
 	got := pickInviteHostPorts(p2pkit.ShareableAddrs(fixture))
 	want := []string{
 		"[" + p + "::577]:4001", // 该链路的代表（排序后首条）
 		"192.168.50.170:49709",  // 局域网网卡
-		"10.70.38.92:52000",     // VPN 网卡
+		"10.99.99.99:52000",     // 另一块网卡
 	}
 	if len(got) != len(want) {
 		t.Fatalf("应覆盖 3 条不同链路，got %v", got)

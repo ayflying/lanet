@@ -52,12 +52,21 @@ func (c *Client) openPeersDB(ctx context.Context) (*peersdb.DB, error) {
 	if n, err := db.PruneSelf(ctx, c.peerID); err == nil && n > 0 {
 		c.logf("地址簿自愈：清理了 %d 条指向本机自己的残留记录", n)
 	}
+	// 自愈：修剪每个节点累积的过期地址（地址簿只增不减，单个节点攒到几十条
+	// 无用地址后每次连接都要逐条试，见 peersdb.PrunePeerAddrs 注释）。放在
+	// 预热之前，让预热拿到的是修剪后的高价值地址。
+	if n, err := db.PrunePeerAddrs(ctx, 0); err == nil && n > 0 {
+		c.logf("地址簿自愈：清理了 %d 条失效的节点地址（每节点保留最近可用的若干条）", n)
+	}
 	known, _ := db.ListPeers(ctx, false)
 	c.logf("地址簿已打开：%s（已知节点 %d 个）", db.Path(), len(known))
 	// 冷启动预热：地址簿里存着上次真正拨通过的地址，入网就绪后主动重连，
 	// 不必干等 DHT 把成员表慢慢填回来（用户存地址簿的初衷就是「启动快速
 	// 连接」）。异步、有界、一次性，不阻塞启动。
 	c.startWarmup(ctx, db)
+	// 设备名对账：成员表里的名字是内存态，重启或对端长期离线后就没了。定期
+	// 落进本地库，列表在离线时也能显示「这是谁」；对端改名后本地跟随更新。
+	c.startNameSync(ctx, db)
 	return db, nil
 }
 
@@ -415,6 +424,125 @@ func (c *Client) rememberPeer(peerID string, addrs []string, name string, truste
 	}
 }
 
+// ---- 设备名持久化（本地留住「谁是谁」）----
+//
+// 运行时成员表里的名字是**内存态**：进程重启、或对端长期离线之后名字就没了，
+// 列表退化成「12D3KooW…」+ 虚拟 IP，用户根本认不出是谁。做法是把成员表里的
+// 名字定期对账进本地库（peers.name），展示时以本地库兜底；对端改了名字，
+// 下一轮对账就跟着改（用户要求「对方改名，下次连上就本地改一下」）。
+//
+// 为什么不做成写入时同步：成员表刷新与 info 交换都在连接热路径上，多一次
+// 写库就多一次潜在阻塞。慢速巡检既够用，也不给连接流程添负担。
+const (
+	// nameSyncInitialDelay 入网就绪后多久开始第一次对账（避开启动期噪声）。
+	nameSyncInitialDelay = 15 * time.Second
+	// nameSyncInterval 对账周期。名字变动极不频繁，慢速足够。
+	nameSyncInterval = 30 * time.Second
+	// nameSyncBudget 单条写库的时间预算。
+	nameSyncBudget = 10 * time.Second
+)
+
+// startNameSync 后台定期把成员表里的设备名对账进本地库（异步、有界、可取消）。
+func (c *Client) startNameSync(ctx context.Context, db *peersdb.DB) {
+	if db == nil {
+		return
+	}
+	go func() {
+		if !c.waitReady(ctx, warmupReadyWait) {
+			return // 启动失败或被取消
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(nameSyncInitialDelay):
+		}
+		for {
+			c.syncMemberNames(ctx, db)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(nameSyncInterval):
+			}
+		}
+	}()
+}
+
+// syncMemberNames 把成员表里的名字写进本地库（名字为空则跳过），返回写入条数。
+//
+// 只处理成员表（同群 + 已互信/已发现），不碰「附近」列表：附近节点的名字本来
+// 就来自「对端主动申请」或历史记录，写回去会形成自我强化，把一个可能已经
+// 失效的名字永久钉在那儿。
+func (c *Client) syncMemberNames(ctx context.Context, db *peersdb.DB) int {
+	members := c.NetMap().Members
+	if len(members) == 0 {
+		return 0
+	}
+	known, err := db.NameIndex(ctx)
+	if err != nil {
+		c.logf("设备名对账：读取本地名称索引失败: %v", err)
+		return 0
+	}
+	updated := 0
+	for _, m := range members {
+		name := strings.TrimSpace(m.Name)
+		if m.PeerID == "" || name == "" {
+			continue
+		}
+		if cur, ok := known[m.PeerID]; ok && cur.Name == name {
+			continue // 名字没变：不写库（每 30s 一次的巡检不该产生无谓写入）
+		}
+		wctx, cancel := context.WithTimeout(ctx, nameSyncBudget)
+		werr := db.SetName(wctx, m.PeerID, name)
+		cancel()
+		if werr != nil {
+			c.logf("设备名对账：写入 %s 的名称失败: %v", shortPeer(m.PeerID), werr)
+			continue
+		}
+		updated++
+	}
+	if updated > 0 {
+		c.logf("设备名对账：已更新 %d 个成员的本地名称（离线后仍可显示）", updated)
+	}
+	return updated
+}
+
+// SetPeerNotes 写入某节点的备注（控制台「备注」入口）。空串表示清除备注。
+//
+// 备注是本机用户手写的别名，与对端自报的 name 并存：展示时备注优先、真名
+// 次之——对端把名字改成一串乱码也不影响列表可读性。
+func (c *Client) SetPeerNotes(peerID, notes string) error {
+	if c.peers == nil {
+		return fmt.Errorf("地址簿未启用")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.peers.SetNotes(ctx, peerID, notes); err != nil {
+		return err
+	}
+	if notes = strings.TrimSpace(notes); notes == "" {
+		c.logf("已清除节点 %s 的备注", shortPeer(peerID))
+	} else {
+		c.logf("已设置节点 %s 的备注：%s", shortPeer(peerID), notes)
+	}
+	return nil
+}
+
+// PeerNameIndex 当前本地库的全量「节点 ID → 名称/备注」索引（展示兜底用）。
+// 地址簿未启用时返回空 map（调用方无需判空）。
+func (c *Client) PeerNameIndex() map[string]peersdb.NameInfo {
+	if c.peers == nil {
+		return map[string]peersdb.NameInfo{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	idx, err := c.peers.NameIndex(ctx)
+	if err != nil {
+		c.logf("读取本地名称索引失败: %v", err)
+		return map[string]peersdb.NameInfo{}
+	}
+	return idx
+}
+
 // ---- 对外 API ----
 
 // ConnResult 一次连接申请的结果。
@@ -435,6 +563,9 @@ type ConnResult struct {
 	VirtualIP string `json:"virtual_ip,omitempty"`
 	// Via 本次地址来源：local（本地地址簿）/ dht（私有 DHT 查找）/ manual（直填地址）。
 	Via string `json:"via,omitempty"`
+	// AlreadyMember 为 true 表示该节点本来就在成员表 / 地址簿里（重复添加）。
+	// 连接仍会照常尝试（重连是合理需求），界面据此给出「无需重复添加」提示。
+	AlreadyMember bool `json:"already_member,omitempty"`
 }
 
 // clearUnfriendedPeer 供 serverless 协议层使用：墓碑告知送达后消费掉，
@@ -466,7 +597,63 @@ func (c *Client) clearUnfriended(ctx context.Context, peerID string) {
 //   - 完整 multiaddr（/ip4/1.2.3.4/tcp/4001/p2p/12D3Koo...）：直接拨号。
 //
 // 返回 Pending=true 表示已提交申请、等对方在控制台同意（加好友语义）。
+//
+// 目标本来就在成员表 / 地址簿里时（重复添加），结果里会带 AlreadyMember=true，
+// 界面据此提示「无需重复添加」——但连接照常尝试，重连本身就是合理需求。
 func (c *Client) ConnectPeer(ctx context.Context, address string) (*ConnResult, error) {
+	// 必须在建连写入信任之前判断，否则首次添加也会被误报为重复。
+	knownBefore := c.knownMemberAddress(address)
+	res, err := c.connectPeerInner(ctx, address)
+	if err != nil || res == nil {
+		return res, err
+	}
+	if res.PeerID != "" && knownBefore {
+		res.AlreadyMember = true
+		if res.Message == "" {
+			res.Message = "该设备已在成员列表中，无需重复添加（已按重新连接处理）"
+		}
+	}
+	return res, nil
+}
+
+// knownMemberAddress 解析三种连接输入，在任何建连副作用发生前查询信任状态。
+func (c *Client) knownMemberAddress(address string) bool {
+	address = strings.TrimSpace(address)
+	if invitecode.IsInviteCode(address) {
+		id, _, err := invitecode.ToMultiaddrs(address)
+		return err == nil && c.isKnownMember(id.String())
+	}
+	if strings.Contains(address, "/p2p/") {
+		m, err := ma.NewMultiaddr(address)
+		if err != nil {
+			return false
+		}
+		ai, err := peer.AddrInfoFromP2pAddr(m)
+		return err == nil && ai != nil && c.isKnownMember(ai.ID.String())
+	}
+	id, err := peer.Decode(address)
+	return err == nil && c.isKnownMember(id.String())
+}
+
+// isKnownMember 该节点是否已在本地地址簿里（重复添加检测）。
+//
+// 与 isTrustedPeer 的区别很重要：后者在「关闭连接审批」时恒返回 true，
+// 拿它做重复检测会把每一次连接都误报成「已在成员列表」。
+func (c *Client) isKnownMember(peerID string) bool {
+	if c.peers == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ok, err := c.peers.IsTrusted(ctx, peerID)
+	if err != nil {
+		return false
+	}
+	return ok
+}
+
+// connectPeerInner ConnectPeer 的实现体（语义见 ConnectPeer 的说明）。
+func (c *Client) connectPeerInner(ctx context.Context, address string) (*ConnResult, error) {
 	if c.disc == nil {
 		return nil, fmt.Errorf("连接节点功能仅在 Standalone 无服务器模式可用")
 	}
@@ -851,6 +1038,24 @@ func (c *Client) NearbyList() []peersdb.Nearby {
 	if err != nil {
 		c.logf("读取附近列表失败: %v", err)
 		return nil
+	}
+	// 设备名 / 备注兜底：附近节点是**被动发现**的，本就拿不到对方自报的名字
+	// （审批隔离），唯一真实的来源是「对方主动申请连接」时带来的名字，以及
+	// 本机历史上存过的名字（曾经是好友、或手动添加过）。没有这一步，附近
+	// 列表就是一串「12D3KooW…」，用户根本不知道该不该点「申请连接」。
+	idx, ierr := c.peers.NameIndex(ctx)
+	if ierr != nil {
+		c.logf("读取本地名称索引失败（附近列表将只显示节点 ID）: %v", ierr)
+	}
+	for i := range list {
+		info, ok := idx[list[i].PeerID]
+		if !ok {
+			continue
+		}
+		if list[i].Name == "" {
+			list[i].Name = info.Name
+		}
+		list[i].Notes = info.Notes
 	}
 	return dropSelfNearby(list, c.peerID)
 }

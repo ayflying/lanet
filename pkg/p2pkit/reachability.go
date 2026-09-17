@@ -12,6 +12,7 @@ package p2pkit
 import (
 	"net"
 	"net/netip"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -389,6 +390,42 @@ func containsAnyHint(lower string, hints []string) bool {
 	return false
 }
 
+// envShareTunnelAddrs 逃生口：设 1/true/yes/on 时，隧道与宿主虚拟网卡的地址
+// 照旧参与分享（等价于本版之前的行为）。默认关闭——剔除才是默认策略。
+const envShareTunnelAddrs = "LANET_SHARE_TUNNEL_ADDRS"
+
+// DiscouragedShareAddrs 返回本机上「不该被分享出去」的地址集合：VPN / 隧道
+// 网卡（ZeroTier、Tailscale、WireGuard，以及靠空 MAC 认出来的无名隧道）与宿主
+// 内部虚拟交换机 / 容器网桥（WSL、Hyper-V、VMware、docker0…）上的地址。
+//
+// 为什么从「降级」改为「剔除」：降级只改排序，名额有余量时这些地址照样会被
+// 分享、照样扩散。而连接码只有 4 个名额、连接种子也有上限，本机挂上三块虚拟
+// 网卡就能把名额吃光；对端拿到后逐条尝试，预算全耗在「只对同一台宿主上的
+// 虚拟机」或「同一个第三方 VPN 网络内」可达的地址上。真机实测本机连接码里
+// 混进了 ZeroTier 的 10.70.38.92 与 NodeBabyLink 的 10.222.222.1，对方拿去
+// 拨号注定失败，还挤掉了真正可达的那条。
+//
+// 逃生口：LANET_SHARE_TUNNEL_ADDRS=1（例如整组机器都在同一个 ZeroTier 网络
+// 里，确实要靠它互连）。
+func DiscouragedShareAddrs() map[string]bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(envShareTunnelAddrs))) {
+	case "1", "true", "yes", "on":
+		return nil
+	}
+	s := localIfaceAddrSets()
+	if s == nil || (len(s.tunnel) == 0 && len(s.hostVirtual) == 0) {
+		return nil
+	}
+	out := make(map[string]bool, len(s.tunnel)+len(s.hostVirtual))
+	for ip := range s.tunnel {
+		out[ip] = true
+	}
+	for ip := range s.hostVirtual {
+		out[ip] = true
+	}
+	return out
+}
+
 // DialableHostPort 取 multiaddr 里可直接拨号的「IP:端口」及其传输类型。
 //
 // 只认两类：裸 TCP（/tcp/<p>，后面不再跟 /ws、/wss 等需要额外协商的协议）
@@ -444,15 +481,39 @@ func AddrIP(a ma.Multiaddr) (netip.Addr, bool) {
 	return ip.Unmap(), true
 }
 
-// ShareableAddrs 整理出「可供分享」的地址列表：剔除容器内网地址 → 去重 →
-// 按可达性排序 → 按链路前缀折叠冗余 → 把显式声明的对外地址顶到最前。
-// 连接种子与连接码统一走这里，保证两者口径一致。
+// ShareableAddrs 整理出「可供分享」的地址列表：剔除容器内网地址与
+// 隧道 / 宿主虚拟网卡地址 → 去重 → 按可达性排序 → 按链路前缀折叠冗余 →
+// 把显式声明的对外地址顶到最前。连接种子与连接码统一走这里，保证两者口径一致。
+//
+// 保底：整机只挂着隧道 / 虚拟网卡（例如只能靠 ZeroTier 出网）时，过滤后可能
+// 一条不剩——此时退回「不剔除任何地址」的结果。宁可分享一条弱地址，也不要让
+// 连接码 / 种子列表变成空的（空列表对用户完全不可用，而弱地址至少还有机会）。
 func ShareableAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
 	var drop map[string]bool
 	if InContainer() {
 		drop = collectContainerInternalAddrs()
 	}
-	return shareableAddrsWith(addrs, drop, AdvertiseAddrs())
+	drop = mergeAddrSets(drop, DiscouragedShareAddrs())
+	out := shareableAddrsWith(addrs, drop, AdvertiseAddrs())
+	if len(out) == 0 && len(addrs) > 0 {
+		return shareableAddrsWith(addrs, nil, AdvertiseAddrs())
+	}
+	return out
+}
+
+// mergeAddrSets 合并两个「IP 字符串集合」（就地写入 a，返回结果）。两者都为空
+// 时返回 nil，让 DropAddrSet 走「空集合 ⇒ 原样返回」的快速路径。
+func mergeAddrSets(a, b map[string]bool) map[string]bool {
+	if len(b) == 0 {
+		return a
+	}
+	if a == nil {
+		return b
+	}
+	for k := range b {
+		a[k] = true
+	}
+	return a
 }
 
 // shareableAddrsWith 是 ShareableAddrs 的实现体：剔除集合与自声明地址由参数

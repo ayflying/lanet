@@ -195,6 +195,21 @@
   </div>
 </div>
 
+<!-- 备注弹框（给成员 / 附近节点起一个本机可读的别名） -->
+<div class="overlay" id="notesOverlay" style="display:none" onclick="if(event.target===this)closeNotes()">
+  <div class="modal" style="max-width:460px">
+    <h2>设置备注</h2>
+    <div class="modal-body" id="notesTarget" style="white-space:normal"></div>
+    <div class="kv"><b>备注</b><input type="text" id="notesInput" placeholder="例如：家里的 NAS / 办公室主机" maxlength="40"></div>
+    <div class="sub">备注只保存在本机，用于区分设备；对方改名或长期离线都不影响它。留空保存即清除备注。</div>
+    <div class="modal-btns">
+      <button onclick="saveNotes()">保存</button>
+      <button class="ghost" onclick="closeNotes()">取消</button>
+    </div>
+    <div class="msg" id="notesMsg" style="display:none"></div>
+  </div>
+</div>
+
 <div class="panel active" id="pMembers">
   <div class="card" id="connectCard" style="display:none">
     <h2>连接其他节点 <span class="tag unknown">连接码直连</span></h2>
@@ -264,7 +279,7 @@
   <div class="card">
     <h2>成员与链路 <button class="ghost" style="float:right;font-size:12px;padding:2px 10px" onclick="openInfoModal()">本机信息</button></h2>
     <div class="row" style="margin:0 0 10px">
-      <input type="text" id="mSearch" placeholder="搜索：设备名 / 虚拟地址 / 虚拟 IP / PeerID" oninput="mPage=1;renderMembers()">
+      <input type="text" id="mSearch" placeholder="搜索：设备名 / 备注 / 虚拟地址 / 虚拟 IP / PeerID" oninput="mPage=1;renderMembers()">
       <select id="mFilter" style="flex:0 0 140px" onchange="mPage=1;renderMembers()">
         <option value="all">全部状态</option>
         <option value="online">仅在线</option>
@@ -376,6 +391,7 @@
     <div class="sub" style="margin-bottom:8px">写入程序同目录 lanet.json，保存后重启程序生效。控制台默认仅本机可访问（127.0.0.1）；改为 0.0.0.0:8900 允许远程时，请务必同时设置控制台密码。</div>
     <div class="sub" id="cRuntime" style="display:none;margin-bottom:8px;padding:8px 10px;border:1px solid #d8dee9;border-radius:6px;background:#f6f8fa"></div>
     <div class="kv"><b>节点名称</b><input type="text" id="cName"></div>
+    <div class="sub" id="cNameHint" style="display:none;color:#c0392b;margin:-1px 0 6px 88px"></div>
     <div class="kv"><b>网络密钥</b><input type="text" id="cKey" placeholder="留空 = 本机专属默认网络（按节点 ID 派生，不与他人互通）；填写相同密钥才能互相连通">
       <div class="sub" id="cKeyEnvHint" style="display:none;color:#c0392b;margin-top:4px"></div>
     </div>
@@ -499,17 +515,21 @@ async function connectPeer() {
       headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ address }) });
     const res = await r.json().catch(() => ({}));
     if (r.ok) {
+      // already_member：该节点本来就在成员表里（重复添加）。连接照常进行，
+      // 只是提示用户「不用再加一次」——避免以为哪里没生效而反复点。
+      const dupTip = res.already_member ? '该设备已在成员列表中，无需重复添加 · ' : '';
       if (res.pending) {
-        flash('peerMsg', res.message || '已提交连接申请，等待对方同意', true);
+        flash('peerMsg', dupTip + (res.message || '已提交连接申请，等待对方同意'), true);
       } else if (res.searching) {
         // DHT 冷启动查不到地址不算失败：已记录并信任，后台发现会自动补连。
         // 保留输入框内容，提示用户等待即可，不必反复点连接。
         flash('peerMsg', res.message || '已记录节点，正在网络中查找其地址，查到后自动连接…', true);
       } else {
-        const who = res.name ? `「${res.name}」` : '';
+        const _di = findPeerDisplay(res.peer_id);
+        const who = (_di.notes || _di.name || res.name) ? `「${_di.notes || _di.name || res.name}」` : '';
         const vip = res.virtual_ip ? `（虚拟 IP ${res.virtual_ip}）` : '';
         const how = res.via === 'local' ? '本地地址簿' : (res.via === 'dht' ? '私有 DHT' : '直接拨号');
-        flash('peerMsg', `已连接 ${who}${vip} · 地址来源：${how}`, true);
+        flash('peerMsg', dupTip + `已连接 ${who}${vip} · 地址来源：${how}`, true);
         $('peerInput').value = '';
         autoGrow($('peerInput'));   // 清空后把框收回去，别留一大片空白
       }
@@ -570,16 +590,20 @@ function renderConnect() {
   box.style.display = '';
   $('pendingList').innerHTML = pending.map(p => {
     const pid = esc(p.peer_id);
-    const nm = p.name ? `<b>${esc(p.name)}</b>` : '';
+    // 待审批节点来自对方申请，名字由对方自报；本机若写过备注则优先显示备注。
+    const shown = p.notes || p.name;
+    const nm = shown ? `<b>${esc(shown)}</b>` : '';
+    const realName = (p.notes && p.name) ? `&nbsp;<span class="li-pid">${esc(p.name)}</span>` : '';
     const t = p.created_at ? new Date(p.created_at * 1000).toLocaleString() : '—';
     return `<div class="listitem">
-      ${listAvatar(p.name)}
+      ${listAvatar(p.notes || p.name)}
       <div class="li-main">
-        <div class="li-name">${nm}<span class="li-pid" title="点击复制完整节点 ID：${pid}"
+        <div class="li-name">${nm}${realName}<span class="li-pid" title="点击复制完整节点 ID：${pid}"
              onclick="copyText('${pid}', this)">${esc(shortPeerID(p.peer_id))}</span></div>
         <div class="li-meta">申请时间 ${esc(t)}</div>
       </div>
       <div class="li-acts">
+        <button class="ghost" onclick="openNotesModal('${pid}')">备注</button>
         <button onclick="resolvePending('${pid}', true)">同意</button>
         <button class="ghost danger" onclick="resolvePending('${pid}', false)">拒绝</button>
       </div>
@@ -618,19 +642,24 @@ function renderNearby() {
   }
   $('nearbyList').innerHTML = rows.map(n => {
     const pid = esc(n.peer_id);
-    const nm = n.name ? `<b>${esc(n.name)}</b>` : '';
+    // 附近节点的名字来源：本机备注 > 本地库留存的旧名字 > 对方申请时自报的名字
+    // （被动发现本身拿不到身份信息）。有备注时附一份真名。
+    const shown = n.notes || n.name;
+    const nm = shown ? `<b>${esc(shown)}</b>` : '';
+    const realName = (n.notes && n.name) ? `&nbsp;<span class="li-pid">${esc(n.name)}</span>` : '';
     const t = n.last_seen ? relTime(n.last_seen) : '—';
     const src = n.source === 'mdns' ? '局域网发现' : (n.source === 'dht-private' ? '同密钥网络发现' : (n.source ? '网络发现' : ''));
     // 申请后进入的是「对方」的待审批列表（本机看不到对方审批状态），
     // 故这里始终提供按钮，重复点击幂等（后端去重，不会刷屏）。
     return `<div class="listitem">
-      ${listAvatar(n.name)}
+      ${listAvatar(n.notes || n.name)}
       <div class="li-main">
-        <div class="li-name">${nm}<span class="li-pid" title="点击复制完整节点 ID：${pid}"
+        <div class="li-name">${nm}${realName}<span class="li-pid" title="点击复制完整节点 ID：${pid}"
              onclick="copyText('${pid}', this)">${esc(shortPeerID(n.peer_id))}</span></div>
         <div class="li-meta">${esc(src)} · 最近发现 ${esc(t)}</div>
       </div>
       <div class="li-acts">
+        <button class="ghost" onclick="openNotesModal('${pid}')">备注</button>
         <button class="ghost" onclick="reconnectNearby('${pid}', this)">申请连接</button>
       </div>
     </div>`;
@@ -651,7 +680,10 @@ async function reconnectNearby(peerID, btn) {
     } else if (res.searching) {
       flash('nearbyMsg', res.message || '已记录，正在查找对方地址，查到后自动连接…', true);
     } else {
-      flash('nearbyMsg', (res.name ? '已连接「' + esc(res.name) + '」' : '已连接') + (res.virtual_ip ? '（虚拟 IP ' + res.virtual_ip + '）' : ''), true);
+      const _ni = findPeerDisplay(peerID);
+      const _nwho = _ni.notes || _ni.name || res.name;
+      flash('nearbyMsg', (res.already_member ? '该设备已在成员列表中，无需重复添加 · ' : '') +
+        (_nwho ? '已连接「' + esc(_nwho) + '」' : '已连接') + (res.virtual_ip ? '（虚拟 IP ' + res.virtual_ip + '）' : ''), true);
     }
     loadState();
   } catch (e) {
@@ -671,6 +703,55 @@ function askConfirm(title, body, action) {
   $('confirmOverlay').style.display = 'flex';
 }
 function closeConfirm() { $('confirmOverlay').style.display = 'none'; _confirmAction = null; }
+
+// ---- 备注（本机给设备起别名，离线也认得出谁是谁） ----
+let _notesPeerID = '';
+// findPeerDisplay 在成员 / 附近 / 待审批三张列表里查某个节点的展示信息。
+// 备注弹框只需要 peer_id 就能打开，要显示的名字在这里现查——避免把用户备注
+// 塞进 HTML 属性（那要处理引号转义，容易出错）。
+function findPeerDisplay(peerID) {
+  const pools = [(S && S.members) || [], (S && S.nearby) || [], (S && S.pending) || []];
+  for (const pool of pools) {
+    const hit = pool.find(x => x.peer_id === peerID);
+    if (hit) return hit;
+  }
+  return {};
+}
+function openNotesModal(peerID) {
+  if (!peerID) return;
+  _notesPeerID = peerID;
+  const info = findPeerDisplay(peerID);
+  $('notesInput').value = info.notes || '';
+  const who = info.name || info.notes || shortPeerID(peerID);
+  $('notesTarget').innerHTML = '设备：<b>' + esc(who) + '</b>' +
+    (info.name ? '<span class="pid"> (' + esc(shortPeerID(peerID)) + ')</span>' : '');
+  const msg = $('notesMsg'); msg.style.display = 'none'; msg.textContent = '';
+  $('notesOverlay').style.display = 'flex';
+  $('notesInput').focus();
+}
+function closeNotes() { $('notesOverlay').style.display = 'none'; _notesPeerID = ''; }
+async function saveNotes() {
+  const peerID = _notesPeerID;
+  if (!peerID) return;
+  const notes = $('notesInput').value.trim();
+  try {
+    const r = await fetch('/api/peer-notes', { method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ peer_id: peerID, notes }) });
+    const res = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const el = $('notesMsg'); el.style.display = ''; el.className = 'msg bad';
+      el.textContent = '保存失败：' + (res.error || '');
+      return;
+    }
+    closeNotes();
+    loadState();
+  } catch (e) {
+    const el = $('notesMsg'); el.style.display = ''; el.className = 'msg bad';
+    el.textContent = '保存失败：' + e;
+  }
+}
+
 async function doConfirm() {
   if (!_confirmAction) { closeConfirm(); return; }
   const okBtn = $('confirmOk'); okBtn.disabled = true;
@@ -721,8 +802,11 @@ async function connectSeed() {
       headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ seed }) });
     const res = await r.json().catch(() => ({}));
     if (r.ok) {
-      const who = res.virtual_ip ? `（虚拟 IP ${res.virtual_ip}）` : '';
-      flash('seedMsg', '已连接成员 ' + (res.peer_id ? res.peer_id.slice(0, 16) + '…' : '') + who, true);
+      const _si = findPeerDisplay(res.peer_id);
+      const _swho = _si.notes || _si.name || res.name;
+      const who = _swho ? `「${_swho}」` : (res.peer_id ? res.peer_id.slice(0, 16) + '…' : '');
+      const vip = res.virtual_ip ? `（虚拟 IP ${res.virtual_ip}）` : '';
+      flash('seedMsg', '已连接成员 ' + who + vip, true);
       $('seedInput').value = '';
       autoGrow($('seedInput'));   // 同上：清空后收回高度
       $('seedHint').style.display = 'none';
@@ -905,7 +989,7 @@ function filteredMembers() {
     if (f === 'online' && !m.online) return false;
     if (f === 'offline' && m.online) return false;
     if (!q) return true;
-    return [m.name, m.virtual_ip, m.hostname, m.peer_id]
+    return [m.notes, m.name, m.virtual_ip, m.hostname, m.peer_id]
       .some(v => (v || '').toLowerCase().includes(q));
   });
 }
@@ -925,10 +1009,13 @@ function renderMembers() {
   }
   const page = list.slice((mPage - 1) * M_PAGE_SIZE, mPage * M_PAGE_SIZE);
   $('members').innerHTML =
-    '<table><tr><th>设备</th><th>虚拟地址</th><th>虚拟 IP</th><th>状态</th><th>链路</th><th>版本</th><th>最后活跃</th><th style="width:110px">操作</th></tr>' +
+    '<table><tr><th>设备</th><th>虚拟地址</th><th>虚拟 IP</th><th>状态</th><th>链路</th><th>版本</th><th>最后活跃</th><th style="width:160px">操作</th></tr>' +
     page.map(m => {
-      const label = m.name || (m.peer_id ? m.peer_id.slice(0, 10) + '…' : '未知设备');
-      const pid = m.name ? '<span class="pid"> (' + esc(m.peer_id.slice(0, 8)) + '…)</span>' : '';
+      // 展示名优先级：本机备注 > 对端自报名 > 节点 ID 缩写。有备注时后面仍跟
+      // 一份真名（灰色小字）：对方改名后一眼能看出变化，不会认错设备。
+      const label = m.notes || m.name || (m.peer_id ? m.peer_id.slice(0, 10) + '…' : '未知设备');
+      const realName = (m.notes && m.name) ? '&nbsp;<span class="vhost">' + esc(m.name) + '</span>' : '';
+      const pid = (m.notes || m.name) ? '<span class="pid"> (' + esc(m.peer_id.slice(0, 8)) + '…)</span>' : '';
       const host = m.hostname
         ? `<span class="vhost" title="点击复制虚拟地址" onclick="copyText('${esc(m.hostname)}', this)">${esc(m.hostname)}</span>`
         : '<span class="tag unknown">—</span>';
@@ -941,11 +1028,12 @@ function renderMembers() {
         ? '<span class="tag unknown" title="' + esc(m.platform || '') + '">' + esc(m.version) + '</span>'
         : '<span class="tag unknown" title="旧版本节点，未上报版本号">—</span>';
       const last = m.last_seen ? relTime(m.last_seen) : '—';
-      return `<tr><td class="mname">${esc(label)}${pid}</td><td>${host}</td><td>${esc(m.virtual_ip)}</td>` +
+      return `<tr><td class="mname">${esc(label)}${realName}${pid}</td><td>${host}</td><td>${esc(m.virtual_ip)}</td>` +
         `<td><span class="tag ${m.online ? 'online' : 'offline'}"><span class="dot ${m.online ? 'on' : 'off'}"></span>${m.online ? '在线' : '离线'}</span></td>` +
         `<td>${path}</td><td>${ver}</td><td>${esc(last)}</td>` +
         `<td><button class="ghost mdetail" onclick="openMemberModal('${esc(m.peer_id)}')">详情</button>` +
-        `<button class="ghost del" style="margin-left:4px" onclick="removeFriend('${esc(m.peer_id)}', '${esc(m.name || '')}')">删除</button></td></tr>`;
+        `<button class="ghost" style="margin-left:4px" onclick="openNotesModal('${esc(m.peer_id)}')">备注</button>` +
+        `<button class="ghost del" style="margin-left:4px" onclick="removeFriend('${esc(m.peer_id)}', '${esc(m.notes || m.name || '')}')">删除</button></td></tr>`;
     }).join('') +
     '</table>';
   $('mPager').style.display = 'flex';
@@ -1039,7 +1127,29 @@ async function loadNodeConfig() {
     if (!r.ok) return;
     const c = await r.json();
     $('tabConfig').style.display = '';
-    $('cName').value = c.name || '';
+    // 节点名称：与网络密钥同一套处理——环境变量 LANET_NAME / 启动参数 -name
+    // 优先级高于配置文件。容器里首次生成的 lanet.json 常把容器主机名（容器短
+    // ID）写成 name，页面若只读文件值，就会出现「页眉 fnos、配置页
+    // 52b57e329f43」这种自相矛盾的显示。生效值与文件值不一致时回填生效值。
+    const fileCName = c.name || '';
+    const rtCName = (c.runtime && c.runtime.name) || '';
+    const nameTips = [];
+    if (rtCName && rtCName !== fileCName) {
+      $('cName').value = rtCName;
+      nameTips.push(c.name_env
+        ? '⚠ 当前生效名称来自环境变量 LANET_NAME（容器编排），文件里保存的是「' + esc(fileCName) + '」。此处显示的是实际运行值；在此保存会写进配置文件，但启动时环境变量仍优先。要彻底改名请改编排里的 LANET_NAME 后重启容器。'
+        : '⚠ 当前生效名称来自启动参数，与文件保存值「' + esc(fileCName) + '」不一致。此处显示的是实际运行值；保存并重启后两者一致。');
+    } else {
+      $('cName').value = fileCName;
+    }
+    // 名称是容器短 ID（12 位十六进制主机名）时给改名建议：容器里 os.Hostname()
+    // 默认就是容器 ID，拿它当节点名既难读，虚拟域名也会变成 <容器ID>.lanet。
+    if (/^[0-9a-f]{12}$/.test($('cName').value.trim())) {
+      nameTips.push('⚠ 当前名称是容器主机名（容器短 ID）。建议改成有意义的名字：容器编排里设 LANET_NAME 后重启，或在此改名并保存重启。');
+    }
+    const nameHint = $('cNameHint');
+    nameHint.style.display = nameTips.length ? '' : 'none';
+    nameHint.innerHTML = nameTips.join('<br>');
     // 网络密钥：容器/命令行常用环境变量 LANET_NETWORK_KEY 传入，此时文件里是空的，
     // 页面若只读文件值就会出现「编排里填了密钥、网页上却是空的」。
     // 生效值来自环境变量时，输入框回填实际运行值并给出来源提示。
@@ -1288,6 +1398,7 @@ function renderInfoModal() {
   $('infoBody').innerHTML = `
     ${kv('主机名', i.os_hostname)}
     ${kv('节点名', i.node_name)}
+    ${(!isSelf && findPeerDisplay(i.peer_id).notes) ? kv('备注', findPeerDisplay(i.peer_id).notes) : ''}
     ${kv('虚拟 IP', i.virtual_ip, true)}
     ${kv('虚拟地址', i.virtual_host, true)}
     ${kv('节点 ID', i.peer_id)}
@@ -1454,6 +1565,7 @@ function refreshEntryIfVisible() {
   if (p && p.classList.contains('active')) loadSeedSettings(false);
 }
 // ================= 公网入口共享 结束 =================
+
 loadState(); loadNodeConfig(); initTopActions(); setInterval(loadState, 10000);
 // 公网入口共享（种子表）：进页面加载一次；之后只在「公网入口」页处于激活状态时才刷新。
 loadSeedSettings();

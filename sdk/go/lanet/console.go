@@ -107,6 +107,7 @@ func (c *Client) startConsole() error {
 	mux.HandleFunc("POST /api/peers", c.apiRemovePeer)
 	mux.HandleFunc("GET /api/nearby", c.apiNearby)
 	mux.HandleFunc("POST /api/nearby", c.apiReconnectPeer)
+	mux.HandleFunc("POST /api/peer-notes", c.apiSetPeerNotes)
 	// 种子表接口（实现在 console_seeds.go，避免与内嵌 UI 的改动面重叠）。
 	c.registerSeedRoutes(mux)
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
@@ -251,6 +252,7 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 	type memberView struct {
 		PeerID    string `json:"peer_id"`
 		Name      string `json:"name"`
+		Notes     string `json:"notes,omitempty"` // 本机手写备注（展示时优先于 name）
 		VirtualIP string `json:"virtual_ip"`
 		Hostname  string `json:"hostname"` // 虚拟地址（如 yunloli.lanet），可能为空
 		Online    bool   `json:"online"`
@@ -260,14 +262,25 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		Version   string `json:"version,omitempty"`  // 程序版本号（info 协议交换；旧节点为空）
 		Platform  string `json:"platform,omitempty"` // 运行平台（如 windows/amd64）
 	}
+	// 本地名称 / 备注索引：成员表的 name 是运行时态（进程重启、对端长期离线
+	// 之后就没了），用本地库兜底，列表才能在对方不在线时照样显示「这是谁」；
+	// 备注（notes）更是只有本机才有。
+	nameIdx := c.PeerNameIndex()
 	members := []memberView{}
 	for _, m := range c.NetMap().Members {
 		online := false
 		if pid, err := peer.Decode(m.PeerID); err == nil {
 			online = c.node.Network().Connectedness(pid) == network.Connected
 		}
+		name, notes := m.Name, ""
+		if info, ok := nameIdx[m.PeerID]; ok {
+			if name == "" {
+				name = info.Name
+			}
+			notes = info.Notes
+		}
 		mv := memberView{
-			PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP,
+			PeerID: m.PeerID, Name: name, Notes: notes, VirtualIP: m.VirtualIP,
 			Hostname: m.Hostname,
 			Online:   online,
 			Path:     c.LastPathUsed(m.PeerID),
@@ -295,7 +308,17 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 	// 待审批连接申请 + 地址簿规模（连接审批启用时有意义）。
 	pending := []map[string]any{}
 	for _, p := range c.PendingList() {
-		item := map[string]any{"peer_id": p.PeerID, "name": p.Name}
+		name, notes := p.Name, ""
+		if info, ok := nameIdx[p.PeerID]; ok {
+			if name == "" {
+				name = info.Name
+			}
+			notes = info.Notes
+		}
+		item := map[string]any{"peer_id": p.PeerID, "name": name}
+		if notes != "" {
+			item["notes"] = notes
+		}
 		if !p.RequestedAt.IsZero() {
 			item["created_at"] = p.RequestedAt.Unix()
 		}
@@ -305,7 +328,19 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 	// 控制台「附近」卡片展示 + 申请连接入口。
 	nearby := []map[string]any{}
 	for _, n := range c.NearbyList() {
-		item := map[string]any{"peer_id": n.PeerID, "name": n.Name, "source": n.Source}
+		name, notes := n.Name, n.Notes
+		if info, ok := nameIdx[n.PeerID]; ok {
+			if name == "" {
+				name = info.Name
+			}
+			if notes == "" {
+				notes = info.Notes
+			}
+		}
+		item := map[string]any{"peer_id": n.PeerID, "name": name, "source": n.Source}
+		if notes != "" {
+			item["notes"] = notes
+		}
 		if !n.LastSeen.IsZero() {
 			item["last_seen"] = n.LastSeen.Unix()
 		}
@@ -354,9 +389,22 @@ func (c *Client) apiConnectPeer(w http.ResponseWriter, r *http.Request) {
 
 // apiPending 待审批连接申请列表。
 func (c *Client) apiPending(w http.ResponseWriter, r *http.Request) {
+	// 与 apiState 同一口径：名字优先用本地库 / 待审批记录里留存的，避免
+	// 「对方还没握手就先掉线」时列表只剩一串节点 ID。
+	nameIdx := c.PeerNameIndex()
 	list := []map[string]any{}
 	for _, p := range c.PendingList() {
-		item := map[string]any{"peer_id": p.PeerID, "name": p.Name, "addrs": p.Addrs}
+		name, notes := p.Name, ""
+		if info, ok := nameIdx[p.PeerID]; ok {
+			if name == "" {
+				name = info.Name
+			}
+			notes = info.Notes
+		}
+		item := map[string]any{"peer_id": p.PeerID, "name": name, "addrs": p.Addrs}
+		if notes != "" {
+			item["notes"] = notes
+		}
 		if !p.RequestedAt.IsZero() {
 			item["created_at"] = p.RequestedAt.Unix()
 		}
@@ -399,6 +447,9 @@ func (c *Client) apiPeers(w http.ResponseWriter, r *http.Request) {
 	list := []map[string]any{}
 	for _, p := range c.TrustedPeers() {
 		item := map[string]any{"peer_id": p.PeerID, "name": p.Name}
+		if p.Notes != "" {
+			item["notes"] = p.Notes
+		}
 		if !p.LastSeen.IsZero() {
 			item["last_seen"] = p.LastSeen.Unix()
 		}
@@ -430,15 +481,51 @@ func (c *Client) apiRemovePeer(w http.ResponseWriter, r *http.Request) {
 // apiNearby 附近节点列表：同网络密钥内可发现但尚未成为好友的节点
 // （含被删除过的好友）。前端据此展示「申请连接」按钮。
 func (c *Client) apiNearby(w http.ResponseWriter, r *http.Request) {
+	nameIdx := c.PeerNameIndex()
 	list := []map[string]any{}
 	for _, n := range c.NearbyList() {
-		item := map[string]any{"peer_id": n.PeerID, "name": n.Name, "addrs": n.Addrs, "source": n.Source}
+		name, notes := n.Name, n.Notes
+		if info, ok := nameIdx[n.PeerID]; ok {
+			if name == "" {
+				name = info.Name
+			}
+			if notes == "" {
+				notes = info.Notes
+			}
+		}
+		item := map[string]any{"peer_id": n.PeerID, "name": name, "addrs": n.Addrs, "source": n.Source}
+		if notes != "" {
+			item["notes"] = notes
+		}
 		if !n.LastSeen.IsZero() {
 			item["last_seen"] = n.LastSeen.Unix()
 		}
 		list = append(list, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"nearby": list})
+}
+
+// apiSetPeerNotes 设置某节点的备注（控制台「备注」入口）。
+// 请求体 {"peer_id": "12D3Koo…", "notes": "家里的 NAS"}；notes 传空串即清除。
+//
+// 备注只存本机（peers.notes），不会被对端数据覆盖：对端把设备名改成一串乱码
+// 也不影响本机列表的可读性——这正是这个功能的用途。
+func (c *Client) apiSetPeerNotes(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PeerID string `json:"peer_id"`
+		Notes  string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PeerID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体需包含 peer_id"})
+		return
+	}
+	if err := c.SetPeerNotes(req.PeerID, req.Notes); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "peer_id": req.PeerID, "notes": strings.TrimSpace(req.Notes),
+	})
 }
 
 // apiReconnectPeer 向附近节点重新申请连接（好友被删除后的恢复入口）。

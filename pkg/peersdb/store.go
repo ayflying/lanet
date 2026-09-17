@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 )
@@ -30,7 +31,7 @@ ON CONFLICT(peer_id) DO UPDATE SET
 		p.PeerID, p.Name, now, now, p.LastIP, boolInt(p.Manually)); err != nil {
 		return fmt.Errorf("peersdb: upsert peer %s: %w", p.PeerID, err)
 	}
-	for _, a := range NormalizeAddrs(addrs) {
+	for _, a := range FilterDialableAddrs(NormalizeAddrs(addrs)) {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT OR IGNORE INTO peer_addrs (peer_id, addr) VALUES (?, ?)`, p.PeerID, a); err != nil {
 			return fmt.Errorf("peersdb: upsert addr: %w", err)
@@ -225,10 +226,14 @@ func (d *DB) DeletePeer(ctx context.Context, peerID string) error {
 
 // Nearby 一条「附近」观察：同网络密钥内可见、但本机未信任的节点。
 type Nearby struct {
-	PeerID    string
-	Name      string
-	Addrs     []string
-	Source    string
+	PeerID string
+	Name   string
+	Addrs  []string
+	Source string
+	// Notes 本机手写的备注（来自 peers 表，**不是** nearby 表的列）。
+	// 仅用于展示：用户给「曾经是好友、后来删掉」的节点写过备注时，它在附近
+	// 列表里仍应显示出来，否则用户认不出这是谁而不敢重新申请。
+	Notes     string
 	FirstSeen time.Time
 	LastSeen  time.Time
 }
@@ -254,6 +259,16 @@ func (d *DB) UpsertNearby(ctx context.Context, n Nearby) error {
 		return nil
 	}
 	now := time.Now()
+	if n.Name == "" {
+		// 被动发现拿不到对端身份（审批隔离），但本机可能早就认识它——曾经是
+		// 好友、或手动添加过。把本地已知名字一起写进观察表，展示时不必每次
+		// 回查；对端改名后，下一次「对方主动申请」会以新名字覆盖。
+		var known sql.NullString
+		if err := d.db.QueryRowContext(ctx,
+			`SELECT name FROM peers WHERE peer_id = ?`, n.PeerID).Scan(&known); err == nil && known.Valid {
+			n.Name = known.String
+		}
+	}
 	if _, err = d.db.ExecContext(ctx, `
 INSERT INTO nearby (peer_id, name, addrs, source, first_seen, last_seen)
 VALUES (?, ?, ?, ?, ?, ?)
@@ -262,7 +277,7 @@ ON CONFLICT(peer_id) DO UPDATE SET
 	addrs     = CASE WHEN excluded.addrs != '' THEN excluded.addrs ELSE nearby.addrs END,
 	source    = CASE WHEN excluded.source != '' THEN excluded.source ELSE nearby.source END,
 	last_seen = excluded.last_seen`,
-		n.PeerID, n.Name, strings.Join(NormalizeAddrs(n.Addrs), ","), n.Source, now, now); err != nil {
+		n.PeerID, n.Name, strings.Join(FilterDialableAddrs(NormalizeAddrs(n.Addrs)), ","), n.Source, now, now); err != nil {
 		return fmt.Errorf("peersdb: upsert nearby %s: %w", n.PeerID, err)
 	}
 	// 封顶修剪：只保留最近出现的 200 条。
@@ -523,4 +538,215 @@ func NormalizeAddrs(in []string) []string {
 		out = append(out, a)
 	}
 	return out
+}
+
+// =================================================================================
+// 地址清洗：结构过滤（与 NormalizeAddrs 分层，语义不同）
+// =================================================================================
+
+// lanetOverlayPrefix lanet 自身的隧道地址段（10.7.0.0/16）。与 p2pkit 侧
+// IsLanetOverlayAddr 同源：经自身隧道再拨号会成环，必须挡在地址簿之外。
+var lanetOverlayPrefix = netip.MustParsePrefix("10.7.0.0/16")
+
+// prunePeerAddrsKeep 每个节点在地址簿里保留的地址条数上限（见 PrunePeerAddrs）。
+const prunePeerAddrsKeep = 16
+
+// FilterDialableAddrs 剔除「结构上不可能拨通」的地址，保留其余顺序不变。
+//
+// 被判掉的四类（都只依赖地址形态，不需要任何对端信息）：
+//   - 回环（127.0.0.0/8、::1）：只有对端自己可达；
+//   - 链路本地（169.254/16、fe80::/10）：只在同一物理链路上有意义，跨网
+//     必然失败；
+//   - 未指定（0.0.0.0、::）：那是监听通配地址，不是可拨地址；
+//   - lanet overlay（10.7.0.0/16）：本网自己的隧道段，拨它成环。
+//
+// 为什么必须清理而不是仅排序：拨号是「逐个尝试、共享一份时间预算」的。
+// 真机实测某好友的地址簿累积 52 条、ok_count 全为 0，其中绝大部分是
+// 127.0.0.1 / 169.254.x / WSL / ZeroTier 网段——每次「按 ID 连接」都要在
+// 这些注定失败的地址上耗掉预算，真正能通的那条反而没机会试，表现为
+// 「列表里看得到、连不上、过一会儿又自己通了」。
+//
+// 保底：若过滤后一条不剩（例如某节点只在链路本地可见），则退回原列表首条——
+// 同链路的 mDNS 场景仍应保留连接能力，不能因为清洗过狠而彻底断掉。
+func FilterDialableAddrs(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, a := range in {
+		if !isStructurallyDialable(a) {
+			continue
+		}
+		out = append(out, a)
+	}
+	if len(out) == 0 && len(in) > 0 {
+		return []string{in[0]}
+	}
+	return out
+}
+
+// isStructurallyDialable 判断单个地址文本是否值得尝试拨号（无 IP 段者一律保留，
+// 交给拨号侧解析，如 /dns4/…）。
+func isStructurallyDialable(addr string) bool {
+	ip, ok := addrIP(addr)
+	if !ok {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+	return !lanetOverlayPrefix.Contains(ip)
+}
+
+// addrIP 从 multiaddr 文本里取出 IP，兼容带 zone 的 IPv6（fe80::1%12）与
+// IPv4-mapped IPv6（::ffff:1.2.3.4 → 归一为 IPv4）。
+//
+// 走字符串切分而不引 multiaddr 依赖：地址簿里存的形态固定是
+// `/ip4/<v>/…` 或 `/ip6/<v>/…`，这里只需要判断可达性，不需要完整解析。
+func addrIP(addr string) (netip.Addr, bool) {
+	parts := strings.Split(addr, "/")
+	for i := 0; i+1 < len(parts); i++ {
+		if parts[i] != "ip4" && parts[i] != "ip6" {
+			continue
+		}
+		v := parts[i+1]
+		if j := strings.IndexByte(v, '%'); j >= 0 {
+			v = v[:j] // 剥 zone：ParseAddr 不接受 "fe80::1%12"
+		}
+		ip, err := netip.ParseAddr(v)
+		if err != nil {
+			return netip.Addr{}, false
+		}
+		return ip.Unmap(), true
+	}
+	return netip.Addr{}, false
+}
+
+// PrunePeerAddrs 修剪地址簿：每个节点最多保留 keep 条地址，其余删除，返回删除条数。
+//
+// 保留顺序 = 拨号顺序（成功过的优先、最近成功优先，其次后入库的靠前），
+// 与 KnownAddrs 的排序口径一致，故被删掉的一定是排在最后、最不可能被用到的。
+//
+// 地址簿是只增不减的：每轮发现都会把对端新枚举出来的地址并进来。长期下来
+// 单个节点几十条地址、绝大多数从未拨通，每次连接都要逐条试（见
+// FilterDialableAddrs 的注释）。幂等，可在每次打开库时调用。
+//
+// keep <= 0 时取默认值 prunePeerAddrsKeep。
+func (d *DB) PrunePeerAddrs(ctx context.Context, keep int) (int64, error) {
+	if keep <= 0 {
+		keep = prunePeerAddrsKeep
+	}
+	res, err := d.db.ExecContext(ctx, `
+DELETE FROM peer_addrs WHERE rowid IN (
+	SELECT rowid FROM (
+		SELECT rowid, ROW_NUMBER() OVER (
+			PARTITION BY peer_id
+			ORDER BY ok_count DESC, (last_ok IS NULL), last_ok DESC, rowid DESC) AS rn
+		FROM peer_addrs
+	) WHERE rn > ?`, keep)
+	if err != nil {
+		return 0, fmt.Errorf("peersdb: prune peer addrs: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// =================================================================================
+// 名称与备注（展示用身份）
+// =================================================================================
+
+// SetName 更新某节点的自报名称。对端改名后，本机下次见到时跟随更新。
+//
+// 与 UpsertPeer 的区别：只改 name，**不碰 last_seen**。调用方是成员表对账，
+// 此刻对端可能早已离线，把 last_seen 刷成当前时间会让地址簿排序误以为它
+// 刚刚活跃过。行不存在时插入（被动发现到的成员可能还没落过库）。
+func (d *DB) SetName(ctx context.Context, peerID, name string) error {
+	name = strings.TrimSpace(name)
+	if peerID == "" || name == "" {
+		return nil
+	}
+	now := time.Now()
+	if _, err := d.db.ExecContext(ctx, `
+INSERT INTO peers (peer_id, name, first_seen, last_seen) VALUES (?, ?, ?, ?)
+ON CONFLICT(peer_id) DO UPDATE SET name = excluded.name`,
+		peerID, name, now, now); err != nil {
+		return fmt.Errorf("peersdb: set name %s: %w", peerID, err)
+	}
+	return nil
+}
+
+// SetNotes 写入某节点的备注（本机用户手写的别名，如「家里的 NAS」）。
+//
+// 与 name 的语义差别是刻意的：name 来自对端自报，会被对端改名覆盖；notes
+// 是本机写的，**永不被对端数据覆盖**。两者并存，展示时备注优先、真名次之，
+// 这样「对方把名字改成一串乱码」也不会让列表失去可读性。
+//
+// 目标可能还没有 peers 行（附近节点、待审批节点都可能有备注），不存在时建一行；
+// 不改变 trusted / approved 状态——备注只是标注，不是授权。
+func (d *DB) SetNotes(ctx context.Context, peerID, notes string) error {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return fmt.Errorf("peersdb: set notes: 节点 ID 为空")
+	}
+	now := time.Now()
+	if _, err := d.db.ExecContext(ctx, `
+INSERT INTO peers (peer_id, notes, first_seen, last_seen) VALUES (?, ?, ?, ?)
+ON CONFLICT(peer_id) DO UPDATE SET notes = excluded.notes`,
+		peerID, strings.TrimSpace(notes), now, now); err != nil {
+		return fmt.Errorf("peersdb: set notes %s: %w", peerID, err)
+	}
+	return nil
+}
+
+// NameInfo 一个节点的展示用身份：对端自报名 + 本机手写备注。
+type NameInfo struct {
+	Name  string
+	Notes string
+}
+
+// NameIndex 一次性返回「节点 ID → 名称/备注」全量索引，供控制台在渲染成员 /
+// 附近 / 待审批列表时做展示兜底。
+//
+// 为什么需要兜底：
+//   - 成员表（运行时）只有在线/近期节点才带名字，重启或对端长期离线后名字
+//     就没了，列表退化成「12D3KooW…」——用户下次根本认不出谁是谁；
+//   - 附近节点是**被动发现**的，本就拿不到身份信息（审批隔离），唯一真实的
+//     名字来源是「对方主动申请连接」时带来的那个名字（存在 pending_requests）。
+//
+// 故合并两个来源：peers 表为主，pending_requests 里非空的名字作次级补充
+// （仅当 peers 表无该行时采用）。表都很小（几十到几百行），一次全量读比在
+// 渲染路径上逐条查询更划算。
+func (d *DB) NameIndex(ctx context.Context) (map[string]NameInfo, error) {
+	out := map[string]NameInfo{}
+	rows, err := d.db.QueryContext(ctx, `SELECT peer_id, name, notes FROM peers`)
+	if err != nil {
+		return nil, fmt.Errorf("peersdb: name index: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var info NameInfo
+		if err := rows.Scan(&id, &info.Name, &info.Notes); err != nil {
+			return nil, err
+		}
+		out[id] = info
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 次级来源：待审批请求里的名字（申请方自报）。查询失败不影响主结果。
+	prows, perr := d.db.QueryContext(ctx,
+		`SELECT peer_id, name FROM pending_requests WHERE name != ''`)
+	if perr != nil {
+		return out, nil
+	}
+	defer prows.Close()
+	for prows.Next() {
+		var id, name string
+		if err := prows.Scan(&id, &name); err != nil {
+			return out, nil
+		}
+		if cur, ok := out[id]; ok && cur.Name != "" {
+			continue // peers 表已有名字，优先
+		}
+		out[id] = NameInfo{Name: name, Notes: out[id].Notes}
+	}
+	return out, nil
 }
