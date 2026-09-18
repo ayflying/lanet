@@ -110,7 +110,18 @@
   .listitem .li-pid:hover { color:var(--accent); border-bottom-color:var(--accent); }
   .listitem .li-meta { font-size:11.5px; color:#8a94a6; margin-top:3px; }
   .listitem .li-acts { display:flex; gap:6px; flex-shrink:0; }
-  .listitem .li-acts button { padding:5px 12px; font-size:12px; white-space:nowrap; }
+  /* ⚠️ 行内操作按钮统一高度：详情 / 备注 / 删除原本各带一套 padding 与字号
+     （详情 mdetail 是 3px 10px + 12px 字、备注继承基础 button 的 7px 14px + 13px 字、
+     删除 del 是 2px 6px + 13px 字），靠 padding 撑出来的高度能差 10px，
+     同一行高矮不齐。这里显式钉死 height 并统一字号与水平内边距，
+     删除按钮只保留「无底色 + 红字」这一点视觉差异。
+     表格操作列与附近/待审批卡片列表共用同一套尺寸。 */
+  td button, td button.mdetail, td button.del,
+  .listitem .li-acts button {
+    height:28px; padding:0 12px; font-size:12.5px; line-height:1; white-space:nowrap;
+    display:inline-flex; align-items:center; justify-content:center;
+    vertical-align:middle; }
+  td button.del { padding:0 8px; }
   @media (max-width: 720px) {
     body { padding:12px; }
     h1 { font-size:16px; }
