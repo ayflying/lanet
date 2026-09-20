@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ayflying/pvn/pkg/firewall"
@@ -26,6 +27,18 @@ const (
 	outboundQueueSize  = 256
 	maxOutboundWorkers = 1024
 	outboundWorkerIdle = time.Minute
+	// outboundQueueBudget 全局出向队列字节预算：所有目标 worker 队列里尚未
+	// 转发（在途）的包字节数之和上限。超过即丢弃新包（先判满再拷贝），由上层
+	// TCP/UDP 重传兜底。默认 16MiB，足以在 ~1Gbps 下缓冲约 70ms，同时把最坏
+	// 情况下的内存占用钉死，避免单一离线目标把 TUN 读取缓冲无限堆积。
+	outboundQueueBudget = 16 * 1024 * 1024
+	// outboundWriteDeadline 单包写向隧道流的最大阻塞时间。对端不读时 Write 会
+	// 一直挂起并拖垮整个串行 worker；超时即判定对端失效、摘流重连。
+	outboundWriteDeadline = 30 * time.Second
+	// outboundCooldownBase/Max 连续转发失败时的退避区间：对失效对端空转会打满
+	// 日志与资源，按失败次数指数退避、封顶 Max。
+	outboundCooldownBase = 5 * time.Millisecond
+	outboundCooldownMax  = 500 * time.Millisecond
 	// maxConsecutiveReadErrors 连续「非瞬时」读错误上限：达到即判定设备
 	// 已失效并退出读循环。单包级瞬时错误（IsRecoverableReadError）不计入。
 	maxConsecutiveReadErrors = 100
@@ -63,6 +76,15 @@ type Router struct {
 	outboundLimit int
 	outboundIdle  time.Duration
 	limitDrops    uint64
+	// writeBudget / writeBudgetMax 出向队列在途字节预算（原子访问）。
+	// writeBudget 为所有目标 worker 当前在途（已入队、尚未转发）的字节总数；
+	// 超过 writeBudgetMax（默认 16MiB）时 enqueue 直接丢弃新包。包被 worker
+	// 取走转发后释放；worker 停止时队列里残留的包一并释放（停止后预算释放）。
+	writeBudget    int64
+	writeBudgetMax int64
+	// forwardImpl 是 forwardPacket 的可替换实现，仅供单元测试注入；
+	// 生产路径始终为 (*Router).forwardPacket。
+	forwardImpl func(context.Context, []byte) error
 	// Wintun 的 NativeTun.Read/Write 要求每个方向由单一调用方串行访问。
 	// 多条入向隧道流可能同时写 TUN，不加锁会在环形缓冲上产生间歇性丢包。
 	writeMu sync.Mutex
@@ -92,15 +114,18 @@ type streamState struct {
 }
 
 func New(device Device, tunnelSvc *tunnel.Service) *Router {
-	return &Router{
-		device:        device,
-		tunnel:        tunnelSvc,
-		streams:       make(map[string]*streamState),
-		outbound:      make(map[string]*outboundWorker),
-		outboundLimit: maxOutboundWorkers,
-		outboundIdle:  outboundWorkerIdle,
-		dialing:       make(map[string]*dialCall),
+	r := &Router{
+		device:         device,
+		tunnel:         tunnelSvc,
+		streams:        make(map[string]*streamState),
+		outbound:       make(map[string]*outboundWorker),
+		outboundLimit:  maxOutboundWorkers,
+		outboundIdle:   outboundWorkerIdle,
+		dialing:        make(map[string]*dialCall),
+		writeBudgetMax: outboundQueueBudget,
 	}
+	r.forwardImpl = func(ctx context.Context, p []byte) error { return r.forwardPacket(ctx, p) }
+	return r
 }
 
 // SetFirewall 启用统一入向防火墙（Run 之前调用）。
@@ -209,7 +234,8 @@ func (r *Router) Run(ctx context.Context) {
 }
 
 // enqueuePacket 把包交给目标 IP 专属的串行 worker。不同目标可并行拨号和发送，
-// 同一目标仍保持内核交付顺序，避免 TCP 包乱序。队列满时丢弃新包，由上层协议重传。
+// 同一目标仍保持内核交付顺序，避免 TCP 包乱序。队列满或全局字节预算满时丢弃新包，
+// 由上层协议重传。
 func (r *Router) enqueuePacket(ctx context.Context, packet []byte) error {
 	if len(packet) < 20 {
 		return fmt.Errorf("packet too short: %d", len(packet))
@@ -239,6 +265,20 @@ func (r *Router) enqueuePacket(ctx context.Context, packet []byte) error {
 		r.outbound[destination] = worker
 		go r.runOutbound(ctx, destination, worker)
 	}
+
+	// 先判满再拷贝：队列或全局字节预算已满时直接丢弃，避免为必丢的包分配并
+	// 拷贝内存。预算约束所有目标 worker 的在途字节总量（默认 16MiB）。
+	if len(worker.packets) >= cap(worker.packets) || !r.acquireBudget(len(packet)) {
+		worker.dropped++
+		dropped := worker.dropped
+		r.mu.Unlock()
+		if dropped == 1 || dropped%100 == 0 {
+			return fmt.Errorf("outbound to %s dropped (queue full or budget %d/%d bytes exceeded)",
+				destination, atomic.LoadInt64(&r.writeBudget), r.writeBudgetMax)
+		}
+		return nil
+	}
+
 	// Run 复用 TUN 读取缓冲。队列和 worker 异步消费，因此入队前必须复制，
 	// 与 Nebula 握手缓存、WireGuard staged queue 的数据所有权语义一致。
 	ownedPacket := append([]byte(nil), packet...)
@@ -247,14 +287,36 @@ func (r *Router) enqueuePacket(ctx context.Context, packet []byte) error {
 		r.mu.Unlock()
 		return nil
 	default:
+		// 极小概率的竞争：判满到入队之间队列被灌满。释放刚占用的预算并丢弃，
+		// 不浪费已拷贝的内存（调用方走丢包重传）。
+		r.releaseBudget(len(packet))
 		worker.dropped++
 		dropped := worker.dropped
 		r.mu.Unlock()
 		if dropped == 1 || dropped%100 == 0 {
-			return fmt.Errorf("outbound queue to %s is full (dropped=%d)", destination, dropped)
+			return fmt.Errorf("outbound to %s dropped (queue full under race)", destination)
 		}
 		return nil
 	}
+}
+
+// acquireBudget 尝试占用 n 字节出向队列预算；预算不足返回 false。
+// 先判满再拷贝：调用方应在拷贝包之前调用，预算不足时直接丢弃，避免无谓内存拷贝。
+func (r *Router) acquireBudget(n int) bool {
+	for {
+		cur := atomic.LoadInt64(&r.writeBudget)
+		if cur+int64(n) > r.writeBudgetMax {
+			return false
+		}
+		if atomic.CompareAndSwapInt64(&r.writeBudget, cur, cur+int64(n)) {
+			return true
+		}
+	}
+}
+
+// releaseBudget 归还 n 字节出向队列预算（包被消费或 worker 停止时调用）。
+func (r *Router) releaseBudget(n int) {
+	atomic.AddInt64(&r.writeBudget, -int64(n))
 }
 
 func (r *Router) runOutbound(ctx context.Context, destination string, worker *outboundWorker) {
@@ -273,14 +335,21 @@ func (r *Router) runOutbound(ctx context.Context, destination string, worker *ou
 				default:
 				}
 			}
-			if err := r.forwardPacket(ctx, packet); err != nil {
+			if err := r.forwardImpl(ctx, packet); err != nil {
 				failures++
+				// 失败冷却：连续失败时对失效对端指数退避、封顶，避免空转打满
+				// 资源与日志。ctx 已取消时不再睡眠，尽快退出。
 				if failures == 1 || failures%100 == 0 {
 					log.Printf("[router] forward to %s failed (count=%d): %v", destination, failures, err)
+				}
+				if ctx.Err() == nil {
+					time.Sleep(r.failureCooldown(failures))
 				}
 			} else {
 				failures = 0
 			}
+			// 释放在途字节预算：无论成功失败，包都已离开队列。
+			r.releaseBudget(len(packet))
 			timer.Reset(r.outboundIdle)
 		case <-timer.C:
 			r.mu.Lock()
@@ -296,11 +365,39 @@ func (r *Router) runOutbound(ctx context.Context, destination string, worker *ou
 	}
 }
 
+// failureCooldown 返回第 failures 次连续失败后的退避时长（指数退避、封顶）。
+func (r *Router) failureCooldown(failures uint64) time.Duration {
+	exp := failures - 1
+	if exp > 6 {
+		exp = 6
+	}
+	d := outboundCooldownBase * (1 << exp)
+	if d > outboundCooldownMax {
+		return outboundCooldownMax
+	}
+	return d
+}
+
+// removeOutboundWorker 摘除 worker 映射，并释放其队列里残留包的在途字节预算
+// （停止后预算释放）。以 defer 形式调用，runOutbound 任意出口都会执行。
 func (r *Router) removeOutboundWorker(destination string, worker *outboundWorker) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.outbound[destination] == worker {
 		delete(r.outbound, destination)
+	}
+	r.mu.Unlock()
+	// 排空队列：worker 已停止，残留包不再转发，直接归还其占用的字节预算。
+	var total int
+	for {
+		select {
+		case p := <-worker.packets:
+			total += len(p)
+		default:
+			if total > 0 {
+				r.releaseBudget(total)
+			}
+			return
+		}
 	}
 }
 
@@ -321,7 +418,17 @@ func (r *Router) forwardPacket(ctx context.Context, packet []byte) error {
 	if err != nil {
 		return err
 	}
+
+	// 写超时 + 取消即 Reset：对端不读时 Write 会无限挂起并拖垮整个串行 worker。
+	// 用 context.AfterFunc 在 ctx 取消时 Reset 流以打断阻塞写；写成功/失败后
+	// 立即取消该 AfterFunc（defer），避免误 Reset 一条健康、可复用的流。
+	resetFn := context.AfterFunc(ctx, func() {
+		_ = state.stream.Reset()
+	})
+	defer resetFn()
+
 	state.writeMu.Lock()
+	state.stream.SetWriteDeadline(time.Now().Add(outboundWriteDeadline))
 	_, err = state.stream.Write(packet)
 	state.writeMu.Unlock()
 	if err != nil {

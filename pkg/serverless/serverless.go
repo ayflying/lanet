@@ -110,6 +110,29 @@ var ErrGroupMismatch = errors.New("serverless: 对端与本节点不在同一网
 // 超时无论是否发现同群成员都自动退出（省流量；重启可重新引导）。
 const DefaultPublicDHTTimeout = 10 * time.Minute
 
+// infoHandshakeTimeout info 协议单次握手的真实截止时间。
+// 入向 handleInfo / 出向 fetchInfo 都给流设置该截止时间：即使对端
+// 不回包也不写响应，读取也不会永久阻塞。出向若携带更短的 ctx 截止，
+// 取两者较小者（见 infoStreamDeadline）。
+const infoHandshakeTimeout = 10 * time.Second
+
+// maxInfoJSONSize info/unfriend 载荷的有界读取上限（64KiB）。
+// 历史上的 json.NewDecoder(s).Decode 对无限流是「读到 EOF 为止」，若对端
+// 恶意发送超长载荷会一直占用流与内存。用 io.LimitReader 截断到 64KiB，
+// 截断即 Decode 失败 → 直接 Reset 流终止握手（防半开流堆积）。
+const maxInfoJSONSize = 64 * 1024
+
+// infoStreamDeadline 计算 info 流应设置的截止时间：ctx 若带更短截止则
+// 用之，否则用 infoHandshakeTimeout，保证任何路径都能在合理时间内收尾。
+func infoStreamDeadline(ctx context.Context) time.Time {
+	if dl, ok := ctx.Deadline(); ok {
+		if left := time.Until(dl); left < infoHandshakeTimeout {
+			return time.Now().Add(left)
+		}
+	}
+	return time.Now().Add(infoHandshakeTimeout)
+}
+
 // Config 发现服务配置。
 type Config struct {
 	// NetworkKey 网络密钥：相同密钥的节点组成同一张 P2P 网络。
@@ -326,6 +349,9 @@ type Discovery struct {
 	advFailMu    sync.Mutex // DHT 广播失败日志降噪计数（独立锁）
 	advFailCount int        // 连续「路由表空」失败次数
 
+	// cbMu 保护 onDiscovered 切片：OnDiscovered 追加与 emit 迭代并发时需安全，
+	// 否则一个 goroutine 在迭代、另一个在 append 会触发 data race。
+	cbMu        sync.RWMutex
 	onDiscovered []Discovered
 
 	// relayOnce 保证常驻中继预约循环只启动一次（Run 可能被多次调用）。
@@ -836,8 +862,12 @@ func (d *Discovery) RequestConnect(ctx context.Context, ai peer.AddrInfo) (strin
 // GroupKey 本群的群组密钥（由邀请码派生）。
 func (d *Discovery) GroupKey() []byte { return d.groupKey }
 
-// OnDiscovered 注册新成员回调。
-func (d *Discovery) OnDiscovered(cb Discovered) { d.onDiscovered = append(d.onDiscovered, cb) }
+// OnDiscovered 注册新成员回调。可运行期并发调用，故需 cbMu 保护切片追加。
+func (d *Discovery) OnDiscovered(cb Discovered) {
+	d.cbMu.Lock()
+	d.onDiscovered = append(d.onDiscovered, cb)
+	d.cbMu.Unlock()
+}
 
 // Peers 当前成员表快照（不含自身）。Hostname 按当前成员表推导。
 func (d *Discovery) Peers() []Member {
@@ -1171,10 +1201,14 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 			LastSeen:  time.Now(),
 		}
 		d.members[id.String()] = m
+	} else if m.Source == "inbound" && source != "" && source != "inbound" {
+		// 入向握手可能抢先到达；真实发现成功后补齐来源，避免永久停留在占位来源。
+		m.Source = source
 	}
 	if len(addrs) > 0 {
 		m.Addrs = toStrings(addrs)
 	}
+	snapshot := *m
 	d.mu.Unlock()
 
 	// peerstore 记录地址，供 Connect / 隧道直连使用。
@@ -1182,7 +1216,7 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 		d.host.Peerstore().AddAddrs(id, addrs, time.Hour)
 	}
 	if !ok {
-		d.emit(*m)
+		d.emit(snapshot)
 	}
 	go d.connectAndIdentify(id)
 }
@@ -1304,8 +1338,13 @@ const rejectionUnfriended = "unfriended"
 // 提前 CloseWrite 会导致响应丢失（对端读 EOF）。
 func (d *Discovery) handleInfo(s network.Stream) {
 	defer s.Close()
+	// 真实流截止时间：防止对端不回包时读取永久阻塞（历史读无超时）。
+	_ = s.SetDeadline(infoStreamDeadline(context.Background()))
 	var req infoPayload
-	if err := json.NewDecoder(s).Decode(&req); err != nil {
+	// 有界 JSON：截断到 64KiB，超限/非法载荷 → Decode 失败 → Reset
+	// 直接终止握手，避免半开流与内存被超长载荷占用。
+	if err := json.NewDecoder(io.LimitReader(s, maxInfoJSONSize)).Decode(&req); err != nil {
+		_ = s.Reset()
 		return
 	}
 	if req.Group != GroupFingerprint(d.groupKey) {
@@ -1411,7 +1450,17 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 	if err != nil {
 		return infoPayload{}, err
 	}
-	defer stream.Close()
+	// ctx 取消/截止时 Reset 而非优雅关闭：半关闭状态下优雅 Close 会等对方读
+	// 完成，取消场景无法立即释放流；Reset 直接发 RST 让本端立刻返回。
+	defer func() {
+		if ctx.Err() != nil {
+			_ = stream.Reset()
+		} else {
+			_ = stream.Close()
+		}
+	}()
+	// 真实流截止时间：携带更短 ctx 截止时取 ctx，否则用默认握手超时。
+	_ = stream.SetDeadline(infoStreamDeadline(ctx))
 	req := infoPayload{
 		Name:       d.cfg.Name,
 		Group:      GroupFingerprint(d.groupKey),
@@ -1425,13 +1474,16 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 	}
 	_ = stream.CloseWrite()
 	var resp infoPayload
-	if err = json.NewDecoder(stream).Decode(&resp); err != nil {
+	// 有界 JSON：截断到 64KiB，防止对端回超长响应占用流与内存。
+	if err = json.NewDecoder(io.LimitReader(stream, maxInfoJSONSize)).Decode(&resp); err != nil {
 		// 对端在群指纹校验失败时按防泄漏设计静默关流（不回任何身份字节），
 		// 本端表现为协议已协商、但响应读到 EOF。把这一特征识别为「跨群拒绝」，
 		// 上抛可判定的 ErrGroupMismatch，避免把裸 EOF 直接抛给用户。
 		if errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF") {
 			return infoPayload{}, ErrGroupMismatch
 		}
+		// 其他解码错误（超限/截断/非法）：Reset 终止，不留下半开流。
+		_ = stream.Reset()
 		return infoPayload{}, err
 	}
 	return resp, nil
@@ -1611,12 +1663,45 @@ func (d *Discovery) DHTRoutingPeers() []string {
 }
 
 func (d *Discovery) emit(m Member) {
-	for _, cb := range d.onDiscovered {
+	// 先快照再回调：回调内部可能再次 OnDiscovered（追加到切片），
+	// 若在迭代中并发追加会 data race；快照隔离后回调可自由注册新回调。
+	d.cbMu.RLock()
+	cbs := make([]Discovered, len(d.onDiscovered))
+	copy(cbs, d.onDiscovered)
+	d.cbMu.RUnlock()
+	for _, cb := range cbs {
 		func() {
 			defer func() { recover() }()
 			cb(m)
 		}()
 	}
+}
+
+// Close 释放发现服务持有的长生命周期资源：私有/公共 DHT 与 mDNS（幂等）。
+// 周期 Run 循环由调用方取消其 ctx 停止，本方法负责 Run 之外仍需显式关闭的
+// 网络资源（DHT kad 协议流处理 / mDNS 监听），避免进程退出后端口与 goroutine
+// 残留。重复调用安全。
+func (d *Discovery) Close() error {
+	var firstErr error
+	d.mu.Lock()
+	priv := d.dhtPrivate
+	pub := d.dhtPublic
+	d.mu.Unlock()
+
+	if priv != nil {
+		if err := priv.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if pub != nil {
+		if err := pub.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if d.mdnsSvc != nil {
+		d.mdnsSvc.Close()
+	}
+	return firstErr
 }
 
 func (d *Discovery) logf(format string, args ...any) {

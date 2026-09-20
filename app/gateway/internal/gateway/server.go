@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/ayflying/pvn/pkg/firewall"
 	"github.com/ayflying/pvn/pkg/gatewayproto"
@@ -135,7 +136,7 @@ func Run(ctx context.Context, cfg Config) (*lanet.Client, error) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	s.srv = &http.Server{Addr: cfg.ListenAddr, Handler: mux}
+	s.srv = &http.Server{Addr: cfg.ListenAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 
 	go func() {
 		<-ctx.Done()
@@ -165,7 +166,9 @@ func (s *Server) dispatchInbound(ctx context.Context, inbound chan lanet.Stream)
 			}
 			id := svc.newStreamID()
 			st := &meshStream{rw: stream}
-			svc.track(id, st)
+			if !svc.track(id, st) {
+				continue
+			}
 			payload, _ := json.Marshal(streamOpen{
 				Protocol:   stream.Protocol(),
 				RemotePeer: remotePeerOf(stream),
@@ -191,6 +194,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer ws.Close()
+	ws.SetReadLimit(1 << 20)
+	_ = ws.SetReadDeadline(time.Now().Add(10 * time.Second))
 
 	conn := &wsConn{
 		ws:      ws,
@@ -258,6 +263,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		VirtualIP: info.VirtualIP, PeerID: info.PeerID, Group: info.Group, Mode: req.Mode,
 	})})
 
+	// 鉴权后允许正常空闲长连接，写阻塞另由写截止时间保护。
+	_ = ws.SetReadDeadline(time.Time{})
 	// 2. 主循环：处理客户端帧。
 	for {
 		msg, err = conn.readMessage()
@@ -318,7 +325,10 @@ func (s *Server) handleDial(conn *wsConn, frame gatewayproto.Frame) {
 		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialOk, StreamID: id,
 			Payload: mustJSON(dialOk{ViaRelay: viaRelay})})
 		st := &meshStream{rw: stream}
-		conn.track(id, st)
+		if !conn.track(id, st) {
+			conn.closeAllStreams()
+			return
+		}
 		go conn.pumpStreamToClient(id, st)
 		return
 	}
@@ -340,7 +350,10 @@ func (s *Server) handleDial(conn *wsConn, frame gatewayproto.Frame) {
 	conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialOk, StreamID: id,
 		Payload: mustJSON(dialOk{ViaRelay: viaRelay})})
 	st := &meshStream{rw: nc}
-	conn.track(id, st)
+	if !conn.track(id, st) {
+		conn.closeAllStreams()
+		return
+	}
 	go conn.pumpStreamToClient(id, st)
 }
 
@@ -368,10 +381,16 @@ type wsConn struct {
 
 func (c *wsConn) newStreamID() uint32 { return c.nextID.Add(1) }
 
-func (c *wsConn) track(id uint32, st *meshStream) {
+func (c *wsConn) track(id uint32, st *meshStream) bool {
 	c.mu.Lock()
+	if c.closed || len(c.streams) >= 128 || c.streams[id] != nil {
+		c.mu.Unlock()
+		_ = st.close()
+		return false
+	}
 	c.streams[id] = st
 	c.mu.Unlock()
+	return true
 }
 
 func (c *wsConn) get(id uint32) *meshStream {
@@ -394,12 +413,14 @@ func (c *wsConn) send(f gatewayproto.Frame) bool {
 		c.mu.Unlock()
 		return false
 	}
-	c.mu.Unlock()
 	select {
 	case c.out <- gatewayproto.Marshal(f):
+		c.mu.Unlock()
 		return true
 	default:
-		log.Printf("[gateway] 发送队列满，丢弃帧 type=%d", f.Type)
+		c.mu.Unlock()
+		log.Printf("[gateway] 发送队列满，关闭会话避免静默丢数据 type=%d", f.Type)
+		c.closeAllStreams()
 		return false
 	}
 }
@@ -419,7 +440,9 @@ func (c *wsConn) readMessage() ([]byte, error) {
 
 // writeLoop 单协程串行写 WS（gorilla 不支持并发写）。
 func (c *wsConn) writeLoop() {
+	defer c.closeAllStreams()
 	for msg := range c.out {
+		_ = c.ws.SetWriteDeadline(time.Now().Add(15 * time.Second))
 		if err := c.ws.WriteMessage(websocket.BinaryMessage, msg); err != nil {
 			return
 		}
@@ -458,11 +481,14 @@ func (c *wsConn) closeAllStreams() {
 		return
 	}
 	c.closed = true
+	// send 与关闭通道共用锁，让空队列上的写协程也能退出。
+	close(c.out)
 	streams := c.streams
 	c.streams = make(map[uint32]*meshStream)
 	c.mu.Unlock()
-	// 不 close(c.out)：writeLoop 依赖 ws.WriteMessage 失败退出，
-	// 避免 send 与 close 的竞态 panic。
+	if c.ws != nil {
+		_ = c.ws.Close()
+	}
 	for _, st := range streams {
 		_ = st.close()
 	}

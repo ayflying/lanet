@@ -7,6 +7,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -376,7 +377,11 @@ func (c *Client) apiConnectPeer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Address string `json:"address"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeConsoleBody(w, r, &req); err != nil {
+		if isMaxBytesErr(err) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "请求体过大（上限 4MB）"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
 		return
 	}
@@ -558,7 +563,11 @@ func (c *Client) apiConnectSeed(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Seed string `json:"seed"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeConsoleBody(w, r, &req); err != nil {
+		if isMaxBytesErr(err) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "请求体过大（上限 4MB）"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
 		return
 	}
@@ -602,7 +611,11 @@ func (c *Client) apiSetFirewall(w http.ResponseWriter, r *http.Request) {
 		Mode  firewall.Mode   `json:"mode"`
 		Rules []firewall.Rule `json:"rules"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeConsoleBody(w, r, &req); err != nil {
+		if isMaxBytesErr(err) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "请求体过大（上限 4MB）"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
 		return
 	}
@@ -618,7 +631,11 @@ func (c *Client) apiSetForwards(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Forwards []LANForward `json:"forwards"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeConsoleBody(w, r, &req); err != nil {
+		if isMaxBytesErr(err) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "请求体过大（上限 4MB）"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
 		return
 	}
@@ -782,6 +799,26 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// maxConsoleBody 控制台 JSON 请求体上限（4MB）。防火墙/转发映射/审批等
+// 请求体均为小结构，4MB 余量充足；超限一律 413，防止恶意超大 body 拖垮节点。
+// 注意：仅限制「解析 JSON 的接口」，不引入全局 Server.ReadTimeout——
+// P2P 在线更新（二进制经 libp2p 流下发，不走本 HTTP 控制台）等长连接
+// 不会被本限制切断。
+const maxConsoleBody = 4 << 20
+
+// decodeConsoleBody 在 maxConsoleBody 上限下解析 JSON 请求体。
+// w 传入 http.MaxBytesReader 以便超限时由标准库接管（读取直接报错）。
+func decodeConsoleBody(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxConsoleBody)
+	return json.NewDecoder(r.Body).Decode(v)
+}
+
+// isMaxBytesErr 判断错误是否由请求体超限引起（用于返回 413）。
+func isMaxBytesErr(err error) bool {
+	var maxErr *http.MaxBytesError
+	return errors.As(err, &maxErr)
 }
 
 // Firewall 防火墙快照（编程接口，与控制台等价）。

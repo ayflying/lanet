@@ -22,6 +22,15 @@ services:
     image: ghcr.io/ayflying/lanet-node:latest
     container_name: lanet-node
     restart: unless-stopped
+    # 文件日志轮转不能限制 Docker 捕获的标准错误，需单独设置保留预算。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # 资源上限只保护宿主机，不替代应用内预算；按实际成员数与吞吐调整。
+    mem_limit: 512m
+    pids_limit: 256
     environment:
       # ==================== 身份与网络 ====================
       # 节点名称（成员表中的虚拟域名，成员可通过 <名称>.lanet 访问）

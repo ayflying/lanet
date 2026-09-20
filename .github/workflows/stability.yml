@@ -1,0 +1,44 @@
+name: stability
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: 稳定性回归-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: 核心模块覆盖测试
+        shell: bash
+        run: go test -count=1 -timeout=180s -coverprofile=coverage.out ./pkg/... ./sdk/go/lanet/... ./app/gateway/...
+      - name: 日志轮转回归
+        shell: bash
+        run: go test -count=1 app/agent/cmd/pvn-node/logrotate.go app/agent/cmd/pvn-node/logrotate_test.go
+      - name: 节点完整回归（测试副本不携带管理员清单）
+        shell: bash
+        run: |
+          RESOURCE=app/agent/cmd/pvn-node/rsrc_windows_amd64.syso
+          if [ "${RUNNER_OS}" = "Windows" ] && [ -f "$RESOURCE" ]; then
+            mv "$RESOURCE" "${RESOURCE}.test-backup"
+            trap 'mv "${RESOURCE}.test-backup" "$RESOURCE"' EXIT
+          fi
+          go test -count=1 -timeout=180s ./...
+      - name: Linux 并发竞争检测
+        if: runner.os == 'Linux'
+        shell: bash
+        run: go test -race -count=1 -timeout=240s ./pkg/... ./sdk/go/lanet/... ./app/gateway/...
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stability-coverage-${{ matrix.os }}
+          path: coverage.out

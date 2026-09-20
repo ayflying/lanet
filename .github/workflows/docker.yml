@@ -20,6 +20,7 @@ on:
       - "build/**"
       - "VERSION"
       - ".github/workflows/docker.yml"
+      - ".github/workflows/stability.yml"
   workflow_dispatch:
 
 env:
@@ -27,7 +28,10 @@ env:
   IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
 
 jobs:
+  stability:
+    uses: ./.github/workflows/stability.yml
   build:
+    needs: stability
     name: Build ${{ matrix.name }}
     runs-on: ubuntu-latest
     permissions:

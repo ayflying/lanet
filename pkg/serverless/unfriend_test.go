@@ -105,10 +105,12 @@ func TestUnfriendNotifyOnline(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	mu.Lock()
-	defer mu.Unlock()
-	if len(unfriended) == 0 || unfriended[0] != ha.ID().String() {
-		t.Fatalf("B 应收到删除好友通知并回调本机 ID，实际 %v", unfriended)
+	received := append([]string(nil), unfriended...)
+	mu.Unlock()
+	if len(received) == 0 || received[0] != ha.ID().String() {
+		t.Fatalf("B 应收到删除好友通知并回调本机 ID，实际 %v", received)
 	}
+	// 轮询期间不能持有信任回调的锁，否则在途握手无法重新检查撤销状态。
 	// 等移除生效；再留一小段时间确认「在途握手」不会把 A 写回来（见上面
 	// trustA 的注释）。写成有界轮询而不是一次性断言，避免依赖调度时序。
 	deadline = time.Now().Add(3 * time.Second)

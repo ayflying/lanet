@@ -267,9 +267,10 @@ func TestRouterOfflineDestinationDoesNotBlockOthers(t *testing.T) {
 func TestEnqueuePacketOwnsPacketData(t *testing.T) {
 	worker := &outboundWorker{packets: make(chan []byte, 1)}
 	router := &Router{
-		outbound:      map[string]*outboundWorker{"10.7.0.3": worker},
-		outboundLimit: 1,
-		outboundIdle:  time.Minute,
+		outbound:        map[string]*outboundWorker{"10.7.0.3": worker},
+		outboundLimit:   1,
+		outboundIdle:    time.Minute,
+		writeBudgetMax:  outboundQueueBudget,
 	}
 	packet := buildIPv4([4]byte{10, 7, 0, 2}, [4]byte{10, 7, 0, 3}, []byte("original"))
 	if err := router.enqueuePacket(context.Background(), packet); err != nil {
@@ -287,8 +288,9 @@ func TestEnqueuePacketLimitsDestinationWorkers(t *testing.T) {
 		outbound: map[string]*outboundWorker{
 			"10.7.0.3": {packets: make(chan []byte, 1)},
 		},
-		outboundLimit: 1,
-		outboundIdle:  time.Minute,
+		outboundLimit:  1,
+		outboundIdle:    time.Minute,
+		writeBudgetMax: outboundQueueBudget,
 	}
 	packet := buildIPv4([4]byte{10, 7, 0, 2}, [4]byte{10, 7, 0, 4}, nil)
 	if err := router.enqueuePacket(context.Background(), packet); err == nil {
@@ -300,9 +302,10 @@ func TestOutboundWorkerIsReapedWhenIdle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	router := &Router{
-		outbound:      make(map[string]*outboundWorker),
-		outboundLimit: 1,
-		outboundIdle:  20 * time.Millisecond,
+		outbound:       make(map[string]*outboundWorker),
+		outboundLimit:  1,
+		outboundIdle:   20 * time.Millisecond,
+		writeBudgetMax: outboundQueueBudget,
 	}
 	worker := &outboundWorker{packets: make(chan []byte, 1)}
 	router.outbound["10.7.0.3"] = worker

@@ -22,26 +22,66 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 // dnsListenAddr 内置 DNS 服务默认监听地址（本机回环，仅本机解析器使用）。
 const dnsListenAddr = "127.0.0.1:53"
+
+// DNS 服务资源边界：默认并发连接上限与单连接读写超时。
+//   - maxDNSConns：单实例可同时服务的 TCP 连接数上限（UDP 无连接不计入）。
+//     超出时新连接被直接拒绝，防止恶意/故障解析器把连接数打满拖垮宿主进程。
+//   - dnsConnTimeout：每条 TCP 连接的读写截止时间，每处理完一个报文就刷新。
+//     对端只连不发包（或发包不收应答）时连接会在超时后自动回收，避免永久挂着。
+const (
+	dnsMaxConns    = 256
+	dnsConnTimeout = 5 * time.Second
+	// dnsMaxMsgSize TCP DNS 报文长度上限（2 字节大端长度前缀可达 65535）。
+	dnsMaxMsgSize = 65535
+)
 
 // MembersFunc 返回当前成员表快照（每次查询实时调用，解析天然跟随成员变化）。
 type MembersFunc func() []MemberRef
 
 // DNSServer .lanet 域名 DNS 应答器。
 type DNSServer struct {
-	mu      sync.Mutex
-	members MembersFunc
-	udp     *net.UDPConn
-	tcp     net.Listener
-	closed  bool
+	mu          sync.Mutex
+	members     MembersFunc
+	udp         *net.UDPConn
+	tcp         net.Listener
+	conns       map[net.Conn]struct{} // 活动 TCP 连接（Close 时全量回收）
+	closed      bool
+	maxConns    int           // 并发连接上限（默认 dnsMaxConns，测试可改小）
+	connTimeout time.Duration // 单连接读写超时（默认 dnsConnTimeout）
 }
 
 // NewDNSServer 创建应答器；members 在每次查询时实时调用。
 func NewDNSServer(members MembersFunc) *DNSServer {
-	return &DNSServer{members: members}
+	return &DNSServer{
+		members:     members,
+		conns:       make(map[net.Conn]struct{}),
+		maxConns:    dnsMaxConns,
+		connTimeout: dnsConnTimeout,
+	}
+}
+
+// trackConn 在 accept 后登记一条新连接；若已关闭或已达并发上限则拒绝
+// （返回 false，由调用方直接关闭连接）。必须在 d.mu 下调用。
+func (d *DNSServer) trackConn(conn net.Conn) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed || len(d.conns) >= d.maxConns {
+		return false
+	}
+	d.conns[conn] = struct{}{}
+	return true
+}
+
+// untrackConn 连接结束时从活动集合移除。必须在 d.mu 下调用。
+func (d *DNSServer) untrackConn(conn net.Conn) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.conns, conn)
 }
 
 // ListenAndServe 绑定 UDP/53（TCP/53 尽力而为）并阻塞服务，直到 ctx 取消。
@@ -89,6 +129,11 @@ func (d *DNSServer) listenAndServe(ctx context.Context, addr string) error {
 				if err != nil {
 					return
 				}
+				// 并发上限/已关闭：直接拒连接（不等处理），由调用方关闭。
+				if !d.trackConn(conn) {
+					_ = conn.Close()
+					continue
+				}
 				go d.serveTCP(conn)
 			}
 		}()
@@ -119,6 +164,8 @@ func (d *DNSServer) listenAndServe(ctx context.Context, addr string) error {
 }
 
 // Close 停止应答并释放端口（幂等）。
+// 除关闭 UDP/TCP 监听外，还会回收当前全部活动 TCP 连接——否则仅关监听会让
+// 已建立的连接悬空：对端不停它们的连接，本端 goroutine 与 fd 长期残留。
 func (d *DNSServer) Close() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -132,6 +179,10 @@ func (d *DNSServer) Close() {
 	if d.tcp != nil {
 		_ = d.tcp.Close()
 	}
+	for c := range d.conns {
+		_ = c.Close()
+	}
+	d.conns = nil
 }
 
 func (d *DNSServer) isClosed() bool {
@@ -141,8 +192,14 @@ func (d *DNSServer) isClosed() bool {
 }
 
 // serveTCP 处理单条 DNS-over-TCP 连接（2 字节大端长度前缀的报文流）。
+// 每条连接受 connTimeout 约束：读/写都带截止时间，每处理完一个报文刷新，
+// 对端挂起不发包时连接会在超时后回收。连接结束自动从活动集合移除。
 func (d *DNSServer) serveTCP(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
+	defer func() {
+		_ = conn.Close()
+		d.untrackConn(conn)
+	}()
+	_ = conn.SetDeadline(time.Now().Add(d.connTimeout))
 	var lenBuf [2]byte
 	for {
 		if _, err := ioReadFull(conn, lenBuf[:]); err != nil {
@@ -152,6 +209,9 @@ func (d *DNSServer) serveTCP(conn net.Conn) {
 		if n == 0 {
 			return
 		}
+		if n > dnsMaxMsgSize {
+			return // 超出 DNS over TCP 报文上限，视为畸形，终止连接
+		}
 		msg := make([]byte, n)
 		if _, err := ioReadFull(conn, msg); err != nil {
 			return
@@ -160,6 +220,7 @@ func (d *DNSServer) serveTCP(conn net.Conn) {
 		if resp == nil {
 			return
 		}
+		_ = conn.SetDeadline(time.Now().Add(d.connTimeout))
 		out := make([]byte, 2+len(resp))
 		binary.BigEndian.PutUint16(out, uint16(len(resp)))
 		copy(out[2:], resp)

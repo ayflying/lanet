@@ -28,6 +28,7 @@ on:
       - "packaging/**"
       - "VERSION"
       - ".github/workflows/release.yml"
+      - ".github/workflows/stability.yml"
     tags: ["v*"]
   workflow_dispatch:
 
@@ -38,7 +39,10 @@ env:
   WIN_TUN_VERSION: "0.14.1"
 
 jobs:
+  stability:
+    uses: ./.github/workflows/stability.yml
   build:
+    needs: stability
     name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
     runs-on: ubuntu-latest
     strategy:
@@ -176,6 +180,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: lanet-*
           merge-multiple: true
 
       - name: Merge checksums

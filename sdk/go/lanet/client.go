@@ -182,6 +182,10 @@ type Config struct {
 	// 转发到 Target（本机所在真实局域网内的设备地址，如 192.168.1.100:5000）。
 	// 运行中可经 Web 控制台热更新；入向转发始终受防火墙约束（默认全拒绝）。
 	LANForwards []LANForward
+	// LANForwardMaxConns 单条转发监听器允许的最大并发活动连接；
+	// 超出后新连接被直接拒绝（连接关闭），防止单端口被打爆拖垮节点。
+	// 0 = 使用默认上限（见 fwdDefaultQuota）；设负数等同 0。
+	LANForwardMaxConns int
 	// ConsoleAddr 内置 Web 控制台监听地址，默认 127.0.0.1:8900
 	// （仅本机可访问；端口被占用时自动向后尝试到 8910）；设为 "-" 关闭控制台。
 	// 如需局域网/远程访问请显式设为 0.0.0.0:8900 并务必配合 ConsolePassword。
@@ -309,6 +313,8 @@ type Client struct {
 	lfMu        sync.Mutex
 	lfListeners map[int]*fwdListener // 端口转发本地监听表（listen 端口 → 监听器）
 	rootCtx     context.Context      // 节点生命周期 context（监听 goroutine 用）
+	cancel      context.CancelFunc   // 取消 rootCtx：触发全部生命周期 goroutine 退出
+	closeOnce   sync.Once            // Close 幂等保证
 
 	tunMu     sync.Mutex
 	tunDevice tundevice.Device  // TUN 虚拟网卡（cfg.Tun 且创建成功时非 nil）
@@ -338,7 +344,7 @@ type Info struct {
 //   - 常规模式：CTLURL 必填；InviteCode 为空则创建新群组，否则凭码加入。
 //   - Standalone 模式：CTLURL 留空；NetworkKey 留空 = 公共网络，
 //     填写相同 NetworkKey 的节点组成私有网络，经 DHT + mDNS 自动发现。
-func New(ctx context.Context, cfg Config) (*Client, error) {
+func New(ctx context.Context, cfg Config) (c *Client, err error) {
 	if cfg.Standalone && cfg.CTLURL != "" {
 		return nil, fmt.Errorf("lanet: Standalone 模式不需要 CTLURL")
 	}
@@ -357,6 +363,9 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = 8 * time.Second
 	}
+	// 自有生命周期 context：与调用方传入的 ctx 解耦——Close 通过 cancel
+	// 统一退出全部 goroutine，调用方提前 cancel 我们也会跟着退出（双保险）。
+	// 失败回滚：任何一步出错都走 defer 调 Close 释放已启动的子资源。
 	// 本机设备信息（info 协议交换给同群成员，供对方控制台「详情」识别设备）：
 	// 操作系统主机名 + 全部非回环网卡 IP。采集失败仅留空，不影响入网。
 	localHostname, _ := os.Hostname()
@@ -374,7 +383,16 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		}
 	}
 
-	c := &Client{cfg: cfg}
+	// 节点对象 + 自有生命周期 context（在资源分配前创建，保证任何一步
+	// 失败时 defer 回滚都能安全关闭已启动的子资源）。
+	lifeCtx, cancel := context.WithCancel(ctx)
+	c = &Client{cfg: cfg, rootCtx: lifeCtx, cancel: cancel}
+	// 捕获实际实例：错误返回会把命名返回值 c 改成 nil。
+	defer func(owned *Client) {
+		if err != nil {
+			_ = owned.Close()
+		}
+	}(c)
 
 	// 1. libp2p Host。
 	listenAddrs := cfg.ListenAddrs
@@ -403,7 +421,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		c.peerSource = peersource.NewClient(cfg.CTLURL)
 		spec.RelaySource = c.peerSource.AutoRelayPeerSource()
 	}
-	node, err := p2pkit.NewHost(ctx, spec)
+	node, err := p2pkit.NewHost(c.rootCtx, spec)
 	if err != nil && p2pkit.HasIPv6Listen(spec.ListenAddrs) {
 		// IPv6 监听失败不应拖垮整个节点：摘掉 IPv6 项重试一次，成功则按
 		// 仅 IPv4 继续（记日志说明降级）。探测过「能监听」也可能因端口占用、
@@ -413,7 +431,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		c.logf("IPv6 监听失败，回退为仅 IPv4 继续启动: %v", err)
 		fallback := spec
 		fallback.ListenAddrs = p2pkit.StripIPv6Listen(spec.ListenAddrs)
-		if node2, err2 := p2pkit.NewHost(ctx, fallback); err2 == nil {
+		if node2, err2 := p2pkit.NewHost(c.rootCtx, fallback); err2 == nil {
 			node, err = node2, nil
 		}
 	}
@@ -428,12 +446,12 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Standalone {
 		// 地址簿 + 审批记录（SQLite，独立 lanet.db）：本地保存已知节点、
 		// 待审批申请与信任白名单。DBPath 为 "-" 时关闭持久化（仅内存）。
-		if db, dbErr := c.openPeersDB(ctx); dbErr != nil {
+		if db, dbErr := c.openPeersDB(c.rootCtx); dbErr != nil {
 			c.logf("地址簿打开失败（连接审批降级为内存态）: %v", dbErr)
 		} else {
 			c.peers = db
 		}
-		disc, err = serverless.New(ctx, node, serverless.Config{
+		disc, err = serverless.New(c.rootCtx, node, serverless.Config{
 			NetworkKey:           cfg.NetworkKey,
 			LegacyDefaultKey:     cfg.LegacyDefaultKey,
 			LegacyProtocols:      cfg.LegacyProtocols,
@@ -460,10 +478,9 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 			OnUnfriendReceived:   c.onUnfriendReceived,
 		})
 		if err == nil {
-			err = disc.Start(ctx)
+			err = disc.Start(c.rootCtx)
 		}
 		if err != nil {
-			_ = node.Close()
 			return nil, err
 		}
 		c.disc = disc
@@ -486,13 +503,11 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	} else {
 		c.netmapCli = netmapclient.NewClient(cfg.CTLURL, c.peerID)
 		if cfg.InviteCode == "" {
-			if err = c.createGroup(ctx); err != nil {
-				_ = node.Close()
+			if err = c.createGroup(c.rootCtx); err != nil {
 				return nil, err
 			}
 		} else {
-			if err = c.joinGroup(ctx); err != nil {
-				_ = node.Close()
+			if err = c.joinGroup(c.rootCtx); err != nil {
 				return nil, err
 			}
 		}
@@ -511,25 +526,23 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	c.forwards = append([]LANForward(nil), cfg.LANForwards...)
 	c.statePath = cfg.StateFile
 	c.lfListeners = make(map[int]*fwdListener)
-	c.rootCtx = ctx
 	c.loadState()
 	c.enablePortFWD()
 	// 4.4 端口转发本地监听：转发表里的端口在虚拟 IP 上真实监听并代理到
 	// 目标——容器节点只有虚拟 IP 可达时（TUN 数据面），没有监听的端口
 	// 会被内核 RST，表现为「ping 得通但服务连不上」。
-	c.startListenForwards(ctx)
+	c.startListenForwards(c.rootCtx)
 	// 4.5 TUN 虚拟网卡（IP 层互通，可选）：放在防火墙初始化之后，
 	// Router 的入向 IP 包判定复用同一套防火墙规则。
 	if cfg.Tun {
-		c.startTUN(ctx)
+		c.startTUN(c.rootCtx)
 	}
 	// 4.6 .lanet DNS 应答器（可选）：把成员名域名解析交给操作系统，
 	// `ping <成员名>.lanet` 可直接用。成员表实时读取，IP 变化自动跟随。
 	// .lanet DNS 强制开启：入网即启动内置应答器（默认 127.0.0.1:53）。
-	c.startDNS(ctx, cfg.LanetDNSAddr)
+	c.startDNS(c.rootCtx, cfg.LanetDNSAddr)
 	// 5. 内置 Web 控制台。
 	if err = c.startConsole(); err != nil {
-		_ = node.Close()
 		return nil, err
 	}
 	return c, nil
@@ -1071,33 +1084,57 @@ func (c *Client) Run(ctx context.Context) {
 	}
 }
 
-// Close 关闭节点与底层连接。
+// Close 关闭节点与底层连接。幂等：重复调用安全，仅首次生效。
+// 先取消自有 rootCtx（触发全部生命周期 goroutine 退出），再按序释放
+// TUN / 控制台 / DNS / 端口转发监听（含全部活动连接）/ 地址簿 /
+// 本地发现服务（Discovery.Close）/ libp2p Host。
 func (c *Client) Close() error {
-	c.tunMu.Lock()
-	if c.tunDevice != nil {
-		_ = c.tunDevice.Close()
-		c.tunDevice = nil
-	}
-	c.tunMu.Unlock()
-	if c.consoleSrv != nil {
-		_ = c.consoleSrv.Close()
-	}
-	if c.dns != nil {
-		c.dns.Close()
-	}
-	c.lfMu.Lock()
-	for _, fl := range c.lfListeners {
-		_ = fl.ln.Close()
-	}
-	c.lfListeners = make(map[int]*fwdListener)
-	c.lfMu.Unlock()
-	if c.peers != nil {
-		if err := c.peers.Close(); err != nil {
-			c.logf("地址簿关闭失败（忽略）: %v", err)
+	c.closeOnce.Do(func() {
+		// 1. 取消节点生命周期 context：所有派生 goroutine 收到信号后自退。
+		if c.cancel != nil {
+			c.cancel()
 		}
-		c.peers = nil
-	}
-	return c.node.Close()
+		// 2. TUN 虚拟网卡。
+		c.tunMu.Lock()
+		if c.tunDevice != nil {
+			_ = c.tunDevice.Close()
+			c.tunDevice = nil
+		}
+		c.tunMu.Unlock()
+		// 3. Web 控制台。
+		if c.consoleSrv != nil {
+			_ = c.consoleSrv.Close()
+		}
+		// 4. .lanet DNS 应答器。
+		if c.dns != nil {
+			c.dns.Close()
+		}
+		// 5. 端口转发本地监听：取消 accept 循环并关闭全部活动连接。
+		c.lfMu.Lock()
+		for _, fl := range c.lfListeners {
+			fl.shutdown()
+		}
+		c.lfListeners = make(map[int]*fwdListener)
+		c.lfMu.Unlock()
+		// 6. 地址簿 + 审批记录。
+		if c.peers != nil {
+			if err := c.peers.Close(); err != nil {
+				c.logf("地址簿关闭失败（忽略）: %v", err)
+			}
+			c.peers = nil
+		}
+		// 7. 本地发现服务（Standalone）：释放 DHT/mDNS 长生命周期资源。
+		if c.disc != nil {
+			if err := c.disc.Close(); err != nil {
+				c.logf("发现服务关闭失败（忽略）: %v", err)
+			}
+		}
+		// 8. libp2p Host（最后关，其余子资源都已先行释放）。
+		if c.node != nil {
+			_ = c.node.Close()
+		}
+	})
+	return nil
 }
 
 // handleInbound 入向流分发到已注册的 Handler。

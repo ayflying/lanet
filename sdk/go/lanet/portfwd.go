@@ -23,6 +23,44 @@ type PortFWDTarget struct {
 	Port int
 }
 
+// portFWDHandshakeTimeout 握手（目标地址头写入/读取）超时：对端迟迟不收
+// 或网络异常时，必须及时释放底层流，否则流会永久占用并泄漏 goroutine。
+const portFWDHandshakeTimeout = 10 * time.Second
+
+// handshakePortFWDWrite 在 ctx 约束下写入转发目标地址头。ctx 被取消或超时
+// 时立即返回 ctx 错误（不再阻塞在流写上）。注意：返回后调用方应 Reset 流，
+// Reset 会解除阻塞中的底层写，本函数派生的 goroutine 随之退出，不泄漏。
+func handshakePortFWDWrite(ctx context.Context, w io.Writer, addr string) error {
+	done := make(chan error, 1)
+	go func() { done <- writePortFWDHeader(w, addr) }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// handshakePortFWDRead 在 ctx 约束下读取转发目标地址头。ctx 被取消或超时
+// 时立即返回 ctx 错误。同样需调用方 Reset 流以解除阻塞中的读并回收 goroutine。
+func handshakePortFWDRead(ctx context.Context, r io.Reader) (string, error) {
+	type res struct {
+		addr string
+		err  error
+	}
+	done := make(chan res, 1)
+	go func() {
+		addr, err := readPortFWDHeader(r)
+		done <- res{addr: addr, err: err}
+	}()
+	select {
+	case r := <-done:
+		return r.addr, r.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
 // DialPortFWD 按虚拟 IP + 端口连接对端的 TCP 服务：
 // 先与对端建立 PortFWD 协议流，由对端 net.Dial 本地/内网目标，
 // 之后本连接等价于一条到目标端口的双向字节管道。
@@ -43,9 +81,13 @@ func (c *Client) DialPortFWD(ctx context.Context, target PortFWDTarget) (net.Con
 		return nil, err
 	}
 	addr := fmt.Sprintf("%s:%d", virtualIP, target.Port)
-	if err = writePortFWDHeader(raw, addr); err != nil {
-		_ = raw.Close()
-		return nil, fmt.Errorf("lanet: 发送转发目标: %w", err)
+	// 握手超时 + 调用方 ctx 取消：写目标头时若对端迟迟不收或 ctx 被取消，
+	// 必须 Reset 流释放（否则流永久占用）。
+	hsCtx, hsCancel := context.WithTimeout(ctx, portFWDHandshakeTimeout)
+	defer hsCancel()
+	if err = handshakePortFWDWrite(hsCtx, raw, addr); err != nil {
+		_ = raw.Reset()
+		return nil, fmt.Errorf("lanet: 发送转发目标（握手失败: %w）", err)
 	}
 	return &PortFWDConn{
 		streamAdapter: streamAdapter{Stream: raw, viaRelay: viaRelay},
@@ -60,9 +102,13 @@ func (c *Client) enablePortFWD() {
 	c.node.SetStreamHandler(protocol.PortFWD, func(stream network.Stream) {
 		// 1. 来源判定：PeerID 反查虚拟 IP；未知来源无法过防火墙。
 		srcIP := c.virtualIPByPeer(stream.Conn().RemotePeer().String())
-		addr, err := readPortFWDHeader(stream)
+		// 握手读取目标地址：带超时 + 节点生命周期 ctx 取消。对端迟迟不
+		// 发头或节点关闭时，Reset 流释放，不阻塞 goroutine。
+		hsCtx, hsCancel := context.WithTimeout(c.rootCtx, portFWDHandshakeTimeout)
+		defer hsCancel()
+		addr, err := handshakePortFWDRead(hsCtx, stream)
 		if err != nil {
-			c.logf("portfwd 读取目标地址失败: %v", err)
+			c.logf("portfwd 读取目标地址失败（握手超时/取消: %v）", err)
 			_ = stream.Reset()
 			return
 		}
@@ -88,7 +134,7 @@ func (c *Client) enablePortFWD() {
 			}
 		}
 		var dialer net.Dialer
-		dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		dialCtx, cancel := context.WithTimeout(c.rootCtx, 10*time.Second)
 		defer cancel()
 		target, err := dialer.DialContext(dialCtx, "tcp", addr)
 		if err != nil {
@@ -97,6 +143,11 @@ func (c *Client) enablePortFWD() {
 			return
 		}
 		c.logf("portfwd 放行：来源=%s → %s", srcIP, addr)
+		stop := context.AfterFunc(c.rootCtx, func() {
+			_ = stream.Reset()
+			_ = target.Close()
+		})
+		defer stop()
 		pipeBoth(streamAdapter{Stream: stream}, target)
 	})
 }
@@ -199,15 +250,25 @@ type halfCloseWriter interface{ CloseWrite() error }
 func pipeBoth(a Stream, b net.Conn) {
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(b, a)
-		if hc, ok := b.(halfCloseWriter); ok {
+		_, err := io.Copy(b, a)
+		if err != nil {
+			_ = a.Close()
+			_ = b.Close()
+		} else if hc, ok := b.(halfCloseWriter); ok {
 			_ = hc.CloseWrite()
+		} else {
+			_ = b.Close()
 		}
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(a, b)
-		_ = a.CloseWrite()
+		_, err := io.Copy(a, b)
+		if err != nil {
+			_ = a.Close()
+			_ = b.Close()
+		} else {
+			_ = a.CloseWrite()
+		}
 		done <- struct{}{}
 	}()
 	<-done

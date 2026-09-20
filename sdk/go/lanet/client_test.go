@@ -3,6 +3,8 @@ package lanet
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -149,6 +151,32 @@ func TestNewRejectsInvalidJoin(t *testing.T) {
 	if !strings.Contains(err.Error(), "加入群组") {
 		t.Errorf("error should wrap join failure, got: %v", err)
 	}
+}
+
+// 初始化已创建 Host 后失败，必须释放监听，而不只是避免空指针。
+func TestNewFailureReleasesListener(t *testing.T) {
+	srv := newFakeCTL(t, "correct-code")
+	defer srv.Close()
+	reserved, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := reserved.Addr().(*net.TCPAddr).Port
+	_ = reserved.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	client, err := New(ctx, Config{
+		CTLURL: srv.URL, Name: "rollback-test", InviteCode: "wrong-code",
+		ListenAddrs: []string{fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", port)},
+	})
+	if err == nil || client != nil {
+		t.Fatalf("预期构造失败，client=%v err=%v", client, err)
+	}
+	reopened, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("初始化失败未释放监听: %v", err)
+	}
+	_ = reopened.Close()
 }
 
 func TestNewRequiresMandatoryConfig(t *testing.T) {
