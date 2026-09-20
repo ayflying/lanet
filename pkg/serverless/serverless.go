@@ -337,6 +337,12 @@ type Discovery struct {
 	mu      sync.RWMutex
 	members map[string]*Member // peerID -> member
 
+	// unfriendedAt 复活防护表：近期收到删除好友通知（unfriend / Forget）
+	// 的节点 -> 通知处理时间。与 members 同受 mu 保护，读写必须在同一
+	// 临界区内完成「删成员 + 记防护」，否则两者之间的窗口恰好被在途
+	// 握手命中时，刚删除的成员会被写回（复活）。作用域见 unfriendGuardTTL。
+	unfriendedAt map[string]time.Time
+
 	publicRetired      bool      // 公共 DHT 已退出（私有 DHT 就绪后省流量）
 	publicRetireReason string    // 退出原因（连上同群成员 / 超时），控制台展示用
 	publicStartedAt    time.Time // 公共 DHT 开启时刻（剩余时长展示用）
@@ -351,7 +357,7 @@ type Discovery struct {
 
 	// cbMu 保护 onDiscovered 切片：OnDiscovered 追加与 emit 迭代并发时需安全，
 	// 否则一个 goroutine 在迭代、另一个在 append 会触发 data race。
-	cbMu        sync.RWMutex
+	cbMu         sync.RWMutex
 	onDiscovered []Discovered
 
 	// relayOnce 保证常驻中继预约循环只启动一次（Run 可能被多次调用）。
@@ -422,13 +428,14 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		cfg.MemberTTL = MinMemberTTL
 	}
 	d := &Discovery{
-		host:       h,
-		cfg:        cfg,
-		groupKey:   GroupKey(cfg.Channel, cfg.NetworkKey), // 空密钥按公共网络处理
-		memberTTL:  cfg.MemberTTL,
-		members:    make(map[string]*Member),
-		trigger:    make(chan struct{}, 1),
-		nearbySeen: make(map[string]time.Time),
+		host:         h,
+		cfg:          cfg,
+		groupKey:     GroupKey(cfg.Channel, cfg.NetworkKey), // 空密钥按公共网络处理
+		memberTTL:    cfg.MemberTTL,
+		members:      make(map[string]*Member),
+		unfriendedAt: make(map[string]time.Time),
+		trigger:      make(chan struct{}, 1),
+		nearbySeen:   make(map[string]time.Time),
 	}
 	// 种子交换的运行期字段在此统一初始化（Config 同名项只作初值）。
 	d.initSeedRuntime(cfg)
@@ -841,7 +848,11 @@ func (d *Discovery) RequestConnect(ctx context.Context, ai peer.AddrInfo) (strin
 		return ai.ID.String(), fmt.Errorf("对方节点未被信任，无法连接")
 	}
 	// 已信任：按普通成员流程建连 + info 交换（失败即返回真实原因）。
+	// RequestConnect 是「用户显式重新添加 / 同意申请」的唯一收敛入口
+	// （ApprovePeer、连接码、ID 直连都走这里）：信任由用户动作恢复，
+	// 此处解除复活防护，让重新加好友的双向握手立即畅通。
 	d.mu.Lock()
+	delete(d.unfriendedAt, ai.ID.String())
 	if _, ok := d.members[ai.ID.String()]; !ok {
 		d.members[ai.ID.String()] = &Member{
 			PeerID:    ai.ID.String(),
@@ -1190,9 +1201,15 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 		return
 	}
 
+	// 信任检查后进锁写入；guard 拦下检查与写入之间收到 unfriend 通知的
+	// 迟到发现记录（见 unfriendGuardTTL）。
 	d.mu.Lock()
 	m, ok := d.members[id.String()]
 	if !ok {
+		if d.unfriendGuardBlocked(id.String()) {
+			d.mu.Unlock()
+			return // 刚被删除好友的节点，迟到的发现记录不复活成员、也不上报附近
+		}
 		m = &Member{
 			PeerID:    id.String(),
 			VirtualIP: DeriveVirtualIP(d.groupKey, id.String()),
@@ -1391,9 +1408,16 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	if conn := s.Conn(); conn != nil {
 		addrs = p2pkit.CleanUnderlayAddrs([]ma.Multiaddr{conn.RemoteMultiaddr()})
 	}
+	// 信任检查后进锁写入；guard 拦下「检查已通过、写入未完成」期间收到
+	// unfriend 通知的迟到握手（见 unfriendGuardTTL）。
 	d.mu.Lock()
 	m, ok := d.members[remote.String()]
 	if !ok {
+		if d.unfriendGuardBlocked(remote.String()) {
+			d.mu.Unlock()
+			d.logf("忽略节点 %s 的迟到握手：删除好友通知刚处理过，不复活成员", remote.ShortString())
+			return
+		}
 		m = &Member{
 			PeerID:    remote.String(),
 			VirtualIP: DeriveVirtualIP(d.groupKey, remote.String()),
@@ -1507,6 +1531,7 @@ func (d *Discovery) Forget(peerID string) {
 	}
 	d.mu.Lock()
 	delete(d.members, id.String())
+	d.markUnfriendedLocked(id.String())
 	d.mu.Unlock()
 	for _, c := range d.host.Network().ConnsToPeer(id) {
 		_ = c.Close()
@@ -1565,6 +1590,41 @@ func (d *Discovery) handleUnfriend(s network.Stream) {
 	for _, c := range d.host.Network().ConnsToPeer(remote) {
 		_ = c.Close()
 	}
+}
+
+// unfriendGuardTTL 收到删除好友通知后的「复活防护期」：期内该节点不得
+// 重新进入成员表。只需覆盖「信任检查已通过、成员表写入还未发生」的
+// 在途握手/发现窗口（握手超时与发现周期均为 30s 量级），取 5 分钟留足
+// 余量。重新添加好友不受影响：guard 只拦「信任尚未恢复」的节点，用户
+// 重新同意对方申请后 IsTrusted=true，写入正常放行。
+const unfriendGuardTTL = 5 * time.Minute
+
+// markUnfriendedLocked 在已持有 d.mu 写锁的前提下记录复活防护起点。
+// 必须与 delete(d.members,…) 处于同一临界区：分开会在两者之间留出窗口，
+// 在途握手恰好落在窗内就会把刚删除的成员写回成员表（复活）——
+// 成员表只在删除时刻移除一次，复活后要等 TTL 回收，表现为「删了还在」。
+// 顺带惰性清理过期项，防 map 无界增长（unfriend 频率低，量极小）。
+func (d *Discovery) markUnfriendedLocked(peerID string) {
+	if d.unfriendedAt == nil {
+		d.unfriendedAt = make(map[string]time.Time)
+	}
+	now := time.Now()
+	d.unfriendedAt[peerID] = now
+	for pid, t := range d.unfriendedAt {
+		if now.Sub(t) > unfriendGuardTTL {
+			delete(d.unfriendedAt, pid)
+		}
+	}
+}
+
+// unfriendGuardBlocked 复活防护判定：防护期内（unfriendGuardTTL）收到过
+// 删除好友通知的节点一律不得重新进入成员表——「删除前放行、删除后写入」
+// 的迟到握手/发现记录，以及「信任检查时回调尚未翻转」的灰区握手全部
+// 拦下。放行只能走显式恢复路径（RequestConnect 清除防护记录）。
+// 须在持有 d.mu 时调用。
+func (d *Discovery) unfriendGuardBlocked(peerID string) bool {
+	t, banned := d.unfriendedAt[peerID]
+	return banned && time.Since(t) < unfriendGuardTTL
 }
 
 // reportNearby 被动发现未信任节点时上报「附近」回调（带去抖：同一节点

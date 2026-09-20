@@ -288,6 +288,46 @@ func TestPassiveDiscoverRepeatedStaysQuiet(t *testing.T) {
 	}
 }
 
+// TestUnfriendGuardBlocksRevival 复活防护的确定性单测：unfriend 通知处理
+// 后的防护期内，该节点一律不得重新进入成员表——无论握手/发现的信任检查
+// 何时通过（OnUnfriendReceived 是异步回调，IsTrusted 翻转可能滞后，任何
+// 「检查时刻还信任」的判断都不可靠）。放行只能走显式恢复路径
+// （RequestConnect 清除防护记录，对应「用户重新加好友」）。直接验证
+// guard 状态机，不依赖网络时序——集成路径由 TestUnfriendNotifyOnline
+// 的概率性失败暴露。
+func TestUnfriendGuardBlocksRevival(t *testing.T) {
+	d := &Discovery{
+		members:      map[string]*Member{},
+		unfriendedAt: map[string]time.Time{},
+	}
+	// 删除好友：与生产同一临界区语义（先删成员、再记防护）。
+	d.mu.Lock()
+	delete(d.members, "p1")
+	d.markUnfriendedLocked("p1")
+	d.mu.Unlock()
+
+	if !d.unfriendGuardBlocked("p1") {
+		t.Fatal("防护期内应被复活防护拦截")
+	}
+	// 防护期已过：放行（自愈路径）。
+	d.mu.Lock()
+	d.unfriendedAt["p2"] = time.Now().Add(-unfriendGuardTTL - time.Second)
+	d.mu.Unlock()
+	if d.unfriendGuardBlocked("p2") {
+		t.Fatal("防护期已过期的节点不应再被拦截")
+	}
+	// 显式恢复路径：RequestConnect 清除防护记录（锁内 delete，同生产实现）。
+	d.mu.Lock()
+	delete(d.unfriendedAt, "p1")
+	d.mu.Unlock()
+	if d.unfriendGuardBlocked("p1") {
+		t.Fatal("清除防护记录后应放行（重新加好友）")
+	}
+	if d.unfriendGuardBlocked("p3") {
+		t.Fatal("无删除记录的节点不应被拦截")
+	}
+}
+
 // memberOf 查成员表中是否有指定节点。
 func memberOf(d *Discovery, peerID string) (Member, bool) {
 	for _, m := range d.Peers() {
