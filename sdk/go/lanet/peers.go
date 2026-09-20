@@ -148,19 +148,15 @@ func pickWarmupTargets(peers []peersdb.Peer, addrsOf func(string) []string, max 
 
 // waitReady 阻塞直到入网就绪（c.disc 就位）。返回 false 表示超时或 ctx 取消。
 func (c *Client) waitReady(ctx context.Context, limit time.Duration) bool {
-	deadline := time.Now().Add(limit)
-	for {
-		if c.disc != nil {
-			return true
-		}
-		if ctx.Err() != nil || time.Now().After(deadline) {
-			return false
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(500 * time.Millisecond):
-		}
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	select {
+	case <-c.ready:
+		return c.disc != nil && ctx.Err() == nil
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
 	}
 }
 

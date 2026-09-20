@@ -315,6 +315,7 @@ type Client struct {
 	rootCtx     context.Context      // 节点生命周期 context（监听 goroutine 用）
 	cancel      context.CancelFunc   // 取消 rootCtx：触发全部生命周期 goroutine 退出
 	closeOnce   sync.Once            // Close 幂等保证
+	ready       chan struct{}        // 构造完成后关闭，安全发布初始化字段
 
 	tunMu     sync.Mutex
 	tunDevice tundevice.Device  // TUN 虚拟网卡（cfg.Tun 且创建成功时非 nil）
@@ -386,7 +387,7 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 	// 节点对象 + 自有生命周期 context（在资源分配前创建，保证任何一步
 	// 失败时 defer 回滚都能安全关闭已启动的子资源）。
 	lifeCtx, cancel := context.WithCancel(ctx)
-	c = &Client{cfg: cfg, rootCtx: lifeCtx, cancel: cancel}
+	c = &Client{cfg: cfg, rootCtx: lifeCtx, cancel: cancel, ready: make(chan struct{})}
 	// 捕获实际实例：错误返回会把命名返回值 c 改成 nil。
 	defer func(owned *Client) {
 		if err != nil {
@@ -545,6 +546,7 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 	if err = c.startConsole(); err != nil {
 		return nil, err
 	}
+	close(c.ready)
 	return c, nil
 }
 
