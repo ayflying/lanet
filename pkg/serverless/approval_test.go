@@ -20,13 +20,16 @@ func TestApprovalRejectsUntrusted(t *testing.T) {
 	ha := testHost(t, false)
 	hb := testHost(t, false)
 
-	var pending []string
+	pending := make(chan string, 8)
 	da, err := New(ctx, ha, Config{
 		NetworkKey: "grp-approval",
 		Name:       "node-a",
 		IsTrusted:  func(string) bool { return false }, // 谁都不信任
 		OnPending: func(peerID string, _ []string, _ string) {
-			pending = append(pending, peerID)
+			select {
+			case pending <- peerID:
+			default:
+			}
 		},
 	})
 	if err != nil {
@@ -68,15 +71,13 @@ func TestApprovalRejectsUntrusted(t *testing.T) {
 		}
 	}
 	// A 应把 B 记入待审批列表。
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(pending) > 0 {
-			break
+	select {
+	case received := <-pending:
+		if received != hb.ID().String() {
+			t.Fatalf("陌生节点申请连接后应上报待审批，实际 %v", received)
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if len(pending) == 0 || pending[0] != hb.ID().String() {
-		t.Fatalf("陌生节点申请连接后应上报待审批，实际 %v", pending)
+	case <-time.After(5 * time.Second):
+		t.Fatal("陌生节点申请连接后未上报待审批")
 	}
 }
 

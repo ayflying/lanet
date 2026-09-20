@@ -129,11 +129,48 @@ class Portainer:
                 self.request('DELETE', '/containers/' + cid + '?force=true&v=true')
 
 
+def watch_github(sha, timeout=1800):
+    import time
+    deadline = time.monotonic() + timeout
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    failures = 0
+    while time.monotonic() < deadline:
+        try:
+            request = urllib.request.Request(
+                'https://api.github.com/repos/ayflying/lanet/actions/runs?head_sha=' + sha,
+                headers={'User-Agent': 'lanet-ops/1.0'})
+            with opener.open(request, timeout=30) as response:
+                runs = json.load(response)['workflow_runs']
+            selected = {}
+            for run in runs:
+                if run['name'] in ('docker', 'release'):
+                    selected.setdefault(run['name'], run)
+            state = {name: {'id': run['id'], 'status': run['status'], 'conclusion': run['conclusion']} for name, run in selected.items()}
+            print(json.dumps(state, ensure_ascii=False), flush=True)
+            if any(run['status'] == 'completed' and run['conclusion'] != 'success' for run in selected.values()):
+                return 1
+            if len(selected) == 2 and all(run['conclusion'] == 'success' for run in selected.values()):
+                return 0
+            failures = 0
+        except (OSError, ValueError) as exc:
+            failures += 1
+            print(f'流水线查询暂时失败：{type(exc).__name__}', flush=True)
+            if failures >= 3:
+                return 2
+        time.sleep(20)
+    return 3
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['status', 'isolated-tests'])
+    parser.add_argument('command', choices=['status', 'isolated-tests', 'watch-github'])
     parser.add_argument('--directory')
+    parser.add_argument('--sha')
     args = parser.parse_args()
+    if args.command == 'watch-github':
+        if not args.sha:
+            parser.error('watch-github 需要 --sha')
+        return watch_github(args.sha)
     api = Portainer()
     if args.command == 'status':
         node = api.node()
