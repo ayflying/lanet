@@ -16,6 +16,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
@@ -61,7 +62,7 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 		libp2p.UserAgent(spec.UserAgent),
 		libp2p.EnableNATService(),
 		libp2p.EnableRelay(),
-		libp2p.AddrsFactory(FilterUnderlayAddrs),
+		libp2p.AddrsFactory(CleanUnderlayAddrs),
 		libp2p.ConnectionGater(lanetOverlayGater{}),
 	}
 	if spec.Identity != nil {
@@ -119,23 +120,143 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 // Such an address can carry application traffic, but must never be advertised as
 // a libp2p transport endpoint: dialing the tunnel through itself creates a loop.
 func IsLanetOverlayAddr(addr ma.Multiaddr) bool {
-	ipText, err := addr.ValueForProtocol(ma.P_IP4)
-	if err != nil {
-		return false
-	}
-	ip, err := netip.ParseAddr(ipText)
-	return err == nil && lanetOverlayPrefix.Contains(ip)
+	ip, ok := AddrIP(addr)
+	return ok && lanetOverlayPrefix.Contains(ip)
 }
 
-// FilterUnderlayAddrs removes Lanet overlay addresses while preserving order.
+// isCircuitAddr 报告地址是否为 Circuit Relay v2 路径（含 /p2p-circuit 段）。
+func isCircuitAddr(addr ma.Multiaddr) bool {
+	if addr == nil {
+		return false
+	}
+	_, err := addr.ValueForProtocol(ma.P_CIRCUIT)
+	return err == nil
+}
+
+// isDialableUnderlay 报告地址是否值得作为 libp2p 承载地址（收发两侧共用判据）。
+//
+// 五类被剔除，判据只依赖地址形态、不需要任何对端信息：
+//   - 回环（127.0.0.0/8、::1）：只有对端自己可达，拨它必然失败；
+//   - 链路本地（169.254/16、fe80::/10）：只在同一物理链路上有意义；
+//   - 未指定（0.0.0.0、::）：那是监听通配地址，不是可拨地址；
+//   - lanet overlay（10.7.0.0/16）：拨它成环（见 IsLanetOverlayAddr）；
+//   - /p2p-circuit：中继路径是临时中转，随中继与预约变化，不该被持久化。
+//     真机实测某节点地址簿 404 条里有 130 条是 circuit 变体。
+func isDialableUnderlay(addr ma.Multiaddr) bool {
+	if isCircuitAddr(addr) {
+		return false
+	}
+	ip, ok := AddrIP(addr)
+	if !ok {
+		return true // /dns4/… 之类无 IP 的地址交给拨号侧解析
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+	return !lanetOverlayPrefix.Contains(ip)
+}
+
+// FilterUnderlayAddrs 只保留值得承载 libp2p 的地址，顺序不变。
+//
+// 这是**收发共用的唯一出口**：出向挂在 libp2p.AddrsFactory 上（决定本机
+// 对外通告什么），入向用于 peerstore 写入前的清洗（见 serverless.addMember
+// 与 handleInfo）。一处改动即同时收敛「自己别乱发」与「别把对端的脏地址收下」。
+//
+// 保底：若过滤后一条不剩（典型是单元测试只监听 127.0.0.1，或节点只在链路
+// 本地可见），退回「既非 overlay 也非 circuit」的那批——特殊拓扑仍保留连接
+// 能力，但 overlay / circuit 永不复活。全都不合规时返回空：宁可不通告，
+// 也不通告必然失败的地址。
 func FilterUnderlayAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
 	filtered := make([]ma.Multiaddr, 0, len(addrs))
 	for _, addr := range addrs {
-		if !IsLanetOverlayAddr(addr) {
+		if isDialableUnderlay(addr) {
 			filtered = append(filtered, addr)
 		}
 	}
-	return filtered
+	if len(filtered) > 0 {
+		return filtered
+	}
+	fallback := make([]ma.Multiaddr, 0, len(addrs))
+	for _, addr := range addrs {
+		if !IsLanetOverlayAddr(addr) && !isCircuitAddr(addr) {
+			fallback = append(fallback, addr)
+		}
+	}
+	return fallback
+}
+
+// isHarmfulUnderlayAddr 报告地址是否「结构性有害」——它不只是可能拨不通，
+// 而是会造成实际问题或无限膨胀：
+//   - overlay（10.7.0.0/16）：经隧道再拨隧道会成环；
+//   - circuit：中继路径是临时中转，随中继与预约变化，每轮都会被重新通告。
+//
+// 与 isDialableUnderlay 的分工很关键：那个判据用于**收集与通告**（把可能
+// 拨不通的地址挡在地址簿与对外通告之外，避免扩散）；本判据用于**清理已经
+// 写进 peerstore 的存量**——只清确定有害的，绝不顺手删掉回环 / 链路本地，
+// 因为同机多实例、同一物理链路等特殊拓扑下它们可能是唯一通路。
+// 实测教训：早期版本用「不可达」判据清 peerstore，直接把单测里靠 127.0.0.1
+// 建立的 DHT 发现链切断（TestDualDHTPrivateDiscovery 失败）。
+func isHarmfulUnderlayAddr(addr ma.Multiaddr) bool {
+	return IsLanetOverlayAddr(addr) || isCircuitAddr(addr)
+}
+
+// PrunePeerstoreAddrs 清掉 peerstore 里「结构性有害」的地址（overlay /
+// circuit），返回清理条数；幂等，可在每轮发现时调用。
+//
+// 为什么必须主动清：peerstore 里的地址带 1 小时 TTL，但发现循环每轮都会把
+// 对端通告的地址重新写入，等价于永不过期。老版本节点仍在乱发地址，只有在
+// 写入侧持续清洗，存量脏地址才会收敛。
+func PrunePeerstoreAddrs(ps peerstore.Peerstore, id peer.ID) int {
+	if ps == nil {
+		return 0
+	}
+	removed := 0
+	for _, addr := range ps.Addrs(id) {
+		if !isHarmfulUnderlayAddr(addr) {
+			continue
+		}
+		ps.SetAddr(id, addr, 0) // TTL=0 即删除
+		removed++
+	}
+	return removed
+}
+
+// maxUnderlayAddrsPerPeer 单个节点在 peerstore / 地址簿里保留的地址条数上限。
+//
+// 取值参考：正常节点 1~2 块网卡 × 2~3 种传输 ≈ 6 条；12 条留足多网卡 / 多
+// 端口场景的余量，同时把「几十条」压到不会造成拨号风暴的量级。
+const maxUnderlayAddrsPerPeer = 12
+
+// CleanUnderlayAddrs = 剔除不可达 + 按可达性排序 + 折叠同链路冗余，
+// 是「拿到一批候选地址后」的标准入口：拨号前、写 peerstore / 地址簿前都用它。
+// 也直接挂在 libp2p.AddrsFactory 上（决定本机对外通告什么）。
+func CleanUnderlayAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
+	filtered := FilterUnderlayAddrs(addrs)
+	if len(filtered) == 0 {
+		return filtered
+	}
+	// 复用项目既有的两级收敛：SortByReachability 按网卡类型排序（物理网卡
+	// 私网 > 公网 > 隧道网卡 > 宿主虚拟交换机 > 链路本地），再由
+	// CollapseRedundant 按「链路前缀 + 传输」折叠冗余。后者正是把
+	// 「一块网卡 × 多端口 × 多传输」压到个位数的关键——实测单节点曾累积
+	// 110 条，绝大多数是同链路的重复形态。
+	out := CollapseRedundant(SortByReachability(filtered))
+	// 保底：SortByReachability 面向「分享给对端」，会主动剔除回环与未指定
+	// 地址。若过滤结果只剩它们（单测监听 127.0.0.1、同机多实例），这里会
+	// 返回空——而本函数还挂在 AddrsFactory 上，返回空等于让 host 变成零地址，
+	// 别人再也拿不到本机任何地址。此时退回过滤结果（宁可保留弱地址）。
+	// 实测教训：少了这段保底，TestDualDHTPrivateDiscovery 的引导种子会变空，
+	// 私有 DHT 起不来（B 只能等 A 反向连入，来源退化成 inbound）。
+	if len(out) == 0 {
+		out = filtered
+	}
+	// 端口不同的地址折叠不掉（折叠键含端口），必须再截断一道：真机实测
+	// 一台装了 WSL/VMware 的机器会通告「5 个网卡 × 3 个端口 × 4 种传输」
+	// 共几十条，截断前单节点地址簿曾累积 110 条。
+	if len(out) > maxUnderlayAddrsPerPeer {
+		out = out[:maxUnderlayAddrsPerPeer]
+	}
+	return out
 }
 
 // lanetOverlayGater is the final guard against old peers reintroducing overlay

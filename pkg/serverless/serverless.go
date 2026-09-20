@@ -780,7 +780,7 @@ func (d *Discovery) FindPeer(ctx context.Context, peerID string) (peer.AddrInfo,
 		return peer.AddrInfo{}, fmt.Errorf("私有 DHT 未就绪")
 	}
 	// 先看 peerstore 是否已有可用地址（此前连过、或对端主动握手留下）。
-	if addrs := p2pkit.FilterUnderlayAddrs(d.host.Peerstore().Addrs(id)); len(addrs) > 0 {
+	if addrs := p2pkit.CleanUnderlayAddrs(d.host.Peerstore().Addrs(id)); len(addrs) > 0 {
 		return peer.AddrInfo{ID: id, Addrs: addrs}, nil
 	}
 	findCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -789,7 +789,7 @@ func (d *Discovery) FindPeer(ctx context.Context, peerID string) (peer.AddrInfo,
 	if err != nil {
 		return peer.AddrInfo{}, err
 	}
-	pi.Addrs = p2pkit.FilterUnderlayAddrs(pi.Addrs)
+	pi.Addrs = p2pkit.CleanUnderlayAddrs(pi.Addrs)
 	if len(pi.Addrs) == 0 {
 		return peer.AddrInfo{}, fmt.Errorf("查到节点 %s 但无可用地址", shortID(peerID))
 	}
@@ -803,7 +803,7 @@ func (d *Discovery) RequestConnect(ctx context.Context, ai peer.AddrInfo) (strin
 	if ai.ID == d.host.ID() {
 		return "", fmt.Errorf("这就是本机节点 ID，无需连接")
 	}
-	addrs := p2pkit.FilterUnderlayAddrs(ai.Addrs)
+	addrs := p2pkit.CleanUnderlayAddrs(ai.Addrs)
 	if len(addrs) > 0 {
 		d.host.Peerstore().AddAddrs(ai.ID, addrs, peerstore.PermanentAddrTTL)
 	}
@@ -1127,11 +1127,15 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 	// TUN 地址只能承载 overlay 流量，不能作为承载 libp2p 的 underlay 地址。
 	// 旧节点可能已把 10.7/16 通告进 DHT；接收侧也必须过滤并清理 peerstore，
 	// 否则拨号隧道时会再次进入同一隧道，形成递归拨号和队列堆积。
-	addrs = p2pkit.FilterUnderlayAddrs(addrs)
-	for _, addr := range d.host.Peerstore().Addrs(id) {
-		if p2pkit.IsLanetOverlayAddr(addr) {
-			d.host.Peerstore().SetAddr(id, addr, 0)
-		}
+	// 清洗 + 收敛：剔除 overlay / 回环 / 链路本地 / circuit，并把同一对端的
+	// 地址折叠到每条链路 + 传输一条（详见 p2pkit.CleanUnderlayAddrs）。
+	// 不做这一步，一台装了 WSL/VMware 的对端就能让本机每次连接都并发拨号
+	// 上百次——实测单个节点地址簿曾达 110 条、全库 404 条。
+	addrs = p2pkit.CleanUnderlayAddrs(addrs)
+	// 同轮顺手清掉 peerstore 里已不合规的存量地址：peerstore 带 1h TTL，但
+	// 发现循环每轮都会重写，等价于永不过期，指望它自然收敛是等不到的。
+	if n := p2pkit.PrunePeerstoreAddrs(d.host.Peerstore(), id); n > 0 {
+		d.logf("清理节点 %s 的 %d 条不可达地址（回环/链路本地/circuit）", id.ShortString(), n)
 	}
 
 	// 审批门：陌生节点不进成员表、不建连（完全隔离）。
@@ -1346,7 +1350,7 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	// 本机成员表却始终为空」的假象。
 	var addrs []ma.Multiaddr
 	if conn := s.Conn(); conn != nil {
-		addrs = p2pkit.FilterUnderlayAddrs([]ma.Multiaddr{conn.RemoteMultiaddr()})
+		addrs = p2pkit.CleanUnderlayAddrs([]ma.Multiaddr{conn.RemoteMultiaddr()})
 	}
 	d.mu.Lock()
 	m, ok := d.members[remote.String()]
@@ -1383,6 +1387,9 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	if len(addrs) > 0 {
 		d.host.Peerstore().AddAddrs(remote, addrs, time.Hour)
 	}
+	// 入向握手同样顺手清一遍存量脏地址（老版本对端仍会写入回环/链路本地/
+	// circuit，见 p2pkit.PrunePeerstoreAddrs）。
+	p2pkit.PrunePeerstoreAddrs(d.host.Peerstore(), remote)
 	if d.dhtPrivate != nil {
 		_, _ = d.dhtPrivate.RoutingTable().TryAddPeer(remote, false, false)
 	}

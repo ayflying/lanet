@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -429,10 +430,19 @@ func runNode(parent context.Context, serviceMode bool) {
 	go node.Run(ctx)
 
 	// 周期探测：向成员表内所有其他成员发起 echo 往返。
+	//
+	// probe 同时承担两个职责：① 连通性可见（控制台在线状态与 RTT）；
+	// ② P2P 连接保温——间隔过长时 libp2p 连接会被空闲回收，TUN 数据面
+	// 每包都要重拨。因此**成功路径不引入任何延迟**，只有连续失败的成员
+	// 才退避（它们本来就没有连接需要保温）。
+	//
+	// 退避的必要性：地址簿被污染时，每个失败的成员每轮都要在几十条不可达
+	// 地址上并发拨号，稳态下数千个拨号 goroutine 挂着，内存被撑到 1G。
 	lastMembers := ""
 	ticker := time.NewTicker(effProbe)
 	defer ticker.Stop()
 	first := time.After(5 * time.Second)
+	backoff := newProbeBackoff()
 	for {
 		select {
 		case <-ctx.Done():
@@ -448,11 +458,90 @@ func runNode(parent context.Context, serviceMode bool) {
 			lastMembers = sig
 		}
 		self := node.Info().VirtualIP
+		now := time.Now()
 		for _, m := range members {
 			if !shouldProbe(self, m) {
 				continue
 			}
-			probeOnce(ctx, node, m.Name, m.VirtualIP)
+			if !backoff.due(m.VirtualIP, now) {
+				continue
+			}
+			backoff.record(m.VirtualIP, probeOnce(ctx, node, m.Name, m.VirtualIP), effProbe)
+		}
+		// 成员表里已消失的目标不再保留退避状态，避免 map 随成员更替增长。
+		backoff.retain(members)
+	}
+}
+
+// probeBackoffMax 连续失败成员的探测间隔上限。
+//
+// 取 60s 而非更长：probe 兼作连接保温，上限过高会让「其实已恢复、只是
+// 探测连续失败」的成员久久不被重新纳入探测。
+const probeBackoffMax = 60 * time.Second
+
+// probeBackoff 记录每个成员的探测退避状态（按虚拟 IP 归档——它是成员在
+// 本网络里的稳定身份，换连接也不变）。
+//
+// 规则：连续失败 n 次的成员，下次探测延迟为 base × 2^(n-1)，上限
+// probeBackoffMax。**第 1 次失败不延迟**：单次失败常是瞬时抖动，而 probe
+// 还承担保温职责，不该因一次抖动就打乱已连通成员的探测节奏。
+type probeBackoff struct {
+	mu     sync.Mutex
+	fails  map[string]int
+	nextAt map[string]time.Time
+}
+
+func newProbeBackoff() *probeBackoff {
+	return &probeBackoff{fails: make(map[string]int), nextAt: make(map[string]time.Time)}
+}
+
+// due 报告目标当前是否到达可探测时间（无记录即视为到期）。
+func (b *probeBackoff) due(key string, now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	at, ok := b.nextAt[key]
+	return !ok || !now.Before(at)
+}
+
+// record 记录一次探测结果：成功立即清零，失败推进退避窗口。
+func (b *probeBackoff) record(key string, ok bool, base time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ok {
+		delete(b.fails, key)
+		delete(b.nextAt, key)
+		return
+	}
+	n := b.fails[key] + 1
+	b.fails[key] = n
+	if n < 2 {
+		return // 首次失败不延迟，下一轮照常探测
+	}
+	delay := base << (n - 1)
+	if delay <= 0 || delay > probeBackoffMax {
+		delay = probeBackoffMax
+	}
+	b.nextAt[key] = time.Now().Add(delay)
+}
+
+// retain 丢弃已不在成员表里的目标的退避状态。
+func (b *probeBackoff) retain(members []netmapclient.Member) {
+	alive := make(map[string]bool, len(members))
+	for _, m := range members {
+		if m.VirtualIP != "" {
+			alive[m.VirtualIP] = true
+		}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for k := range b.fails {
+		if !alive[k] {
+			delete(b.fails, k)
+		}
+	}
+	for k := range b.nextAt {
+		if !alive[k] {
+			delete(b.nextAt, k)
 		}
 	}
 }
@@ -475,8 +564,8 @@ func shouldProbe(selfIP string, m netmapclient.Member) bool {
 	return true
 }
 
-// probeOnce 对单个成员做一次 echo 往返探测。
-func probeOnce(ctx context.Context, node *lanet.Client, name, virtualIP string) {
+// probeOnce 对单个成员做一次 echo 往返探测，返回是否成功（失败驱动退避）。
+func probeOnce(ctx context.Context, node *lanet.Client, name, virtualIP string) bool {
 	start := time.Now()
 	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -489,13 +578,13 @@ func probeOnce(ctx context.Context, node *lanet.Client, name, virtualIP string) 
 	stream, viaRelay, err := node.DialProtocols(pctx, virtualIP, protos)
 	if err != nil {
 		log.Printf("[probe] FAIL %s(%s): %v", name, virtualIP, err)
-		return
+		return false
 	}
 	defer stream.Close()
 	payload := fmt.Sprintf("probe-%d", start.UnixMilli())
 	if _, err = stream.Write([]byte(payload)); err != nil {
 		log.Printf("[probe] FAIL %s(%s): write: %v", name, virtualIP, err)
-		return
+		return false
 	}
 	_ = stream.CloseWrite()
 	buf := make([]byte, 4096)
@@ -506,9 +595,10 @@ func probeOnce(ctx context.Context, node *lanet.Client, name, virtualIP string) 
 	}
 	if err != nil || string(buf[:n]) != payload {
 		log.Printf("[probe] FAIL %s(%s): 回显不匹配 (n=%d err=%v)", name, virtualIP, n, err)
-		return
+		return false
 	}
 	log.Printf("[probe] OK %s(%s) via=%s rtt=%s", name, virtualIP, via, time.Since(start).Round(time.Millisecond))
+	return true
 }
 
 // readAll 读完直到 EOF 或缓冲满。
@@ -772,12 +862,22 @@ func loadNodeConfig(path string) (*nodeConfig, bool) {
 	return nc, true
 }
 
-// defaultNodeConfig 开箱即用默认值：主机名作为节点名、无引导（私有 DHT +
-// mDNS，不接触公共 DHT）、控制台全开。
+// defaultNodeConfig 开箱即用默认值：节点名、无引导（私有 DHT + mDNS，
+// 不接触公共 DHT）、控制台全开。
+//
+// 节点名优先取环境变量 LANET_NAME（容器编排里显式指定的名字），否则退回主机名。
+// 容器里 os.Hostname() 通常是容器短 ID（12 位十六进制，如 52b57e329f43），既没
+// 可读性，又会与运行时生效名（被 LANET_NAME / -name 覆盖）不一致——表现为控制台
+// 页眉显示 fnos、节点配置页却显示 52b57e329f43。有 LANET_NAME 时直接以它落盘，
+// 文件值与生效值从第一次启动就一致。
 func defaultNodeConfig() *nodeConfig {
-	name, err := os.Hostname()
-	if err != nil || name == "" {
-		name = "node"
+	name := strings.TrimSpace(os.Getenv("LANET_NAME"))
+	if name == "" {
+		if h, err := os.Hostname(); err == nil && h != "" {
+			name = h
+		} else {
+			name = "node"
+		}
 	}
 	return &nodeConfig{
 		Name: name,
@@ -882,6 +982,11 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 			writeJSONLocal(w, http.StatusOK, map[string]any{
 				"config_path": path,
 				"name":        nc.Name,
+				// name_env 标记当前进程的节点名来自环境变量 LANET_NAME（容器编排
+				// 常见，优先级高于配置文件）：此时文件里的 name 往往是首次启动
+				// 写入的容器主机名（容器短 ID），与生效名不一致。前端据此把名称
+				// 输入框回填为实际生效值并说明来源，避免页眉与配置页各显示一个名字。
+				"name_env":    os.Getenv("LANET_NAME") != "",
 				"network_key": nc.NetworkKey,
 				// network_key_env 标记当前进程的网络密钥来自环境变量
 				// LANET_NETWORK_KEY（容器编排常见）：lanet.json 里可能没有该值，

@@ -52,10 +52,23 @@ func (c *Client) openPeersDB(ctx context.Context) (*peersdb.DB, error) {
 	if n, err := db.PruneSelf(ctx, c.peerID); err == nil && n > 0 {
 		c.logf("地址簿自愈：清理了 %d 条指向本机自己的残留记录", n)
 	}
+	// 自愈：按「可达判据」清掉结构上永远拨不通的地址（回环 / 链路本地 /
+	// overlay / circuit）。写入侧过滤只管新增，存量得靠这一遍——老版本对端
+	// 每轮都会把这类地址重新通告进来（见 peersdb.PruneUnreachableAddrs）。
+	if n, err := db.PruneUnreachableAddrs(ctx); err != nil {
+		c.logf("地址簿自愈：清理不可达地址失败: %v", err)
+	} else if n > 0 {
+		c.logf("地址簿自愈：清理了 %d 条不可达的节点地址（回环/链路本地/overlay/circuit）", n)
+	}
 	// 自愈：修剪每个节点累积的过期地址（地址簿只增不减，单个节点攒到几十条
 	// 无用地址后每次连接都要逐条试，见 peersdb.PrunePeerAddrs 注释）。放在
 	// 预热之前，让预热拿到的是修剪后的高价值地址。
-	if n, err := db.PrunePeerAddrs(ctx, 0); err == nil && n > 0 {
+	if n, err := db.PrunePeerAddrs(ctx, 0); err != nil {
+		// ⚠️ 这里曾经静默吞错（`err == nil && n > 0`），于是「SQL 少一个右括号、
+		// 修剪从未成功」这个缺陷被掩盖了几个月：单节点地址簿涨到 110 条，
+		// 每次 probe 都在上百条不可达地址上并发拨号。错误必须可见。
+		c.logf("地址簿自愈：修剪节点地址失败: %v", err)
+	} else if n > 0 {
 		c.logf("地址簿自愈：清理了 %d 条失效的节点地址（每节点保留最近可用的若干条）", n)
 	}
 	known, _ := db.ListPeers(ctx, false)
@@ -67,6 +80,11 @@ func (c *Client) openPeersDB(ctx context.Context) (*peersdb.DB, error) {
 	// 设备名对账：成员表里的名字是内存态，重启或对端长期离线后就没了。定期
 	// 落进本地库，列表在离线时也能显示「这是谁」；对端改名后本地跟随更新。
 	c.startNameSync(ctx, db)
+	// 种子表接线：入网就绪后启用「群内 / 全域」两域种子交换，并启动纯本地的种子
+	// 自举与新鲜度核对。与预热一样异步、有界、一次性，不阻塞启动。
+	// db 用入参而非 c.peers：此刻调用方尚未赋值 c.peers（返回后才赋）。
+	c.startSeedWiring(ctx, db)
+	c.startSeedVerifier(ctx, db)
 	return db, nil
 }
 

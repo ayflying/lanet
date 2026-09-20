@@ -15,9 +15,10 @@ func TestFilterUnderlayAddrsRemovesLanetOverlay(t *testing.T) {
 		ma.StringCast("/ip4/10.8.9.215/udp/4001/quic-v1"),
 	}
 	got := FilterUnderlayAddrs(input)
+	// ::1 同样被剔除：回环地址只有对端自己可达，播报它只会让对端白拨一条
+	//（见 isDialableUnderlay）。
 	want := []string{
 		"/ip4/192.168.50.217/tcp/4001",
-		"/ip6/::1/tcp/4001",
 		"/ip4/10.8.9.215/udp/4001/quic-v1",
 	}
 	if len(got) != len(want) {

@@ -31,10 +31,22 @@ ON CONFLICT(peer_id) DO UPDATE SET
 		p.PeerID, p.Name, now, now, p.LastIP, boolInt(p.Manually)); err != nil {
 		return fmt.Errorf("peersdb: upsert peer %s: %w", p.PeerID, err)
 	}
+	added := 0
 	for _, a := range FilterDialableAddrs(NormalizeAddrs(addrs)) {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO peer_addrs (peer_id, addr) VALUES (?, ?)`, p.PeerID, a); err != nil {
+		res, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO peer_addrs (peer_id, addr) VALUES (?, ?)`, p.PeerID, a)
+		if err != nil {
 			return fmt.Errorf("peersdb: upsert addr: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			added++
+		}
+	}
+	// 有新增才修剪：地址簿是只增不减的，运行期也必须收敛，否则单个节点
+	// 会一直涨（实测某节点攒到 110 条，每次连接都要逐条试）。
+	if added > 0 {
+		if err := prunePeerAddrsTx(ctx, tx, p.PeerID, prunePeerAddrsKeep); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()
@@ -144,7 +156,12 @@ func (d *DB) NoteDialResult(ctx context.Context, peerID, addr string, ok bool) e
 		return nil
 	}
 	if !ok {
-		// 失败不改动计数，仅确保记录存在（保留历史便于排查）。
+		// 失败不改动计数，仅确保记录存在（保留历史便于排查）。但结构性不可达
+		// 的地址连记录都不该留：它们永远拨不通，留着只会让每次「按 ID 连接」
+		// 多试一条。此处是与 UpsertPeer 对齐的写入侧闸门。
+		if !isStructurallyDialable(addr) {
+			return nil
+		}
 		_, err := d.db.ExecContext(ctx,
 			`INSERT OR IGNORE INTO peer_addrs (peer_id, addr) VALUES (?, ?)`, peerID, addr)
 		return err
@@ -585,6 +602,11 @@ func FilterDialableAddrs(in []string) []string {
 // isStructurallyDialable 判断单个地址文本是否值得尝试拨号（无 IP 段者一律保留，
 // 交给拨号侧解析，如 /dns4/…）。
 func isStructurallyDialable(addr string) bool {
+	// circuit 是中继路径，临时且随中继预约变化，会被对端每轮重新通告——
+	// 持久化它只会让地址簿越攒越多（实测 404 条里有 130 条是 circuit 变体）。
+	if strings.Contains(addr, "/p2p-circuit") {
+		return false
+	}
 	ip, ok := addrIP(addr)
 	if !ok {
 		return true
@@ -640,12 +662,87 @@ DELETE FROM peer_addrs WHERE rowid IN (
 			PARTITION BY peer_id
 			ORDER BY ok_count DESC, (last_ok IS NULL), last_ok DESC, rowid DESC) AS rn
 		FROM peer_addrs
-	) WHERE rn > ?`, keep)
+	) WHERE rn > ?
+)`, keep)
 	if err != nil {
 		return 0, fmt.Errorf("peersdb: prune peer addrs: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
+}
+
+// prunePeerAddrsTx 事务内修剪单个节点的地址条数（保留排序口径同 PrunePeerAddrs）。
+func prunePeerAddrsTx(ctx context.Context, tx *sql.Tx, peerID string, keep int) error {
+	if keep <= 0 {
+		keep = prunePeerAddrsKeep
+	}
+	_, err := tx.ExecContext(ctx, `
+DELETE FROM peer_addrs WHERE rowid IN (
+	SELECT rowid FROM (
+		SELECT rowid, ROW_NUMBER() OVER (
+			PARTITION BY peer_id
+			ORDER BY ok_count DESC, (last_ok IS NULL), last_ok DESC, rowid DESC) AS rn
+		FROM peer_addrs WHERE peer_id = ?
+	) WHERE rn > ?
+)`, peerID, keep)
+	if err != nil {
+		return fmt.Errorf("peersdb: prune peer %s addrs: %w", peerID, err)
+	}
+	return nil
+}
+
+// PruneUnreachableAddrs 删除地址簿里所有「结构上不可达」的地址（回环 /
+// 链路本地 / 未指定 / overlay / circuit），返回删除条数。幂等，可每次开库调用。
+//
+// 与 PrunePeerAddrs 的分工：后者按「数量」收敛，本函数按「判据」收敛。
+// 写入侧过滤只管新增，历史积累的脏地址必须靠这一遍清掉——真机实测某节点
+// 地址簿 404 条里有 169 条是回环/链路本地、130 条是 circuit，全是老版本
+// 对端通告进来的。
+func (d *DB) PruneUnreachableAddrs(ctx context.Context) (int64, error) {
+	rows, err := d.db.QueryContext(ctx, `SELECT rowid, addr FROM peer_addrs`)
+	if err != nil {
+		return 0, fmt.Errorf("peersdb: scan addrs: %w", err)
+	}
+	var stale []any
+	for rows.Next() {
+		var (
+			rowid int64
+			addr  string
+		)
+		if err := rows.Scan(&rowid, &addr); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("peersdb: scan addrs: %w", err)
+		}
+		if !isStructurallyDialable(addr) {
+			stale = append(stale, rowid)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("peersdb: scan addrs: %w", err)
+	}
+	rows.Close()
+	if len(stale) == 0 {
+		return 0, nil
+	}
+	var removed int64
+	const chunkSize = 400 // 低于 SQLite 默认变量上限（999），留足余量
+	for start := 0; start < len(stale); start += chunkSize {
+		end := start + chunkSize
+		if end > len(stale) {
+			end = len(stale)
+		}
+		chunk := stale[start:end]
+		placeholders := strings.Repeat("?,", len(chunk)-1) + "?"
+		res, err := d.db.ExecContext(ctx,
+			`DELETE FROM peer_addrs WHERE rowid IN (`+placeholders+`)`, chunk...)
+		if err != nil {
+			return removed, fmt.Errorf("peersdb: prune unreachable addrs: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		removed += n
+	}
+	return removed, nil
 }
 
 // =================================================================================
