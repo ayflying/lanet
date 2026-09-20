@@ -9,6 +9,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"sync"
 )
@@ -28,6 +29,8 @@ type rotatingFile struct {
 	maxBackups int
 	f          *os.File
 	size       int64
+	warn       func(string)        // 轮转出错时的告警回调；nil 时静默
+	renameHook func(string, string) error // 测试可注入改名失败；nil 时用 os.Rename
 }
 
 // newRotatingFile 打开（或创建）日志文件；若当前文件已超过阈值，
@@ -47,6 +50,9 @@ func newRotatingFile(path string, maxSize int64, maxBackups int) (*rotatingFile,
 		maxBackups: maxBackups,
 		f:          f,
 		size:       size,
+	}
+	if r.warn == nil {
+		r.warn = func(s string) { log.Print(s) }
 	}
 	// 上次退出时可能已超限（或历史遗留的巨型日志）：先轮转再写。
 	if r.size >= r.maxSize {
@@ -83,8 +89,30 @@ func (r *rotatingFile) Close() error {
 	return err
 }
 
+// warnf 触发轮转告警（回调为 nil 时静默）。
+func (r *rotatingFile) warnf(format string, args ...interface{}) {
+	if r.warn != nil {
+		r.warn(fmt.Sprintf(format, args...))
+	}
+}
+
+// doRename 执行「当前日志 → .1」改名；测试可注入失败以验证失败回退路径。
+func (r *rotatingFile) doRename(old, new string) error {
+	if r.renameHook != nil {
+		return r.renameHook(old, new)
+	}
+	return os.Rename(old, new)
+}
+
 // rotateLocked 执行一次轮转，调用方须持锁。
+//
+// 失败安全原则（长期运行审计 item 7）：任何一步失败都「绝不截断仍在用的日志」。
+//   - 改名失败（磁盘满/权限/被占用）：以追加方式重新打开原路径继续写，旧日志不丢；
+//   - 改名成功但重建新文件失败（极少）：退回以追加方式复用已改名的 .1，旧日志仍在；
+//   - 仅当两步都失败时才返回错误，此时 r.f 为 nil，后续 Write 会报 ErrClosed
+//     而非静默丢日志。
 func (r *rotatingFile) rotateLocked() error {
+	// 改名前必须先关闭当前句柄（Windows 下被占用则无法改名）。
 	if r.f != nil {
 		_ = r.f.Close()
 		r.f = nil
@@ -98,11 +126,32 @@ func (r *rotatingFile) rotateLocked() error {
 			_ = os.Rename(src, dst)
 		}
 	}
-	_ = os.Rename(r.path, r.path+".1")
-
+	if err := r.doRename(r.path, r.path+".1"); err != nil {
+		// 改名失败：不截断原日志，退回追加写原文件，保证日志不丢。
+		r.warnf("logrotate: 轮转改名失败（%v），继续写入当前文件", err)
+		reopen, oerr := os.OpenFile(r.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if oerr != nil {
+			return fmt.Errorf("logrotate: 改名失败且无法回退打开原文件: %w", err)
+		}
+		if st, serr := reopen.Stat(); serr == nil {
+			r.size = st.Size()
+		}
+		r.f = reopen
+		return nil
+	}
 	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		// 改名已成功但重建新文件失败（极少）：退回以追加方式复用 .1（含全部旧日志）。
+		r.warnf("logrotate: 轮转重建新文件失败（%v），继续写入备份 .1", err)
+		alt, aerr := os.OpenFile(r.path+".1", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if aerr != nil {
+			return fmt.Errorf("logrotate: 重建新文件失败且无可用句柄: %w", err)
+		}
+		if st, serr := alt.Stat(); serr == nil {
+			r.size = st.Size()
+		}
+		r.f = alt
+		return nil
 	}
 	r.f = f
 	r.size = 0

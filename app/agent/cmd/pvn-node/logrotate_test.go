@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,5 +135,49 @@ func TestRotatingFileRotatesOversizedExistingFile(t *testing.T) {
 	}
 	if st.Size() != 0 {
 		t.Fatalf("轮转后当前文件应为空，实际 %d 字节", st.Size())
+	}
+}
+
+// 改名失败（磁盘满/目标被占用）时不得截断原日志，且仍能继续追加写入（审计 item 7）。
+// 用注入的改名失败钩子稳定触发失败路径（Windows 下 os.Rename 到已存在目录会改为移入
+// 目录而非报错，无法直接用它制造失败）。
+func TestRotatingFileKeepsWritingOnRenameFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lanet.log")
+	if err := os.WriteFile(path, []byte("old-log-line\n"), 0o600); err != nil {
+		t.Fatalf("预置日志: %v", err)
+	}
+
+	var warned int
+	r, err := newRotatingFile(path, 16, 3)
+	if err != nil {
+		t.Fatalf("newRotatingFile: %v", err)
+	}
+	r.warn = func(string) { warned++ }
+	// 注入改名失败：模拟磁盘满/权限/被占用导致 os.Rename 失败。
+	r.renameHook = func(string, string) error { return fmt.Errorf("injected rename failure") }
+	defer r.Close()
+
+	// 触发轮转：现有 12B + 新内容 > 16B 阈值。
+	if _, err := r.Write([]byte("new-big-entry-that-exceeds-threshold\n")); err != nil {
+		t.Fatalf("改名失败后写入应成功: %v", err)
+	}
+
+	// 原日志不得被截断：旧内容仍在，新内容已追加。
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读当前日志: %v", err)
+	}
+	if !strings.Contains(string(got), "old-log-line") {
+		t.Fatalf("原日志被截断，旧内容丢失: %q", string(got))
+	}
+	if !strings.Contains(string(got), "new-big-entry") {
+		t.Fatalf("新内容未写入: %q", string(got))
+	}
+	if _, stErr := os.Stat(path + ".1"); stErr == nil {
+		t.Fatal("改名失败不应产生 .1 备份文件")
+	}
+	if warned == 0 {
+		t.Fatal("改名失败未触发告警")
 	}
 }

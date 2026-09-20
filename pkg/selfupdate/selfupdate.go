@@ -219,6 +219,11 @@ type Config struct {
 	// 默认 5 分钟。与 PerPeerMinInterval（清单征询）分开计数——一次正常
 	// 升级需要「1 次征询 + 1 次下载」，合算会把升级链自己掐死。
 	FileDownloadCooldown time.Duration
+	// StreamIOTimeout 入向分发 handler 的读写截止时间，默认 10 分钟。防止对端
+	// 建流后不发完整请求/不消费响应而长期占用协程与连接（长期运行审计 item 8：
+	// handler 此前无任何 SetDeadline，慢连接会一直挂着）。该值较宽松以容纳数十
+	// MB 文件在慢链上的正常传输，只有异常挂死才会触发；0 表示沿用调用方超时。
+	StreamIOTimeout time.Duration
 	// UpdateInFlight 宿主的更新锁查询：返回 true 表示「已有一轮更新在途」
 	// （已下载校验完成、等待重启；或 GitHub 在线更新正在执行）。巡检每轮
 	// 开头先查这一门：更新一旦启动就锁到进程重启为止，期间即便又发现更高
@@ -259,6 +264,12 @@ func (c *Config) fillDefaults() {
 	}
 	if c.FileDownloadCooldown <= 0 {
 		c.FileDownloadCooldown = 5 * time.Minute
+	}
+	if c.StreamIOTimeout < 0 {
+		c.StreamIOTimeout = 0
+	}
+	if c.StreamIOTimeout == 0 {
+		c.StreamIOTimeout = 10 * time.Minute
 	}
 }
 
@@ -313,20 +324,19 @@ func New(h host.Host, src PeerSource, cfg Config, onUpdate func(path string, m M
 		c.protoFile = ProtocolFile
 	}
 	c.self = c.loadSelfManifest()
-	// 固定 ID 谁都能协商 → 一律过限流器（主 ID 本身就是固定 ID 时同样如此）。
-	gateFixed := func(id libprotocol.ID, bucket string, h func(network.Stream)) func(network.Stream) {
-		if id == ProtocolManifest || id == ProtocolFile {
-			return c.gateRate(bucket, h)
-		}
-		return h
+	// 0.5.49 起更新分发对整个私有 DHT 网络开放（不再要求同群/好友），防滥用
+	// 手段从「协议隔离 + 好友门」换成分发限流（gateRate：单对端最小间隔 +
+	// 全局并发上限）。无论主 ID 是派生群 ID 还是历史固定 ID，入向一律过限流器——
+	// 旧实现只对固定 ID 包 gateRate，导致派生群协议 handler 直接裸注册，等于把
+	// 群协议重新敞开成免费 CDN（长期运行审计 item 8）。这里统一包一层，固定 ID
+	// 在 derived 模式下再单独注册一次（不同协议 ID，不会双重限流）。
+	gate := func(bucket string, h func(network.Stream)) func(network.Stream) {
+		return c.gateRate(bucket, h)
 	}
-	h.SetStreamHandler(c.protoManifest, gateFixed(c.protoManifest, bucketManifest, c.handleManifest))
-	h.SetStreamHandler(c.protoFile, gateFixed(c.protoFile, bucketFile, c.handleFile))
+	h.SetStreamHandler(c.protoManifest, gate(bucketManifest, c.handleManifest))
+	h.SetStreamHandler(c.protoFile, gate(bucketFile, c.handleFile))
 	if derived {
-		// 全域兼容入口（0.5.49）：更新分发不再要求「同群 + 好友」——用户要的
-		// 是整个私有 DHT 网络内任何节点发现新版本都能互传，所以固定 ID 对
-		// 所有 lanet 节点开放。旧的 gateMember（IsMember=是否好友）因此换成
-		// gateRate：单对端最小间隔 + 全局并发上限，挡的是流量放大，而不是人。
+		// 全域兼容入口：固定 ID 对全网开放，保证老版本/异群节点也能拉到更新。
 		h.SetStreamHandler(ProtocolManifest, c.gateRate(bucketManifest, c.handleManifest))
 		h.SetStreamHandler(ProtocolFile, c.gateRate(bucketFile, c.handleFile))
 	}
@@ -675,10 +685,22 @@ func (c *Coordinator) gateRate(bucket string, next func(network.Stream)) func(ne
 	}
 }
 
+// streamDeadline 给入向分发流设置读写截止时间，避免对端建流后不发完整请求/
+// 不消费响应而长期占用协程（审计 item 8）。未配置（<=0）则不设，沿用调用方超时。
+func (c *Coordinator) streamDeadline(s network.Stream) {
+	if c.cfg.StreamIOTimeout <= 0 {
+		return
+	}
+	d := time.Now().Add(c.cfg.StreamIOTimeout)
+	_ = s.SetReadDeadline(d)
+	_ = s.SetWriteDeadline(d)
+}
+
 // handleManifest 响应版本清单征询：无有效凭证则静默关闭。
 // 顺序与 info 协议一致：先读完请求（对端 CloseWrite 后 EOF）再回写。
 func (c *Coordinator) handleManifest(s network.Stream) {
 	defer s.Close()
+	c.streamDeadline(s)
 	var req struct {
 		Current string `json:"current"`
 	}
@@ -703,6 +725,7 @@ type fileReq struct {
 // handleFile 响应文件分发：帧格式 = [4 字节大端 JSON head 长度][head JSON][裸文件字节]。
 func (c *Coordinator) handleFile(s network.Stream) {
 	defer s.Close()
+	c.streamDeadline(s)
 	var req fileReq
 	if err := json.NewDecoder(s).Decode(&req); err != nil {
 		return

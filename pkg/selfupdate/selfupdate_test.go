@@ -246,3 +246,76 @@ func TestP2PFileTransfer(t *testing.T) {
 		t.Fatal("伪造 sha256 的下载请求不应成功")
 	}
 }
+
+// TestDerivedProtocolRateLimited 验证按 GroupKey 派生的群协议 handler 同样走
+// gateRate 限流，不再裸注册（审计 item 8：旧实现派生协议因 gateFixed 直接 return h
+// 而被绕过，等于把群协议重新敞开成免费 CDN）。
+//
+// 双侧都带相同 GroupKey，请求方以派生 ID 为首选协议；提供方把限流间隔压到 1 小时，
+// 第二次同对端征询应被 handler 上的 gateRate 拦下（Reset）。若派生协议未过限流，
+// 第二次征询会成功——这正是旧实现的回归。
+func TestDerivedProtocolRateLimited(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	pubB64 := base64.StdEncoding.EncodeToString(pub)
+
+	bin := make([]byte, 16*1024)
+	_, _ = rand.Read(bin)
+	sum := sha256.Sum256(bin)
+	shaHex := hex.EncodeToString(sum[:])
+	dir := t.TempDir()
+	srcExe := filepath.Join(dir, "lanet-new.exe")
+	if err := os.WriteFile(srcExe, bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := Manifest{Version: "9.9.9", Platform: "windows/amd64", Size: int64(len(bin)), SHA256: shaHex}
+	if err := SignManifest(priv, &m); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(dir, "update-manifest.json")
+	if err := saveManifest(manifestPath, m); err != nil {
+		t.Fatal(err)
+	}
+
+	gk := []byte("group-secret-key")
+	hProvider := newTestHost(t)
+	cProvider := New(hProvider, staticPeers{}, Config{
+		CurrentVersion:      "9.9.9",
+		Platform:            "windows/amd64",
+		ExePath:             srcExe,
+		ManifestPath:        manifestPath,
+		PublicKey:           pubB64,
+		CheckInterval:       time.Hour, // 不触发自动巡检
+		Quiet:               true,
+		GroupKey:            gk,
+		PerPeerMinInterval:  time.Hour, // 把同对端间隔压到极大，凸显限流
+		FileDownloadCooldown: time.Hour,
+	}, nil)
+	if _, ok := cProvider.SelfManifest(); !ok {
+		t.Fatal("提供方 head 加载失败")
+	}
+
+	hRequester := newTestHost(t)
+	cRequester := New(hRequester, staticPeers{}, Config{
+		CurrentVersion: "0.1.0",
+		Platform:       "windows/amd64",
+		ExePath:        filepath.Join(dir, "lanet-old.exe"),
+		PublicKey:      pubB64,
+		Quiet:          true,
+		GroupKey:       gk, // 请求方也用派生 ID 作为首选协议
+	}, nil)
+	if err := hRequester.Connect(context.Background(), peer.AddrInfo{ID: hProvider.ID(), Addrs: hProvider.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// 首次征询（派生群协议）应成功。
+	if _, err := cRequester.requestManifest(ctx, hProvider.ID().String()); err != nil {
+		t.Fatalf("首次派生协议征询失败: %v", err)
+	}
+	// 立即第二次：同对端、间隔 < PerPeerMinInterval(1h)，派生协议 handler 也必须
+	// 被 gateRate 拦下。未被限流则通过（这正是要修的回归）。
+	if _, err := cRequester.requestManifest(ctx, hProvider.ID().String()); err == nil {
+		t.Fatal("派生群协议 handler 未被限流：立即第二次征询竟成功")
+	}
+}
