@@ -294,10 +294,13 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		}
 		members = append(members, mv)
 	}
-	// 固定排序：按发现时间倒序（最后发现的成员固定在最上面），与在线状态、
-	// 活跃时间无关——列表顺序在成员增减之外永不跳动。
-	// FirstSeen 为零（控制面 NetMap 无此概念）时按虚拟 IP 兜底，保证稳定。
+	// 排序：在线优先（online 的成员永远排在离线之上），同一在线状态内按
+	// 发现时间倒序（最后发现的靠前），FirstSeen 为零（控制面 NetMap 无此
+	// 概念）时按虚拟 IP 兜底——同状态内的相对次序在成员增减之外不跳动。
 	sort.Slice(members, func(i, j int) bool {
+		if members[i].Online != members[j].Online {
+			return members[i].Online
+		}
 		if members[i].FirstSeen != members[j].FirstSeen && members[i].FirstSeen != 0 && members[j].FirstSeen != 0 {
 			return members[i].FirstSeen > members[j].FirstSeen
 		}
