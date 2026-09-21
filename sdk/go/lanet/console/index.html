@@ -427,16 +427,10 @@
     </div>
     <div class="row" style="margin-top:10px">
       <label style="display:flex;gap:6px;align-items:center">
-        <input type="checkbox" id="cRequireApproval" onchange="saveApproval()"> 需要审批才能连接（默认开启）
+        <input type="checkbox" id="cAutoAccept" onchange="saveApproval()"> 自动同意所有连接申请（默认关闭）
       </label>
     </div>
-    <div class="sub" style="margin:2px 0 0">开启后，陌生节点必须先经你同意（类似加好友）才能互连；同意一次即永久信任，之后自动重连。关闭则相同网络密钥的节点可直接互连。</div>
-    <div class="row" style="margin-top:8px">
-      <label style="display:flex;gap:6px;align-items:center">
-        <input type="checkbox" id="cAutoAccept" onchange="saveApproval()"> 自动同意所有连接申请
-      </label>
-    </div>
-    <div class="sub" style="margin:2px 0 0">供<b>无人值守的中央服务器 / 种子节点</b>使用：开启后陌生节点无需人工审批即可互连。普通客户端不建议开启（等于放弃审批这道安全边界）。</div>
+    <div class="sub" style="margin:2px 0 0">不勾选（默认）：陌生节点必须先经你同意（类似加好友）才能互连，同意一次即永久信任；勾选：无需审核，相同网络密钥的节点直接互连，适合<b>无人值守的中央服务器 / 种子节点</b>。普通客户端不建议开启（等于放弃审批这道安全边界）。</div>
     <div class="row" id="cAutorunRow" style="display:none">
       <label style="display:flex;gap:6px;align-items:center">
         <input type="checkbox" id="cAutorun" onchange="saveAutorun()"> Windows 服务自启（<b>无需登录账号</b>，机器开机后即以 LocalSystem 后台运行；服务模式不显示托盘、不打开浏览器）
@@ -1185,9 +1179,8 @@ async function loadNodeConfig() {
     // 运行中/已退出只影响徽标，不再回写复选框。
     setPublicBox(!!c.enable_public_dht);
     $('cTun').checked = c.tun === undefined ? true : !!c.tun;
-    // 连接审批开关（配置意图，重启生效）：默认开启审批、默认不自动同意。
-    $('cRequireApproval').checked = c.require_approval === undefined ? true : !!c.require_approval;
-    $('cAutoAccept').checked = !!c.auto_accept;
+    // 连接审批开关（配置意图，重启生效）：勾选=免审核自动同意；兼容旧配置 require_approval=false（效果同为免审核）。
+    $('cAutoAccept').checked = !!c.auto_accept || c.require_approval === false;
     if (c.autorun_supported) {
       $('cAutorunRow').style.display = '';
       $('cAutorun').checked = !!c.autorun;
@@ -1224,7 +1217,7 @@ async function saveNodeConfig() {
     enable_public_dht: cfgPublicDHT,
     public_dht_minutes: parseInt($('cPublicMin').value, 10) || 10,
     tun: $('cTun').checked,
-    require_approval: $('cRequireApproval').checked,
+    require_approval: true,
     auto_accept: $('cAutoAccept').checked,
     autorun: $('cAutorunRow').style.display !== 'none' ? $('cAutorun').checked : undefined,
   };
@@ -1257,12 +1250,9 @@ async function saveAutorun() {
 // saveApproval 即时持久化连接审批开关（重启程序后生效）。
 // 与「自动同意」联动：关掉审批时自动同意已无意义，一并取消勾选避免误导。
 async function saveApproval() {
-  if (!$('cRequireApproval').checked && $('cAutoAccept').checked) {
-    $('cAutoAccept').checked = false;
-  }
   const body = {
     partial_approval: true,
-    require_approval: $('cRequireApproval').checked,
+    require_approval: true,
     auto_accept: $('cAutoAccept').checked,
   };
   const r = await fetch('/api/node-config', { method: 'PUT',
