@@ -74,6 +74,70 @@ func TestInfoExchange(t *testing.T) {
 	}
 }
 
+// TestPEXMemberSync 成员地址同步（PEX）：A↔B 直连，C 只连 B。
+// B 的成员表里有 C；A 通过 B 的握手摘要拿到 C 的地址并完成建连——
+// 验证「先恢复的成员把其他成员的地址带给还没恢复的」这条自愈链路。
+func TestPEXMemberSync(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	ha := testHost(t, false)
+	hb := testHost(t, false)
+	hc := testHost(t, false)
+
+	mk := func(h host.Host, name string) *Discovery {
+		d, err := New(ctx, h, Config{
+			NetworkKey: "pex-test", Name: name,
+			Interval:             500 * time.Millisecond,
+			EnablePublicFallback: false,
+		})
+		if err != nil {
+			t.Fatalf("new %s: %v", name, err)
+		}
+		if err = d.Start(ctx); err != nil {
+			t.Fatalf("start %s: %v", name, err)
+		}
+		return d
+	}
+	da := mk(ha, "pex-a")
+	mk(hb, "pex-b")
+	dc := mk(hc, "pex-c")
+
+	// A↔B、B↔C 直连并握手（成员表互相可见）；A↔C 不给任何直接地址。
+	if err := ha.Connect(ctx, peer.AddrInfo{ID: hb.ID(), Addrs: hb.Addrs()}); err != nil {
+		t.Fatalf("connect a-b: %v", err)
+	}
+	if err := hc.Connect(ctx, peer.AddrInfo{ID: hb.ID(), Addrs: hb.Addrs()}); err != nil {
+		t.Fatalf("connect c-b: %v", err)
+	}
+	// 走真实路径 connectAndIdentify：成员表先互见，PEX 摘要才有内容。
+	if err := da.connectAndIdentify(hb.ID()); err != nil {
+		t.Fatalf("a identify b: %v", err)
+	}
+	if err := dc.connectAndIdentify(hb.ID()); err != nil {
+		t.Fatalf("c identify b: %v", err)
+	}
+	// 给 B 一点时间消化 A/C 的握手摘要（异步 goroutine）。
+	time.Sleep(2 * time.Second)
+
+	// B 的摘要应同时含 A 与 C；A 消化后应把 C 纳入成员表。
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		found := false
+		for _, m := range da.Peers() {
+			if m.PeerID == hc.ID().String() {
+				found = true
+				break
+			}
+		}
+		if found {
+			return // A 经 B 的 PEX 拿到了 C
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	t.Fatalf("A 未通过 PEX 获得 C（A 成员表: %v）", da.Peers())
+}
+
 // TestRelayServiceHopReservation 验证「节点即服务端」的 relay service
 // （非专用模式，EnableRelayService 无参）能被其他节点预约。
 func TestRelayServiceHopReservation(t *testing.T) {

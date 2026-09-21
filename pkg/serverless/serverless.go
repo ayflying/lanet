@@ -353,6 +353,10 @@ type Discovery struct {
 	nearbySeen   map[string]time.Time // peerID -> 上次上报时间
 
 	advFailMu    sync.Mutex // DHT 广播失败日志降噪计数（独立锁）
+
+	// pexLast/pexMu 成员地址同步（PEX）的入向消化节流：对端 → 上次消化时刻。
+	pexMu    sync.Mutex
+	pexLast  map[string]time.Time
 	advFailCount int        // 连续「路由表空」失败次数
 
 	// cbMu 保护 onDiscovered 切片：OnDiscovered 追加与 emit 迭代并发时需安全，
@@ -432,6 +436,7 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		cfg:          cfg,
 		groupKey:     GroupKey(cfg.Channel, cfg.NetworkKey), // 空密钥按公共网络处理
 		memberTTL:    cfg.MemberTTL,
+		pexLast:      make(map[string]time.Time),
 		members:      make(map[string]*Member),
 		unfriendedAt: make(map[string]time.Time),
 		trigger:      make(chan struct{}, 1),
@@ -1334,6 +1339,92 @@ func (d *Discovery) connectAndIdentify(id peer.ID) error {
 	return nil
 }
 
+// ---- 成员地址同步（PEX，0.5.58）----
+
+const (
+	// pexMaxMembers 单次握手携带的成员摘要条数上限。
+	pexMaxMembers = 32
+	// pexMaxAddrs 单条摘要携带的地址数上限。
+	pexMaxAddrs = 4
+	// pexMinInterval 同一对端两次 PEX 消化的最小间隔（防握手风暴放大）。
+	// 出向握手本身有发现周期节流，这里主要拦入向侧的重复消化。
+	pexMinInterval = 2 * time.Minute
+)
+
+// pexSnapshot 取本机成员表摘要（按 LastSeen 新鲜度优先，截断到上限）。
+// 地址复用成员表里已清洗的值；不含自己。锁内快照、锁外构造。
+func (d *Discovery) pexSnapshot() []memberHint {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	out := make([]memberHint, 0, len(d.members))
+	for _, m := range d.members {
+		if m.PeerID == "" || len(m.Addrs) == 0 {
+			continue
+		}
+		addrs := m.Addrs
+		if len(addrs) > pexMaxAddrs {
+			addrs = addrs[:pexMaxAddrs]
+		}
+		cp := make([]string, len(addrs))
+		copy(cp, addrs)
+		out = append(out, memberHint{PeerID: m.PeerID, Addrs: cp})
+		if len(out) >= pexMaxMembers {
+			break
+		}
+	}
+	return out
+}
+
+// pexAllow 判断是否消化该对端本轮摘要（冷却已过才消化，但始终回包）。
+// d.pexLast 记录每个对端最近一次消化时刻；同对端 2 分钟内重复摘要不重复消化。
+func (d *Discovery) pexAllow(remote string, now time.Time) bool {
+	d.pexMu.Lock()
+	defer d.pexMu.Unlock()
+	if t, ok := d.pexLast[remote]; ok && now.Sub(t) < pexMinInterval {
+		return false
+	}
+	if len(d.pexLast) > 512 {
+		for k, v := range d.pexLast {
+			if now.Sub(v) > time.Hour {
+				delete(d.pexLast, k)
+			}
+		}
+	}
+	d.pexLast[remote] = now
+	return true
+}
+
+// applyMemberHints 消化对端带来的成员摘要：逐条走 addMember 的完整审批门
+// （信任检查 / unfriend 墓碑 / 地址清洗 / peerstore / 建连确认）。摘要里的
+// 节点若不可信，addMember 会走「附近」上报路径，不会建连——PEX 不产生
+// 任何越权连接。
+func (d *Discovery) applyMemberHints(hints []memberHint) {
+	if len(hints) == 0 {
+		return
+	}
+	applied := 0
+	for _, h := range hints {
+		id, err := peer.Decode(h.PeerID)
+		if err != nil || id == d.host.ID() {
+			continue
+		}
+		addrs := make([]ma.Multiaddr, 0, len(h.Addrs))
+		for _, raw := range h.Addrs {
+			if a, err := ma.NewMultiaddr(raw); err == nil {
+				addrs = append(addrs, a)
+			}
+		}
+		before := len(d.members)
+		d.addMember(id, addrs, "pex")
+		if len(d.members) > before {
+			applied++
+		}
+	}
+	if applied > 0 && !d.cfg.Quiet {
+		d.logf("成员地址同步：从对端摘要新纳入 %d 个成员", applied)
+	}
+}
+
 // infoPayload info 协议载荷。
 // Rejected 非空表示本端拒绝了这次握手（未通过连接审批）——此时其余字段
 // 一律留空，不向对方泄漏任何身份信息，只告知「你还没被同意」。
@@ -1346,6 +1437,18 @@ type infoPayload struct {
 	OSHostname string   `json:"os_hostname,omitempty"` // 操作系统主机名（0.5.15 起）
 	LocalIPs   []string `json:"local_ips,omitempty"`   // 本机非回环网卡 IP（0.5.15 起）
 	Rejected   string   `json:"rejected,omitempty"`    // 非空 = 拒绝原因（连接审批）
+	// Members 成员表摘要（0.5.58 起，成员地址同步 / PEX）：把本机已知
+	// 同群成员的节点 ID 与地址分享给对端，解决「唯一种子一挂全网失联」
+	// ——种子恢复前，先恢复的成员把其他成员的地址带给还没恢复的。
+	// 只含 ID+地址（无名称/主机名等身份细节），接收方仍走完整审批门。
+	Members []memberHint `json:"members,omitempty"`
+}
+
+// memberHint 成员地址同步的单条摘要。Addrs 已按 underlay 清洗（无回环/
+// overlay/circuit），上限 pexMaxMembers 条、每条 pexMaxAddrs 个地址。
+type memberHint struct {
+	PeerID string   `json:"peer_id"`
+	Addrs  []string `json:"addrs,omitempty"`
 }
 
 // rejectionNotApproved 拒绝原因常量（info 协议内传递）。
@@ -1402,6 +1505,11 @@ func (d *Discovery) handleInfo(s network.Stream) {
 			Rejected: rejectionNotApproved,
 		})
 		return
+	}
+	// 成员地址同步（PEX）：消化对端带来的成员摘要（冷却节流内），
+	// 并在回包里带上本机成员表摘要——一次握手双向互换。
+	if len(req.Members) > 0 && d.pexAllow(remote.String(), time.Now()) {
+		go d.applyMemberHints(req.Members)
 	}
 	// 对端主动来握手：同样视为活跃成员，顺带补齐名称与活跃时间
 	// （本端出向 connectAndIdentify 失败时也能从这里拿到名称）。
@@ -1470,6 +1578,7 @@ func (d *Discovery) handleInfo(s network.Stream) {
 		Platform:   d.cfg.Platform,
 		OSHostname: d.cfg.OSHostname,
 		LocalIPs:   d.cfg.LocalIPs,
+		Members:    d.pexSnapshot(),
 	}
 	_ = json.NewEncoder(s).Encode(resp)
 }
@@ -1498,6 +1607,7 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 		Platform:   d.cfg.Platform,
 		OSHostname: d.cfg.OSHostname,
 		LocalIPs:   d.cfg.LocalIPs,
+		Members:    d.pexSnapshot(),
 	}
 	if err = json.NewEncoder(stream).Encode(req); err != nil {
 		return infoPayload{}, err
@@ -1515,6 +1625,10 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 		// 其他解码错误（超限/截断/非法）：Reset 终止，不留下半开流。
 		_ = stream.Reset()
 		return infoPayload{}, err
+	}
+	// 成员地址同步（PEX）：消化对端回包里的成员摘要（冷却节流内）。
+	if len(resp.Members) > 0 && d.pexAllow(id.String(), time.Now()) {
+		go d.applyMemberHints(resp.Members)
 	}
 	return resp, nil
 }
