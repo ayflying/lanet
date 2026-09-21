@@ -224,6 +224,72 @@ func TestDualDHTPrivateDiscovery(t *testing.T) {
 	}
 }
 
+// TestBadBootstrapDoesNotKillStartup 引导地址写错不能拦住节点启动：
+// 非法 multiaddr / 缺 /p2p 节点 ID / 解析不出的 dnsaddr 都只跳过并记日志，
+// 节点照常创建与启动；混合列表中的合法条目仍正常生效（历史上单条写错
+// 会让 New 直接报错、节点起不来，只能手改配置文件恢复）。
+func TestBadBootstrapDoesNotKillStartup(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ha := testHost(t, false)
+	hb := testHost(t, false)
+	goodSeed := ""
+	for _, a := range ha.Addrs() {
+		goodSeed = a.String() + "/p2p/" + ha.ID().String()
+		break
+	}
+
+	// 种子侧同样要有 Discovery 实例（与 TestDualDHTPrivateDiscovery 一致），
+	// 否则入向连接无法完成 info 协议交换、成不了成员。
+	da, err := New(ctx, ha, Config{
+		NetworkKey:           "bad-bootstrap",
+		Name:                 "seed-node",
+		Interval:             500 * time.Millisecond,
+		EnablePublicFallback: false,
+		Quiet:                true,
+	})
+	if err != nil {
+		t.Fatalf("new discovery seed: %v", err)
+	}
+	d, err := New(ctx, hb, Config{
+		NetworkKey:           "bad-bootstrap",
+		Name:                 "bad-bootstrap",
+		Interval:             500 * time.Millisecond,
+		EnablePublicFallback: false,
+		Quiet:                true,
+		Bootstrap: []string{
+			"not-a-multiaddr",                              // 非 multiaddr：跳过
+			"/ip4/127.0.0.1/tcp/1",                         // 缺 /p2p 节点 ID：跳过
+			"/ip4/999.0.0.1/tcp/1/p2p/" + hb.ID().String(), // 非法 IP：跳过
+			goodSeed, // 合法条目：必须仍然生效
+		},
+	})
+	if err != nil {
+		t.Fatalf("非法引导地址不应阻止创建: %v", err)
+	}
+	if err = da.Start(ctx); err != nil {
+		t.Fatalf("start seed: %v", err)
+	}
+	if err = d.Start(ctx); err != nil {
+		t.Fatalf("非法引导地址不应阻止启动: %v", err)
+	}
+	go da.Run(ctx)
+	go d.Run(ctx)
+
+	// 合法种子应照常入网：等 hb 经种子发现 ha。
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, m := range d.Peers() {
+			if m.PeerID == ha.ID().String() {
+				return // 发现成功，混合配置下合法条目生效
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("合法种子未被生效（members=%v），非法条目可能污染了整个列表", d.Peers())
+}
+
 // TestDefaultNoPublicFallback 默认语义（v0.5.16 起）：公共 DHT 兜底默认
 // 关闭——不建立公共 DHT、留空密钥归一化为默认公共网络密钥、公共引导
 // 地址从引导列表剔除（连 Start 阶段也不接触 bootstrap.libp2p.io）。

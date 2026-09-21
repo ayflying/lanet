@@ -468,19 +468,20 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 			privSeeds = append(privSeeds, b)
 		}
 	}
-	privParsed, err := parseBootstrap(ctx, privSeeds)
-	if err != nil {
-		return nil, err
+	privParsed, privSkipped := parseBootstrap(ctx, privSeeds)
+	for _, reason := range privSkipped {
+		d.logf("引导地址被忽略（不影响启动，修正 bootstrap 配置后重启生效）: %s", reason)
 	}
 	// 私有 DHT 前缀：默认用全网共享的固定 /lanet（见 privateDHTPrefix）。
 	privPrefix := privateDHTPrefix(cfg.LegacyGroupDHT, d.groupKey)
-	d.dhtPrivate, err = kaddht.New(h,
+	var derr error
+	d.dhtPrivate, derr = kaddht.New(h,
 		kaddht.Mode(kaddht.ModeAutoServer),
 		kaddht.BootstrapPeers(privParsed...),
 		kaddht.ProtocolPrefix(libprotocol.ID(privPrefix)),
 	)
-	if err != nil {
-		return nil, fmt.Errorf("serverless: init private dht: %w", err)
+	if derr != nil {
+		return nil, fmt.Errorf("serverless: init private dht: %w", derr)
 	}
 	if cfg.EnablePublicFallback {
 		pub, perr := newPublicDHT(ctx, h, d.logf)
@@ -522,10 +523,12 @@ func privateDHTPrefix(legacyGroupDHT bool, groupKey []byte) string {
 // 公共引导地址解析失败不致命：实例照建，后续每轮广播会重试自举。
 func newPublicDHT(ctx context.Context, h host.Host, logf func(string, ...any)) (*kaddht.IpfsDHT, error) {
 	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	pubParsed, perr := parseBootstrap(pubCtx, []string{DefaultBootstrap})
+	pubParsed, pubSkipped := parseBootstrap(pubCtx, []string{DefaultBootstrap})
 	cancel()
-	if perr != nil && logf != nil {
-		logf("公共引导解析失败，公共兜底暂不可用（下轮重试广播）: %v", perr)
+	for _, reason := range pubSkipped {
+		if logf != nil {
+			logf("公共引导解析失败，公共兜底暂不可用（下轮重试广播）: %s", reason)
+		}
 	}
 	return kaddht.New(h,
 		kaddht.Mode(kaddht.ModeAutoServer),
@@ -668,12 +671,15 @@ func (d *Discovery) DisablePublicDHTRuntime(reason string) {
 // 种子），从而完全不经公共 DHT 完成跨网入网。返回连通的对端节点 ID。
 // 支持一次传入多个地址（同一成员的多个候选地址逐个尝试）。
 func (d *Discovery) DialSeed(ctx context.Context, addrs []string) (string, error) {
-	infos, err := parseBootstrap(ctx, addrs)
-	if err != nil {
-		return "", err
-	}
+	infos, skipped := parseBootstrap(ctx, addrs)
 	if len(infos) == 0 {
+		if len(skipped) > 0 {
+			return "", fmt.Errorf("连接种子非法: %s", strings.Join(skipped, "; "))
+		}
 		return "", fmt.Errorf("连接种子非法：需要形如 /ip4/1.2.3.4/tcp/4001/p2p/12D3Koo... 的完整地址")
+	}
+	for _, reason := range skipped {
+		d.logf("连接种子部分地址被忽略: %s", reason)
 	}
 	var lastErr error
 	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -1778,34 +1784,60 @@ func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	n.d.addMember(pi.ID, pi.Addrs, "mdns")
 }
 
-// parseBootstrap 解析引导节点地址。
-// parseBootstrap 解析引导地址：支持普通 multiaddr 与 /dnsaddr/（经
-// DNS TXT 记录解析出具体地址列表，含 /p2p 节点 ID，如官方公共 DHT）。
-func parseBootstrap(ctx context.Context, addrs []string) ([]peer.AddrInfo, error) {
+// parseBootstrap 解析引导地址：支持普通 multiaddr 与 /dnsaddr/（经 DNS TXT
+// 记录解析出具体地址列表，含 /p2p 节点 ID，如官方公共 DHT）。
+//
+// 单条非法不致命：引导种子只是入网加速器，配置写错一条（拼错 multiaddr、
+// dnsaddr 暂时解析不出、漏了 /p2p 节点 ID）不应拦住整个节点启动——历史
+// 行为是直接返回错误导致节点起不来，只能手改配置文件才能恢复。现在坏条目
+// 被跳过并记入 skipped（形如 "地址: 原因"），由调用方记日志；全部非法时
+// 节点照常启动（退化为仅 mDNS / 运行期手动拨种子入网）。
+func parseBootstrap(ctx context.Context, addrs []string) ([]peer.AddrInfo, []string) {
 	out := make([]peer.AddrInfo, 0, len(addrs))
+	var skipped []string
 	for _, raw := range addrs {
-		ma0, err := ma.NewMultiaddr(raw)
+		infos, err := parseOneBootstrap(ctx, raw)
 		if err != nil {
-			return nil, fmt.Errorf("serverless: 引导地址 %q 非法: %w", raw, err)
+			skipped = append(skipped, fmt.Sprintf("%s: %v", raw, err))
+			continue
 		}
-		resolved := []ma.Multiaddr{ma0}
-		if _, errIsDNS := ma0.ValueForProtocol(ma.P_DNSADDR); errIsDNS == nil {
-			rs, rerr := madns.DefaultResolver.Resolve(ctx, ma0)
-			if rerr != nil {
-				return nil, fmt.Errorf("serverless: dnsaddr %q 解析失败: %w", raw, rerr)
-			}
-			if len(rs) == 0 {
-				continue
-			}
-			resolved = rs
+		out = append(out, infos...)
+	}
+	return out, skipped
+}
+
+// parseOneBootstrap 解析单条引导地址。返回解析出的 AddrInfo（dnsaddr 展开
+// 后可能多条）；一条都没解析出来时返回原因。个别展开项缺 /p2p 组件时跳过
+// 该项（保持旧版逐项容错），其余展开项正常返回。
+func parseOneBootstrap(ctx context.Context, raw string) ([]peer.AddrInfo, error) {
+	ma0, err := ma.NewMultiaddr(raw)
+	if err != nil {
+		return nil, fmt.Errorf("非法 multiaddr: %w", err)
+	}
+	resolved := []ma.Multiaddr{ma0}
+	if _, isDNS := ma0.ValueForProtocol(ma.P_DNSADDR); isDNS == nil {
+		rs, rerr := madns.DefaultResolver.Resolve(ctx, ma0)
+		if rerr != nil {
+			return nil, fmt.Errorf("dnsaddr 解析失败: %w", rerr)
 		}
-		for _, r := range resolved {
-			ai, err := peer.AddrInfoFromP2pAddr(r)
-			if err != nil || ai == nil {
-				continue // 无 /p2p 组件的地址无法确定节点 ID，跳过
-			}
-			out = append(out, *ai)
+		if len(rs) == 0 {
+			return nil, errors.New("dnsaddr 解析结果为空")
 		}
+		resolved = rs
+	}
+	out := make([]peer.AddrInfo, 0, len(resolved))
+	var lastErr error
+	for _, r := range resolved {
+		ai, err := peer.AddrInfoFromP2pAddr(r)
+		if err != nil || ai == nil {
+			// 无 /p2p 组件的地址无法确定节点 ID：跳过该项继续看其余展开项。
+			lastErr = errors.New("缺少 /p2p/<节点ID> 组件，无法确定对端身份")
+			continue
+		}
+		out = append(out, *ai)
+	}
+	if len(out) == 0 && lastErr != nil {
+		return nil, lastErr
 	}
 	return out, nil
 }
