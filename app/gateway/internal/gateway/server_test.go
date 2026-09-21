@@ -17,7 +17,7 @@ func (s *trackedStream) Close() error                { s.closed.Add(1); return n
 
 func TestQueueFullClosesSession(t *testing.T) {
 	s := &trackedStream{}
-	c := &wsConn{out: make(chan []byte, 1), streams: map[uint32]*meshStream{1: {rw: s}}}
+	c := &wsConn{out: make(chan []byte, 1), streams: map[uint32]*meshStream{1: newMeshStream(s)}}
 	if !c.send(gatewayproto.Frame{Type: gatewayproto.TypeData}) {
 		t.Fatal("首帧应成功")
 	}

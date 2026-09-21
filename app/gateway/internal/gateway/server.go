@@ -49,7 +49,16 @@ type Server struct {
 	srv    *http.Server
 
 	mu          sync.Mutex
-	serviceConn *wsConn // 当前 service 模式连接（至多一个）
+	serviceConn *wsConn             // 当前 service 模式连接（至多一个）
+	clients     map[string]*wsConn  // 游戏客户端路由表：鉴权 name → 连接（玩家互连用）
+}
+
+// nodeInfo 网关节点身份。client 未就绪（如测试桩）时返回零值，不 panic。
+func (s *Server) nodeInfo() lanet.Info {
+	if s.client == nil {
+		return lanet.Info{}
+	}
+	return s.client.Info()
 }
 
 // 鉴权请求/应答。
@@ -74,6 +83,9 @@ type dialReq struct {
 	IP       string `json:"ip"`
 	Port     int    `json:"port"`
 	Protocol string `json:"protocol"`
+	// Peer 目标客户端鉴权名（玩家互连）。非空时网关在本机两个客户端
+	// 连接之间桥接一条流，忽略 ip/port；为空时保持原语义（网格内开流）。
+	Peer string `json:"peer"`
 }
 
 type dialOk struct {
@@ -121,7 +133,7 @@ func Run(ctx context.Context, cfg Config) (*lanet.Client, error) {
 	// SDK 周期任务（NetMap 刷新 / 地址通告 / 中继预约），开流依赖 NetMap。
 	go client.Run(ctx)
 
-	s := &Server{cfg: cfg, client: client}
+	s := &Server{cfg: cfg, client: client, clients: make(map[string]*wsConn)}
 
 	// 入向流分发：交给 service 连接（没有则拒绝）。
 	inbound := make(chan lanet.Stream, 16)
@@ -165,7 +177,7 @@ func (s *Server) dispatchInbound(ctx context.Context, inbound chan lanet.Stream)
 				continue
 			}
 			id := svc.newStreamID()
-			st := &meshStream{rw: stream}
+			st := newMeshStream(stream)
 			if !svc.track(id, st) {
 				continue
 			}
@@ -198,9 +210,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	_ = ws.SetReadDeadline(time.Now().Add(10 * time.Second))
 
 	conn := &wsConn{
-		ws:      ws,
-		out:     make(chan []byte, 128),
-		streams: make(map[uint32]*meshStream),
+		ws:         ws,
+		out:        make(chan []byte, 128),
+		writerDone: make(chan struct{}),
+		streams:    make(map[uint32]*meshStream),
 	}
 	go conn.writeLoop()
 	defer conn.closeAllStreams()
@@ -222,7 +235,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			Payload: mustJSON(authErr{Error: "Auth 载荷非法"})})
 		return
 	}
-	info := s.client.Info()
+	info := s.nodeInfo()
 	if req.InviteCode != info.InviteCode {
 		log.Printf("[gateway] 鉴权失败：邀请码不匹配 name=%q", req.Name)
 		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeAuthErr,
@@ -258,6 +271,29 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
+	// 游戏客户端路由登记（玩家互连按 name 寻址）：name 全局唯一，重名拒绝，
+	// 避免两台设备注册同一名字后互相打错人。service 连接同样入表（可被 Dial）。
+	conn.name = req.Name
+	s.mu.Lock()
+	if s.clients == nil {
+		s.clients = make(map[string]*wsConn)
+	}
+	if _, exists := s.clients[req.Name]; exists {
+		s.mu.Unlock()
+		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeAuthErr,
+			Payload: mustJSON(authErr{Error: "名称已被占用，请换一个名字再连"})})
+		return
+	}
+	s.clients[req.Name] = conn
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.clients[req.Name] == conn {
+			delete(s.clients, req.Name)
+		}
+		s.mu.Unlock()
+	}()
+
 	log.Printf("[gateway] 客户端接入 name=%q mode=%s", req.Name, req.Mode)
 	conn.send(gatewayproto.Frame{Type: gatewayproto.TypeAuthOk, Payload: mustJSON(authOk{
 		VirtualIP: info.VirtualIP, PeerID: info.PeerID, Group: info.Group, Mode: req.Mode,
@@ -288,6 +324,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				if hc, ok := st.rw.(halfCloseWriter); ok {
 					_ = hc.CloseWrite()
 				}
+				// 双方都已半关 → 桥接流终结：摘流并唤醒对侧 pump。
+				if fc, ok := st.rw.(interface{ FullyHalfClosed() bool }); ok && fc.FullyHalfClosed() {
+					if s2 := conn.untrack(frame.StreamID); s2 != nil {
+						_ = s2.close()
+					}
+				}
 			}
 		case gatewayproto.TypeReset:
 			if st := conn.untrack(frame.StreamID); st != nil {
@@ -296,6 +338,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				} else {
 					_ = st.rw.Close()
 				}
+				st.finish() // 唤醒 EOF 挂起中的 pump
 			}
 		case gatewayproto.TypePing:
 			conn.send(gatewayproto.Frame{Type: gatewayproto.TypePong, Payload: frame.Payload})
@@ -309,9 +352,16 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDial(conn *wsConn, frame gatewayproto.Frame) {
 	var req dialReq
 	id := frame.StreamID
-	if err := json.Unmarshal(frame.Payload, &req); err != nil || req.IP == "" {
+	if err := json.Unmarshal(frame.Payload, &req); err != nil || (req.IP == "" && req.Peer == "") {
 		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialErr, StreamID: id,
-			Payload: []byte("Dial 载荷非法：需 {ip, port, protocol?}")})
+			Payload: []byte("Dial 载荷非法：需 {ip, port, protocol?} 或 {peer, protocol?}")})
+		return
+	}
+
+	// 玩家互连：目标为同网关在线客户端的鉴权名，网关在两条 WS 连接之间
+	// 桥接一条流。协议子集（帧语义）与网格内开流完全一致，客户端无感。
+	if req.Peer != "" {
+		s.bridgeDial(conn, id, req)
 		return
 	}
 
@@ -324,7 +374,7 @@ func (s *Server) handleDial(conn *wsConn, frame gatewayproto.Frame) {
 		}
 		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialOk, StreamID: id,
 			Payload: mustJSON(dialOk{ViaRelay: viaRelay})})
-		st := &meshStream{rw: stream}
+		st := newMeshStream(stream)
 		if !conn.track(id, st) {
 			conn.closeAllStreams()
 			return
@@ -349,7 +399,7 @@ func (s *Server) handleDial(conn *wsConn, frame gatewayproto.Frame) {
 	}
 	conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialOk, StreamID: id,
 		Payload: mustJSON(dialOk{ViaRelay: viaRelay})})
-	st := &meshStream{rw: nc}
+	st := newMeshStream(nc)
 	if !conn.track(id, st) {
 		conn.closeAllStreams()
 		return
@@ -357,26 +407,93 @@ func (s *Server) handleDial(conn *wsConn, frame gatewayproto.Frame) {
 	go conn.pumpStreamToClient(id, st)
 }
 
+// bridgeDial 客户端互连：把发起方与目标客户端的两条 WS 连接桥接成一条流。
+//
+// 数据面：发起方 Data 帧 → 发起管道 → 目标管道 → 目标侧 Data 帧，反向对称。
+// 两侧各自分配独立的 streamID（与各自连接上的其他流互不冲突），目标侧以
+// StreamOpen 帧获知入向流（protocol + 发起方鉴权名）。目标断开时管道
+// Close，两侧 pump 自然收尾，语义与网格内流一致。
+func (s *Server) bridgeDial(conn *wsConn, id uint32, req dialReq) {
+	s.mu.Lock()
+	target := s.clients[req.Peer]
+	s.mu.Unlock()
+	if target == nil {
+		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialErr, StreamID: id,
+			Payload: []byte("玩家不在线或名称不存在: " + req.Peer)})
+		return
+	}
+	if target == conn {
+		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialErr, StreamID: id,
+			Payload: []byte("不能连接自己")})
+		return
+	}
+
+	pipeA, pipeB := newBridgePipePair()
+
+	// 发起方侧：复用普通出向流语义（DialOk + Data 泵）。
+	stA := newMeshStream(pipeA)
+	if !conn.track(id, stA) {
+		_ = pipeA.Close()
+		_ = pipeB.Close()
+		return
+	}
+	conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialOk, StreamID: id,
+		Payload: mustJSON(dialOk{ViaRelay: false})})
+	go conn.pumpStreamToClient(id, stA)
+
+	// 目标侧：分配新 streamID，以 StreamOpen 通知（与网格入向流同帧型）。
+	targetID := target.newStreamID()
+	stB := newMeshStream(pipeB)
+	if !target.track(targetID, stB) {
+		// 目标侧登记失败（连接已断/流满）：回拆发起侧。
+		_ = pipeA.Close()
+		_ = pipeB.Close()
+		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeReset, StreamID: id})
+		return
+	}
+	target.send(gatewayproto.Frame{Type: gatewayproto.TypeStreamOpen, StreamID: targetID,
+		Payload: mustJSON(streamOpen{Protocol: req.Protocol, RemotePeer: conn.name})})
+	go target.pumpStreamToClient(targetID, stB)
+}
+
 // halfCloseWriter 支持半关闭写端的流（libp2p 流、TCP 连接等）。
 type halfCloseWriter interface{ CloseWrite() error }
 
-// meshStream 一条活跃流（端口转发 net.Conn 或原始 lanet.Stream）。
-// 两者都满足 io.ReadWriteCloser，统一走 rw。
+// meshStream 一条活跃流（端口转发 net.Conn 或原始 lanet.Stream，或桥接
+// 管道）。两者都满足 io.ReadWriteCloser，统一走 rw。
+//
+// done 是流终结通知：对端 Reset、双方半关（桥接流）、连接断开时关闭，
+// 用于让 EOF（对端半关）后挂起的 pump 知道何时收尾——半关闭是单向的，
+// 对端半关后本端仍可能继续发送，不能提前摘除流。
 type meshStream struct {
-	rw io.ReadWriteCloser
+	rw        io.ReadWriteCloser
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
-func (st *meshStream) read(p []byte) (int, error) { return st.rw.Read(p) }
-func (st *meshStream) close() error               { return st.rw.Close() }
+func newMeshStream(rw io.ReadWriteCloser) *meshStream {
+	return &meshStream{rw: rw, done: make(chan struct{})}
+}
+
+// finish 标记流终结并唤醒等待者；幂等。
+func (st *meshStream) finish() { st.closeOnce.Do(func() { close(st.done) }) }
+
+// close 关闭底层流并通知终结。
+func (st *meshStream) close() error {
+	st.finish()
+	return st.rw.Close()
+}
 
 // wsConn 一条已鉴权的客户端 WebSocket 连接。
 type wsConn struct {
-	ws      *websocket.Conn
-	out     chan []byte
-	nextID  atomic.Uint32
-	mu      sync.Mutex
-	streams map[uint32]*meshStream
-	closed  bool
+	ws         *websocket.Conn
+	name       string // 鉴权名（玩家互连的路由键，网关内唯一）
+	out        chan []byte
+	writerDone chan struct{} // writeLoop 退出时关闭：closeAllStreams 等它排空队列后再关 ws
+	nextID     atomic.Uint32
+	mu         sync.Mutex
+	streams    map[uint32]*meshStream
+	closed     bool
 }
 
 func (c *wsConn) newStreamID() uint32 { return c.nextID.Add(1) }
@@ -439,8 +556,10 @@ func (c *wsConn) readMessage() ([]byte, error) {
 }
 
 // writeLoop 单协程串行写 WS（gorilla 不支持并发写）。
+// 退出时只关闭 writerDone；底层 ws 由 closeAllStreams 在队列排空后关闭，
+// 保证「入队即尽力送达」——否则 AuthErr 等错误帧会在关闭竞态中静默丢失。
 func (c *wsConn) writeLoop() {
-	defer c.closeAllStreams()
+	defer close(c.writerDone)
 	for msg := range c.out {
 		_ = c.ws.SetWriteDeadline(time.Now().Add(15 * time.Second))
 		if err := c.ws.WriteMessage(websocket.BinaryMessage, msg); err != nil {
@@ -450,11 +569,16 @@ func (c *wsConn) writeLoop() {
 }
 
 // pumpStreamToClient 把网格流的数据以 Data 帧推给客户端，EOF 发 Close。
+//
+// EOF 只代表对端半关闭写端，流并未终结（本端仍可继续发送，对端仍会
+// 继续发数据过来）：发完 Close 帧后挂起等待流终结（对端 Reset、双方
+// 半关、连接断开），绝不能提前 untrack——否则对端后续 Data 帧在路由表
+// 里找不到落点，被静默丢弃（TCP 全双工语义被破坏）。
 func (c *wsConn) pumpStreamToClient(id uint32, st *meshStream) {
 	defer c.untrack(id)
 	buf := make([]byte, 16*1024)
 	for {
-		n, err := st.read(buf)
+		n, err := st.rw.Read(buf)
 		if n > 0 {
 			if !c.send(gatewayproto.Frame{Type: gatewayproto.TypeData, StreamID: id,
 				Payload: buf[:n]}) {
@@ -469,6 +593,7 @@ func (c *wsConn) pumpStreamToClient(id uint32, st *meshStream) {
 				return
 			}
 			c.send(gatewayproto.Frame{Type: gatewayproto.TypeClose, StreamID: id})
+			<-st.done // 等流终结；untrack 交由 defer
 			return
 		}
 	}
@@ -486,11 +611,16 @@ func (c *wsConn) closeAllStreams() {
 	streams := c.streams
 	c.streams = make(map[uint32]*meshStream)
 	c.mu.Unlock()
-	if c.ws != nil {
-		_ = c.ws.Close()
-	}
 	for _, st := range streams {
 		_ = st.close()
+	}
+	// 等写循环把已入队消息写完再关底层连接（writerDone 为 nil 说明是
+	// 单测里手工构造的连接，无写循环）。
+	if c.ws != nil && c.writerDone != nil {
+		<-c.writerDone
+		_ = c.ws.Close()
+	} else if c.ws != nil {
+		_ = c.ws.Close()
 	}
 }
 

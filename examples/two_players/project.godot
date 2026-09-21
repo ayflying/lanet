@@ -1,0 +1,19 @@
+; Godot 4 工程配置：Lanet 双人 P2P 示例。
+
+config_version=5
+
+[application]
+
+config/name="Lanet Two Players Demo"
+config/description="双人 P2P 位置同步最小示例（房间制）"
+run/main_scene="res://main.tscn"
+config/features=PackedStringArray("4.3", "GL Compatibility")
+
+[autoload]
+
+Lanet="*res://addons/lanet/lanet_manager.gd"
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
