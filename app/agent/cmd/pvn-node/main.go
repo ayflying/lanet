@@ -129,6 +129,10 @@ func runNode(parent context.Context, serviceMode bool) {
 				"开启后重新暴露于跨群噪音，问题解决后应关闭")
 		probe = flag.Duration("probe", envDurationOr("LANET_PROBE"),
 			"成员探测间隔（可经 LANET_PROBE 设置，Go duration 如 20s/1m）；不传则读配置文件（默认 20s）")
+		maxProcs = flag.Int("maxprocs", atoiOr(envOr("LANET_MAX_PROCS", ""), 0),
+			"调度线程上限 GOMAXPROCS（LANET_MAX_PROCS）；0 = 自动：容器 CPU 配额优先（Go 1.25 起"+
+				"原生读取 cgroup，配额 2 核即用 2 线程），无配额时默认 min(核数, 4)。"+
+				"限制 CPU/线程占用，网络数据面走 epoll 不受影响")
 	)
 	// ---- 开机自启路径识别：注册表 Run 键带 -autorun 参数拉起 ----
 	// 必须在 flag.Parse 之前剔除 -autorun（flag 包对未定义 flag 会报错退出），
@@ -145,6 +149,14 @@ func runNode(parent context.Context, serviceMode bool) {
 	os.Args = args
 
 	flag.Parse()
+
+	// ---- 调度线程上限：限制 CPU/线程数，不影响网络数据面 ----
+	// Go 的网络 IO 走 epoll/kqueue（goroutine 阻塞在 poller 上，不占线程），
+	// GOMAXPROCS 只约束「同时执行 Go 代码」的 OS 线程数——收紧它不会降低
+	// 转发/隧道吞吐，却能避免「容器未配 CPU 限额时按宿主核数开满」的失控占用。
+	// Go 1.25 起 GOMAXPROCS 默认已感知 cgroup CPU 配额：配置了 cpus 的容器
+	// 自动生效；这里兜底处理「无配额」场景（默认 min(核数,4)）与显式覆盖。
+	applyMaxProcs(*maxProcs)
 
 	// ---- 日志：stderr + exe 同目录 lanet.log 双写（windowsgui 无黑框时靠文件看日志）----
 	// 注意：不能用 io.MultiWriter(os.Stderr, lf)——windowsgui 下 stderr 是无效句柄，
