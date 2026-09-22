@@ -338,11 +338,12 @@
 <div class="panel" id="pForwards">
   <div class="card">
     <h2>局域网端口转发</h2>
-    <div class="sub" style="margin-bottom:8px">群内成员访问「本节点虚拟 IP : Listen」时，转发到局域网设备 Target。本节点同时在 Listen 端口开监听并代理到 Target——容器节点没有真实服务监听时（如转发宿主上其他容器的服务），这样 <b>http://虚拟IP:端口</b> 才能直接访问。</div>
+    <div class="sub" style="margin-bottom:8px">三条必填项：<b>本地端口</b>（群内成员访问「本节点虚拟 IP : 本地端口」）、<b>目标 IP</b> 与 <b>目标端口</b>（局域网里真实服务的地址）。本节点同时在本地端口开监听并代理到目标——容器节点没有真实服务监听时（如转发宿主上其他容器的服务），这样 <b>http://虚拟IP:本地端口</b> 才能直接访问。</div>
     <div id="fwdList"></div>
     <div class="row">
-      <input type="number" id="fListen" placeholder="Listen 端口" style="flex:.5">
-      <input type="text" id="fTarget" placeholder="目标 192.168.1.100:5000">
+      <input type="number" id="fListen" placeholder="本地端口" style="flex:.5">
+      <input type="text" id="fTargetHost" placeholder="目标 IP（如 192.168.1.100）">
+      <input type="number" id="fTargetPort" placeholder="目标端口" style="flex:.5">
       <button onclick="addForward()">添加</button>
     </div>
     <button onclick="saveForwards()">保存转发映射</button>
@@ -1063,10 +1064,15 @@ function renderRules() {
 function renderForwards() {
   $('fwdList').innerHTML = S.forwards.length === 0
     ? '<div class="empty" style="margin:8px 0">暂无转发映射</div>'
-    : '<table><tr><th>Listen</th><th>Target</th><th></th></tr>' +
-      S.forwards.map((f, idx) =>
-        `<tr><td>${f.listen}</td><td>${esc(f.target)}</td>` +
-        `<td><button class="del" onclick="S.forwards.splice(${idx},1);renderForwards()">删除</button></td></tr>`).join('') +
+    : '<table><tr><th>本地端口</th><th>目标 IP</th><th>目标端口</th><th></th></tr>' +
+      S.forwards.map((f, idx) => {
+        // target 存储为 "IP:端口"；lastIndexOf 兼容 IPv6 的 [::1]:80 形态。
+        const i = (f.target || '').lastIndexOf(':');
+        const th = i > 0 ? f.target.slice(0, i) : f.target;
+        const tp = i > 0 ? f.target.slice(i + 1) : '';
+        return `<tr><td>${f.listen}</td><td>${esc(th)}</td><td>${esc(tp)}</td>` +
+          `<td><button class="del" onclick="S.forwards.splice(${idx},1);renderForwards()">删除</button></td></tr>`;
+      }).join('') +
       '</table>';
 }
 function addRule() {
@@ -1080,10 +1086,14 @@ function addRule() {
   renderRules();
 }
 function addForward() {
-  const listen = parseInt($('fListen').value, 10), target = $('fTarget').value.trim();
-  if (!listen || listen < 1 || listen > 65535 || !target) { flash('fwdMsg', '请填写有效端口与目标地址', false); return; }
-  S.forwards.push({ listen, target });
-  $('fListen').value = ''; $('fTarget').value = '';
+  const listen = parseInt($('fListen').value, 10);
+  const host = $('fTargetHost').value.trim(), tport = parseInt($('fTargetPort').value, 10);
+  if (!listen || listen < 1 || listen > 65535) { flash('fwdMsg', '请填写有效的本地端口（1-65535）', false); return; }
+  if (!host) { flash('fwdMsg', '请填写目标 IP', false); return; }
+  if (!tport || tport < 1 || tport > 65535) { flash('fwdMsg', '请填写有效的目标端口（1-65535）', false); return; }
+  // 后端 LANForward.Target 仍是 "IP:端口" 合一存储，这里拼回去，旧数据不受影响。
+  S.forwards.push({ listen, target: host + ':' + tport });
+  $('fListen').value = ''; $('fTargetHost').value = ''; $('fTargetPort').value = '';
   renderForwards();
 }
 async function saveFirewall() {
