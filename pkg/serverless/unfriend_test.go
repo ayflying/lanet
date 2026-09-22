@@ -328,6 +328,73 @@ func TestUnfriendGuardBlocksRevival(t *testing.T) {
 	}
 }
 
+// TestHandleUnfriendMarksGuard 锁死 handleUnfriend 的临界区语义：收到
+// 删除好友通知时，成员表移除与复活防护记录必须在同一临界区内完成。
+// 漏记防护正是 TestUnfriendNotifyOnline 在 CI 上概率性失败的根因：
+// OnUnfriendReceived 异步回调翻转信任之前，对端的在途握手通过信任检查、
+// 且 guard 无记录可拦，刚删除的成员被写回成员表（复活，「删了还在」）。
+// 通过真实 handleUnfriend 流（构造合法载荷）验证，防实现回退。
+func TestHandleUnfriendMarksGuard(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	ha := testHost(t, false)
+	hb := testHost(t, false)
+
+	db, err := New(ctx, hb, Config{
+		NetworkKey: "grp-uf-guard",
+		Name:       "node-b",
+		IsTrusted:  func(string) bool { return true },
+	})
+	if err != nil {
+		t.Fatalf("new B: %v", err)
+	}
+	if err = db.Start(ctx); err != nil {
+		t.Fatalf("start B: %v", err)
+	}
+	// B 先把 A 记为成员（模拟好友在线）。
+	db.addMember(ha.ID(), ha.Addrs(), "test")
+	if _, ok := memberOf(db, ha.ID().String()); !ok {
+		t.Fatalf("前置失败：A 应已在 B 的成员表")
+	}
+
+	// A 发送真实 unfriend 流（与 NotifyUnfriend 同一协议路径）。
+	if err = ha.Connect(ctx, peer.AddrInfo{ID: hb.ID(), Addrs: hb.Addrs()}); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	da, err := New(ctx, ha, Config{NetworkKey: "grp-uf-guard", Name: "node-a"})
+	if err != nil {
+		t.Fatalf("new A: %v", err)
+	}
+	if err = da.NotifyUnfriend(ctx, hb.ID().String()); err != nil {
+		t.Fatalf("notify unfriend: %v", err)
+	}
+
+	// 成员表移除与 guard 记录必须同时生效：guard 有记录 ⇒ 之后的迟到
+	// 握手（即使信任检查通过）也会被 handleInfo 拦下，不复活成员。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		db.mu.Lock()
+		guarded := db.unfriendGuardBlocked(ha.ID().String())
+		_, inMembers := db.members[ha.ID().String()]
+		db.mu.Unlock()
+		if guarded && !inMembers {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	db.mu.Lock()
+	guarded := db.unfriendGuardBlocked(ha.ID().String())
+	_, inMembers := db.members[ha.ID().String()]
+	db.mu.Unlock()
+	if inMembers {
+		t.Fatalf("收到删除通知后 A 不应留在 B 的成员表")
+	}
+	if !guarded {
+		t.Fatalf("handleUnfriend 必须记录复活防护（与成员表移除同临界区），否则迟到握手会复活成员")
+	}
+}
+
 // memberOf 查成员表中是否有指定节点。
 func memberOf(d *Discovery, peerID string) (Member, bool) {
 	for _, m := range d.Peers() {

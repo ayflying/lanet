@@ -1701,8 +1701,13 @@ func (d *Discovery) handleUnfriend(s network.Stream) {
 	}
 	d.logf("收到节点 %s 的删除好友通知：本机将同步移除该节点", remote.ShortString())
 	// 成员表立即移除（不等上层回调），再断开连接。
+	// 复活防护必须与 delete 处于同一临界区（与 Forget 同一语义）：
+	// OnUnfriendReceived 是异步回调，上层地址簿/信任翻转滞后——窗口期内
+	// 对端的在途握手会在 handleInfo 里通过信任检查（回调尚未翻转），
+	// 没有 guard 就会把刚删除的成员写回成员表（复活，「删了还在」）。
 	d.mu.Lock()
 	delete(d.members, remote.String())
+	d.markUnfriendedLocked(remote.String())
 	d.mu.Unlock()
 	if d.cfg.OnUnfriendReceived != nil {
 		go d.cfg.OnUnfriendReceived(remote.String())
