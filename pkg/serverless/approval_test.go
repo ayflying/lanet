@@ -3,6 +3,7 @@ package serverless
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -147,16 +148,28 @@ func TestAutoAcceptUnattended(t *testing.T) {
 	ha := testHost(t, false)
 	hb := testHost(t, false)
 
-	var autoAccepted []string
+	// autoAccepted 在 AutoAccept 回调（libp2p stream handler goroutine）里
+	// 写入、主 goroutine 断言读取，必须互斥——race 检测实测报告过该竞争，
+	// goroutine 调度时序（如种子交换 goroutine 提前）会让它稳定复现。
+	var (
+		autoAcceptedMu sync.Mutex
+		autoAccepted   []string
+	)
 	da, err := New(ctx, ha, Config{
 		NetworkKey: "grp-auto",
 		Name:       "central",
 		IsTrusted:  func(string) bool { return false },
 		AutoAccept: func(peerID string, _ []string, _ string) bool {
+			autoAcceptedMu.Lock()
 			autoAccepted = append(autoAccepted, peerID)
+			autoAcceptedMu.Unlock()
 			return true
 		},
-		OnPending: func(string, []string, string) { t.Fatalf("自动放行后不应再记待审批") },
+		OnPending: func(string, []string, string) {
+			// 回调运行在 libp2p stream handler goroutine 上，t.Fatalf 只允许
+			// 测试 goroutine 调用；t.Errorf 是协程安全版本。
+			t.Errorf("自动放行后不应再记待审批")
+		},
 	})
 	if err != nil {
 		t.Fatalf("new A: %v", err)
@@ -182,8 +195,11 @@ func TestAutoAcceptUnattended(t *testing.T) {
 	if info.Name != "central" {
 		t.Fatalf("info.Name = %q, want central", info.Name)
 	}
-	if len(autoAccepted) == 0 || autoAccepted[0] != hb.ID().String() {
-		t.Fatalf("auto_accept 应记录被自动放行的节点，实际 %v", autoAccepted)
+	autoAcceptedMu.Lock()
+	got := append([]string(nil), autoAccepted...)
+	autoAcceptedMu.Unlock()
+	if len(got) == 0 || got[0] != hb.ID().String() {
+		t.Fatalf("auto_accept 应记录被自动放行的节点，实际 %v", got)
 	}
 }
 
