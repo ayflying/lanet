@@ -2,7 +2,6 @@ package lanet
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"time"
 
@@ -85,8 +84,7 @@ func (c *Client) apiSetSeedSettings(w http.ResponseWriter, r *http.Request) {
 		GlobalEnabled *bool `json:"global_enabled"`
 		GlobalLimit   *int  `json:"global_limit"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
+	if !c.decodeBody(w, r, &req) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
@@ -151,8 +149,7 @@ func (c *Client) apiDeleteSeed(w http.ResponseWriter, r *http.Request) {
 		Scope  string `json:"scope"`
 		PeerID string `json:"peer_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
+	if !c.decodeBody(w, r, &req) {
 		return
 	}
 	scope := peersdb.SeedScope(req.Scope)

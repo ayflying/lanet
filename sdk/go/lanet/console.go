@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -433,7 +434,10 @@ func (c *Client) apiResolvePending(w http.ResponseWriter, r *http.Request) {
 		PeerID  string `json:"peer_id"`
 		Approve *bool  `json:"approve"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PeerID == "" || req.Approve == nil {
+	if !c.decodeBody(w, r, &req) {
+		return
+	}
+	if req.PeerID == "" || req.Approve == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体需包含 peer_id 与 approve"})
 		return
 	}
@@ -475,7 +479,10 @@ func (c *Client) apiRemovePeer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PeerID string `json:"peer_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PeerID == "" {
+	if !c.decodeBody(w, r, &req) {
+		return
+	}
+	if req.PeerID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体需包含 peer_id"})
 		return
 	}
@@ -523,7 +530,10 @@ func (c *Client) apiSetPeerNotes(w http.ResponseWriter, r *http.Request) {
 		PeerID string `json:"peer_id"`
 		Notes  string `json:"notes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PeerID == "" {
+	if !c.decodeBody(w, r, &req) {
+		return
+	}
+	if req.PeerID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体需包含 peer_id"})
 		return
 	}
@@ -543,7 +553,10 @@ func (c *Client) apiReconnectPeer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PeerID string `json:"peer_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PeerID == "" {
+	if !c.decodeBody(w, r, &req) {
+		return
+	}
+	if req.PeerID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体需包含 peer_id"})
 		return
 	}
@@ -593,7 +606,10 @@ func (c *Client) apiSetPublicDHT(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Enable *bool `json:"enable"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Enable == nil {
+	if !c.decodeBody(w, r, &req) {
+		return
+	}
+	if req.Enable == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体需包含 enable 布尔值"})
 		return
 	}
@@ -812,13 +828,31 @@ const maxConsoleBody = 4 << 20
 // w 传入 http.MaxBytesReader 以便超限时由标准库接管（读取直接报错）。
 func decodeConsoleBody(w http.ResponseWriter, r *http.Request, v any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxConsoleBody)
-	return json.NewDecoder(r.Body).Decode(v)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(body, v)
 }
 
 // isMaxBytesErr 判断错误是否由请求体超限引起（用于返回 413）。
 func isMaxBytesErr(err error) bool {
 	var maxErr *http.MaxBytesError
 	return errors.As(err, &maxErr)
+}
+
+// decodeBody 在 4MB 上限下解析完整 JSON 请求体，并就地写出错误响应。
+// 返回 false 表示已写出响应、调用方直接 return。
+func (c *Client) decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	if err := decodeConsoleBody(w, r, v); err != nil {
+		if isMaxBytesErr(err) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "请求体过大（上限 4MB）"})
+		} else {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体非法: " + err.Error()})
+		}
+		return false
+	}
+	return true
 }
 
 // Firewall 防火墙快照（编程接口，与控制台等价）。

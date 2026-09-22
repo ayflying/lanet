@@ -46,7 +46,7 @@ func TestDerivedProtoSameGroup(t *testing.T) {
 	if da.protoInfo != db.protoInfo || da.protoUnfriend != db.protoUnfriend {
 		t.Fatalf("同群派生 ID 不一致: %s/%s vs %s/%s", da.protoInfo, da.protoUnfriend, db.protoInfo, db.protoUnfriend)
 	}
-	if da.dhtPrivate == nil {
+	if da.dhtPrivate.Load() == nil {
 		t.Fatal("私有 DHT 未初始化")
 	}
 	if err = ha.Connect(ctx, peer.AddrInfo{ID: hb.ID(), Addrs: hb.Addrs()}); err != nil {

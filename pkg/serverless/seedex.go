@@ -451,7 +451,11 @@ func (d *Discovery) handleSeeds(s network.Stream, scope string) {
 	defer gate.release()
 
 	_ = s.SetDeadline(now.Add(seedsStreamTimeout))
-	raw, err := io.ReadAll(io.LimitReader(s, seedsMaxPayload))
+	raw, err := io.ReadAll(io.LimitReader(s, seedsMaxPayload+1))
+	if len(raw) > seedsMaxPayload {
+		_ = s.Reset()
+		err = errors.New("种子载荷超过大小上限")
+	}
 	if err != nil {
 		return
 	}
@@ -594,8 +598,7 @@ func (d *Discovery) exchangeSeeds(ctx context.Context, id peer.ID, scope string)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = s.Close() }()
-	_ = s.SetDeadline(time.Now().Add(seedsStreamTimeout))
+	defer bindControlIO(exchangeCtx, s)()
 
 	payload, err := json.Marshal(seedPayload{
 		Scope: scope, Fingerprint: d.seedFingerprint(scope), Records: records,
@@ -606,11 +609,19 @@ func (d *Discovery) exchangeSeeds(ctx context.Context, id peer.ID, scope string)
 	if _, err := s.Write(payload); err != nil {
 		return err
 	}
+	// 入向按 EOF 读取完整 JSON，必须半关闭写端才能开始响应。
+	if err := s.CloseWrite(); err != nil {
+		return err
+	}
 	// 本机记录为空时对端不会回包：不等它，直接成功返回。
 	if len(records) == 0 {
 		return nil
 	}
-	raw, err := io.ReadAll(io.LimitReader(s, seedsMaxPayload))
+	raw, err := io.ReadAll(io.LimitReader(s, seedsMaxPayload+1))
+	if len(raw) > seedsMaxPayload {
+		_ = s.Reset()
+		err = errors.New("种子载荷超过大小上限")
+	}
 	if err != nil || len(raw) == 0 {
 		return err
 	}

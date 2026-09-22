@@ -31,7 +31,7 @@ type fwdListener struct {
 	cancel context.CancelFunc // 取消 accept 循环与全部活动连接
 	mu     sync.Mutex
 	conns  map[net.Conn]struct{} // 活动连接集合（配额判定 + 关闭时批量释放）
-	closed bool // 关闭后禁止接纳已被 accept 的在途连接
+	closed bool                  // 关闭后禁止接纳已被 accept 的在途连接
 }
 
 // addConn 登记一条活动连接；超出配额返回 false（调用方应拒绝该连接）。
@@ -82,15 +82,12 @@ func (fl *fwdListener) shutdown() {
 	fl.mu.Unlock()
 }
 
-// fwdQuota 解析单监听器配额：配置值 >0 用配置，否则回退默认；负数视作不限制。
+// fwdQuota 解析单监听器配额：配置值 >0 用配置；0 或负数回退默认上限。
 func (c *Client) fwdQuota() int {
-	if c.cfg.LANForwardMaxConns > 0 {
-		return c.cfg.LANForwardMaxConns
+	if c.cfg.LANForwardMaxConns <= 0 {
+		return fwdDefaultQuota
 	}
-	if c.cfg.LANForwardMaxConns < 0 {
-		return 0
-	}
-	return fwdDefaultQuota
+	return c.cfg.LANForwardMaxConns
 }
 
 // startListenForwards 按当前转发表启动全部本地监听（New 与热更新共用）。
@@ -112,6 +109,10 @@ func (c *Client) startListenForward(ctx context.Context, f LANForward) {
 	}
 	key := listenKey(f.Listen)
 	c.lfMu.Lock()
+	if ctx.Err() != nil || (c.rootCtx != nil && c.rootCtx.Err() != nil) {
+		c.lfMu.Unlock()
+		return
+	}
 	if _, ok := c.lfListeners[key]; ok {
 		c.lfMu.Unlock()
 		return // 已在监听
@@ -193,6 +194,9 @@ func (c *Client) syncListenForwards(ctx context.Context) {
 
 // acceptLoop 接受入向连接并逐条代理到目标，受单监听器配额约束。
 func (c *Client) acceptLoop(ctx context.Context, fl *fwdListener) {
+	stop := context.AfterFunc(ctx, fl.shutdown)
+	defer stop()
+	defer fl.shutdown()
 	for {
 		conn, err := fl.ln.Accept()
 		if err != nil {
@@ -226,6 +230,13 @@ func (c *Client) proxyToTarget(ctx context.Context, fl *fwdListener, conn net.Co
 		_ = conn.Close()
 		return
 	}
+	// 仅关闭入向连接不一定结束回程 io.Copy：目标可能收到 FIN 后仍保持连接。
+	// 监听器取消时关闭两端，确保两个复制 goroutine 都能退出。
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		_ = target.Close()
+	})
+	defer stop()
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(target, conn)

@@ -1104,17 +1104,22 @@ func (c *Client) startTUN(ctx context.Context) {
 	c.logf("TUN 网卡 %s 已就绪（虚拟 IP=%s）：组内成员可通过虚拟 IP 直接访问本机（ping/任意端口，入向受防火墙约束）", name, c.myIP)
 }
 
-// Run 阻塞运行周期任务，直到 ctx 取消。
+// Run 阻塞运行周期任务，直到 ctx 取消——或节点被 Close。
 //   - Standalone：周期 DHT 广播与发现（mDNS 持续运行）。
 //   - 常规：刷新 NetMap / 通告地址 / 补充中继预约。
 func (c *Client) Run(ctx context.Context) {
+	runCtx, stop := c.mergeCtx(ctx)
+	defer stop()
+	if runCtx.Err() != nil {
+		return
+	}
 	if c.disc != nil {
-		c.disc.Run(ctx)
+		c.disc.Run(runCtx)
 		return
 	}
 	// 入网后先完成一次通告 + 中继预约（兜底链路关键步骤）。
-	c.announce(ctx)
-	if err := p2pkit.EnsureRelayReservation(ctx, c.node, c.peerSource.AutoRelayPeerSource(), 2); err != nil {
+	c.announce(runCtx)
+	if err := p2pkit.EnsureRelayReservation(runCtx, c.node, c.peerSource.AutoRelayPeerSource(), 2); err != nil {
 		c.logf("relay 预约暂未成功（将周期重试）: %v", err)
 	}
 
@@ -1122,20 +1127,39 @@ func (c *Client) Run(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			c.logf("收到退出信号，正在关闭")
 			return
 		case <-ticker.C:
-			if _, err := c.netmapCli.Refresh(ctx); err != nil {
+			if _, err := c.netmapCli.Refresh(runCtx); err != nil {
 				c.logf("刷新 NetMap: %v", err)
 				continue
 			}
-			c.announce(ctx)
+			c.announce(runCtx)
 			// 预约有有效期，周期补充（已有时 Reserve 会刷新有效期）。
-			if err := p2pkit.EnsureRelayReservation(ctx, c.node, c.peerSource.AutoRelayPeerSource(), 2); err != nil {
+			if err := p2pkit.EnsureRelayReservation(runCtx, c.node, c.peerSource.AutoRelayPeerSource(), 2); err != nil {
 				c.logf("relay 预约补充失败（下个周期重试）: %v", err)
 			}
 		}
+	}
+}
+
+// mergeCtx 派生运行 ctx：传入 ctx 或节点 rootCtx 任一取消即取消。
+// rootCtx 为 nil（理论不可达，防御）时退化为仅听传入 ctx。
+// 返回 cancel 需由调用方 defer 调用以解注册 AfterFunc，避免 goroutine 泄漏。
+func (c *Client) mergeCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.rootCtx == nil {
+		return context.WithCancel(ctx)
+	}
+	merged, cancel := context.WithCancel(ctx)
+	// rootCtx 取消 → 连带取消运行 ctx；调用方 defer cancel 时 stop 解注册。
+	stop := context.AfterFunc(c.rootCtx, cancel)
+	if c.rootCtx.Err() != nil {
+		cancel()
+	}
+	return merged, func() {
+		stop()
+		cancel()
 	}
 }
 

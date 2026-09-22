@@ -9,7 +9,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"sync"
 )
@@ -29,7 +28,8 @@ type rotatingFile struct {
 	maxBackups int
 	f          *os.File
 	size       int64
-	warn       func(string)        // 轮转出错时的告警回调；nil 时静默
+	inBackup   bool                       // 重建失败时暂时写入 .1，不再移动该备份。
+	warn       func(string)               // 轮转出错时的告警回调；nil 时静默
 	renameHook func(string, string) error // 测试可注入改名失败；nil 时用 os.Rename
 }
 
@@ -52,11 +52,14 @@ func newRotatingFile(path string, maxSize int64, maxBackups int) (*rotatingFile,
 		size:       size,
 	}
 	if r.warn == nil {
-		r.warn = func(s string) { log.Print(s) }
+		// 不经全局 log 输出，避免其输出恰好是当前 writer 时重入死锁。
+		r.warn = func(s string) { _, _ = fmt.Fprintln(os.Stderr, s) }
 	}
 	// 上次退出时可能已超限（或历史遗留的巨型日志）：先轮转再写。
 	if r.size >= r.maxSize {
-		_ = r.rotateLocked()
+		if err := r.rotateLocked(); err != nil {
+			return nil, err
+		}
 	}
 	return r, nil
 }
@@ -69,8 +72,21 @@ func (r *rotatingFile) Write(p []byte) (int, error) {
 	if r.f == nil {
 		return 0, os.ErrClosed
 	}
-	if r.size > 0 && r.size+int64(len(p)) > r.maxSize {
-		_ = r.rotateLocked()
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.size > 0 && int64(len(p)) > r.maxSize-r.size {
+		if err := r.rotateLocked(); err != nil {
+			// 轮转彻底失败（改名与回退重开都失败）：保持「日志不丢」的底线——
+			// 不截断、绝不解引用 nil 句柄 panic，以 ErrClosed 显式暴露，交由调用方决定。
+			if r.f == nil {
+				return 0, os.ErrClosed
+			}
+			r.warnf("logrotate: 轮转失败，退回当前文件继续写: %v", err)
+		}
+	}
+	if r.f == nil {
+		return 0, os.ErrClosed
 	}
 	n, err := r.f.Write(p)
 	r.size += int64(n)
@@ -112,6 +128,21 @@ func (r *rotatingFile) doRename(old, new string) error {
 //   - 仅当两步都失败时才返回错误，此时 r.f 为 nil，后续 Write 会报 ErrClosed
 //     而非静默丢日志。
 func (r *rotatingFile) rotateLocked() error {
+	// 上次重建失败时可能仍写在 .1；不可把仍在使用的备份移位或删除。
+	if r.f != nil && r.inBackup {
+		f, err := os.OpenFile(r.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return nil // 原路径仍不可用，继续保留备份句柄。
+		}
+		_ = r.f.Close()
+		r.f = f
+		r.inBackup = false
+		r.size = 0
+		if st, err := f.Stat(); err == nil {
+			r.size = st.Size()
+		}
+		return nil
+	}
 	// 改名前必须先关闭当前句柄（Windows 下被占用则无法改名）。
 	if r.f != nil {
 		_ = r.f.Close()
@@ -151,6 +182,7 @@ func (r *rotatingFile) rotateLocked() error {
 			r.size = st.Size()
 		}
 		r.f = alt
+		r.inBackup = true
 		return nil
 	}
 	r.f = f

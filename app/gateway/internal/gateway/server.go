@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,23 @@ import (
 	"github.com/ayflying/pvn/pkg/gatewayproto"
 	"github.com/ayflying/pvn/sdk/go/lanet"
 	"github.com/gorilla/websocket"
+)
+
+// 网关稳定性相关的硬上限与超时，集中声明便于复核与测试：
+//   - httpReadHeaderTimeout / httpIdleTimeout：HTTP 读头与空闲超时，避免
+//     慢速/空闲连接长期占用 accept 协程与文件描述符；
+//   - wsReadDeadlinePreAuth：鉴权首帧必须在限时内到达，杜绝握手期挂死；
+//   - wsWriteDeadline：单条写出限时，写阻塞由它兜底（不靠全局读超时，
+//     以免误杀鉴权后的正常空闲长连接）；
+//   - maxStreams：单连接应用层流数硬上限，超限明确拒绝而非无限膨胀；
+//   - outBufSize：单连接出站帧队列容量，满时显式终止会话而非静默丢帧。
+const (
+	httpReadHeaderTimeout = 10 * time.Second
+	httpIdleTimeout       = 60 * time.Second
+	wsReadDeadlinePreAuth = 10 * time.Second
+	wsWriteDeadline       = 15 * time.Second
+	maxStreams            = 128
+	outBufSize            = 128
 )
 
 // Config 网关配置。
@@ -49,8 +67,8 @@ type Server struct {
 	srv    *http.Server
 
 	mu          sync.Mutex
-	serviceConn *wsConn             // 当前 service 模式连接（至多一个）
-	clients     map[string]*wsConn  // 游戏客户端路由表：鉴权 name → 连接（玩家互连用）
+	serviceConn *wsConn            // 当前 service 模式连接（至多一个）
+	clients     map[string]*wsConn // 游戏客户端路由表：鉴权 name → 连接（玩家互连用）
 }
 
 // nodeInfo 网关节点身份。client 未就绪（如测试桩）时返回零值，不 panic。
@@ -59,6 +77,18 @@ func (s *Server) nodeInfo() lanet.Info {
 		return lanet.Info{}
 	}
 	return s.client.Info()
+}
+
+// httpServer 构造带稳定性超时的 HTTP/WS 服务：读头超时与空闲超时由连接
+// 进入 WS 升级前兜底，避免慢速或空闲连接长期占用文件描述符；空闲超时仅
+// 作用于尚未升级的 HTTP 连接，升级后的 WebSocket 长连接不受其影响。
+func (s *Server) httpServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              s.cfg.ListenAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		IdleTimeout:       httpIdleTimeout,
+	}
 }
 
 // 鉴权请求/应答。
@@ -112,6 +142,8 @@ func Run(ctx context.Context, cfg Config) (*lanet.Client, error) {
 		cfg.Name = "gateway"
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	client, err := lanet.New(ctx, lanet.Config{
 		CTLURL:     cfg.CTLURL,
 		InviteCode: cfg.InviteCode,
@@ -136,9 +168,15 @@ func Run(ctx context.Context, cfg Config) (*lanet.Client, error) {
 	s := &Server{cfg: cfg, client: client, clients: make(map[string]*wsConn)}
 
 	// 入向流分发：交给 service 连接（没有则拒绝）。
-	inbound := make(chan lanet.Stream, 16)
+	inbound := make(chan lanet.Stream)
 	client.OnStream(func(stream lanet.Stream) {
-		inbound <- stream
+		select {
+		case inbound <- stream:
+		case <-ctx.Done():
+			_ = stream.Reset()
+		default:
+			_ = stream.Reset()
+		}
 	})
 	go s.dispatchInbound(ctx, inbound)
 
@@ -148,7 +186,8 @@ func Run(ctx context.Context, cfg Config) (*lanet.Client, error) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	s.srv = &http.Server{Addr: cfg.ListenAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
+	s.srv = s.httpServer(mux)
+	s.srv.BaseContext = func(net.Listener) context.Context { return ctx }
 
 	go func() {
 		<-ctx.Done()
@@ -156,6 +195,7 @@ func Run(ctx context.Context, cfg Config) (*lanet.Client, error) {
 	}()
 	log.Printf("[gateway] WS 监听 %s%s", cfg.ListenAddr, cfg.Path)
 	if err = s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		_ = client.Close()
 		return client, fmt.Errorf("gateway: %w", err)
 	}
 	return client, nil
@@ -168,6 +208,10 @@ func (s *Server) dispatchInbound(ctx context.Context, inbound chan lanet.Stream)
 		case <-ctx.Done():
 			return
 		case stream := <-inbound:
+			if ctx.Err() != nil {
+				_ = stream.Reset()
+				return
+			}
 			s.mu.Lock()
 			svc := s.serviceConn
 			s.mu.Unlock()
@@ -207,15 +251,24 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.Close()
 	ws.SetReadLimit(1 << 20)
-	_ = ws.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_ = ws.SetReadDeadline(time.Now().Add(wsReadDeadlinePreAuth))
 
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
 	conn := &wsConn{
+		ctx:        ctx,
+		cancel:     cancel,
 		ws:         ws,
-		out:        make(chan []byte, 128),
+		out:        make(chan []byte, outBufSize),
 		writerDone: make(chan struct{}),
 		streams:    make(map[uint32]*meshStream),
 	}
 	go conn.writeLoop()
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = ws.Close()
+		conn.closeAllStreams()
+	})
+	defer stopCancel()
 	defer conn.closeAllStreams()
 
 	// 1. 首帧必须是鉴权。
@@ -365,18 +418,26 @@ func (s *Server) handleDial(conn *wsConn, frame gatewayproto.Frame) {
 		return
 	}
 
+	ctx := conn.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	if req.Protocol != "" {
 		// 自定义协议直开流（对端需注册了该协议处理器）。
-		stream, viaRelay, err := s.client.DialProtocol(context.Background(), req.IP, req.Protocol)
+		stream, viaRelay, err := s.client.DialProtocol(ctx, req.IP, req.Protocol)
 		if err != nil {
 			conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialErr, StreamID: id, Payload: []byte(err.Error())})
 			return
 		}
-		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialOk, StreamID: id,
-			Payload: mustJSON(dialOk{ViaRelay: viaRelay})})
 		st := newMeshStream(stream)
 		if !conn.track(id, st) {
-			conn.closeAllStreams()
+			conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialErr, StreamID: id, Payload: []byte("流数超限或 ID 已占用")})
+			return
+		}
+		if !conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialOk, StreamID: id,
+			Payload: mustJSON(dialOk{ViaRelay: viaRelay})}) {
 			return
 		}
 		go conn.pumpStreamToClient(id, st)
@@ -388,7 +449,7 @@ func (s *Server) handleDial(conn *wsConn, frame gatewayproto.Frame) {
 		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialErr, StreamID: id, Payload: []byte("无效端口")})
 		return
 	}
-	nc, err := s.client.DialPortFWD(context.Background(), lanet.PortFWDTarget{VirtualIP: req.IP, Port: req.Port})
+	nc, err := s.client.DialPortFWD(ctx, lanet.PortFWDTarget{VirtualIP: req.IP, Port: req.Port})
 	if err != nil {
 		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialErr, StreamID: id, Payload: []byte(err.Error())})
 		return
@@ -397,11 +458,13 @@ func (s *Server) handleDial(conn *wsConn, frame gatewayproto.Frame) {
 	if pfc, ok := nc.(*lanet.PortFWDConn); ok {
 		viaRelay = pfc.ViaRelay()
 	}
-	conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialOk, StreamID: id,
-		Payload: mustJSON(dialOk{ViaRelay: viaRelay})})
 	st := newMeshStream(nc)
 	if !conn.track(id, st) {
-		conn.closeAllStreams()
+		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialErr, StreamID: id, Payload: []byte("流数超限或 ID 已占用")})
+		return
+	}
+	if !conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialOk, StreamID: id,
+		Payload: mustJSON(dialOk{ViaRelay: viaRelay})}) {
 		return
 	}
 	go conn.pumpStreamToClient(id, st)
@@ -433,26 +496,43 @@ func (s *Server) bridgeDial(conn *wsConn, id uint32, req dialReq) {
 	// 发起方侧：复用普通出向流语义（DialOk + Data 泵）。
 	stA := newMeshStream(pipeA)
 	if !conn.track(id, stA) {
-		_ = pipeA.Close()
 		_ = pipeB.Close()
+		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialErr, StreamID: id, Payload: []byte("流数超限或 ID 已占用")})
 		return
 	}
-	conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialOk, StreamID: id,
-		Payload: mustJSON(dialOk{ViaRelay: false})})
-	go conn.pumpStreamToClient(id, stA)
-
 	// 目标侧：分配新 streamID，以 StreamOpen 通知（与网格入向流同帧型）。
 	targetID := target.newStreamID()
 	stB := newMeshStream(pipeB)
 	if !target.track(targetID, stB) {
-		// 目标侧登记失败（连接已断/流满）：回拆发起侧。
-		_ = pipeA.Close()
+		// 回拆必须摘表并通知 done，单关管道会把 EOF 泵留在等待中。
+		if st := conn.untrack(id); st != nil {
+			_ = st.close()
+		}
 		_ = pipeB.Close()
-		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeReset, StreamID: id})
+		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialErr, StreamID: id, Payload: []byte("目标流数超限或连接已关闭")})
 		return
 	}
-	target.send(gatewayproto.Frame{Type: gatewayproto.TypeStreamOpen, StreamID: targetID,
-		Payload: mustJSON(streamOpen{Protocol: req.Protocol, RemotePeer: conn.name})})
+	rollback := func() {
+		if st := conn.untrack(id); st != nil {
+			_ = st.close()
+		}
+		if st := target.untrack(targetID); st != nil {
+			_ = st.close()
+		}
+	}
+	if !target.send(gatewayproto.Frame{Type: gatewayproto.TypeStreamOpen, StreamID: targetID,
+		Payload: mustJSON(streamOpen{Protocol: req.Protocol, RemotePeer: conn.name})}) {
+		rollback()
+		conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialErr, StreamID: id, Payload: []byte("目标连接已关闭")})
+		return
+	}
+	if !conn.send(gatewayproto.Frame{Type: gatewayproto.TypeDialOk, StreamID: id,
+		Payload: mustJSON(dialOk{ViaRelay: false})}) {
+		rollback()
+		target.send(gatewayproto.Frame{Type: gatewayproto.TypeReset, StreamID: targetID})
+		return
+	}
+	go conn.pumpStreamToClient(id, stA)
 	go target.pumpStreamToClient(targetID, stB)
 }
 
@@ -486,6 +566,8 @@ func (st *meshStream) close() error {
 
 // wsConn 一条已鉴权的客户端 WebSocket 连接。
 type wsConn struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
 	ws         *websocket.Conn
 	name       string // 鉴权名（玩家互连的路由键，网关内唯一）
 	out        chan []byte
@@ -500,7 +582,7 @@ func (c *wsConn) newStreamID() uint32 { return c.nextID.Add(1) }
 
 func (c *wsConn) track(id uint32, st *meshStream) bool {
 	c.mu.Lock()
-	if c.closed || len(c.streams) >= 128 || c.streams[id] != nil {
+	if c.closed || len(c.streams) >= maxStreams || c.streams[id] != nil {
 		c.mu.Unlock()
 		_ = st.close()
 		return false
@@ -556,12 +638,14 @@ func (c *wsConn) readMessage() ([]byte, error) {
 }
 
 // writeLoop 单协程串行写 WS（gorilla 不支持并发写）。
-// 退出时只关闭 writerDone；底层 ws 由 closeAllStreams 在队列排空后关闭，
-// 保证「入队即尽力送达」——否则 AuthErr 等错误帧会在关闭竞态中静默丢失。
+// 先通知写循环退出，再清理会话，避免清理等待自身；写失败必须唤醒读端。
 func (c *wsConn) writeLoop() {
-	defer close(c.writerDone)
+	defer func() {
+		close(c.writerDone)
+		c.closeAllStreams()
+	}()
 	for msg := range c.out {
-		_ = c.ws.SetWriteDeadline(time.Now().Add(15 * time.Second))
+		_ = c.ws.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
 		if err := c.ws.WriteMessage(websocket.BinaryMessage, msg); err != nil {
 			return
 		}
@@ -617,10 +701,15 @@ func (c *wsConn) closeAllStreams() {
 	// 等写循环把已入队消息写完再关底层连接（writerDone 为 nil 说明是
 	// 单测里手工构造的连接，无写循环）。
 	if c.ws != nil && c.writerDone != nil {
+		timer := time.AfterFunc(wsWriteDeadline, func() { _ = c.ws.Close() })
 		<-c.writerDone
+		timer.Stop()
 		_ = c.ws.Close()
 	} else if c.ws != nil {
 		_ = c.ws.Close()
+	}
+	if c.cancel != nil {
+		c.cancel()
 	}
 }
 

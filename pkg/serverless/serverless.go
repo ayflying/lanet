@@ -34,6 +34,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ayflying/pvn/pkg/netmapclient"
@@ -117,9 +118,8 @@ const DefaultPublicDHTTimeout = 10 * time.Minute
 const infoHandshakeTimeout = 10 * time.Second
 
 // maxInfoJSONSize info/unfriend 载荷的有界读取上限（64KiB）。
-// 历史上的 json.NewDecoder(s).Decode 对无限流是「读到 EOF 为止」，若对端
-// 恶意发送超长载荷会一直占用流与内存。用 io.LimitReader 截断到 64KiB，
-// 截断即 Decode 失败 → 直接 Reset 流终止握手（防半开流堆积）。
+// 解码必须限制读取字节，避免超长单个 JSON 值占用流与内存。
+// 入向额外读取一字节用于判定超限，并拒绝有效 JSON 后的尾随内容。
 const maxInfoJSONSize = 64 * 1024
 
 // infoStreamDeadline 计算 info 流应设置的截止时间：ctx 若带更短截止则
@@ -315,8 +315,18 @@ type Discovery struct {
 	groupKey []byte
 	selfIP   string
 
-	dhtPrivate *kaddht.IpfsDHT // 私有 DHT（前缀按群派生；仅私有网络非 nil）
-	dhtPublic  *kaddht.IpfsDHT // 公共 DHT（/ipfs 前缀；兜底与公共网络）
+	// dhtPrivate/dhtPublic 用 atomic.Pointer 承载：它们会在 Close / 运行时开关
+	// （EnablePublicDHTRuntime / retirePublicDHT）与周期性广播（Run 循环里的
+	// advertiseAndDiscover）之间被并发读写，必须用原子访问避免数据竞争。
+	dhtPrivate atomic.Pointer[kaddht.IpfsDHT] // 私有 DHT（前缀按群派生；仅私有网络非 nil）
+	dhtPublic  atomic.Pointer[kaddht.IpfsDHT] // 公共 DHT（/ipfs 前缀；兜底与公共网络）
+
+	// closeOnce 保证 Close 并发/重复调用只执行一次资源回收，避免双重关闭
+	// DHT（kad.Close 非幂等）或与 retirePublicDHT 竞争关闭同一实例。
+	closeOnce sync.Once
+	// closed 在 closeOnce 内于 d.mu 下置真，运行时开关据此拒操作。
+	closed bool
+
 	mdnsSvc    mdns.Service
 
 	// protoInfo / protoUnfriend 控制面协议 ID（0.5.34 起按群密钥派生）。
@@ -371,6 +381,7 @@ type Discovery struct {
 	protoSeedsGroup libprotocol.ID
 	// seedGate 种子交换限流（出入向共用：同对端冷却 + 全局并发上限）。
 	seedGate *seedRateLimiter
+	controlGate controlRateLimiter
 	// seedOnce 保证种子交换循环只启动一次。
 	seedOnce sync.Once
 
@@ -480,7 +491,7 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	// 私有 DHT 前缀：默认用全网共享的固定 /lanet（见 privateDHTPrefix）。
 	privPrefix := privateDHTPrefix(cfg.LegacyGroupDHT, d.groupKey)
 	var derr error
-	d.dhtPrivate, derr = kaddht.New(h,
+	priv, derr := kaddht.New(h,
 		kaddht.Mode(kaddht.ModeAutoServer),
 		kaddht.BootstrapPeers(privParsed...),
 		kaddht.ProtocolPrefix(libprotocol.ID(privPrefix)),
@@ -488,12 +499,13 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	if derr != nil {
 		return nil, fmt.Errorf("serverless: init private dht: %w", derr)
 	}
+	d.dhtPrivate.Store(priv)
 	if cfg.EnablePublicFallback {
 		pub, perr := newPublicDHT(ctx, h, d.logf)
 		if perr != nil {
 			return nil, fmt.Errorf("serverless: init public dht: %w", perr)
 		}
-		d.dhtPublic = pub
+		d.dhtPublic.Store(pub)
 	}
 
 	// 2. mDNS（可选）：NewMdnsService 创建即启动。
@@ -552,17 +564,17 @@ func (d *Discovery) Start(ctx context.Context) error {
 		}
 		cancel()
 	}
-	if d.dhtPrivate != nil {
-		if err := d.dhtPrivate.Bootstrap(ctx); err != nil {
+	if priv := d.dhtPrivate.Load(); priv != nil {
+		if err := priv.Bootstrap(ctx); err != nil {
 			d.logf("私有 DHT 自举未完成（周期重试）: %v", err)
 		}
 	}
-	if d.dhtPublic != nil {
-		if err := d.dhtPublic.Bootstrap(ctx); err != nil {
+	if pub := d.dhtPublic.Load(); pub != nil {
+		if err := pub.Bootstrap(ctx); err != nil {
 			d.logf("公共 DHT 自举未完成（周期重试）: %v", err)
 		}
 	}
-	if d.dhtPrivate != nil && d.dhtPublic != nil {
+	if d.dhtPrivate.Load() != nil && d.dhtPublic.Load() != nil {
 		d.logf("双 DHT 模式：私有发现优先，公共 DHT 临时引导（找到同群成员即退出，最长 %s）",
 			d.cfg.PublicDHTTimeout)
 	} else {
@@ -571,15 +583,15 @@ func (d *Discovery) Start(ctx context.Context) error {
 	// 公共 DHT 临时引导超时：到点无论是否发现同群成员都自动退出。
 	// 与「找到即退」（maybeRetirePublicDHT）双保险，防止开关忘关导致
 	// 公共 DHT 长期挂载消耗流量。
-	if d.dhtPublic != nil {
+	if d.dhtPublic.Load() != nil {
 		d.mu.Lock()
 		d.publicStartedAt = time.Now()
-		pub := d.dhtPublic
+		pub := d.dhtPublic.Load()
 		d.mu.Unlock()
 		d.armPublicDHTTimeout(ctx, pub, d.cfg.PublicDHTTimeout)
 	}
-	d.host.SetStreamHandler(d.protoInfo, d.handleInfo)
-	d.host.SetStreamHandler(d.protoUnfriend, d.handleUnfriend)
+	d.host.SetStreamHandler(d.protoInfo, d.gateControl("info", d.handleInfo))
+	d.host.SetStreamHandler(d.protoUnfriend, d.gateControl("unfriend", d.handleUnfriend))
 	if d.protoInfoAlt != "" {
 		// 混版本过渡（0.5.34）：未升级的老版本对端（≤0.5.33）只认历史固定
 		// ID。派生模式下同时注册固定 ID handler——老→新握手不断（升级节奏
@@ -587,8 +599,8 @@ func (d *Discovery) Start(ctx context.Context) error {
 		// 安全不依赖 handler 种类：info/unfriend 载荷第一步都有群指纹校验
 		// （handleInfo/handleUnfriend 现成逻辑），异群扫描器伪造不出正确
 		// 指纹，在审批门之前就被静默丢弃，零待审批污染。
-		d.host.SetStreamHandler(d.protoInfoAlt, d.handleInfo)
-		d.host.SetStreamHandler(d.protoUnfriendAlt, d.handleUnfriend)
+		d.host.SetStreamHandler(d.protoInfoAlt, d.gateControl("info", d.handleInfo))
+		d.host.SetStreamHandler(d.protoUnfriendAlt, d.gateControl("unfriend", d.handleUnfriend))
 	}
 	// 种子交换：构造时若已开启就注册 handler；未开启的范围连 handler 都
 	// 不存在（对端拨过来直接协商失败，无法强制本机产生处理开销）。
@@ -627,7 +639,7 @@ func (d *Discovery) armPublicDHTTimeout(ctx context.Context, pub *kaddht.IpfsDHT
 			return
 		case <-t.C:
 			d.mu.RLock()
-			same := d.dhtPublic == pub
+			same := d.dhtPublic.Load() == pub
 			d.mu.RUnlock()
 			if same {
 				d.retirePublicDHT(fmt.Sprintf("超时未发现同群成员（引导时限 %s）", timeout))
@@ -642,8 +654,12 @@ func (d *Discovery) armPublicDHTTimeout(ctx context.Context, pub *kaddht.IpfsDHT
 // EnablePublicFallback 决定。
 func (d *Discovery) EnablePublicDHTRuntime(ctx context.Context) error {
 	d.mu.RLock()
-	active := d.dhtPublic != nil
+	active := d.dhtPublic.Load() != nil
+	closed := d.closed
 	d.mu.RUnlock()
+	if closed {
+		return nil // 已 Close，运行时开关拒操作（避免挂上永不回收的 DHT）
+	}
 	if active {
 		return nil
 	}
@@ -652,7 +668,13 @@ func (d *Discovery) EnablePublicDHTRuntime(ctx context.Context) error {
 		return fmt.Errorf("serverless: enable public dht: %w", err)
 	}
 	d.mu.Lock()
-	d.dhtPublic = pub
+	// 构造期间可能已关闭或被另一请求抢先启用，不能覆盖并泄漏实例。
+	if d.closed || d.dhtPublic.Load() != nil {
+		d.mu.Unlock()
+		_ = pub.Close()
+		return nil
+	}
+	d.dhtPublic.Store(pub)
 	d.publicRetired = false
 	d.publicRetireReason = ""
 	d.publicStartedAt = time.Now()
@@ -820,7 +842,8 @@ func (d *Discovery) FindPeer(ctx context.Context, peerID string) (peer.AddrInfo,
 	if id == d.host.ID() {
 		return peer.AddrInfo{}, fmt.Errorf("这就是本机节点 ID，无需连接")
 	}
-	if d.dhtPrivate == nil {
+	priv := d.dhtPrivate.Load()
+	if priv == nil {
 		return peer.AddrInfo{}, fmt.Errorf("私有 DHT 未就绪")
 	}
 	// 先看 peerstore 是否已有可用地址（此前连过、或对端主动握手留下）。
@@ -829,7 +852,7 @@ func (d *Discovery) FindPeer(ctx context.Context, peerID string) (peer.AddrInfo,
 	}
 	findCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	pi, err := d.dhtPrivate.FindPeer(findCtx, id)
+	pi, err := priv.FindPeer(findCtx, id)
 	if err != nil {
 		return peer.AddrInfo{}, err
 	}
@@ -982,18 +1005,18 @@ func (d *Discovery) reapExpired() {
 // 私有 DHT 与公共 DHT 并行工作：私有命中快，公共兜底（跨网冷启动）。
 func (d *Discovery) advertiseAndDiscover(ctx context.Context) {
 	var wg sync.WaitGroup
-	if d.dhtPrivate != nil {
+	if priv := d.dhtPrivate.Load(); priv != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d.dhtRound(ctx, d.dhtPrivate, "dht-private", 15*time.Second, 8*time.Second)
+			d.dhtRound(ctx, priv, "dht-private", 15*time.Second, 8*time.Second)
 		}()
 	}
-	if d.dhtPublic != nil {
+	if pub := d.dhtPublic.Load(); pub != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d.dhtRound(ctx, d.dhtPublic, "dht", 20*time.Second, 25*time.Second)
+			d.dhtRound(ctx, pub, "dht", 20*time.Second, 25*time.Second)
 		}()
 	}
 	wg.Wait()
@@ -1068,13 +1091,13 @@ const publicRetireThreshold = 1
 // 重启节点即可重新冷启动。
 func (d *Discovery) maybeRetirePublicDHT() {
 	d.mu.Lock()
-	if d.dhtPublic == nil || d.publicRetired {
+	if d.dhtPublic.Load() == nil || d.publicRetired {
 		d.mu.Unlock()
 		return
 	}
 	var n int
-	if d.dhtPrivate != nil {
-		n = len(d.dhtPrivate.RoutingTable().ListPeers())
+	if priv := d.dhtPrivate.Load(); priv != nil {
+		n = len(priv.RoutingTable().ListPeers())
 	} else {
 		cutoff := time.Now().Add(-d.memberTTL)
 		for _, m := range d.members {
@@ -1088,11 +1111,11 @@ func (d *Discovery) maybeRetirePublicDHT() {
 		return
 	}
 	reason := fmt.Sprintf("已连接 %d 个同群成员", n)
-	if d.dhtPrivate != nil {
+	if d.dhtPrivate.Load() != nil {
 		reason = fmt.Sprintf("私有 DHT 就绪（路由表 %d 个同群节点）", n)
 	}
 	d.mu.Unlock()
-	if d.dhtPrivate != nil {
+	if d.dhtPrivate.Load() != nil {
 		d.logf("%s，退出公共 DHT 省流量", reason)
 	} else {
 		d.logf("%s，退出公共 DHT 省流量", reason)
@@ -1118,7 +1141,7 @@ func (d *Discovery) PublicDHTState() PublicDHTState {
 	defer d.mu.RUnlock()
 	return PublicDHTState{
 		Enabled:   d.cfg.EnablePublicFallback,
-		Active:    d.dhtPublic != nil,
+		Active:    d.dhtPublic.Load() != nil,
 		Retired:   d.publicRetired,
 		Reason:    d.publicRetireReason,
 		StartedAt: d.publicStartedAt,
@@ -1135,19 +1158,24 @@ func (d *Discovery) PublicDHTState() PublicDHTState {
 // 私有 DHT / mDNS / 成员表直连不受影响。
 func (d *Discovery) retirePublicDHT(reason string) {
 	d.mu.Lock()
-	if d.dhtPublic == nil || d.publicRetired {
+	if d.dhtPublic.Load() == nil || d.publicRetired {
 		d.mu.Unlock()
 		return
 	}
 	d.publicRetired = true // 先置位，防并发重复触发
 	d.publicRetireReason = reason
-	pub := d.dhtPublic
+	// 锁内移交关闭所有权，避免 Close 同时取得相同实例而重复关闭。
+	pub := d.dhtPublic.Swap(nil)
 	d.mu.Unlock()
 	if err := pub.Close(); err != nil {
 		d.logf("公共 DHT 关闭失败（忽略）: %v", err)
 	}
 	d.mu.Lock()
-	d.dhtPublic = nil
+	// 旧实例关闭期间若已重新启用，不能清空新实例或拆掉它的连接。
+	if d.dhtPublic.Load() != nil {
+		d.mu.Unlock()
+		return
+	}
 	// 同群成员快照（保留这些连接）。
 	keep := make(map[string]struct{}, len(d.members))
 	for id := range d.members {
@@ -1310,8 +1338,8 @@ func (d *Discovery) connectAndIdentify(id peer.ID) error {
 	}
 	// 同群成员互为私有 DHT 种子：确认后立即进路由表，
 	// 后续发现不再依赖公共 DHT（快路径生效）。
-	if d.dhtPrivate != nil {
-		_, _ = d.dhtPrivate.RoutingTable().TryAddPeer(id, false, false)
+	if priv := d.dhtPrivate.Load(); priv != nil {
+		_, _ = priv.RoutingTable().TryAddPeer(id, false, false)
 	}
 	// 确认同群即检查公共 DHT 退出（公共网络模式无私有 DHT，同样适用）。
 	d.maybeRetirePublicDHT()
@@ -1467,9 +1495,8 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	// 真实流截止时间：防止对端不回包时读取永久阻塞（历史读无超时）。
 	_ = s.SetDeadline(infoStreamDeadline(context.Background()))
 	var req infoPayload
-	// 有界 JSON：截断到 64KiB，超限/非法载荷 → Decode 失败 → Reset
-	// 直接终止握手，避免半开流与内存被超长载荷占用。
-	if err := json.NewDecoder(io.LimitReader(s, maxInfoJSONSize)).Decode(&req); err != nil {
+	// 对端半关闭写端后校验完整 JSON；最多读取 64KiB+1，超限或尾随垃圾即 Reset。
+	if err := decodeControlJSON(s, &req); err != nil {
 		_ = s.Reset()
 		return
 	}
@@ -1567,8 +1594,8 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	// 入向握手同样顺手清一遍存量脏地址（老版本对端仍会写入回环/链路本地/
 	// circuit，见 p2pkit.PrunePeerstoreAddrs）。
 	p2pkit.PrunePeerstoreAddrs(d.host.Peerstore(), remote)
-	if d.dhtPrivate != nil {
-		_, _ = d.dhtPrivate.RoutingTable().TryAddPeer(remote, false, false)
+	if priv := d.dhtPrivate.Load(); priv != nil {
+		_, _ = priv.RoutingTable().TryAddPeer(remote, false, false)
 	}
 	d.maybeRetirePublicDHT()
 	resp := infoPayload{
@@ -1589,9 +1616,22 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 	if err != nil {
 		return infoPayload{}, err
 	}
+	// ctx 取消/截止监听：主动 Reset 流，使下方 Decode 立即解除阻塞。
+	// 否则纯 WithCancel 取消时只能等流默认 10s 截止，defer 里的 Reset 因函数
+	// 尚未返回无法执行，取消形同虚设——解码会一直阻塞到流超时（见
+	// TestInfoDeadlineCancelReset 场景②：无 deadline 主动 cancel）。
+	ctxDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = stream.Reset()
+		case <-ctxDone:
+		}
+	}()
 	// ctx 取消/截止时 Reset 而非优雅关闭：半关闭状态下优雅 Close 会等对方读
 	// 完成，取消场景无法立即释放流；Reset 直接发 RST 让本端立刻返回。
 	defer func() {
+		close(ctxDone)
 		if ctx.Err() != nil {
 			_ = stream.Reset()
 		} else {
@@ -1615,11 +1655,15 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 	_ = stream.CloseWrite()
 	var resp infoPayload
 	// 有界 JSON：截断到 64KiB，防止对端回超长响应占用流与内存。
-	if err = json.NewDecoder(io.LimitReader(stream, maxInfoJSONSize)).Decode(&resp); err != nil {
+	if err = decodeControlJSON(stream, &resp); err != nil {
 		// 对端在群指纹校验失败时按防泄漏设计静默关流（不回任何身份字节），
-		// 本端表现为协议已协商、但响应读到 EOF。把这一特征识别为「跨群拒绝」，
-		// 上抛可判定的 ErrGroupMismatch，避免把裸 EOF 直接抛给用户。
-		if errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF") {
+		// 本端表现为协议已协商、但响应读到「干净 EOF」。把这一特征识别为
+		// 「跨群拒绝」，上抛可判定的 ErrGroupMismatch，避免把裸 EOF 抛给用户。
+		// 只能用干净的 io.EOF 判定：超长 JSON 被 LimitReader 截断时 json 返回
+		// *json.SyntaxError("unexpected EOF")，那是「超限/畸形」，必须走下面的
+		// Reset 分支终止半开流——绝不能用 strings.Contains(err, "EOF") 误判成
+		// 跨群而跳过 Reset（历史 bug，见 TestInfoOverlimitResponse）。
+		if errors.Is(err, io.EOF) {
 			return infoPayload{}, ErrGroupMismatch
 		}
 		// 其他解码错误（超限/截断/非法）：Reset 终止，不留下半开流。
@@ -1671,7 +1715,7 @@ func (d *Discovery) NotifyUnfriend(ctx context.Context, peerID string) error {
 	if err != nil {
 		return fmt.Errorf("对端不在线或未连通: %w", err)
 	}
-	defer stream.Close()
+	defer bindControlIO(ctx, stream)()
 	if err = json.NewEncoder(stream).Encode(unfriendPayload{
 		PeerID: d.host.ID().String(),
 		Group:  GroupFingerprint(d.groupKey),
@@ -1689,7 +1733,8 @@ func (d *Discovery) handleUnfriend(s network.Stream) {
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(10 * time.Second))
 	var req unfriendPayload
-	if err := json.NewDecoder(s).Decode(&req); err != nil {
+	if err := decodeControlJSON(s, &req); err != nil {
+		_ = s.Reset()
 		return
 	}
 	if req.Group != GroupFingerprint(d.groupKey) {
@@ -1828,10 +1873,14 @@ func (d *Discovery) providerKey() cid.Cid {
 // 只返回节点 ID，不返回地址：建流时由 libp2p 从路由表/DHT 自行解析地址。
 // 纯本地内存读取，零网络开销。
 func (d *Discovery) DHTRoutingPeers() []string {
-	if d == nil || d.dhtPrivate == nil || d.host == nil {
+	if d == nil || d.host == nil {
 		return nil
 	}
-	rt := d.dhtPrivate.RoutingTable()
+	priv := d.dhtPrivate.Load()
+	if priv == nil {
+		return nil
+	}
+	rt := priv.RoutingTable()
 	if rt == nil {
 		return nil
 	}
@@ -1865,27 +1914,34 @@ func (d *Discovery) emit(m Member) {
 // Close 释放发现服务持有的长生命周期资源：私有/公共 DHT 与 mDNS（幂等）。
 // 周期 Run 循环由调用方取消其 ctx 停止，本方法负责 Run 之外仍需显式关闭的
 // 网络资源（DHT kad 协议流处理 / mDNS 监听），避免进程退出后端口与 goroutine
-// 残留。重复调用安全。
+// 残留。重复/并发调用安全：closeOnce 保证资源只回收一次，不会双重关闭 DHT。
 func (d *Discovery) Close() error {
 	var firstErr error
-	d.mu.Lock()
-	priv := d.dhtPrivate
-	pub := d.dhtPublic
-	d.mu.Unlock()
+	d.closeOnce.Do(func() {
+		d.mu.Lock()
+		// 加锁内置置 nil：与 retirePublicDHT / EnablePublicDHTRuntime 对
+		// dhtPublic 的读写都在 d.mu 下，配合 closeOnce 杜绝重复关闭同一实例。
+		priv := d.dhtPrivate.Load()
+		pub := d.dhtPublic.Load()
+		d.dhtPrivate.Store(nil)
+		d.dhtPublic.Store(nil)
+		d.closed = true
+		d.mu.Unlock()
 
-	if priv != nil {
-		if err := priv.Close(); err != nil && firstErr == nil {
-			firstErr = err
+		if priv != nil {
+			if err := priv.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
-	}
-	if pub != nil {
-		if err := pub.Close(); err != nil && firstErr == nil {
-			firstErr = err
+		if pub != nil {
+			if err := pub.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
-	}
-	if d.mdnsSvc != nil {
-		d.mdnsSvc.Close()
-	}
+		if d.mdnsSvc != nil {
+			d.mdnsSvc.Close()
+		}
+	})
 	return firstErr
 }
 

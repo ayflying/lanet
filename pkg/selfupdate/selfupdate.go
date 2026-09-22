@@ -63,6 +63,18 @@ const (
 	ProtocolFile     libprotocol.ID = "/lanet/update-file/1.0.0"
 )
 
+// JSON 报文尺寸上限：防止对端发送超大 JSON 把 handler 协程撑爆内存
+// （审计 item：handler 此前无 JSON 尺寸限额，恶意对端可借超大请求制造 OOM）。
+//   - maxRequestJSON：入向请求体（对端发来的 current / sha256）上限；
+//   - maxResponseJSON：出向清单响应（对端回的 Manifest）上限；
+//   - maxHeadJSON：文件分发 head 上限。head 长度由协议帧的 4 字节字段给出，
+//     该字段可被伪造，故单独再设一道硬上限，避免 make([]byte, 4GB) 直接 OOM。
+const (
+	maxRequestJSON  = 64 << 10 // 64 KiB
+	maxResponseJSON = 64 << 10 // 64 KiB
+	maxHeadJSON     = 1 << 20  // 1 MiB
+)
+
 // signPrefix 签名域分隔：签名内容 = prefix + version + ":" + platform + ":" + size + ":" + sha256hex。
 // 所有字段（含 Size）都入签——测试曾发现仅漏签 Size 时可被篡改。
 const signPrefix = "lanet-update-v1:"
@@ -685,8 +697,8 @@ func (c *Coordinator) gateRate(bucket string, next func(network.Stream)) func(ne
 	}
 }
 
-// streamDeadline 给入向分发流设置读写截止时间，避免对端建流后不发完整请求/
-// 不消费响应而长期占用协程（审计 item 8）。未配置（<=0）则不设，沿用调用方超时。
+// streamDeadline 为更新流设置读写截止时间，避免对端停发或停读后长期占用协程。
+// 未配置（<=0）则不设，沿用调用方超时。
 func (c *Coordinator) streamDeadline(s network.Stream) {
 	if c.cfg.StreamIOTimeout <= 0 {
 		return
@@ -704,7 +716,10 @@ func (c *Coordinator) handleManifest(s network.Stream) {
 	var req struct {
 		Current string `json:"current"`
 	}
-	_ = json.NewDecoder(s).Decode(&req) // 读完（EOF）
+	// 请求体设尺寸上限：超限即视为恶意，直接丢弃连接，不进后续分发逻辑。
+	if err := readUpdateJSON(s, maxRequestJSON, &req); err != nil {
+		return
+	}
 	c.mu.Lock()
 	m := c.self
 	c.mu.Unlock()
@@ -727,7 +742,8 @@ func (c *Coordinator) handleFile(s network.Stream) {
 	defer s.Close()
 	c.streamDeadline(s)
 	var req fileReq
-	if err := json.NewDecoder(s).Decode(&req); err != nil {
+	// 请求体设尺寸上限：超限即视为恶意，直接丢弃连接。
+	if err := readUpdateJSON(s, maxRequestJSON, &req); err != nil {
 		return
 	}
 	c.mu.Lock()
@@ -775,6 +791,28 @@ func (c *Coordinator) newStream(ctx context.Context, pid peer.ID, primary libpro
 	return c.host.NewStream(ctx, pid, protos...)
 }
 
+// readUpdateJSON 读取至真实 EOF，多读一字节区分刚好达到限额和超限。
+func readUpdateJSON(r io.Reader, limit int64, value any) error {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > limit {
+		return errors.New("selfupdate: JSON 超过大小上限")
+	}
+	return json.Unmarshal(data, value)
+}
+
+// bindUpdateStream 将取消与 I/O 绑定，并在请求退出时停止回调、释放流。
+func (c *Coordinator) bindUpdateStream(ctx context.Context, s network.Stream) func() {
+	c.streamDeadline(s)
+	stop := context.AfterFunc(ctx, func() { _ = s.Reset() })
+	return func() {
+		stop()
+		_ = s.Reset()
+	}
+}
+
 // requestManifest 向对端征询版本清单。
 func (c *Coordinator) requestManifest(ctx context.Context, id string) (Manifest, error) {
 	pid, err := peer.Decode(id)
@@ -785,7 +823,7 @@ func (c *Coordinator) requestManifest(ctx context.Context, id string) (Manifest,
 	if err != nil {
 		return Manifest{}, err
 	}
-	defer s.Close()
+	defer c.bindUpdateStream(ctx, s)()
 	// 请求体（当前版本，供对端决策；预留字段）。
 	if err = json.NewEncoder(s).Encode(map[string]string{"current": c.cfg.CurrentVersion}); err != nil {
 		return Manifest{}, err
@@ -794,7 +832,7 @@ func (c *Coordinator) requestManifest(ctx context.Context, id string) (Manifest,
 		return Manifest{}, err
 	}
 	var m Manifest
-	if err = json.NewDecoder(s).Decode(&m); err != nil {
+	if err = readUpdateJSON(s, maxResponseJSON, &m); err != nil {
 		return Manifest{}, err
 	}
 	if !m.Verify(c.cfg.PublicKey) {
@@ -836,7 +874,7 @@ func (c *Coordinator) requestFile(ctx context.Context, id string, m Manifest, de
 	if err != nil {
 		return err
 	}
-	defer s.Close()
+	defer c.bindUpdateStream(ctx, s)()
 	if err = json.NewEncoder(s).Encode(fileReq{SHA256: m.SHA256}); err != nil {
 		return err
 	}
@@ -848,7 +886,11 @@ func (c *Coordinator) requestFile(ctx context.Context, id string, m Manifest, de
 	if _, err = io.ReadFull(br, lenBuf); err != nil {
 		return fmt.Errorf("读 head 长度: %w", err)
 	}
-	headJSON := make([]byte, binary.BigEndian.Uint32(lenBuf))
+	headLen := binary.BigEndian.Uint32(lenBuf)
+	if headLen == 0 || headLen > maxHeadJSON {
+		return fmt.Errorf("文件 head 长度非法: %d（上限 %d）", headLen, maxHeadJSON)
+	}
+	headJSON := make([]byte, headLen)
 	if _, err = io.ReadFull(br, headJSON); err != nil {
 		return fmt.Errorf("读 head: %w", err)
 	}
@@ -857,7 +899,7 @@ func (c *Coordinator) requestFile(ctx context.Context, id string, m Manifest, de
 		return fmt.Errorf("解析 head: %w", err)
 	}
 	// head 必须与征询到的目标一致且验签有效（传输中途被换包也拦得住）。
-	if head.SHA256 != m.SHA256 || head.Version != m.Version || !head.Verify(c.cfg.PublicKey) {
+	if head.SHA256 != m.SHA256 || head.Version != m.Version || head.Platform != m.Platform || head.Size != m.Size || !head.Verify(c.cfg.PublicKey) {
 		return errors.New("selfupdate: 文件头与目标清单不一致或验签失败")
 	}
 	if head.Size <= 0 || head.Size > 512<<20 {
@@ -870,7 +912,13 @@ func (c *Coordinator) requestFile(ctx context.Context, id string, m Manifest, de
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	complete := false
+	defer func() {
+		_ = f.Close()
+		if !complete {
+			_ = os.Remove(dest)
+		}
+	}()
 	h := sha256.New()
 	if n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(br, head.Size)); err != nil {
 		return fmt.Errorf("接收文件: %w", err)
@@ -880,6 +928,13 @@ func (c *Coordinator) requestFile(ctx context.Context, id string, m Manifest, de
 	if sum := hex.EncodeToString(h.Sum(nil)); sum != m.SHA256 {
 		return errors.New("selfupdate: 下载文件 sha256 校验失败")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	complete = true
 	return nil
 }
 

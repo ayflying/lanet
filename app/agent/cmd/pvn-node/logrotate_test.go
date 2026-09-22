@@ -1,12 +1,106 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
+
+func TestRotatingFileBoundaryAndEmptyWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lanet.log")
+	r, err := newRotatingFile(path, 8, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := r.Write([]byte("12345678")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path + ".1"); !os.IsNotExist(err) {
+		t.Fatal("刚好达到阈值不应轮转")
+	}
+	if _, err := r.Write([]byte("oversized-entry")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Write(nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "oversized-entry" {
+		t.Fatalf("空写入不应轮转超长记录: %q %v", got, err)
+	}
+}
+
+func TestRotatingFileBackupFallbackSurvivesRepeatedWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lanet.log")
+	r, err := newRotatingFile(path, 8, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	r.warn = func(string) {}
+	if _, err := r.Write([]byte("original")); err != nil {
+		t.Fatal(err)
+	}
+	r.renameHook = func(old, new string) error {
+		if err := os.Rename(old, new); err != nil {
+			return err
+		}
+		return os.Mkdir(old, 0o700) // 阻断新文件创建，但保留 .1 可写。
+	}
+	for _, entry := range []string{"next", "again", "last"} {
+		if _, err := r.Write([]byte(entry)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := os.ReadFile(path + ".1")
+	if err != nil || string(got) != "originalnextagainlast" {
+		t.Fatalf("重复轮转丢失备份: %q %v", got, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Write([]byte("recovered")); err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(path)
+	if err != nil || string(got) != "recovered" {
+		t.Fatalf("未恢复原路径: %q %v", got, err)
+	}
+}
+
+func TestRotatingFileConcurrentWriteAndClose(t *testing.T) {
+	r, err := newRotatingFile(filepath.Join(t.TempDir(), "lanet.log"), 64, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 30; j++ {
+				if _, err := r.Write([]byte("record\n")); err != nil && !errors.Is(err, os.ErrClosed) {
+					t.Errorf("并发写入: %v", err)
+				}
+			}
+		}()
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Write([]byte("closed")); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("关闭后写入: %v", err)
+	}
+}
 
 // 写入量小于阈值时不应触发轮转。
 func TestRotatingFileNoRotateBelowLimit(t *testing.T) {
@@ -179,5 +273,52 @@ func TestRotatingFileKeepsWritingOnRenameFailure(t *testing.T) {
 	}
 	if warned == 0 {
 		t.Fatal("改名失败未触发告警")
+	}
+}
+
+// TestRotatingFileRenameAndReopenBothFail 极端恢复路径：改名失败（钩子注入）且
+// 回退重开原文件也失败（路径指向不存在的目录）。此时必须「显式返回错误 + 绝不
+// panic」：旧日志文件原样保留（改名从未发生），Write 以 ErrClosed 暴露，而不是
+// 解引用 nil 句柄崩溃（审计 item 7 的失败安全底线）。
+func TestRotatingFileRenameAndReopenBothFail(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "lanet.log")
+	// 种子内容小于阈值，避免 newRotatingFile 启动时抢先轮转（否则原内容会被改名走）。
+	if err := os.WriteFile(oldPath, []byte("seed-log\n"), 0o600); err != nil {
+		t.Fatalf("预置日志: %v", err)
+	}
+	r, err := newRotatingFile(oldPath, 16, 3)
+	if err != nil {
+		t.Fatalf("newRotatingFile: %v", err)
+	}
+	// 把 r.path 指向不存在的子目录，使「改名失败后回退重开原文件」也必然失败。
+	r.path = filepath.Join(dir, "gone-subdir", "lanet.log")
+	var warned int
+	r.warn = func(string) { warned++ }
+	r.renameHook = func(string, string) error { return fmt.Errorf("injected rename failure") }
+	defer r.Close()
+
+	// 触发轮转：现有内容(9B) + 新内容 > 16B 阈值，且此时 r.path 已是无效目录。
+	_, werr := r.Write([]byte("trigger-rotation-now\n"))
+	// 改名与回退重开都失败：必须显式错误暴露，绝不可 panic / 解引用 nil。
+	if werr == nil {
+		t.Fatal("改名与重开都失败时应返回显式错误（而非静默丢日志）")
+	}
+	if !errors.Is(werr, os.ErrClosed) {
+		t.Fatalf("失败路径应返回 ErrClosed，实际: %v", werr)
+	}
+	// 原日志文件未被截断、内容仍在（改名从未发生）。
+	got, rerr := os.ReadFile(oldPath)
+	if rerr != nil {
+		t.Fatalf("原日志文件应仍在: %v", rerr)
+	}
+	if string(got) != "seed-log\n" {
+		t.Fatalf("原日志被截断/篡改: %q", string(got))
+	}
+	if _, stErr := os.Stat(oldPath + ".1"); stErr == nil {
+		t.Fatal("双重失败不应产生 .1 备份")
+	}
+	if warned == 0 {
+		t.Fatal("双重失败未触发告警")
 	}
 }

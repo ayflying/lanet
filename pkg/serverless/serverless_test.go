@@ -375,10 +375,10 @@ func TestDefaultNoPublicFallback(t *testing.T) {
 	if d.cfg.EnablePublicFallback {
 		t.Fatalf("公共 DHT 兜底默认应为关闭")
 	}
-	if d.dhtPublic != nil {
+	if d.dhtPublic.Load() != nil {
 		t.Fatalf("默认不应建立公共 DHT")
 	}
-	if d.dhtPrivate == nil {
+	if d.dhtPrivate.Load() == nil {
 		t.Fatalf("私有 DHT 应始终建立")
 	}
 	if !strings.HasPrefix(d.cfg.NetworkKey, DefaultNetworkKeyPrefix) {
@@ -609,8 +609,8 @@ func TestPublicNetworkAutoRetire(t *testing.T) {
 		t.Fatalf("LegacyDefaultKey 下留空应归一化为 PublicNetworkKey：a=%q b=%q",
 			da.cfg.NetworkKey, db.cfg.NetworkKey)
 	}
-	if da.dhtPrivate == nil || db.dhtPrivate == nil {
-		t.Fatalf("留空密钥也应建立私有 DHT：a=%v b=%v", da.dhtPrivate != nil, db.dhtPrivate != nil)
+	if da.dhtPrivate.Load() == nil || db.dhtPrivate.Load() == nil {
+		t.Fatalf("留空密钥也应建立私有 DHT：a=%v b=%v", da.dhtPrivate.Load() != nil, db.dhtPrivate.Load() != nil)
 	}
 	// 群身份兼容：留空与显式默认密钥的派生必须一致（老网络零迁移）。
 	if string(da.GroupKey()) != string(GroupKey(ChannelOfficial, PublicNetworkKey)) {
@@ -629,7 +629,7 @@ func TestPublicNetworkAutoRetire(t *testing.T) {
 	dhtPublicState := func(d *Discovery) (alive, retired bool) {
 		d.mu.RLock()
 		defer d.mu.RUnlock()
-		return d.dhtPublic != nil, d.publicRetired
+		return d.dhtPublic.Load() != nil, d.publicRetired
 	}
 
 	// 观察窗口：互相发现（成员表非空）且两侧公共 DHT 均已退出。
