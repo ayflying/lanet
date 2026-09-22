@@ -2,6 +2,8 @@ package tunnel
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,5 +82,48 @@ func TestHasCircuitDetectsRelayAddress(t *testing.T) {
 	}
 	if !hasCircuit(viaRelay) {
 		t.Fatal("circuit address should be detected")
+	}
+}
+
+// TestCompactErrorFlattensDialError 回归：libp2p DialError 把每个失败地址展开为
+// "  * [addr] cause" 一行，peerstore 十几个地址全部失败时单条日志十几行，probe
+// 对不可达成员每轮重试会持续刷屏（本机实测 7.9 万行日志里拨号明细占绝大多数）。
+// compactError 必须把它压成单行摘要，保留首行、地址总数与原因计数。
+func TestCompactErrorFlattensDialError(t *testing.T) {
+	multi := "failed to dial 12D3KooWTEST: all dials failed" +
+		"\n  * [/ip4/220.203.161.59/udp/13113/quic-v1] dial refused because of black hole" +
+		"\n  * [/ip6/240e:36f::38/tcp/56997] dial refused because of black hole" +
+		"\n  * [/ip4/192.168.50.217/udp/61862] no transport for protocol" +
+		"\n  * [/ip4/192.168.50.217/udp/62966] no transport for protocol"
+	got := compactError(errors.New(multi))
+	if strings.ContainsAny(got, "\n") {
+		t.Fatalf("压缩结果必须为单行: %q", got)
+	}
+	if !strings.Contains(got, "4 个地址全部失败") {
+		t.Fatalf("应包含地址总数 4: %q", got)
+	}
+	if !strings.Contains(got, "dial refused because of black hole×2") || !strings.Contains(got, "no transport for protocol×2") {
+		t.Fatalf("应包含按次数聚合的原因: %q", got)
+	}
+	if !strings.HasPrefix(got, "failed to dial 12D3KooWTEST: all dials failed") {
+		t.Fatalf("应保留首行: %q", got)
+	}
+}
+
+// TestCompactErrorPlainAndLong 无多行明细的错误原样保留；超长截断。
+func TestCompactErrorPlainAndLong(t *testing.T) {
+	if got := compactError(nil); got != "<nil>" {
+		t.Fatalf("nil 应为 <nil>: %q", got)
+	}
+	if got := compactError(errors.New("simple failure")); got != "simple failure" {
+		t.Fatalf("单行错误应原样: %q", got)
+	}
+	if got := compactError(errors.New("a\nb")); strings.Contains(got, "\n") {
+		t.Fatalf("非地址明细的多行应去行: %q", got)
+	}
+	long := strings.Repeat("x", 600)
+	got := compactError(errors.New(long))
+	if len(got) > 512+3 {
+		t.Fatalf("超长应截断到 512: %d", len(got))
 	}
 }

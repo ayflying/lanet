@@ -3,6 +3,8 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -221,14 +223,57 @@ func describeDirect(route netmapclient.Route, err error) string {
 	return fmt.Sprintf("peer=%s addrs=%d (no address or already connected)", route.PeerID, len(route.Addrs))
 }
 
+// compactError 把错误压成单行短摘要。libp2p 的 DialError 会把一次拨号的
+// 每个失败地址展开为独立一行（"  * [addr] cause"），peerstore 里十几个地址
+// 全部失败时单条日志就膨胀十几行，probe 每轮对不可达成员重试会持续刷屏。
+// 这里压成一行：首行 + 失败地址数与「原因×次数」聚合摘要。
 func compactError(err error) string {
 	if err == nil {
 		return "<nil>"
 	}
-	const maxLength = 512
 	message := err.Error()
-	if len(message) <= maxLength {
-		return message
+	if idx := strings.IndexByte(message, '\n'); idx >= 0 {
+		head := strings.TrimSpace(message[:idx])
+		detail := message[idx+1:]
+		if n := strings.Count(detail, "* ["); n > 0 {
+			message = fmt.Sprintf("%s（%d 个地址全部失败: %s）", head, n, summarizeDialCauses(detail))
+		} else {
+			message = head
+		}
 	}
-	return message[:maxLength] + "..."
+	const maxLength = 512
+	if len(message) > maxLength {
+		message = message[:maxLength] + "..."
+	}
+	return message
+}
+
+// summarizeDialCauses 把逐地址失败明细聚合为「原因×次数」摘要，按次数降序。
+func summarizeDialCauses(detail string) string {
+	type causeCount struct {
+		cause string
+		n     int
+	}
+	counts := map[string]int{}
+	for _, line := range strings.Split(detail, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "* [") {
+			continue
+		}
+		if i := strings.Index(line, "] "); i >= 0 {
+			if cause := strings.TrimSpace(line[i+2:]); cause != "" {
+				counts[cause]++
+			}
+		}
+	}
+	list := make([]causeCount, 0, len(counts))
+	for cause, n := range counts {
+		list = append(list, causeCount{cause, n})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].n > list[j].n })
+	parts := make([]string, 0, len(list))
+	for _, it := range list {
+		parts = append(parts, fmt.Sprintf("%s×%d", it.cause, it.n))
+	}
+	return strings.Join(parts, ", ")
 }
