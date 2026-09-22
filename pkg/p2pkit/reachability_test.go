@@ -378,6 +378,49 @@ func TestIfaceClassify(t *testing.T) {
 	}
 }
 
+// TestHostVirtualIfaceKernelBridge 内核网桥确定性判据：自建网桥可以叫任何名字
+// （br0、lan、bridge0…），按名字猜必然漏——真机实证某云服务器自建网桥上的
+// 10.222.222.1 挤进连接码。isHostVirtualIface 在名字不命中时回退探测
+// /sys/class/net/<名>/bridge（Linux 网桥必有该目录），本测试注入探测桩验证
+// 回退逻辑本身，不依赖跑测试的机器是不是 Linux。
+func TestHostVirtualIfaceKernelBridge(t *testing.T) {
+	orig := bridgeIfaceProbe
+	t.Cleanup(func() { bridgeIfaceProbe = orig })
+
+	// 探测桩：只有名为 "lan" 与 "br0" 的网卡报「是内核网桥」。
+	bridgeIfaceProbe = func(name string) bool { return name == "lan" || name == "br0" }
+
+	// 名字不命中关键词、但探测报网桥 → 判为宿主虚拟网卡。
+	for _, n := range []string{"lan", "br0"} {
+		if !isHostVirtualIface(n) {
+			t.Errorf("isHostVirtualIface(%q) 应为 true（内核网桥探测命中）", n)
+		}
+	}
+	// 名字不命中、探测也不报 → 不降级（真实物理网卡）。
+	for _, n := range []string{"eth0", "以太网", "wlan0"} {
+		if isHostVirtualIface(n) {
+			t.Errorf("isHostVirtualIface(%q) 应为 false（非网桥不误降）", n)
+		}
+	}
+	// 名字命中关键词时无需探测即判 true（短路优先）。
+	bridgeIfaceProbe = func(string) bool { return false }
+	if !isHostVirtualIface("docker0") {
+		t.Error("isHostVirtualIface(docker0) 应为 true（名字命中，不依赖探测）")
+	}
+}
+
+// TestBridgeIfaceProbeDefault 默认探测实现在非 Linux 平台（/sys 路径不存在）
+// 必须安全返回 false，且对空名 / 含路径分隔符的名字不 panic。
+func TestBridgeIfaceProbeDefault(t *testing.T) {
+	for _, n := range []string{"", "docker0", `..\evil`, `a/b`, "eth0"} {
+		if bridgeIfaceProbe(n) {
+			t.Logf("bridgeIfaceProbe(%q) 在本机返回 true（Linux 网桥机器上 eth0 之外的名字出现 true 才是异常）", n)
+		}
+	}
+	// docker0 在真 Linux 网桥机器上应命中；其余平台 /sys 不存在应返回 false。
+	// 两种结果都合法，这里只验证「不 panic、有确定返回」。
+}
+
 // TestRankOfIfaceClasses rankOf 在地址形态之上叠加网卡类别。
 func TestRankOfIfaceClasses(t *testing.T) {
 	sets := &ifaceAddrSets{

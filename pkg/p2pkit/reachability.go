@@ -360,8 +360,30 @@ func ifaceNamesHolding(ips map[string]bool) map[string]bool {
 }
 
 // isHostVirtualIface 判断网卡是否为宿主内部虚拟交换机 / 容器网桥。
+//
+// 两个判据取或：
+//   - 接口名命中关键词（hostVirtualIfaceHints）——各平台通用，覆盖命名规范的
+//     常见网桥（docker0、br-<id>、vEthernet…）；
+//   - **Linux 内核网桥的确定性判据**：/sys/class/net/<名>/bridge 目录存在即为
+//     真网桥。自建网桥可以叫任何名字（br0、lan、bridge0…），按名字猜必然漏——
+//     真机实证某云服务器自建网桥上的 10.222.222.1 挤进连接码，对端拨它必然
+//     超时空耗。/sys 是内存文件系统，探测开销可忽略（枚举本身还有 30s 缓存）。
 func isHostVirtualIface(name string) bool {
-	return containsAnyHint(strings.ToLower(name), hostVirtualIfaceHints)
+	if containsAnyHint(strings.ToLower(name), hostVirtualIfaceHints) {
+		return true
+	}
+	return bridgeIfaceProbe(name)
+}
+
+// bridgeIfaceProbe 探测「该网卡是否为 Linux 内核网桥」，独立成变量供单测注入
+// （Windows/macOS 上 /sys 路径不存在，默认实现恒 false，不影响其他平台）。
+var bridgeIfaceProbe = func(name string) bool {
+	// 网卡名拼进路径前防御：空名与含路径分隔符的名字直接拒绝。
+	if name == "" || strings.ContainsAny(name, `/\`) {
+		return false
+	}
+	_, err := os.Stat("/sys/class/net/" + name + "/bridge")
+	return err == nil
 }
 
 // isTunnelIface 判断网卡是否为 VPN / 隧道类。
