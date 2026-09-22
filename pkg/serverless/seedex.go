@@ -89,7 +89,10 @@ const (
 	// 没有它就会出现「每轮都对着没开开关的对端白试一次」的固定浪费。
 	seedsUnsupportedBackoff = time.Hour
 	// seedsInitialDelay 入网后多久开始第一轮交换。
-	seedsInitialDelay = 45 * time.Second
+	// 曾经是 45s：本意是等 libp2p 连接稳定，但代价是冷启动的成员发现被硬压
+	// 近一分钟——连上种子后要干等 45s 才能从邻居拿到成员表。对端交换有
+	// seedsPeerCooldown（5 分钟/对端）保护，首轮提前不会打爆任何人。
+	seedsInitialDelay = 5 * time.Second
 )
 
 // SeedRecord 一条种子记录（跨节点传输用的中立结构）。

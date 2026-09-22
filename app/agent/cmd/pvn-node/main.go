@@ -439,16 +439,18 @@ func runNode(parent context.Context, serviceMode bool) {
 	// 退避的必要性：地址簿被污染时，每个失败的成员每轮都要在几十条不可达
 	// 地址上并发拨号，稳态下数千个拨号 goroutine 挂着，内存被撑到 1G。
 	lastMembers := ""
-	ticker := time.NewTicker(effProbe)
+	// 冷启动细粒度轮询：成员表首次同步（约 15s）一到就立即开探，不等稳态
+	// tick；首轮全网探测全部成功或 60s 超时后回落到 effProbe 稳态节奏。
+	ticker := time.NewTicker(coldProbeTick)
 	defer ticker.Stop()
-	first := time.After(5 * time.Second)
+	cold := true
+	coldStart := time.Now()
 	backoff := newProbeBackoff()
 	for {
 		select {
 		case <-ctx.Done():
 			log.Printf("[node] 收到退出信号")
 			return
-		case <-first:
 		case <-ticker.C:
 		}
 		members := node.NetMap().Members
@@ -459,6 +461,8 @@ func runNode(parent context.Context, serviceMode bool) {
 		}
 		self := node.Info().VirtualIP
 		now := time.Now()
+		type probeTarget struct{ name, virtualIP string }
+		var targets []probeTarget
 		for _, m := range members {
 			if !shouldProbe(self, m) {
 				continue
@@ -466,7 +470,38 @@ func runNode(parent context.Context, serviceMode bool) {
 			if !backoff.due(m.VirtualIP, now) {
 				continue
 			}
-			backoff.record(m.VirtualIP, probeOnce(ctx, node, m.Name, m.VirtualIP), effProbe)
+			targets = append(targets, probeTarget{m.Name, m.VirtualIP})
+		}
+		results := make([]bool, len(targets))
+		// 有界并发探测：串行时每个离线成员的拨号超时（8s）会把排在后面的
+		// 在线成员拖住，10 成员 5 离线的首轮要 40s+。并发后坏成员只阻塞
+		// 自己；同一对端不会重复探测（targets 唯一），跨对端拨号由 libp2p
+		// swarm 的并发限制与 backoff 兜底，probeBackoff 自带锁可并发 record。
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, probeWorkers)
+		for i, t := range targets {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int, t probeTarget) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				results[i] = probeOnce(ctx, node, t.name, t.virtualIP)
+				backoff.record(t.virtualIP, results[i], effProbe)
+			}(i, t)
+		}
+		wg.Wait()
+		if cold {
+			allOK := len(targets) > 0
+			for _, ok := range results {
+				if !ok {
+					allOK = false
+				}
+			}
+			if allOK || time.Since(coldStart) > time.Minute {
+				cold = false
+				ticker.Reset(effProbe)
+				log.Printf("[node] 冷启动探测完成，进入稳态节奏（%s）", effProbe)
+			}
 		}
 		// 成员表里已消失的目标不再保留退避状态，避免 map 随成员更替增长。
 		backoff.retain(members)
@@ -478,6 +513,17 @@ func runNode(parent context.Context, serviceMode bool) {
 // 取 60s 而非更长：probe 兼作连接保温，上限过高会让「其实已恢复、只是
 // 探测连续失败」的成员久久不被重新纳入探测。
 const probeBackoffMax = 60 * time.Second
+
+// probeWorkers 单轮探测的并发上限。probeOnce 的拨号超时 8s，串行时一个
+// 离线成员就把同一轮里排在后面的在线成员全拖住，冷启动首轮全网探测被
+// 拖到几十秒。6 路并发下几十个成员 2~3 个拨号窗口内完成；同一对端仍由
+// libp2p swarm 的拨号并发限制与 backoff 兜底，不会形成拨号风暴。
+const probeWorkers = 6
+
+// coldProbeTick 冷启动阶段的探测轮询间隔。成员表首次同步约在入网后 15s，
+// 1s tick 让新成员到位后立即被探测，而不是再等一个稳态周期。首轮全网
+// 探测全部成功或 60s 超时后 ticker.Reset(effProbe) 回落稳态节奏。
+const coldProbeTick = time.Second
 
 // probeBackoff 记录每个成员的探测退避状态（按虚拟 IP 归档——它是成员在
 // 本网络里的稳定身份，换连接也不变）。
