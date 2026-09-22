@@ -195,3 +195,126 @@ func mustAddr(t *testing.T, s string) netip.Addr {
 	}
 	return a
 }
+
+// mustMultiaddr 解析 multiaddr，失败直接终止测试。
+func mustMultiaddr(t *testing.T, s string) ma.Multiaddr {
+	t.Helper()
+	a, err := ma.NewMultiaddr(s)
+	if err != nil {
+		t.Fatalf("解析 multiaddr %q 失败：%v", s, err)
+	}
+	return a
+}
+
+// TestAnnounceAddrsReplace 对外通告地址工厂的替换语义：自定义地址生效时
+// identify/DHT 只通告自定义地址；未设置时走 CleanUnderlayAddrs 治理管道。
+// 入向清洗复用 CleanUnderlayAddrs 本体，绝不能被本机的自定义地址污染——
+// 这是替换逻辑独立成 announceAddrs 的原因，用例把两侧行为都钉住。
+func TestAnnounceAddrsReplace(t *testing.T) {
+	listen := []ma.Multiaddr{mustMultiaddr(t, "/ip4/192.168.1.10/tcp/4001")}
+
+	if got := announceAddrs(listen); len(got) != 1 || got[0].String() != "/ip4/192.168.1.10/tcp/4001" {
+		t.Fatalf("未设置自定义时应走治理管道，实际 %v", got)
+	}
+
+	withAdvertiseOverride(t, "1.2.3.4:4001")
+	got := announceAddrs(listen)
+	if len(got) != 2 || got[0].String() != "/ip4/1.2.3.4/tcp/4001" {
+		t.Fatalf("自定义生效时对外通告应只含自定义地址，实际 %v", got)
+	}
+
+	// 入向清洗不受影响：对端地址 192.168.1.10 在自定义生效时依然原样放行。
+	if got := CleanUnderlayAddrs(listen); len(got) != 1 || got[0].String() != "/ip4/192.168.1.10/tcp/4001" {
+		t.Fatalf("CleanUnderlayAddrs 不应被本机自定义地址影响，实际 %v", got)
+	}
+}
+
+// withAdvertiseOverride 设置运行期自声明地址并在测试结束后清除（全局状态，
+// 测试里必须恢复，否则污染同包其他用例）。
+func withAdvertiseOverride(t *testing.T, spec string) {
+	t.Helper()
+	SetAdvertiseSpec(spec)
+	t.Cleanup(func() { SetAdvertiseSpec("") })
+}
+
+// TestSetAdvertiseSpecOverrideEnv 运行期设置优先于 env，且空串 = 清除设置。
+func TestSetAdvertiseSpecOverrideEnv(t *testing.T) {
+	t.Setenv(envAdvertise, "9.9.9.9:9")
+	t.Cleanup(func() { SetAdvertiseSpec("") })
+
+	// 未设置 override：env 生效。
+	got := AdvertiseAddrs()
+	if len(got) == 0 || got[0].String() != "/ip4/9.9.9.9/tcp/9" {
+		t.Fatalf("env 未设置 override 时应生效，实际 %v", got)
+	}
+
+	// 设置 override：覆盖 env。
+	withAdvertiseOverride(t, "1.2.3.4:4001")
+	got = AdvertiseAddrs()
+	if len(got) != 2 || got[0].String() != "/ip4/1.2.3.4/tcp/4001" {
+		t.Fatalf("override 应优先于 env，实际 %v", got)
+	}
+
+	// 清除 override：回退 env。
+	SetAdvertiseSpec("")
+	got = AdvertiseAddrs()
+	if len(got) == 0 || got[0].String() != "/ip4/9.9.9.9/tcp/9" {
+		t.Fatalf("清除 override 后应回退 env，实际 %v", got)
+	}
+}
+
+// TestShareableAddrsReplaceCustom 自定义对外地址的替换语义：
+// 设置后 ShareableAddrs 只返回自定义地址，自动枚举地址一条不剩；
+// 清除后恢复原有治理管道。AutoShareableAddrs 始终返回自动枚举结果
+// （供「系统默认地址」展示，不受替换影响）。
+func TestShareableAddrsReplaceCustom(t *testing.T) {
+	auto := []ma.Multiaddr{mustMultiaddr(t, "/ip4/192.168.1.10/tcp/4001")}
+
+	if got := ShareableAddrs(auto); len(got) != 1 {
+		t.Fatalf("未设置自定义时应走原管道，实际 %v", got)
+	}
+
+	withAdvertiseOverride(t, "1.2.3.4:4001")
+
+	got := ShareableAddrs(auto)
+	if len(got) != 2 || got[0].String() != "/ip4/1.2.3.4/tcp/4001" {
+		t.Fatalf("自定义生效时应只返回自定义地址（TCP+QUIC），实际 %v", got)
+	}
+	for _, a := range got {
+		if a.String() == "/ip4/192.168.1.10/tcp/4001" {
+			t.Fatalf("自动枚举地址 %s 不应再出现在分享结果里", a)
+		}
+	}
+
+	// AutoShareableAddrs 不受替换影响：供「恢复默认」展示系统枚举结果。
+	if got := AutoShareableAddrs(auto); len(got) != 1 || got[0].String() != "/ip4/192.168.1.10/tcp/4001" {
+		t.Fatalf("AutoShareableAddrs 应始终返回自动枚举结果，实际 %v", got)
+	}
+}
+
+// TestValidateAdvertiseSpec 校验侧：合法全收、非法逐项报错、空与超限拒绝。
+func TestValidateAdvertiseSpec(t *testing.T) {
+	cases := []struct {
+		name    string
+		spec    string
+		wantErr bool
+	}{
+		{"合法-ip4", "1.2.3.4:4001", false},
+		{"合法-多项", "1.2.3.4:4001,[2408::1]:4001,/ip4/9.9.9.9/tcp/1", false},
+		{"空", "", true},
+		{"全空白", " , ", true},
+		{"非法-hostport", "1.2.3.4", true},
+		{"非法-ip", "abc.1.2.3:4001", true},
+		{"非法-端口", "1.2.3.4:70000", true},
+		{"非法-multiaddr", "/ip4/x/tcp/1", true},
+		{"超限", "1.1.1.1:1,1.1.1.2:1,1.1.1.3:1,1.1.1.4:1,1.1.1.5:1,1.1.1.6:1,1.1.1.7:1,1.1.1.8:1,1.1.1.9:1", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := ValidateAdvertiseSpec(c.spec)
+			if (err != nil) != c.wantErr {
+				t.Errorf("ValidateAdvertiseSpec(%q) err=%v，wantErr=%v", c.spec, err, c.wantErr)
+			}
+		})
+	}
+}

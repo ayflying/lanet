@@ -62,7 +62,7 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 		libp2p.UserAgent(spec.UserAgent),
 		libp2p.EnableNATService(),
 		libp2p.EnableRelay(),
-		libp2p.AddrsFactory(CleanUnderlayAddrs),
+		libp2p.AddrsFactory(announceAddrs),
 		libp2p.ConnectionGater(lanetOverlayGater{}),
 	}
 	if spec.Identity != nil {
@@ -226,6 +226,25 @@ func PrunePeerstoreAddrs(ps peerstore.Peerstore, id peer.ID) int {
 // 取值参考：正常节点 1~2 块网卡 × 2~3 种传输 ≈ 6 条；12 条留足多网卡 / 多
 // 端口场景的余量，同时把「几十条」压到不会造成拨号风暴的量级。
 const maxUnderlayAddrsPerPeer = 12
+
+// announceAddrs 本机对外通告的地址工厂（挂在 libp2p.AddrsFactory 上，
+// 决定 identify / DHT 向外宣告什么）。
+//
+// 自定义对外地址（AdvertiseAddrs，见 container.go）存在时**整体替换**：
+// 对外只通告用户声明的地址。这与 ShareableAddrs 的替换语义保持同一口径——
+// 否则会出现「连接码里只有自定义地址、对端 identify 却学到一堆内网地址」
+// 的分裂，自定义就失去了意义。
+//
+// 没有自定义地址时走 CleanUnderlayAddrs。注意后者还是**入向**清洗的公共
+// 入口（拨号前、写 peerstore 前都调它），所以替换逻辑必须独立成函数包在
+// 外面，绝不能写进 CleanUnderlayAddrs 本体——对端地址的清洗与本机的对外
+// 声明是两回事，混在一起会让本机的自定义地址污染对端地址的处理路径。
+func announceAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
+	if custom := AdvertiseAddrs(); len(custom) > 0 {
+		return custom
+	}
+	return CleanUnderlayAddrs(addrs)
+}
 
 // CleanUnderlayAddrs = 剔除不可达 + 按可达性排序 + 折叠同链路冗余，
 // 是「拿到一批候选地址后」的标准入口：拨号前、写 peerstore / 地址簿前都用它。

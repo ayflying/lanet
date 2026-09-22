@@ -19,9 +19,12 @@
 package p2pkit
 
 import (
+	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -48,8 +51,10 @@ var (
 	containerOnce sync.Once
 	containerVal  bool
 
-	advertiseOnce sync.Once
-	advertiseList []ma.Multiaddr
+	// advertiseMu 保护 advertiseOverride：它由 SetAdvertiseSpec 在运行期写入
+	// （控制台配置/SDK Config 传入），必须可安全并发读写。
+	advertiseMu       sync.RWMutex
+	advertiseOverride []ma.Multiaddr
 )
 
 // InContainer 判断本机是否运行在容器内。结果进程内缓存（容器身份不会变）。
@@ -111,15 +116,49 @@ func cgroupSaysContainer(content string) bool {
 	return false
 }
 
-// AdvertiseAddrs 返回 LANET_ADVERTISE 声明的对外可达地址（进程内缓存，未配置时为空）。
+// AdvertiseAddrs 返回「自定义对外地址」（替换语义，未配置时为空）。
 //
-// 这些地址会被顶到分享列表最前面——名额有限（连接种子 / 连接码会截断），
-// 显式声明的地址永远比自动枚举出来的更可信。
+// 优先级：SetAdvertiseSpec 运行期设置（节点配置文件 advertise 字段 /
+// SDK Config.Advertise）> LANET_ADVERTISE 环境变量。
+//
+// 语义（0.5.66 起）：这批地址一旦非空，就成为本机对外的**唯一**地址来源——
+// 连接码、连接种子、identify/DHT 对外通告都只使用它们，自动枚举的本机网卡
+// 地址不再出现在任何对外面（见 ShareableAddrs 与 announceAddrs 的替换分支）。
+// 这覆盖了「系统拿到的地址不可用」（NAT/EIP、容器端口映射、多网卡噪音）的
+// 场景：用户比自动探测更清楚哪个地址能被外面拨到。
+//
+// 填错的代价：新节点拿不到本机的真实地址（已在网好友不受影响，地址簿里有
+// 历史真实地址），故 UI 与文档都提示端口必须与实际监听一致。
 func AdvertiseAddrs() []ma.Multiaddr {
-	advertiseOnce.Do(func() {
-		advertiseList = parseAdvertiseSpec(os.Getenv(envAdvertise))
-	})
-	return advertiseList
+	advertiseMu.RLock()
+	override := advertiseOverride
+	advertiseMu.RUnlock()
+	if len(override) > 0 {
+		return override
+	}
+	return envAdvertiseAddrs()
+}
+
+// envAdvertiseAddrs 解析 LANET_ADVERTISE（每次现读现解析，不缓存）。
+//
+// 曾经用 sync.Once 缓存：env 在进程生命周期内不变，缓存看似合理，但进程级
+// Once 会在首个调用点固化结果，测试里 t.Setenv 之后永远读不到新值，env 为
+// 空的进程则永久空。调用点是 identify/通告/分享这类非每包热路径，8 条以内
+// 的 multiaddr 解析是微秒级，不值得为它牺牲可测试性。
+func envAdvertiseAddrs() []ma.Multiaddr {
+	return parseAdvertiseSpec(os.Getenv(envAdvertise))
+}
+
+// SetAdvertiseSpec 运行期设置自定义对外地址（替换语义，见 AdvertiseAddrs）。
+//
+// spec 为空串 = 清除设置（回退 env / 自动枚举）。SDK 在入网前调用一次，
+// 控制台改动经重启进程后随 Config 传入，因此无需支持运行中频繁热改；
+// 带锁是为了与「正在进行的对外通告」互斥，不是为热改。
+func SetAdvertiseSpec(spec string) {
+	parsed := parseAdvertiseSpec(spec)
+	advertiseMu.Lock()
+	advertiseOverride = parsed
+	advertiseMu.Unlock()
 }
 
 // parseAdvertiseSpec 解析 LANET_ADVERTISE 的值：逗号分隔，每项两种形式。
@@ -159,6 +198,46 @@ func parseAdvertiseSpec(spec string) []ma.Multiaddr {
 		out = out[:maxAdvertise]
 	}
 	return out
+}
+
+// ValidateAdvertiseSpec 校验自定义对外地址配置：每一项都必须合法（IP:端口
+// 或完整 multiaddr），有非法项即报错。
+//
+// 与 parseAdvertiseSpec 的分工：解析侧（env / SDK Config）宽容——非法项跳过，
+// 一条写错不该让节点起不来；校验侧（控制台保存配置）严格——写进配置文件前
+// 就该拦住，静默丢弃会让用户以为配上了。
+func ValidateAdvertiseSpec(spec string) error {
+	seen := 0
+	for _, raw := range strings.Split(spec, ",") {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			continue
+		}
+		seen++
+		if strings.HasPrefix(item, "/") {
+			if _, err := ma.NewMultiaddr(item); err != nil {
+				return fmt.Errorf("第 %d 项 %q 不是合法 multiaddr: %v", seen, item, err)
+			}
+			continue
+		}
+		host, port, err := net.SplitHostPort(item)
+		if err != nil {
+			return fmt.Errorf("第 %d 项 %q 应为 IP:端口 形式（IPv6 用 [::1]:4001）", seen, item)
+		}
+		if _, err := netip.ParseAddr(host); err != nil {
+			return fmt.Errorf("第 %d 项 %q 的 IP 非法: %v", seen, host, err)
+		}
+		if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+			return fmt.Errorf("第 %d 项 %q 的端口非法", seen, item)
+		}
+	}
+	if seen == 0 {
+		return errors.New("对外地址不能为空（恢复自动获取请清空该字段）")
+	}
+	if seen > maxAdvertise {
+		return fmt.Errorf("最多 %d 条地址（当前 %d 条）", maxAdvertise, seen)
+	}
+	return nil
 }
 
 // hostPortAddrs 由「IP + 端口」派生 TCP 与 QUIC 两个 multiaddr。

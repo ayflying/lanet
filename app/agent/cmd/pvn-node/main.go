@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/ayflying/pvn/pkg/netmapclient"
+	"github.com/ayflying/pvn/pkg/p2pkit"
 	lanetproto "github.com/ayflying/pvn/pkg/protocol"
 	"github.com/ayflying/pvn/pkg/serverless"
 	"github.com/ayflying/pvn/sdk/go/lanet"
@@ -108,6 +109,10 @@ func runNode(parent context.Context, serviceMode bool) {
 			"防火墙模式：deny-all / allow-list / allow-all；不传则读配置文件")
 		listen = flag.String("listen", envOr("LANET_LISTEN", ""),
 			"覆盖监听地址（逗号分隔）；默认 tcp/ws/quic 全部随机端口")
+		advertise = flag.String("advertise", envOr("LANET_ADVERTISE", ""),
+			"自定义对外地址（逗号分隔 IP:端口 或完整 multiaddr）：设置后连接码/连接种子/对外通告"+
+				"只使用这批地址，自动枚举的网卡地址不再对外出现。端口须与实际监听一致"+
+				"（默认随机端口时需配合 -listen 固定端口）；不传则读配置文件 advertise 字段")
 		tun = flag.String("tun", envOr("LANET_TUN", "@@unset@@"),
 			"虚拟网卡 TUN（true/false，可经 LANET_TUN 设置）；缺省读配置文件（默认 true）")
 		// 三态哨兵：未传 = 读配置文件；显式传 true/false = 覆盖配置文件。
@@ -221,6 +226,9 @@ func runNode(parent context.Context, serviceMode bool) {
 	effConsolePW := firstNonEmpty(*consolePW, nc.ConsolePassword)
 	effFW := firstNonEmpty(*fw, nc.Firewall, "allow-all")
 	effListen := firstNonEmpty(*listen, nc.Listen)
+	// 自定义对外地址（0.5.66，替换语义）：命令行/环境变量 > 配置文件 > 留空
+	// （自动枚举）。传给 SDK 后在 NewHost 之前生效，首批对外通告即用新值。
+	effAdvertise := firstNonEmpty(*advertise, nc.Advertise)
 	// TUN 默认开启：配置文件缺省字段（nil）视为 true，命令行显式 true/false 优先。
 	effTun := nc.Tun == nil || *nc.Tun
 	if *tun != "@@unset@@" {
@@ -270,6 +278,7 @@ func runNode(parent context.Context, serviceMode bool) {
 		NetworkKey:       effKey,
 		Console:          effConsole,
 		Listen:           effListen,
+		Advertise:        effAdvertise,
 		Firewall:         effFW,
 		EnablePublicDHT:  effPublic,
 		PublicDHTMinutes: effPublicMin,
@@ -309,7 +318,10 @@ func runNode(parent context.Context, serviceMode bool) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	extra := nodeConfigRoutes(*config, eff)
+	// node 声明在前：node-config 路由经闭包延迟取运行中的 Client（GET
+	// system_addrs 需要），入网完成前闭包返回 nil，前端自行兜底。
+	var node *lanet.Client
+	extra := nodeConfigRoutes(*config, eff, func() *lanet.Client { return node })
 	for pattern, handler := range updateRoutes(cancel) {
 		extra[pattern] = handler
 	}
@@ -336,6 +348,7 @@ func runNode(parent context.Context, serviceMode bool) {
 		AutoAccept:      effAutoAccept,
 		RequireApproval: &effRequireApproval,
 		DBPath:          effDBPath,
+		Advertise:       effAdvertise,
 	}
 	switch effFW {
 	case "allow-list":
@@ -351,10 +364,11 @@ func runNode(parent context.Context, serviceMode bool) {
 		cfg.ListenAddrs = strings.Split(effListen, ",")
 	}
 
-	node, err := lanet.New(ctx, cfg)
+	n, err := lanet.New(ctx, cfg)
 	if err != nil {
 		log.Fatalf("[node] 入网失败: %v", err)
 	}
+	node = n
 	defer node.Close()
 	info := node.Info()
 	log.Printf("[node] 已入网 name=%s peerID=%s virtualIP=%s network=%s",
@@ -871,6 +885,14 @@ type nodeConfig struct {
 	ConsolePassword string  `json:"console_password,omitempty"`
 	Firewall        string  `json:"firewall"`
 	Listen          string  `json:"listen"`
+	// Advertise 自定义对外地址（0.5.66，替换语义）：逗号分隔 "IP:端口" 或
+	// 完整 multiaddr。设置后连接码 / 连接种子 / 对外通告只使用这批地址，
+	// 自动枚举的网卡地址不再对外出现；留空 = 系统自动获取（默认）。
+	// 典型场景：NAT/EIP（云主机公网 IP 不在网卡上）、容器端口映射、
+	// 多网卡噪音。端口必须与实际监听一致——默认随机端口时需先固定 -listen。
+	// 填错的代价：新节点拿不到本机真实地址（已在网好友不受影响，地址簿有
+	// 历史真实地址），控制台 UI 提示了这一点。
+	Advertise       string  `json:"advertise,omitempty"`
 	EnablePublicDHT bool    `json:"enable_public_dht"` // 公共 DHT 兜底开关（默认关闭，v0.5.16 起语义反转）
 	// PublicDHTMinutes 公共 DHT 临时引导的最长运行分钟数（默认 10）。
 	// 开启公共 DHT 后：连上第一个同群成员立即退出；超时仍未连上也退出。
@@ -1002,6 +1024,8 @@ type nodeRuntime struct {
 	NetworkKey       string
 	Console          string
 	Listen           string
+	// Advertise 自定义对外地址（0.5.66，替换语义；空 = 自动枚举）。
+	Advertise        string
 	Firewall         string
 	EnablePublicDHT  bool
 	PublicDHTMinutes int
@@ -1023,7 +1047,12 @@ func networkID(networkKey string) string {
 
 // nodeConfigRoutes 节点配置 API：GET 读取 / PUT 保存（写回 lanet.json，重启生效）。
 // GET 同时返回 runtime（当前进程实际生效值），前端据此提示与文件保存值的差异。
-func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc {
+//
+// nodeRef 延迟取运行中的 SDK Client（调用时 node 可能尚未入网，返回 nil 即
+// 跳过运行期字段）：GET 用它输出 system_addrs——系统自动枚举的分享地址，
+// 作为「对外地址」输入框的默认填充与「恢复默认」的数据源。自定义地址生效时
+// 它仍返回自动枚举结果（SDK 侧刻意绕开替换），保证用户始终能看到系统默认。
+func nodeConfigRoutes(path string, eff nodeRuntime, nodeRef func() *lanet.Client) map[string]http.HandlerFunc {
 	read := func() nodeConfig {
 		var nc nodeConfig
 		if data, err := os.ReadFile(path); err == nil {
@@ -1037,7 +1066,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 			tunOn := nc.Tun == nil || *nc.Tun
 			requireApprovalOn := nc.RequireApproval == nil || *nc.RequireApproval
 			autoAcceptOn := nc.AutoAccept != nil && *nc.AutoAccept
-			writeJSONLocal(w, http.StatusOK, map[string]any{
+			resp := map[string]any{
 				"config_path": path,
 				"name":        nc.Name,
 				// name_env 标记当前进程的节点名来自环境变量 LANET_NAME（容器编排
@@ -1055,6 +1084,10 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 				"has_password":       nc.ConsolePassword != "",
 				"firewall":           nc.Firewall,
 				"listen":             nc.Listen,
+				// advertise 自定义对外地址（替换语义）：文件保存值；空 = 自动枚举。
+				// system_addrs 系统自动枚举的分享地址（IP:端口），供输入框默认
+				// 填充与「恢复默认」；runtime.advertise 当前进程实际生效值。
+				"advertise":          nc.Advertise,
 				"no_public_dht":      true, // 兼容旧前端字段，恒 true（v0.5.16 起默认关闭公共 DHT）
 				"enable_public_dht":  nc.EnablePublicDHT,
 				"public_dht_minutes": publicDHTMinutesOr(nc.PublicDHTMinutes),
@@ -1077,6 +1110,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 					"network_text":       networkLabel(eff.NetworkKey),
 					"console":            eff.Console,
 					"listen":             eff.Listen,
+					"advertise":          eff.Advertise,
 					"firewall":           eff.Firewall,
 					"enable_public_dht":  eff.EnablePublicDHT,
 					"public_dht_minutes": eff.PublicDHTMinutes,
@@ -1085,7 +1119,13 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 					"auto_accept":        eff.AutoAccept,
 					"db_path":            eff.DBPath,
 				},
-			})
+			}
+			// 系统自动枚举的分享地址（IP:端口）：入网成功后才有——启动早期
+			// 请求（node 尚未就绪）跳过，前端对空值有兜底。
+			if c := nodeRef(); c != nil {
+				resp["system_addrs"] = c.SystemShareHostPorts()
+			}
+			writeJSONLocal(w, http.StatusOK, resp)
 		},
 		"PUT /api/node-config": func(w http.ResponseWriter, r *http.Request) {
 			var req struct {
@@ -1187,6 +1227,18 @@ func nodeConfigRoutes(path string, eff nodeRuntime) map[string]http.HandlerFunc 
 			// 私有协议逃生开关：页面未提供（无该控件）时保留原值。
 			if req.LegacyProtocols == nil {
 				req.LegacyProtocols = prev.LegacyProtocols
+			}
+			// 自定义对外地址（0.5.66）：**无条件采用**请求值（含空串 = 恢复
+			// 自动枚举）。与 Bootstrap「空串保留原值」不同：这里空串是合法的
+			// 显式意图（用户清空输入框 = 关闭自定义），不能与「旧版前端未提供」
+			// 混淆——控制台页面随二进制内嵌升级，不存在持久化的旧前端。
+			// 非法项直接拒绝而不静默跳过：这里写的是配置意图，错了该让用户
+			// 看到报错，而不是保存后无声回退自动枚举。
+			if req.Advertise != "" {
+				if err := p2pkit.ValidateAdvertiseSpec(req.Advertise); err != nil {
+					writeJSONLocal(w, http.StatusBadRequest, map[string]string{"error": "对外地址： " + err.Error()})
+					return
+				}
 			}
 			// 开机自启：平台支持时按请求值切换（立即生效，无需重启）。
 			if req.Autorun != nil && autorunSupported() {

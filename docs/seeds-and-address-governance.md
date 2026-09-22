@@ -171,8 +171,12 @@ saved, err := c.SetSeedSettings(ctx, s)   // 保存并立即生效
 `pkg/p2pkit/container.go`：
 
 - `InContainer()`：判定顺序 `LANET_CONTAINER` 显式覆盖 → `/.dockerenv` → cgroup 关键字（含 `libpod`）。
-- `AdvertiseAddrs()`：`LANET_ADVERTISE` 声明地址，形如 `1.2.3.4:4001`，
-  自动展开 `tcp` + `quic-v1` 两条，上限 8 条；声明后**置顶**。
+- `AdvertiseAddrs()`：自定义对外地址，形如 `1.2.3.4:4001`，
+  自动展开 `tcp` + `quic-v1` 两条，上限 8 条。**0.5.66 起为替换语义**：
+  声明后连接码 / 连接种子 / identify/DHT 对外通告**只使用**这批地址，
+  自动枚举的网卡地址不再对外出现（此前仅置顶）。优先级：
+  节点配置 `advertise` 字段（或 SDK `Config.Advertise`，经 `SetAdvertiseSpec`
+  运行期设置）> `LANET_ADVERTISE` 环境变量。端口须与实际监听一致。
 
 容器内网地址的处置是**剔除而非降级**。原因：容器内网卡名是 `eth0`，
 不命中「宿主虚拟网卡」判定（按网卡名匹配 WSL/Hyper-V/docker 桥），
@@ -180,11 +184,18 @@ saved, err := c.SetSeedSettings(ctx, s)   // 保存并立即生效
 
 ### 6.1 容器节点如何对外可拨
 
-容器映射了端口之后，用 `LANET_ADVERTISE` 声明宿主的公网地址：
+容器映射了端口之后，声明宿主的公网地址（两种等价方式，替换语义）：
 
 ```yaml
 environment:
   LANET_ADVERTISE: "43.136.124.167:4001"
+```
+
+或写入 lanet.json（控制台「节点配置 → 对外地址」，保存后重启生效，
+输入框默认填系统自动获取的地址、可一键还原）：
+
+```json
+{ "advertise": "43.136.124.167:4001" }
 ```
 
 ---

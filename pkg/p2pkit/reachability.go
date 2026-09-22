@@ -503,22 +503,41 @@ func AddrIP(a ma.Multiaddr) (netip.Addr, bool) {
 	return ip.Unmap(), true
 }
 
-// ShareableAddrs 整理出「可供分享」的地址列表：剔除容器内网地址与
-// 隧道 / 宿主虚拟网卡地址 → 去重 → 按可达性排序 → 按链路前缀折叠冗余 →
-// 把显式声明的对外地址顶到最前。连接种子与连接码统一走这里，保证两者口径一致。
+// ShareableAddrs 返回「本机愿意分享出去的地址」（连接种子 / 连接码 / 通告）。
+//
+// 0.5.66 起支持**自定义对外地址（替换语义）**：用户经节点配置显式声明的地址
+// 一旦存在，就直接作为分享结果——自动枚举的本机地址一条都不再混入。用户
+// 比自动探测更清楚「外面到底能拨到哪」（NAT/EIP、容器端口映射场景下系统
+// 自报的内网地址纯属噪音，之前只能置顶缓解，现在支持彻底替换）。
+// 未设置自定义地址时走原有治理管道（AutoShareableAddrs）。
+func ShareableAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
+	if custom := AdvertiseAddrs(); len(custom) > 0 {
+		return CollapseRedundant(custom)
+	}
+	return AutoShareableAddrs(addrs)
+}
+
+// AutoShareableAddrs 原有治理管道：剔除容器内网地址与隧道 / 宿主虚拟网卡
+// 地址 → 去重 → 按可达性排序 → 按链路前缀折叠冗余 → 把 env 自声明地址
+// 顶到最前。连接种子与连接码未启用自定义地址时统一走这里，保证两者口径一致。
+//
+// 置顶只认 env 自声明（envAdvertiseAddrs）、刻意不认 SetAdvertiseSpec 的
+// override：override 是替换语义，它的输出就是 ShareableAddrs 的结果；本函数
+// 的用途是「无论是否启用自定义地址都要看自动枚举结果」（如控制台展示系统
+// 默认地址供恢复默认），混入 override 会让「系统默认」失去参考价值。
 //
 // 保底：整机只挂着隧道 / 虚拟网卡（例如只能靠 ZeroTier 出网）时，过滤后可能
 // 一条不剩——此时退回「不剔除任何地址」的结果。宁可分享一条弱地址，也不要让
 // 连接码 / 种子列表变成空的（空列表对用户完全不可用，而弱地址至少还有机会）。
-func ShareableAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
+func AutoShareableAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
 	var drop map[string]bool
 	if InContainer() {
 		drop = collectContainerInternalAddrs()
 	}
 	drop = mergeAddrSets(drop, DiscouragedShareAddrs())
-	out := shareableAddrsWith(addrs, drop, AdvertiseAddrs())
+	out := shareableAddrsWith(addrs, drop, envAdvertiseAddrs())
 	if len(out) == 0 && len(addrs) > 0 {
-		return shareableAddrsWith(addrs, nil, AdvertiseAddrs())
+		return shareableAddrsWith(addrs, nil, envAdvertiseAddrs())
 	}
 	return out
 }

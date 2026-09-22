@@ -116,6 +116,13 @@ type Config struct {
 	GroupName string
 	// ListenAddrs 覆盖默认监听地址（默认 tcp/udp 全部随机端口）。
 	ListenAddrs []string
+	// Advertise 自定义对外地址（0.5.66，替换语义）：逗号分隔的 "IP:端口"
+	// （同时展开 TCP 与 QUIC）或完整 multiaddr。设置后连接码、连接种子、
+	// identify/DHT 对外通告都只使用这批地址，自动枚举的本机网卡地址不再
+	// 对外出现。适用于 NAT/EIP、容器端口映射、多网卡噪音等「系统拿到的
+	// 地址不可用」的场景。留空 = 自动枚举（原有行为）。
+	// 端口必须与实际监听一致（默认随机端口时需配合 ListenAddrs 固定端口）。
+	Advertise string
 	// WebRTC 启用 webrtc-direct 传输层（默认开启），浏览器节点可直连本节点。
 	WebRTC *bool
 	// NetMapInterval 周期任务间隔，默认 15s。
@@ -396,6 +403,13 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 	}(c)
 
 	// 1. libp2p Host。
+	// 自定义对外地址必须在 NewHost 之前生效：AddrsFactory 在 host 构造时挂上，
+	// 首次 identify / DHT announce 就按它对外通告，晚了会让首批对端学到
+	// 自动枚举的地址。
+	if cfg.Advertise != "" {
+		p2pkit.SetAdvertiseSpec(cfg.Advertise)
+		c.logf("自定义对外地址已启用（替换语义）：%s", cfg.Advertise)
+	}
 	listenAddrs := cfg.ListenAddrs
 	if len(listenAddrs) == 0 {
 		listenAddrs = defaultListenAddrs()
@@ -638,6 +652,30 @@ func (c *Client) SeedAddrs() []string {
 	out := make([]string, 0, len(addrs))
 	for _, a := range addrs {
 		out = append(out, a.String()+"/p2p/"+c.peerID)
+	}
+	return out
+}
+
+// SystemShareHostPorts 返回「系统自动枚举」的分享地址（IP:端口 摘要，去重，
+// 至多 8 条）。
+//
+// 刻意绕开 ShareableAddrs 的自定义替换（走 AutoShareableAddrs）：它是节点
+// 配置页「对外地址」输入框的默认填充值与「恢复默认」的来源——哪怕自定义
+// 已生效，用户也需要看到系统本来会分享什么，才能决定保留自定义还是还原。
+func (c *Client) SystemShareHostPorts() []string {
+	addrs := p2pkit.AutoShareableAddrs(c.node.Addrs())
+	out := make([]string, 0, 8)
+	seen := make(map[string]bool, 8)
+	for _, a := range addrs {
+		if len(out) >= 8 {
+			break
+		}
+		hp, _, ok := p2pkit.DialableHostPort(a)
+		if !ok || seen[hp] {
+			continue
+		}
+		seen[hp] = true
+		out = append(out, hp)
 	}
 	return out
 }
