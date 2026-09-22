@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Lanet 节点控制台</title>
+<!-- 加载状态后由 loadState 把节点名写进页签标题，多开控制台时按页签区分节点。 -->
 <style>
   :root { --bg:#f5f6f8; --card:#fff; --line:#e2e4e9; --txt:#1c1e21; --muted:#6b7280;
           --accent:#2f6fed; --ok:#1a9e6e; --bad:#d5484a; }
@@ -484,6 +485,8 @@ async function loadState() {
   const i = S.info;
   const nodeName = i.name || (i.peer_id ? i.peer_id.slice(0, 16) + '…' : '节点');
   $('nodeTitle').textContent = nodeName;
+  // 节点名写进浏览器页签：多开几个控制台时按页签直接区分是哪台节点。
+  document.title = `${nodeName} · Lanet 控制台`;
   $('addrLine').textContent = `虚拟 IP ${i.virtual_ip}` +
     (i.virtual_host ? ` · 虚拟地址 ${i.virtual_host}` : '') +
     ` · 节点 ${i.peer_id.slice(0,16)}… · 网络 ${i.group || i.group_id}`;
