@@ -89,6 +89,32 @@ func TestBridgePipeClose(t *testing.T) {
 	}
 }
 
+// TestBridgePipeWriteAfterPeerClose 对端全关后写必报错。
+// 回归：Write 的 select 在「入队成功」与「对端 done」同时就绪时随机选择，
+// 曾以约 50% 概率让全关后的写静默成功（Linux CI 间歇失败）。高重复次数
+// 压住这个概率窗口；若实现退化，count=50 下几乎必然复现。
+func TestBridgePipeWriteAfterPeerClose(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		a, b := newBridgePipePair()
+		if _, err := a.Write([]byte("x")); err != nil {
+			t.Fatalf("第 %d 次: 写失败: %v", i, err)
+		}
+		if err := a.Close(); err != nil {
+			t.Fatalf("第 %d 次: Close 失败: %v", i, err)
+		}
+		// 排空残留数据，进入「对端已关且队列空」的稳态。
+		buf := make([]byte, 8)
+		for {
+			if _, err := b.Read(buf); err != nil {
+				break
+			}
+		}
+		if _, err := b.Write([]byte("y")); err == nil {
+			t.Fatalf("第 %d 次: 对端全关后写应报错", i)
+		}
+	}
+}
+
 // TestBridgePipeBigFrame 单帧大于读缓冲：pending 机制保证数据完整。
 func TestBridgePipeBigFrame(t *testing.T) {
 	a, b := newBridgePipePair()

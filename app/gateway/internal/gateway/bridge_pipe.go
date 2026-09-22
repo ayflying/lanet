@@ -114,6 +114,16 @@ func (p *bridgePipe) Write(b []byte) (int, error) {
 	copy(cp, b)
 	select {
 	case p.peer.ch <- cp:
+		// 写入成功后必须复核对端是否已全关：对端 Close 与本端 Write 竞争时，
+		// select 的「入队成功」与「对端 done 就绪」两分支同时就绪会被随机
+		// 选中，导致全关后写入静默成功（TestBridgePipeClose 在 Linux CI 上
+		// 间歇失败）。对端已关即视为未送达，返回错误；已入队的帧对端不会
+		// 再读，随 channel 一起被回收。
+		select {
+		case <-p.peer.done:
+			return 0, io.ErrClosedPipe
+		default:
+		}
 		return len(b), nil
 	case <-p.peer.done:
 		return 0, io.ErrClosedPipe
