@@ -406,8 +406,15 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 	// 自定义对外地址必须在 NewHost 之前生效：AddrsFactory 在 host 构造时挂上，
 	// 首次 identify / DHT announce 就按它对外通告，晚了会让首批对端学到
 	// 自动枚举的地址。
+	//
+	// **无条件**设置（含空串）：advertiseOverride 是进程级状态，只在非空才
+	// Set 会让同进程里第二个空 Advertise 的 Client 残留前一个的自定义地址
+	//（审计矩阵第 9 条跨 Client 污染）。空串显式清除，后创建者生效。
+	// 已知限制：同进程并存多个不同 Advertise 的 Client 仍互相覆盖（进程级
+	// 单值），根治需把 advertise 下沉到 HostSpec 逐 host 隔离——发行版
+	// pvn-node 单实例锁保证单 Client，此限制只影响 SDK 多 Client 集成。
+	p2pkit.SetAdvertiseSpec(cfg.Advertise)
 	if cfg.Advertise != "" {
-		p2pkit.SetAdvertiseSpec(cfg.Advertise)
 		c.logf("自定义对外地址已启用（替换语义）：%s", cfg.Advertise)
 	}
 	listenAddrs := cfg.ListenAddrs
@@ -662,8 +669,16 @@ func (c *Client) SeedAddrs() []string {
 // 刻意绕开 ShareableAddrs 的自定义替换（走 AutoShareableAddrs）：它是节点
 // 配置页「对外地址」输入框的默认填充值与「恢复默认」的来源——哪怕自定义
 // 已生效，用户也需要看到系统本来会分享什么，才能决定保留自定义还是还原。
+//
+// 输入源必须是 Network().ListenAddresses()（原始监听地址）而非 node.Addrs()：
+// 后者经过 announceAddrs/AddrsFactory，custom 生效时它返回的就是自定义地址，
+// 再怎么走 AutoShareableAddrs 也还原不出系统地址（审计矩阵第 10 条）。
+// ListenAddresses 绕过 factory，才是「系统拿到的」的真正源头。
+//
+// 还要先 ExpandWildcardAddrs：测试与实际监听常绑定 /ip4/0.0.0.0/tcp/N，
+// 这是 unspecified 地址，会被可达性排序剔除，不展开成具体网卡地址就会得到空列表。
 func (c *Client) SystemShareHostPorts() []string {
-	addrs := p2pkit.AutoShareableAddrs(c.node.Addrs())
+	addrs := p2pkit.AutoShareableAddrs(p2pkit.ExpandWildcardAddrs(c.node.Network().ListenAddresses()))
 	out := make([]string, 0, 8)
 	seen := make(map[string]bool, 8)
 	for _, a := range addrs {

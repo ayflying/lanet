@@ -292,3 +292,79 @@ func collectContainerInternalAddrs() map[string]bool {
 	}
 	return out
 }
+
+// ExpandWildcardAddrs 把监听地址里的通配符（0.0.0.0 / ::）展开为本机具体
+// 网卡地址（同端口、同传输尾巴）。
+//
+// 为什么需要：Network().ListenAddresses() 对通配绑定返回的是
+// /ip4/0.0.0.0/tcp/... 形态（unspecified），Shareable/排序层按「未指定地址
+// 不可拨」剔除它——不展开就会得到空列表。libp2p 自己在 host.Addrs() 里做
+// 同样的展开，但那个结果经过 AddrsFactory，自定义对外地址生效时已被替换，
+// 还原不出系统地址（审计矩阵第 10 条）；本函数提供 factory 之外的等价展开。
+// 具体地址原样透传；展开含回环与链路本地，交由下游排序层处理（剔/排后）。
+func ExpandWildcardAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
+	var ips []string
+	out := make([]ma.Multiaddr, 0, len(addrs)*2)
+	for _, a := range addrs {
+		s := a.String()
+		var tail string
+		var wildcard bool
+		switch {
+		case strings.HasPrefix(s, "/ip4/0.0.0.0/"):
+			tail = s[len("/ip4/0.0.0.0"):]
+			wildcard = true
+		case strings.HasPrefix(s, "/ip6/::/"):
+			tail = s[len("/ip6/::"):]
+			wildcard = true
+		default:
+			out = append(out, a)
+			continue
+		}
+		if !wildcard {
+			continue
+		}
+		if ips == nil {
+			ips = localHostIPs()
+		}
+		for _, ip := range ips {
+			proto := "ip4"
+			if strings.Contains(ip, ":") {
+				proto = "ip6"
+			}
+			if ea, err := ma.NewMultiaddr("/" + proto + "/" + ip + tail); err == nil {
+				out = append(out, ea)
+			}
+		}
+	}
+	return out
+}
+
+// localHostIPs 本机启用网卡上的全部 IP（含回环与链路本地，交下游排序层处置）。
+func localHostIPs() []string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, aerr := ifc.Addrs()
+		if aerr != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip, ok := netip.AddrFromSlice(ipn.IP)
+			if !ok {
+				continue
+			}
+			out = append(out, ip.Unmap().String())
+		}
+	}
+	return out
+}

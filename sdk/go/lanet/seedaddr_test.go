@@ -1,6 +1,8 @@
 package lanet
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/ayflying/pvn/pkg/invitecode"
@@ -158,5 +160,49 @@ func TestInviteCodeCoversAllNICsNotPrivacyAddrs(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("第 %d 个不匹配：got %q want %q（全量 %v）", i, got[i], want[i], got)
 		}
+	}
+}
+
+// TestSystemShareHostPortsIgnoresCustomAdvertise 真 Host 回归（审计矩阵第 10 条）：
+// custom 生效时 SystemShareHostPorts 必须仍返回**系统监听**地址，不能把自定义
+// 地址当"系统默认"吐给"恢复默认"按钮。
+//
+// bug 形态：输入源若是 node.Addrs()（经 announceAddrs/AddrsFactory），custom
+// 生效时它返回的就是自定义地址——再走 AutoShareableAddrs 也还原不出系统地址。
+// 修复后输入源为 Network().ListenAddresses()（绕过 factory）。
+func TestSystemShareHostPortsIgnoresCustomAdvertise(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h, err := p2pkit.NewHost(ctx, p2pkit.HostSpec{
+		ListenAddrs: []string{"/ip4/0.0.0.0/tcp/0"},
+	})
+	if err != nil {
+		t.Fatalf("起 host 失败: %v", err)
+	}
+	defer func() { _ = h.Close() }()
+
+	p2pkit.SetAdvertiseSpec("1.2.3.4:4001")
+	t.Cleanup(func() { p2pkit.SetAdvertiseSpec("") })
+
+	c := &Client{node: h}
+	got := c.SystemShareHostPorts()
+	if len(got) == 0 {
+		t.Fatal("应至少返回一条系统监听地址（0.0.0.0 应展开到真实网卡）")
+	}
+	for _, hp := range got {
+		if strings.HasPrefix(hp, "1.2.3.4:") {
+			t.Fatalf("自定义地址 %q 泄入「系统默认」——输入源必须绕过 announceAddrs: %v", hp, got)
+		}
+	}
+	// 正向：应来自本机监听（非自定义的任何一条即可证明来源正确）。
+	found := false
+	for _, hp := range got {
+		if !strings.HasPrefix(hp, "1.2.3.4:") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("未找到任何系统监听地址: %v", got)
 	}
 }
