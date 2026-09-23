@@ -2,10 +2,14 @@ package lanet
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/ayflying/pvn/pkg/peersdb"
+	"github.com/ayflying/pvn/pkg/serverless"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -195,6 +199,181 @@ func TestConnectPeerSelfRejected(t *testing.T) {
 	a := newStandaloneClient(t, "node-self", "grp-self", filepath.Join(t.TempDir(), "s.db"))
 	if _, err := a.ConnectPeer(ctx, a.Info().PeerID); err == nil {
 		t.Fatalf("连接本机节点 ID 应报错")
+	}
+}
+
+func TestNearbyListRequiresFreshProbeAndPrefersReportedName(t *testing.T) {
+	c := newStandaloneClient(t, "local", "nearby-list-filter", filepath.Join(t.TempDir(), "nearby.db"))
+	ctx := context.Background()
+	for _, n := range []peersdb.Nearby{
+		{PeerID: "offline", Name: "旧名字", Source: "dht-private"},
+		{PeerID: "online", Name: "历史名字", Source: "dht-private"},
+		{PeerID: "old-version", Source: "dht-private"},
+		{PeerID: c.peerID, Source: "dht-private"},
+		{PeerID: "trusted", Source: "dht-private"},
+	} {
+		if err := c.peers.UpsertNearby(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.peers.SetTrusted(ctx, "trusted", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.peers.UpsertPeer(ctx, peersdb.Peer{PeerID: "online", Name: "本地旧名"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.peers.SetNotes(ctx, "online", "我的备注"); err != nil {
+		t.Fatal(err)
+	}
+	c.nearbyMu.Lock()
+	c.nearbyLive["offline"] = nearbyProbeState{name: "离线设备", expires: time.Now().Add(-time.Second)}
+	c.nearbyLive["online"] = nearbyProbeState{name: "刚自报的名字", expires: time.Now().Add(time.Minute)}
+	c.nearbyLive["trusted"] = nearbyProbeState{name: "好友", expires: time.Now().Add(time.Minute)}
+	c.nearbyLive[c.peerID] = nearbyProbeState{name: "本机", expires: time.Now().Add(time.Minute)}
+	c.nearbyMu.Unlock()
+	list := c.NearbyList()
+	if len(list) != 1 || list[0].PeerID != "online" || list[0].Name != "刚自报的名字" || list[0].Notes != "我的备注" {
+		t.Fatalf("只展示已验证且未信任的在线设备，自报名优先，实际 %+v", list)
+	}
+	c.nearbyMu.Lock()
+	state := c.nearbyLive["online"]
+	state.expires = time.Now().Add(-time.Second)
+	c.nearbyLive["online"] = state
+	c.nearbyMu.Unlock()
+	if list = c.NearbyList(); len(list) != 0 {
+		t.Fatalf("TTL 到期应立即隐藏而不删除附近数据库行，实际 %+v", list)
+	}
+	if stored, err := c.peers.ListNearby(ctx); err != nil || len(stored) < 3 {
+		t.Fatalf("离线节点仍应保留在数据库供下次重验: %+v, %v", stored, err)
+	}
+	c.nearbyMu.Lock()
+	state = c.nearbyLive["online"]
+	state.expires = time.Now().Add(time.Minute)
+	state.name = ""
+	c.nearbyLive["online"] = state
+	c.nearbyMu.Unlock()
+	if list = c.NearbyList(); len(list) != 1 || list[0].Name != "" || list[0].Notes != "我的备注" {
+		t.Fatalf("空自报名不能回填历史名称，备注仍须保留: %+v", list)
+	}
+}
+
+func TestNearbyProbeScheduleIsBoundedAndBacksOff(t *testing.T) {
+	if nearbyProbeWorkers > 2 || nearbyProbeQueue > 12 || nearbyProbeSuccess < time.Minute {
+		t.Fatalf("后台资源预算失效：workers=%d queue=%d success=%s", nearbyProbeWorkers, nearbyProbeQueue, nearbyProbeSuccess)
+	}
+	now := time.Now()
+	state := nearbyProbeState{}
+	for i := 0; i < 6; i++ {
+		state = nearbyNextAttempt(now, state, errors.New("离线"))
+		if state.nextAttempt.Sub(now) > nearbyProbeMaxDelay {
+			t.Fatal("退避超过上限")
+		}
+		if i == 0 && state.nextAttempt.Sub(now) != nearbyProbeFailure {
+			t.Fatal("首次失败应低频重试")
+		}
+	}
+	if state.nextAttempt.Sub(now) != nearbyProbeMaxDelay {
+		t.Fatalf("连续失败应达到最大退避，实际 %s", state.nextAttempt.Sub(now))
+	}
+	state = nearbyNextAttempt(now, state, serverless.ErrNearbyUnsupported)
+	if state.nextAttempt.Sub(now) < time.Hour {
+		t.Fatal("旧版本协议不支持应至少冷却一小时")
+	}
+	state = nearbyNextAttempt(now, state, nil)
+	if state.failures != 0 || state.nextAttempt.Sub(now) < time.Minute {
+		t.Fatalf("成功后应清除失败次数并延迟重验：%+v", state)
+	}
+}
+
+func TestNearbyScanPrioritizesVerifiedAndNewCandidates(t *testing.T) {
+	owner := newStandaloneClient(t, "观察端", "nearby-scan-priority", filepath.Join(t.TempDir(), "scan.db"))
+	ctx := context.Background()
+	addrs := []string{"/ip4/192.0.2.1/tcp/4001"}
+	verified := "verified"
+	if err := owner.peers.UpsertNearby(ctx, peersdb.Nearby{PeerID: verified, Addrs: addrs}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("stale-%02d", i)
+		if err := owner.peers.UpsertNearby(ctx, peersdb.Nearby{PeerID: id, Addrs: addrs}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	latest := "fresh-new"
+	if err := owner.peers.UpsertNearby(ctx, peersdb.Nearby{PeerID: latest, Addrs: addrs}); err != nil {
+		t.Fatal(err)
+	}
+	candidate := &Client{rootCtx: owner.rootCtx, peers: owner.peers, node: owner.node, peerID: owner.peerID, nearbyLive: map[string]nearbyProbeState{}}
+	for i := 0; i < 20; i++ {
+		candidate.nearbyLive[fmt.Sprintf("stale-%02d", i)] = nearbyProbeState{failures: 1}
+	}
+	candidate.nearbyLive[verified] = nearbyProbeState{name: "在线", expires: time.Now().Add(time.Minute)}
+	// 即使旧失败行有 20 条，容量只有 2 的队列仍优先安排已在线重验和最新发现。
+	jobs := make(chan peersdb.Nearby, 2)
+	candidate.scanNearbyProbes(jobs)
+	if len(jobs) != 2 {
+		t.Fatalf("期望两个高优先级候选，实际 %d", len(jobs))
+	}
+	first, second := (<-jobs).PeerID, (<-jobs).PeerID
+	if first != verified || second != latest {
+		t.Fatalf("历史离线节点不应挤占在线和新发现：%q, %q", first, second)
+	}
+}
+
+func TestNearbyProbeFailureHidesVerifiedDevice(t *testing.T) {
+	a := newStandaloneClient(t, "观察端", "nearby-probe-failure", filepath.Join(t.TempDir(), "a.db"))
+	// 无效 ID 可确定性触发探测失败，不依赖对端的网络关闭时序和冷却预算。
+	n := peersdb.Nearby{PeerID: "invalid-peer-id", Source: "dht-private"}
+	if err := a.peers.UpsertNearby(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+	a.wakeNearbyProbes()
+	waitFor(t, 3*time.Second, func() bool {
+		a.nearbyMu.Lock()
+		defer a.nearbyMu.Unlock()
+		return a.nearbyLive[n.PeerID].noAddress
+	}, "等待无地址候选被跳过")
+	a.nearbyMu.Lock()
+	a.nearbyLive[n.PeerID] = nearbyProbeState{name: "旧在线证据", expires: time.Now().Add(time.Minute), nextAttempt: time.Now().Add(time.Minute)}
+	a.nearbyMu.Unlock()
+	if got := a.NearbyList(); len(got) != 1 {
+		t.Fatalf("测试预设的旧在线证据未生效: %+v", got)
+	}
+	a.probeNearby(n)
+	if got := a.NearbyList(); len(got) != 0 {
+		t.Fatalf("重验失败应立即隐藏旧在线结果: %+v", got)
+	}
+}
+
+func TestNearbyProbeKeepsApprovalBoundary(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	a := newStandaloneClient(t, "观察端", "nearby-probe-approval", filepath.Join(dir, "a.db"))
+	b := newStandaloneClient(t, "对端设备", "nearby-probe-approval", filepath.Join(dir, "b.db"))
+	if err := a.Host().Connect(ctx, peer.AddrInfo{ID: b.Host().ID(), Addrs: b.Host().Addrs()}); err != nil {
+		t.Fatalf("建立传输层连接失败: %v", err)
+	}
+	a.onSeenUntrusted(b.peerID, nil, "dht-private")
+	waitFor(t, 12*time.Second, func() bool {
+		for _, n := range a.NearbyList() {
+			if n.PeerID == b.peerID && n.Name == "对端设备" {
+				return true
+			}
+		}
+		return false
+	}, "未审批节点应可受限探测设备名")
+	if trusted, err := a.peers.IsTrusted(ctx, b.peerID); err != nil || trusted {
+		t.Fatalf("读取设备名不能自动信任节点: trusted=%v err=%v", trusted, err)
+	}
+	if len(a.PendingList()) != 0 || len(b.PendingList()) != 0 {
+		t.Fatal("设备名探测不能创建待审批连接申请")
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.NearbyList(); len(got) != 0 {
+		t.Fatalf("关闭后在线缓存必须清理: %+v", got)
 	}
 }
 

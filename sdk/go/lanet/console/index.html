@@ -283,8 +283,8 @@
     </details>
   </div>
   <div class="card" id="nearbyCard" style="display:none">
-    <h2>附近节点 <span class="tag unknown" id="nearbyBadge">0</span></h2>
-    <div class="sub" style="margin-bottom:8px">同一网络密钥内可发现、但还没有互相连接的节点。点「申请连接」向对方发起好友申请（对方同意后双向连通）；被删除过的好友也会回到这里，可重新添加。</div>
+    <h2>附近在线节点 <span class="tag unknown" id="nearbyBadge">0</span></h2>
+    <div class="sub" style="margin-bottom:8px">仅展示近期已确认在线、尚未互相信任的节点；仅被网络发现并不代表在线。点「申请连接」向对方发起好友申请（对方同意后双向连通）；被删除过的好友重新上线后也可在这里申请连接。</div>
     <div id="nearbyList"></div>
     <div class="msg" id="nearbyMsg" style="display:none"></div>
   </div>
@@ -652,16 +652,13 @@ function renderConnect() {
 // selfPeerID 本机节点 ID（列表渲染统一用它排除「自己」）。
 function selfPeerID() { return (S && S.info && S.info.peer_id) || ''; }
 
-// renderNearby 渲染「附近节点」卡片：同网络可发现但非好友的节点，
-// 每个提供「申请连接」按钮（复用统一连接入口，走双向审批）。
+// renderNearby 渲染后端确认在线的未信任节点，提供双向审批的连接入口。
 function renderNearby() {
   const card = $('nearbyCard');
   if (!S) { card.style.display = 'none'; return; }
   const standalone = (S.info && (S.info.group_id === 'standalone' || String(S.info.group || '').startsWith('standalone-')));
   if (!standalone) { card.style.display = 'none'; return; }
-  // 三重过滤：① 本机自己——nearby 是持久化观察表，身份漂移（node.key 换过）
-  // 会留下指向当前身份的行，点「申请连接」会被后端拒绝并报「这就是本机节点
-  // ID」，列表里根本就不该出现自己；② 已在成员表里的好友；③ 重复行防御。
+  // 在线状态由后端探测确认；这里仅防御本机、已信任成员及重复行。
   const selfID = selfPeerID();
   const friendIDs = new Set((S.members || []).map(m => m.peer_id));
   const seen = new Set();
@@ -675,26 +672,23 @@ function renderNearby() {
   $('nearbyBadge').textContent = rows.length;
   card.style.display = '';
   if (!rows.length) {
-    $('nearbyList').innerHTML = '<div class="empty" style="margin:8px 0">附近暂无可发现的节点</div>';
+    $('nearbyList').innerHTML = '<div class="empty" style="margin:8px 0">附近暂无已确认在线的未信任节点</div>';
     return;
   }
   $('nearbyList').innerHTML = rows.map(n => {
     const pid = esc(n.peer_id);
-    // 附近节点的名字来源：本机备注 > 本地库留存的旧名字 > 对方申请时自报的名字
-    // （被动发现本身拿不到身份信息）。有备注时附一份真名。
-    const shown = n.notes || n.name;
-    const nm = shown ? `<b>${esc(shown)}</b>` : '';
-    const realName = (n.notes && n.name) ? `&nbsp;<span class="li-pid">${esc(n.name)}</span>` : '';
-    const t = n.last_seen ? relTime(n.last_seen) : '—';
-    const src = n.source === 'mdns' ? '局域网发现' : (n.source === 'dht-private' ? '同密钥网络发现' : (n.source ? '网络发现' : ''));
+    const name = n.name ? String(n.name).trim() : '';
+    const notes = n.notes ? String(n.notes).trim() : '';
+    const nm = `<b>${esc(name || '设备名未提供')}</b>`;
+    const note = notes ? `&nbsp;<span class="li-pid">备注：${esc(notes)}</span>` : '';
     // 申请后进入的是「对方」的待审批列表（本机看不到对方审批状态），
     // 故这里始终提供按钮，重复点击幂等（后端去重，不会刷屏）。
     return `<div class="listitem">
-      ${listAvatar(n.notes || n.name)}
+      ${listAvatar(name)}
       <div class="li-main">
-        <div class="li-name">${nm}${realName}<span class="li-pid" title="点击复制完整节点 ID：${pid}"
+        <div class="li-name">${nm}${note}<span class="li-pid" title="点击复制完整节点 ID：${pid}"
              onclick="copyText('${pid}', this)">${esc(shortPeerID(n.peer_id))}</span></div>
-        <div class="li-meta">${esc(src)} · 最近发现 ${esc(t)}</div>
+        <div class="li-meta">已确认在线 · 未信任</div>
       </div>
       <div class="li-acts">
         <button class="ghost" onclick="openNotesModal('${pid}')">备注</button>

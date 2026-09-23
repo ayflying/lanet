@@ -341,6 +341,8 @@ type Discovery struct {
 	// 探测流量在传输层就被挡掉（详见 pkg/protocol 包注释）。
 	protoInfo     libprotocol.ID
 	protoUnfriend libprotocol.ID
+	protoNearby   libprotocol.ID
+	nearbyGate    nearbyRateLimiter
 	// protoInfoAlt / protoUnfriendAlt 历史固定协议 ID（派生模式下非空）：
 	// 同群新老版本混跑过渡用——出向建流时作为候选兜底（对端只认固定 ID
 	// 时仍能握手成功），入向也注册同一 handler（跨群伪造不了载荷里的群
@@ -490,6 +492,7 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		// 与「群内种子表 / 全域种子表物理隔离」在协议层一一对应。
 		d.protoSeedsGroup = lproto.GroupProtoID(lproto.BaseSeeds, d.groupKey)
 	}
+	d.protoNearby = lproto.GroupProtoID("nearby-name", d.groupKey)
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
 
 	// 1. DHT：每台节点都是 server（客户端即服务端）。
@@ -624,6 +627,7 @@ func (d *Discovery) Start(ctx context.Context) error {
 	if d.serviceCtx != nil && d.serviceCtx.Err() != nil {
 		return d.serviceCtx.Err()
 	}
+	d.host.SetStreamHandler(d.protoNearby, d.handleNearby)
 	d.host.SetStreamHandler(d.protoInfo, d.gateControl("info", d.handleInfo))
 	d.host.SetStreamHandler(d.protoUnfriend, d.gateControl("unfriend", d.handleUnfriend))
 	if d.protoInfoAlt != "" {
@@ -1990,7 +1994,7 @@ func (d *Discovery) Close() error {
 		d.protocolMu.Lock()
 		if d.host != nil {
 			if d.protocolsStarted {
-				for _, p := range []libprotocol.ID{d.protoInfo, d.protoInfoAlt, d.protoUnfriend, d.protoUnfriendAlt} {
+				for _, p := range []libprotocol.ID{d.protoNearby, d.protoInfo, d.protoInfoAlt, d.protoUnfriend, d.protoUnfriendAlt} {
 					if p != "" {
 						d.host.RemoveStreamHandler(p)
 					}

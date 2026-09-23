@@ -332,6 +332,11 @@ type Client struct {
 	dns *serverless.DNSServer // .lanet DNS 应答器（启动成功时非 nil）
 
 	peers *peersdb.DB // 地址簿 + 审批记录（Standalone 且 DBPath != "-" 时非 nil）
+
+	nearbyMu   sync.Mutex
+	nearbyLive map[string]nearbyProbeState
+	nearbyWake chan struct{}
+	nearbyWG   sync.WaitGroup
 }
 
 // Info 节点入网后的身份信息。
@@ -567,6 +572,9 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 	// 5. 内置 Web 控制台。
 	if err = c.startConsole(); err != nil {
 		return nil, err
+	}
+	if c.peers != nil && c.disc != nil {
+		c.startNearbyProbes()
 	}
 	close(c.ready)
 	return c, nil
@@ -1174,6 +1182,10 @@ func (c *Client) Close() error {
 		if c.cancel != nil {
 			c.cancel()
 		}
+		c.nearbyWG.Wait()
+		c.nearbyMu.Lock()
+		c.nearbyLive = nil
+		c.nearbyMu.Unlock()
 		// 2. TUN 虚拟网卡。
 		c.tunMu.Lock()
 		if c.tunDevice != nil {
