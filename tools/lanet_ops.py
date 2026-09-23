@@ -395,56 +395,68 @@ def path_of(url):
 
 
 # ------------------------------------------------------------------ GitHub 流水线监控
-def watch_github(sha, timeout=1800):
-    """轮询 GitHub Actions，等待该 SHA 的 docker 与 release 流水线结束。"""
-    import time as _time
-    deadline = _time.monotonic() + timeout
+def watch_github(sha, timeout=1800, once=False):
+    """按提交查询双流水线；仅状态变化时输出，失败或查询异常均有明确退出码。"""
+    if not re.fullmatch(r'[0-9a-fA-F]{40}', sha):
+        raise PortainerError('需要完整的 40 位提交 SHA，避免查到其他提交')
+    deadline = time.monotonic() + timeout
     failures = 0
-    while _time.monotonic() < deadline:
+    last_state = None
+    while True:
         try:
             runs = _http_get_json(
-                'https://api.github.com/repos/ayflying/lanet/actions/runs?head_sha=' + sha,
-                timeout=30)
+                'https://api.github.com/repos/ayflying/lanet/actions/runs?head_sha=' + sha + '&per_page=30',
+                timeout=10)
             selected = {}
             for run in runs.get('workflow_runs', []):
-                if run['name'] in ('docker', 'release'):
+                if run.get('head_sha', '').lower() == sha.lower() and run.get('name') in ('docker', 'release'):
                     selected.setdefault(run['name'], run)
             state = {name: {'id': run['id'], 'status': run['status'], 'conclusion': run['conclusion']}
                      for name, run in selected.items()}
-            print(json.dumps(state, ensure_ascii=False), flush=True)
+            if state != last_state:
+                print(json.dumps(state, ensure_ascii=False), flush=True)
+                last_state = state
             if any(run['status'] == 'completed' and run['conclusion'] != 'success' for run in selected.values()):
                 return 1
-            if len(selected) == 2 and all(run['conclusion'] == 'success' for run in selected.values()):
+            if len(selected) == 2 and all(run['status'] == 'completed' and run['conclusion'] == 'success'
+                                          for run in selected.values()):
                 return 0
             failures = 0
         except (OSError, ValueError, PortainerError) as exc:
             failures += 1
-            print(f'流水线查询暂时失败：{type(exc).__name__}', flush=True)
+            print(f'流水线查询失败（{failures}/3）：{_redact(str(exc))}', flush=True)
             if failures >= 3:
                 return 2
-        _time.sleep(20)
-    return 3
+        if once:
+            return 3  # 尚未双绿；单次查询绝不把「正在构建」误判成功
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 3
+        time.sleep(min(20, remaining))
 
 
-def _http_get_json(url, timeout=30):
-    """带 UA 的 JSON GET，直连失败走代理重试。"""
-    headers = {'User-Agent': UA}
+def _http_get_json(url, timeout=10):
+    """GitHub API 查询：鉴权避免匿名限流，直连失败才切代理。"""
+    headers = {'User-Agent': UA, 'Accept': 'application/vnd.github+json'}
+    token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
     last_exc = None
-    for opener in (_make_opener(False), _make_opener(True)):
+    for direct, opener in ((True, _make_opener(False)), (False, _make_opener(True))):
         try:
             req = urllib.request.Request(url, headers=headers)
             with opener.open(req, timeout=timeout) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode('utf-8', errors='replace')
-            if exc.code in RETRYABLE_HTTP and opener is _make_opener(False):
-                last_exc = exc
+            exc.read()  # 不回显远端正文或认证信息
+            if exc.code in RETRYABLE_HTTP and direct:
+                last_exc = f'HTTP {exc.code}'
                 continue
-            raise PortainerError(_redact(f'GET {url}: HTTP {exc.code}: {detail}')) from None
+            raise PortainerError(f'GitHub API HTTP {exc.code}（检查认证与限流）') from None
         except (urllib.error.URLError, socket.timeout, OSError, ConnectionError) as exc:
-            last_exc = exc
+            last_exc = type(exc).__name__
             continue
-    raise PortainerError(_redact(f'GET {url}: 直连与代理均失败: {last_exc}'))
+    raise PortainerError(f'GitHub API 直连与代理均失败：{last_exc}')
 
 
 # ------------------------------------------------------------------ CLI
@@ -470,9 +482,10 @@ def main(argv=None):
     p.add_argument('--path', default='/tmp/lanet-tests', help='容器内目标目录')
     p.add_argument('--endpoint', type=int, default=None)
 
-    p = sub.add_parser('watch-github', help='等待 docker/release 流水线')
-    p.add_argument('--sha', required=True)
+    p = sub.add_parser('watch-github', help='检查指定提交的 docker/release 流水线')
+    p.add_argument('--sha', required=True, help='完整 40 位提交 SHA')
     p.add_argument('--timeout', type=int, default=1800)
+    p.add_argument('--once', action='store_true', help='只查一次；未完成返回退出码 3')
 
     p = sub.add_parser('resource-sample', help='采样容器资源占用')
     p.add_argument('--count', type=int, default=1, help='采样次数')
@@ -486,7 +499,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == 'watch-github':
-        return watch_github(args.sha, timeout=args.timeout)
+        return watch_github(args.sha, timeout=args.timeout, once=args.once)
 
     api = Portainer(endpoint=args.endpoint)
     if args.command == 'status':

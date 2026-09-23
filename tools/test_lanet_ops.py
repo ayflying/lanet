@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import urllib.error
 import urllib.request
 
-from lanet_ops import Portainer, PortainerError, _redact, path_of
+from lanet_ops import Portainer, PortainerError, _http_get_json, _redact, path_of, watch_github
 
 
 class FakeResp:
@@ -256,11 +256,87 @@ class CliDispatchTests(unittest.TestCase):
         api.status.assert_called_once()
 
     def test_watch_github_forwards_sha(self):
-        from lanet_ops import main, watch_github
+        from lanet_ops import main
+        sha = 'a' * 40
         with patch('lanet_ops.watch_github', return_value=0) as wg:
-            rc = main(['watch-github', '--sha', 'abc123'])
+            rc = main(['watch-github', '--sha', sha, '--once'])
         self.assertEqual(rc, 0)
-        wg.assert_called_once_with('abc123', timeout=1800)
+        wg.assert_called_once_with(sha, timeout=1800, once=True)
+
+
+class GithubWatchTests(unittest.TestCase):
+    SHA = 'a' * 40
+
+    def _run(self, status='completed', conclusion='success', name='release'):
+        return {'id': 42, 'head_sha': self.SHA, 'name': name,
+                'status': status, 'conclusion': conclusion}
+
+    def test_both_workflows_succeed_once(self):
+        runs = {'workflow_runs': [self._run(), self._run(name='docker')]}
+        with patch('lanet_ops._http_get_json', return_value=runs):
+            self.assertEqual(watch_github(self.SHA, once=True), 0)
+
+    def test_only_one_or_pending_is_not_success(self):
+        with patch('lanet_ops._http_get_json', return_value={'workflow_runs': [self._run()]}):
+            self.assertEqual(watch_github(self.SHA, once=True), 3)
+        runs = {'workflow_runs': [self._run(), self._run('in_progress', None, 'docker')]}
+        with patch('lanet_ops._http_get_json', return_value=runs):
+            self.assertEqual(watch_github(self.SHA, once=True), 3)
+
+    def test_failure_exits_without_waiting(self):
+        runs = {'workflow_runs': [self._run('completed', 'failure'), self._run(name='docker')]}
+        with patch('lanet_ops._http_get_json', return_value=runs):
+            self.assertEqual(watch_github(self.SHA, once=True), 1)
+
+    def test_other_commit_cannot_make_result_green(self):
+        other = dict(self._run(name='docker'), head_sha='b' * 40)
+        with patch('lanet_ops._http_get_json', return_value={'workflow_runs': [self._run(), other]}):
+            self.assertEqual(watch_github(self.SHA, once=True), 3)
+
+    def test_network_errors_exit_after_three(self):
+        with patch('lanet_ops._http_get_json', side_effect=PortainerError('临时失败')) as get, \
+                patch('lanet_ops.time.sleep'):
+            self.assertEqual(watch_github(self.SHA, timeout=60), 2)
+        self.assertEqual(get.call_count, 3)
+
+    def test_invalid_sha_rejected_before_request(self):
+        with patch('lanet_ops._http_get_json') as get:
+            with self.assertRaisesRegex(PortainerError, '40 位'):
+                watch_github('abc123', once=True)
+        get.assert_not_called()
+
+    def test_github_request_uses_token_and_direct_first(self):
+        direct = MagicMock()
+        proxy = MagicMock()
+        direct.open.return_value = FakeResp([b'{}'])
+        with patch('lanet_ops._make_opener', side_effect=[direct, proxy]), \
+                patch.dict('lanet_ops.os.environ', {'GITHUB_TOKEN': 'test-secret'}, clear=True):
+            self.assertEqual(_http_get_json('https://api.github.com/x'), {})
+        req = direct.open.call_args.args[0]
+        hdrs = {k.lower(): v for k, v in req.header_items()}
+        self.assertEqual(hdrs['authorization'], 'Bearer test-secret')
+        proxy.open.assert_not_called()
+
+    def test_github_503_falls_back_to_proxy(self):
+        direct = MagicMock()
+        proxy = MagicMock()
+        direct.open.side_effect = _http_error(503)
+        proxy.open.return_value = FakeResp([b'{"ok":true}'])
+        with patch('lanet_ops._make_opener', side_effect=[direct, proxy]), \
+                patch.dict('lanet_ops.os.environ', {}, clear=True):
+            self.assertEqual(_http_get_json('https://api.github.com/x'), {'ok': True})
+        proxy.open.assert_called_once()
+
+    def test_github_403_does_not_leak_token_or_retry(self):
+        direct = MagicMock()
+        proxy = MagicMock()
+        direct.open.side_effect = _http_error(403, b'test-secret')
+        with patch('lanet_ops._make_opener', side_effect=[direct, proxy]), \
+                patch.dict('lanet_ops.os.environ', {'GITHUB_TOKEN': 'test-secret'}, clear=True):
+            with self.assertRaises(PortainerError) as ctx:
+                _http_get_json('https://api.github.com/x')
+        self.assertNotIn('test-secret', str(ctx.exception))
+        proxy.open.assert_not_called()
 
 
 if __name__ == '__main__':
