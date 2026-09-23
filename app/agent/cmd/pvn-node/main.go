@@ -414,6 +414,10 @@ func runNode(parent context.Context, serviceMode bool) {
 	}
 	if serviceMode {
 		log.Printf("[service] 正以 Windows 系统服务运行（LocalSystem，无需用户登录；不启动托盘和浏览器）")
+		// 托盘任务兜底：若「Lanet Tray」计划任务缺失（如经 services.msc 手动装/启服务、
+		// 任务被清理），登录后永远没有图标且无任何报错。这里在后台补注册并立即拉起；
+		// 任务已在则只立即拉起一次。异常自愈，不阻塞节点启动。
+		go ensureTrayAutostartFromService(ctx)
 	} else if autorunLaunch {
 		log.Printf("[node] 本次为用户登录后自启启动")
 	}

@@ -99,6 +99,41 @@ func TestTrayTaskXMLShape(t *testing.T) {
 	}
 }
 
+// TestTrayTaskXMLForInjectsUser 服务兜底按「登录用户」生成任务定义：
+// LocalSystem 下 user.Current() 是 SYSTEM，绝不能被写进 LogonTrigger/Principal，
+// 否则任务永远等不到触发。指定用户必须同时出现在触发器与执行身份两处。
+func TestTrayTaskXMLForInjectsUser(t *testing.T) {
+	doc, err := trayTaskXMLFor(`MY-PC\alice`)
+	if err != nil {
+		t.Fatalf("生成任务定义失败: %v", err)
+	}
+	if got := strings.Count(doc, "<UserId>MY-PC\\alice</UserId>"); got != 2 {
+		t.Errorf("UserId 应出现 2 次（触发器+执行身份），实际 %d 次", got)
+	}
+	if strings.Contains(doc, "SYSTEM") {
+		t.Error("任务定义不应包含 SYSTEM 身份")
+	}
+	// 反斜杠在 XML 文本节点里合法，无需转义；仍要求 well-formed，防 schtasks 拒收。
+	var v struct {
+		XMLName xml.Name
+	}
+	dec := xml.NewDecoder(strings.NewReader(doc))
+	dec.CharsetReader = func(_ string, input io.Reader) (io.Reader, error) { return input, nil }
+	if err := dec.Decode(&v); err != nil {
+		t.Fatalf("任务定义不是合法 XML: %v", err)
+	}
+}
+
+// TestConsoleSessionUsersSmoke 冒烟：枚举不能 panic；CI/无桌面环境下允许返回空。
+func TestConsoleSessionUsersSmoke(t *testing.T) {
+	users := consoleSessionUsers()
+	for _, u := range users {
+		if u == "" {
+			t.Error("枚举结果不应包含空用户名")
+		}
+	}
+}
+
 // TestQueryTrayStatusParsesState 校验 /api/state 的解析：成员数 / 在线数 /
 // 待审批数 / 本机虚拟 IP 都要落到菜单上。
 func TestQueryTrayStatusParsesState(t *testing.T) {

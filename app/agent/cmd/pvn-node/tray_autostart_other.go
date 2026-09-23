@@ -2,6 +2,8 @@
 
 package main
 
+import "context"
+
 // 非 Windows 平台的托盘与「登录时拉起托盘」均为空实现：Linux 用 systemd、
 // 容器用 restart 策略，都没有「服务跑在 Session 0、托盘在用户会话」这层
 // 隔离问题，也不需要计划任务。保持与 Windows 版一致的签名，调用方无需
@@ -21,3 +23,6 @@ func isTrayAutostartInstalled() bool { return false }
 
 // startTrayTaskNow 非 Windows 平台无操作。
 func startTrayTaskNow() {}
+
+// ensureTrayAutostartFromService 非 Windows 平台无操作（无 Session 0 隔离问题）。
+func ensureTrayAutostartFromService(ctx context.Context) {}
