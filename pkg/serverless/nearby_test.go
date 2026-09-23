@@ -120,7 +120,7 @@ func TestNearbyProbeRejectsForgedResponseAndReplay(t *testing.T) {
 	if err := d.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var first []byte
+	firstResponse := make(chan []byte, 1)
 	b.SetStreamHandler(d.protoNearby, func(s network.Stream) {
 		defer s.Close()
 		_ = s.SetDeadline(time.Now().Add(3 * time.Second))
@@ -128,16 +128,12 @@ func TestNearbyProbeRejectsForgedResponseAndReplay(t *testing.T) {
 		if _, err := io.ReadFull(s, req[:]); err != nil {
 			return
 		}
-		if first != nil {
-			_, _ = s.Write(first)
-			return
-		}
 		name := []byte("伪造的在线设备")
 		response := make([]byte, 3+len(name)+sha256.Size)
 		response[0] = 1
 		binary.BigEndian.PutUint16(response[1:3], uint16(len(name)))
 		copy(response[3:], name)
-		first = response
+		firstResponse <- response
 		_, _ = s.Write(response)
 	})
 	_, err = d.ProbeNearby(ctx, peer.AddrInfo{ID: b.ID(), Addrs: b.Addrs()})
@@ -149,9 +145,18 @@ func TestNearbyProbeRejectsForgedResponseAndReplay(t *testing.T) {
 	if _, err := rand.Read(oldNonce[:]); err != nil {
 		t.Fatal(err)
 	}
+	first := <-firstResponse
 	binding := append(oldNonce[:], first[:len(first)-sha256.Size]...)
 	oldProof := d.nearbyMAC("response-v1", a.ID(), b.ID(), binding)
 	copy(first[len(first)-sha256.Size:], oldProof[:])
+	b.SetStreamHandler(d.protoNearby, func(s network.Stream) {
+		defer s.Close()
+		_ = s.SetDeadline(time.Now().Add(3 * time.Second))
+		var req [nearbyNonceBytes + sha256.Size]byte
+		if _, err := io.ReadFull(s, req[:]); err == nil {
+			_, _ = s.Write(first)
+		}
+	})
 	// 冷却只影响重试频率，不影响认证校验；这里调整本测试节点的冷却时刻。
 	d.nearbyGate.mu.Lock()
 	d.nearbyGate.lastOut[b.ID()] = time.Time{}
