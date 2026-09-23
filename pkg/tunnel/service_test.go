@@ -3,14 +3,19 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
+
 	"testing"
 	"time"
 
 	netmapclient "github.com/ayflying/pvn/pkg/netmapclient"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	libprotocol "github.com/libp2p/go-libp2p/core/protocol"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -47,6 +52,119 @@ func newTestHost(t *testing.T) host.Host {
 		t.Fatalf("create test host: %v", err)
 	}
 	return h
+}
+
+func TestPathRecordsCapacityAndExpiry(t *testing.T) {
+	s := New(nil, nil, nil)
+	for i := 0; i < 5000; i++ {
+		s.markRelay(fmt.Sprint(i), false)
+	}
+	if len(s.relayUsed) != maxPathRecords {
+		t.Fatalf("历史记录数量%d", len(s.relayUsed))
+	}
+	s.relayUsed["expired"] = pathRecord{at: time.Now().Add(-pathRecordTTL)}
+	s.markRelay("fresh", true)
+	if _, ok := s.relayUsed["expired"]; ok {
+		t.Fatal("过期记录未清理")
+	}
+	if len(s.relayUsed) > maxPathRecords {
+		t.Fatal("清理后仍超限")
+	}
+}
+
+type gatedRelaySource struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *gatedRelaySource) Candidates(ctx context.Context, _ int) ([]peer.AddrInfo, error) {
+	r.once.Do(func() { close(r.entered) })
+	select {
+	case <-r.release:
+		return nil, errors.New("relay unavailable")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestConcurrentDifferentProtocolsDoNotShareStreamError(t *testing.T) {
+	a, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	const supported libprotocol.ID = "/lanet/test/supported/1"
+	const unsupported libprotocol.ID = "/lanet/test/unsupported/1"
+	b.SetStreamHandler(supported, func(st network.Stream) { _ = st.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.Connect(ctx, peer.AddrInfo{ID: b.ID(), Addrs: b.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	relay := &gatedRelaySource{entered: make(chan struct{}), release: make(chan struct{})}
+	s := New(a, &fakeNetmap{routes: []netmapclient.Route{{VirtualIP: "10.7.0.2", PeerID: b.ID().String()}}}, relay)
+	first := make(chan error, 1)
+	go func() {
+		st, _, err := s.OpenStreamToVirtualIPProtocol(ctx, "10.7.0.2", unsupported)
+		if st != nil {
+			_ = st.Close()
+		}
+		first <- err
+	}()
+	select {
+	case <-relay.entered:
+	case <-ctx.Done():
+		t.Fatal("失败协议未进入中继阶段")
+	}
+	second := make(chan error, 1)
+	go func() {
+		st, _, err := s.OpenStreamToVirtualIPProtocol(ctx, "10.7.0.2", supported)
+		if st != nil {
+			_ = st.Close()
+		}
+		second <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		s.mu.Lock()
+		waiting := s.waiters
+		s.mu.Unlock()
+		if waiting == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("不同协议调用未等待同一建连")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(relay.release)
+	if err := <-first; err == nil {
+		t.Fatal("不支持的协议意外成功")
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("支持的协议被先发错误污染: %v", err)
+	}
+}
+
+func TestDialAdmissionRejectsThousandTargets(t *testing.T) {
+	h := newTestHost(t)
+	defer h.Close()
+	s := New(h, &fakeNetmap{routes: []netmapclient.Route{{VirtualIP: "10.7.0.2", PeerID: h.ID().String()}}}, fakeRelaySource{})
+	s.activeDials = maxConcurrentDials
+	for i := 0; i < 1000; i++ {
+		if _, _, err := s.OpenStreamToVirtualIP(context.Background(), "10.7.0.2"); err == nil || !strings.Contains(err.Error(), "limit") {
+			t.Fatalf("未拒绝超限拨号: %v", err)
+		}
+	}
+	if len(s.dials) != 0 || s.waiters != 0 {
+		t.Fatal("拒绝后残留排队任务")
+	}
 }
 
 func TestOpenStreamRejectsUnknownVirtualIP(t *testing.T) {

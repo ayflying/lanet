@@ -83,6 +83,129 @@ func TestUpdateStreamTimeoutAndCancel(t *testing.T) {
 	}
 }
 
+type countedUpdatePeers struct{ calls chan struct{} }
+
+func (s countedUpdatePeers) Peers() []PeerInfo { s.calls <- struct{}{}; return nil }
+
+func TestUpdateStartOnceAndInitialDelay(t *testing.T) {
+	calls := make(chan struct{}, 20)
+	c := &Coordinator{src: countedUpdatePeers{calls}, cfg: Config{CurrentVersion: "1.0.0", InitialDelay: 100 * time.Millisecond, CheckInterval: time.Hour, MinNewPeers: 1}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for i := 0; i < 10; i++ {
+		c.Start(ctx)
+	}
+	select {
+	case <-calls:
+		t.Fatal("首次延迟未生效")
+	case <-time.After(30 * time.Millisecond):
+	}
+	select {
+	case <-calls:
+	case <-time.After(time.Second):
+		t.Fatal("首次巡检未执行")
+	}
+	select {
+	case <-calls:
+		t.Fatal("重复Start启动多轮")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestRoundAcquireDeniedDoesNotConsumeAttempt(t *testing.T) {
+	dir := t.TempDir()
+	provider, sha, pub := makeProvider(t, dir, nil, 0)
+	requester := newRequester(t, dir, nil, pub)
+	if err := requester.host.Connect(context.Background(), peer.AddrInfo{ID: provider.host.ID(), Addrs: provider.host.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	requester.src = staticPeers{peers: []PeerInfo{{ID: provider.host.ID().String(), Version: "9.9.9", Platform: "windows/amd64"}}}
+	requester.cfg.AcquireUpdate = func() bool { return false }
+	requester.round(context.Background())
+	if _, exists := requester.attempts[sha]; exists {
+		t.Fatal("闸门被占用不应记录目标失败")
+	}
+}
+
+func TestRoundDownloadFailureReleasesGate(t *testing.T) {
+	dir := t.TempDir()
+	provider, sha, pub := makeProvider(t, dir, nil, 0)
+	requester := newRequester(t, dir, nil, pub)
+	if err := requester.host.Connect(context.Background(), peer.AddrInfo{ID: provider.host.ID(), Addrs: provider.host.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	requester.src = staticPeers{peers: []PeerInfo{{ID: provider.host.ID().String(), Version: "9.9.9", Platform: "windows/amd64"}}}
+	// 让签名清单合法，但下载写盘在目的目录创建时失败。
+	blocker := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("block"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requester.cfg.ExePath = filepath.Join(blocker, "lanet.exe")
+	acquired, released := 0, 0
+	requester.cfg.AcquireUpdate = func() bool { acquired++; return true }
+	requester.cfg.ReleaseUpdate = func() { released++ }
+	requester.round(context.Background())
+	if acquired != 1 || released != 1 {
+		t.Fatalf("失败闸门 acquire=%d release=%d", acquired, released)
+	}
+	if state := requester.attempts[sha]; state.failures != 1 || state.done {
+		t.Fatalf("未进入可重试状态: %+v", state)
+	}
+}
+
+func TestUpdateRetryBudget(t *testing.T) {
+	c := &Coordinator{attempts: make(map[string]updateAttempt)}
+	now := time.Now()
+	for i, delay := range []time.Duration{2, 4, 8, 16, 30, 30} {
+		if !c.beginAttempt("sha", now) {
+			t.Fatalf("第%d轮未重试", i)
+		}
+		if c.beginAttempt("sha", now) {
+			t.Fatal("在途重复")
+		}
+		c.failAttempt("sha", now)
+		if c.beginAttempt("sha", now.Add(delay*time.Minute-time.Nanosecond)) {
+			t.Fatal("提前重试")
+		}
+		now = now.Add(delay * time.Minute)
+	}
+	for i := 0; i < 1000; i++ {
+		c.beginAttempt(fmt.Sprint(i), now)
+	}
+	if len(c.attempts) != 64 {
+		t.Fatalf("退避表大小%d", len(c.attempts))
+	}
+}
+
+func TestUpdateLimiterHardBudgets(t *testing.T) {
+	r := newRateLimiter(time.Second, time.Minute, 4)
+	if !r.allow(bucketFile, "a") || !r.allow(bucketFile, "b") || r.allow(bucketFile, "c") {
+		t.Fatal("文件配额应为2")
+	}
+	if !r.allow(bucketManifest, "c") {
+		t.Fatal("文件占满后清单应可访问")
+	}
+	r.release(bucketFile)
+	if !r.allow(bucketFile, "d") {
+		t.Fatal("文件名额未归还")
+	}
+	r = newRateLimiter(time.Second, time.Minute, 4)
+	for i := 0; i < 5000; i++ {
+		if r.allow(bucketManifest, fmt.Sprint(i)) {
+			r.release(bucketManifest)
+		}
+	}
+	if len(r.last) != 4096 {
+		t.Fatalf("身份缓存大小%d", len(r.last))
+	}
+	for k := range r.last {
+		r.last[k] = time.Now().Add(-time.Hour)
+	}
+	if !r.allow(bucketManifest, "new") || len(r.last) > 4096 {
+		t.Fatal("过期增量清理未恢复容量")
+	}
+}
+
 func TestUpdateJSONBounds(t *testing.T) {
 	const limit = 64
 	for _, tc := range []struct {

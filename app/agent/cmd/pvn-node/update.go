@@ -72,6 +72,49 @@ type updateState struct {
 
 var upd = &updateState{current: version}
 
+var updateCheckFlight struct {
+	sync.Mutex
+	call *updateCheckCall
+}
+
+type updateCheckCall struct {
+	done chan struct{}
+	err  error
+}
+
+// 并发 force 与启动检查共享一次请求；等待者取消不影响其他等待者。
+func sharedCheckUpdate(ctx context.Context, force bool) error {
+	updateCheckFlight.Lock()
+	call := updateCheckFlight.call
+	if call == nil {
+		upd.mu.Lock()
+		fresh := upd.checked && time.Since(upd.checkedAt) <= updateCacheTTL
+		upd.mu.Unlock()
+		if !force && fresh {
+			updateCheckFlight.Unlock()
+			return nil
+		}
+		call = &updateCheckCall{done: make(chan struct{})}
+		updateCheckFlight.call = call
+		go func() {
+			workCtx, cancel := context.WithTimeout(context.Background(), updateStartTimeout)
+			defer cancel()
+			call.err = checkUpdate(workCtx)
+			updateCheckFlight.Lock()
+			updateCheckFlight.call = nil
+			close(call.done)
+			updateCheckFlight.Unlock()
+		}()
+	}
+	updateCheckFlight.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-call.done:
+		return call.err
+	}
+}
+
 // readConfigToken 从 lanet.json 读 github_token（检查私有仓库更新用）。
 func readConfigToken(path string) string {
 	var nc nodeConfig
@@ -83,14 +126,12 @@ func readConfigToken(path string) string {
 
 // updateRoutes 控制台扩展路由：更新检查 / 应用更新 / 重启 / 退出。
 func updateRoutes(cancel context.CancelFunc) map[string]http.HandlerFunc {
-	var syncCheckMu sync.Mutex
 	return map[string]http.HandlerFunc{
 		"GET /api/update": func(w http.ResponseWriter, r *http.Request) {
 			// force=1：跳过缓存强制重新检查（前端「检查更新」按钮用）。
 			// 其余情况：未检查过或缓存过期时同步补查一次，保证「点开弹框
 			// 即有相对新鲜的结果」；缓存窗口内直接返回，避免打爆 GitHub API。
 			force := r.URL.Query().Get("force") == "1"
-			syncCheckMu.Lock()
 			upd.mu.Lock()
 			checked, checkedAt := upd.checked, upd.checkedAt
 			upd.mu.Unlock()
@@ -98,12 +139,11 @@ func updateRoutes(cancel context.CancelFunc) map[string]http.HandlerFunc {
 			timedOut := false
 			if force || !checked || time.Since(checkedAt) > updateCacheTTL {
 				ctx, cancel := context.WithTimeout(r.Context(), updateSyncTimeout)
-				if err := checkUpdate(ctx); err != nil && ctx.Err() != nil {
+				if err := sharedCheckUpdate(ctx, force); err != nil && ctx.Err() != nil {
 					timedOut = true // 超时：本次放弃，下面返回上次缓存结果
 				}
 				cancel()
 			}
-			syncCheckMu.Unlock()
 			checked, hasUpdate, needToken, latest, notes, _, assetName, errMsg := upd.snapshot()
 			upd.mu.Lock()
 			at := upd.checkedAt
@@ -154,7 +194,7 @@ func StartUpdateCheck(token string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), updateStartTimeout)
 		defer cancel()
-		if err := checkUpdate(ctx); err != nil {
+		if err := sharedCheckUpdate(ctx, false); err != nil {
 			log.Printf("[update] 检查更新失败: %v", err)
 		}
 	}()
@@ -202,7 +242,11 @@ func checkUpdate(ctx context.Context) error {
 			BrowserDownloadURL string `json:"browser_download_url"`
 		} `json:"assets"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	data, err := readUpdateHTTPBody(resp.Body, 2<<20)
+	if err != nil {
+		return upd.fail(err)
+	}
+	if err := json.Unmarshal(data, &rel); err != nil {
 		upd.fail(err)
 		return err
 	}
@@ -393,7 +437,10 @@ func verifySHA256(sumsURL, assetName string, sum []byte, token string) error {
 		return err // 拿不到校验和时不阻断更新（下载本身走 HTTPS）
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	data, err := readUpdateHTTPBody(resp.Body, 1<<20)
 	if err != nil {
 		return err
 	}
@@ -408,6 +455,17 @@ func verifySHA256(sumsURL, assetName string, sum []byte, token string) error {
 		}
 	}
 	return fmt.Errorf("sha256sums.txt 中找不到 %s", assetName)
+}
+
+func readUpdateHTTPBody(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, errors.New("更新响应超过大小上限")
+	}
+	return data, nil
 }
 
 func downloadToFile(url, path, token string) ([]byte, error) {
@@ -437,7 +495,14 @@ func downloadToFile(url, path, token string) ([]byte, error) {
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err = io.Copy(io.MultiWriter(f, h), resp.Body); err != nil {
+	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, (512<<20)+1))
+	if err != nil {
+		return nil, err
+	}
+	if n > 512<<20 {
+		return nil, errors.New("更新发行包超过512MiB上限")
+	}
+	if err := f.Close(); err != nil {
 		return nil, err
 	}
 	return h.Sum(nil), nil
@@ -495,7 +560,7 @@ func readZipEntry(f *zip.File) ([]byte, error) {
 		return nil, err
 	}
 	defer rc.Close()
-	return io.ReadAll(rc)
+	return readUpdateHTTPBody(rc, 1<<20)
 }
 
 // distManifestInstaller 落盘包内签名清单的实现（测试注入点：真实实现要求

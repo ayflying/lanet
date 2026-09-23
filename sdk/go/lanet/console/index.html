@@ -387,7 +387,7 @@
   <div class="card" style="margin-top:12px">
     <h2>种子表内容</h2>
     <div class="row" style="flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:8px">
-      <select id="sScope" onchange="loadSeeds()" style="flex:.35">
+      <select id="sScope" onchange="entryPoll.pause(); loadSeedSettings()" style="flex:.35">
         <option value="group">群内表</option>
         <option value="global">全域表</option>
       </select>
@@ -483,8 +483,33 @@ function autoGrowAddrs() {
   ['myNodeID', 'peerInput', 'seedMine', 'seedInput'].forEach(id => autoGrow($(id)));
 }
 
-async function loadState() {
-  const r = await fetch('/api/state');
+// 单飞请求、完成后计时；暂停时取消请求，恢复时不与旧请求重叠。
+function createPoll(run, enabled) {
+  let pending = null, timer = null, controller = null;
+  function pause() {
+    clearTimeout(timer); timer = null;
+    if (controller) controller.abort();
+  }
+  function refresh() {
+    clearTimeout(timer); timer = null;
+    if (!enabled()) return Promise.resolve();
+    if (pending) {
+      if (controller.signal.aborted) return pending.then(refresh);
+      return pending;
+    }
+    controller = new AbortController();
+    pending = Promise.resolve().then(() => run(controller.signal)).catch(() => {}).finally(() => {
+      pending = null; controller = null;
+      if (enabled()) timer = setTimeout(refresh, 10000);
+    });
+    return pending;
+  }
+  return { refresh, pause };
+}
+const statePoll = createPoll(fetchState, () => !document.hidden);
+function loadState() { return statePoll.refresh(); }
+async function fetchState(signal) {
+  const r = await fetch('/api/state', { signal });
   S = await r.json();
   const i = S.info;
   const nodeName = i.name || (i.peer_id ? i.peer_id.slice(0, 16) + '…' : '节点');
@@ -1058,6 +1083,8 @@ function renderMembers() {
 function switchTab(btn) {
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === btn));
   document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === btn.dataset.panel));
+  if (btn.dataset.panel === 'pEntry') loadSeedSettings();
+  else entryPoll.pause();
 }
 function renderRules() {
   $('ruleList').innerHTML = S.rules.length === 0
@@ -1544,9 +1571,11 @@ const seedAgo = iso => {
   if (s < 86400) return Math.floor(s / 3600) + ' 小时前';
   return Math.floor(s / 86400) + ' 天前';
 };
-async function loadSeedSettings(force) {
+const entryPoll = createPoll(fetchSeedSettings, () => !document.hidden && $('pEntry').classList.contains('active'));
+function loadSeedSettings(force) { return entryPoll.refresh(); }
+async function fetchSeedSettings(signal) {
   try {
-    const r = await fetch('/api/seed-settings', { cache: 'no-store' });
+    const r = await fetch('/api/seed-settings', { cache: 'no-store', signal });
     if (!r.ok) return;
     const d = await r.json();
     const st = d.settings || {};
@@ -1556,7 +1585,7 @@ async function loadSeedSettings(force) {
     $('sRisk').style.display = st.global_enabled ? '' : 'none';
     seedOverview = d.scopes || [];
     $('bEntries').textContent = String(seedOverview.reduce((a, o) => a + (o.total || 0), 0));
-    await loadSeeds();
+    await loadSeeds(signal);
   } catch (e) { /* 控制台暂不可用时静默，不打断其它页 */ }
 }
 async function saveSeedSettings() {
@@ -1575,10 +1604,10 @@ async function saveSeedSettings() {
     await loadSeedSettings(true);
   } catch (e) { flash('sMsg', '保存失败：' + e, false); }
 }
-async function loadSeeds() {
+async function loadSeeds(signal) {
   seedScope = $('sScope').value;
   try {
-    const r = await fetch('/api/seeds?scope=' + encodeURIComponent(seedScope), { cache: 'no-store' });
+    const r = await fetch('/api/seeds?scope=' + encodeURIComponent(seedScope), { cache: 'no-store', signal });
     if (!r.ok) return;
     const d = await r.json();
     seedScope = $('sScope').value;
@@ -1624,10 +1653,18 @@ function refreshEntryIfVisible() {
 }
 // ================= 公网入口共享 结束 =================
 
-loadState(); loadNodeConfig(); initTopActions(); setInterval(loadState, 10000);
-// 公网入口共享（种子表）：进页面加载一次；之后只在「公网入口」页处于激活状态时才刷新。
+loadState(); loadNodeConfig(); initTopActions();
+// 后台标签暂停轮询，恢复可见时立即刷新；请求完成后才安排下一次。
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    statePoll.pause(); entryPoll.pause();
+    return;
+  }
+  loadState();
+  refreshEntryIfVisible();
+});
+// 公网入口仅在该页可见时轮询，切换进入时立即获取。
 loadSeedSettings();
-setInterval(refreshEntryIfVisible, 10000);
 // 窗口尺寸变化会让地址框的换行数变化 → 重算高度。
 window.addEventListener('resize', autoGrowAddrs);
 // ⚠️ 「高级」折叠块收起时内部没有布局，scrollHeight 恒为 0（高度会被压成最小），

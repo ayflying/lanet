@@ -122,6 +122,16 @@ func scanSeed(s rowScanner) (*Seed, error) {
 //  3. **旧数据不覆盖新数据**：仅当入参 updated_at 不早于库内记录时才更新，
 //     防止乱序到达的交换数据把更新的地址/可达性冲掉。
 func (d *DB) UpsertSeed(ctx context.Context, scope SeedScope, seed Seed) (bool, error) {
+	return d.upsertSeedAt(ctx, scope, seed, time.Now(), false)
+}
+
+// ObserveConnectedSeed 记录当前连接的本地观察，不把重复观察误记为新的拨号成功。
+// 首次观察立即通过验证门，之后同内容观察至多每两分钟落库一次。
+func (d *DB) ObserveConnectedSeed(ctx context.Context, scope SeedScope, seed Seed) (bool, error) {
+	return d.upsertSeedAt(ctx, scope, seed, time.Now(), true)
+}
+
+func (d *DB) upsertSeedAt(ctx context.Context, scope SeedScope, seed Seed, now time.Time, connected bool) (bool, error) {
 	table, err := seedTable(scope)
 	if err != nil {
 		return false, err
@@ -129,7 +139,6 @@ func (d *DB) UpsertSeed(ctx context.Context, scope SeedScope, seed Seed) (bool, 
 	if seed.PeerID == "" {
 		return false, fmt.Errorf("peersdb: 种子缺少 peer_id")
 	}
-	now := time.Now()
 	updatedAt := seed.UpdatedAt
 	if updatedAt.IsZero() {
 		updatedAt = now
@@ -162,19 +171,33 @@ func (d *DB) UpsertSeed(ctx context.Context, scope SeedScope, seed Seed) (bool, 
 
 	// 表名来自白名单（见 seedTables），不会是外部可控字符串。
 	query := fmt.Sprintf(`
-INSERT INTO %s (peer_id, name, addrs, public_reachable, first_seen, last_seen, source, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO %[1]s (peer_id, name, addrs, public_reachable, first_seen, last_seen, source, updated_at, ok_count, last_ok)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(peer_id) DO UPDATE SET
-	name             = CASE WHEN excluded.name != '' THEN excluded.name ELSE %s.name END,
-	addrs            = CASE WHEN excluded.addrs != '' THEN excluded.addrs ELSE %s.addrs END,
-	public_reachable = %s.public_reachable OR excluded.public_reachable,
-	last_seen        = CASE WHEN excluded.last_seen > %s.last_seen THEN excluded.last_seen ELSE %s.last_seen END,
-	source           = CASE WHEN excluded.source != '' THEN excluded.source ELSE %s.source END,
-	updated_at       = excluded.updated_at
-WHERE excluded.updated_at >= %s.updated_at`, table, table, table, table, table, table, table, table)
+	name             = CASE WHEN excluded.name != '' THEN excluded.name ELSE %[1]s.name END,
+	addrs            = CASE WHEN excluded.addrs != '' THEN excluded.addrs ELSE %[1]s.addrs END,
+	public_reachable = %[1]s.public_reachable OR excluded.public_reachable,
+	last_seen        = MAX(excluded.last_seen, %[1]s.last_seen),
+	source           = CASE WHEN excluded.source != '' THEN excluded.source ELSE %[1]s.source END,
+	updated_at       = excluded.updated_at,
+	ok_count         = MAX(%[1]s.ok_count, excluded.ok_count),
+	last_ok          = CASE WHEN excluded.ok_count > 0 THEN excluded.last_ok ELSE %[1]s.last_ok END
+WHERE excluded.updated_at >= %[1]s.updated_at
+  AND ((excluded.name != '' AND excluded.name != %[1]s.name)
+    OR (excluded.addrs != '' AND excluded.addrs != %[1]s.addrs)
+    OR excluded.public_reachable > %[1]s.public_reachable
+    OR excluded.ok_count > %[1]s.ok_count
+    OR (? AND excluded.updated_at > %[1]s.updated_at)
+    OR %[1]s.last_seen <= ?)`, table)
 
+	// 显式版本必须持久化水位，不能让随后到达的旧地址穿透乱序保护。
+	var lastOK any
+	if connected {
+		lastOK = now
+	}
 	res, err := tx.ExecContext(ctx, query, seed.PeerID, seed.Name, addrs,
-		boolInt(seed.PublicReachable), firstSeen, lastSeen, seed.Source, updatedAt)
+		boolInt(seed.PublicReachable), firstSeen, lastSeen, seed.Source, updatedAt,
+		boolInt(connected), lastOK, !seed.UpdatedAt.IsZero(), now.Add(-2*time.Minute))
 	if err != nil {
 		return false, fmt.Errorf("peersdb: upsert seed %s: %w", seed.PeerID, err)
 	}
@@ -390,7 +413,7 @@ func (d *DB) PruneStaleSeeds(ctx context.Context, scope SeedScope, maxIdleUnveri
 		res, err := d.db.ExecContext(ctx, fmt.Sprintf(`
 DELETE FROM %s
 WHERE ok_count = 0 AND COALESCE(last_seen, first_seen, updated_at) < ?`, table),
-			now.Add(-maxIdleUnverified))
+			now.Add(-maxIdleUnverified-2*time.Minute))
 		if err != nil {
 			return total, fmt.Errorf("peersdb: prune stale unverified seeds: %w", err)
 		}

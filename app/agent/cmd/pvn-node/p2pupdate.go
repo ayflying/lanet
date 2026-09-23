@@ -153,22 +153,18 @@ func StartP2PUpdate(ctx context.Context, c *lanet.Client, version string, exeDir
 		LegacyProtocols: c.LegacyProtocols(),
 		// UpdateInFlight 更新锁：巡检每轮开头查一次，已有一轮更新在途就跳过。
 		UpdateInFlight: updateInFlight,
+		AcquireUpdate:  acquireUpdate,
+		ReleaseUpdate:  releaseUpdate,
 	}, func(newPath string, m selfupdate.Manifest) {
-		applyP2PUpdate(newPath, m, exePath)
+		applyP2PUpdateLocked(newPath, m, exePath)
 	})
 	coord.Start(ctx)
 	log.Printf("[p2p-update] 已启动：启动 30s 首轮、之后 5 分钟/轮巡检；候选覆盖整个 DHT 网络（不要求同网络密钥或好友），发现更高版本即征询下载（验签通过才升级）")
 	return ""
 }
 
-// applyP2PUpdate 替换自身并随机抖动重启（错峰，避免全网同时重启瘫痪 DHT）。
-func applyP2PUpdate(newPath string, m selfupdate.Manifest, exePath string) {
-	// 闸门：已有一轮更新在途（正在跑，或已替换待重启）就放弃这一次。
-	if !acquireUpdate() {
-		log.Printf("[p2p-update] 已有一轮更新在途，放弃 v%s（不重复下载/替换/重启）", m.Version)
-		_ = os.Remove(newPath)
-		return
-	}
+// applyP2PUpdateLocked 接收下载前已取得的闸门，不再次 acquire。
+func applyP2PUpdateLocked(newPath string, m selfupdate.Manifest, exePath string) {
 	log.Printf("[p2p-update] 新版本 v%s 下载校验完成，替换程序", m.Version)
 	oldPath := exePath + ".old"
 	_ = os.Remove(oldPath)

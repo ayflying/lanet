@@ -317,6 +317,7 @@ type Client struct {
 	consoleURL   string       // 控制台实际访问地址（端口回退后）
 	sessionToken string       // 控制台会话令牌（设置 ConsolePassword 后生成）
 
+	lfReconcileMu sync.Mutex // 完整调和串行化；先于 fwMu/lfMu，Close 不获取此锁
 	lfMu        sync.Mutex
 	lfListeners map[int]*fwdListener // 端口转发本地监听表（listen 端口 → 监听器）
 	rootCtx     context.Context      // 节点生命周期 context（监听 goroutine 用）

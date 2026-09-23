@@ -310,10 +310,16 @@ type Discovered func(Member)
 
 // Discovery 无服务器成员发现服务。
 type Discovery struct {
-	host     host.Host
-	cfg      Config
-	groupKey []byte
-	selfIP   string
+	host             host.Host
+	cfg              Config
+	groupKey         []byte
+	selfIP           string
+	serviceCtx       context.Context
+	serviceCancel    context.CancelFunc
+	scheduler        *discoveryScheduler
+	running          atomic.Bool
+	protocolMu       sync.Mutex
+	protocolsStarted bool
 
 	// dhtPrivate/dhtPublic 用 atomic.Pointer 承载：它们会在 Close / 运行时开关
 	// （EnablePublicDHTRuntime / retirePublicDHT）与周期性广播（Run 循环里的
@@ -327,7 +333,7 @@ type Discovery struct {
 	// closed 在 closeOnce 内于 d.mu 下置真，运行时开关据此拒操作。
 	closed bool
 
-	mdnsSvc    mdns.Service
+	mdnsSvc mdns.Service
 
 	// protoInfo / protoUnfriend 控制面协议 ID（0.5.34 起按群密钥派生）。
 	// LegacyProtocols 开启时退回历史固定常量 ProtocolInfo / ProtocolUnfriend。
@@ -362,12 +368,12 @@ type Discovery struct {
 	nearbySeenMu sync.Mutex           // 附近上报去抖（独立锁，不与 members 混用）
 	nearbySeen   map[string]time.Time // peerID -> 上次上报时间
 
-	advFailMu    sync.Mutex // DHT 广播失败日志降噪计数（独立锁）
+	advFailMu sync.Mutex // DHT 广播失败日志降噪计数（独立锁）
 
 	// pexLast/pexMu 成员地址同步（PEX）的入向消化节流：对端 → 上次消化时刻。
-	pexMu    sync.Mutex
-	pexLast  map[string]time.Time
-	advFailCount int        // 连续「路由表空」失败次数
+	pexMu        sync.Mutex
+	pexLast      map[string]time.Time
+	advFailCount int // 连续「路由表空」失败次数
 
 	// cbMu 保护 onDiscovered 切片：OnDiscovered 追加与 emit 迭代并发时需安全，
 	// 否则一个 goroutine 在迭代、另一个在 append 会触发 data race。
@@ -380,7 +386,7 @@ type Discovery struct {
 	// protoSeedsGroup 群内种子交换协议 ID（按群密钥派生，异群协商不上）。
 	protoSeedsGroup libprotocol.ID
 	// seedGate 种子交换限流（出入向共用：同对端冷却 + 全局并发上限）。
-	seedGate *seedRateLimiter
+	seedGate    *seedRateLimiter
 	controlGate controlRateLimiter
 	// seedOnce 保证种子交换循环只启动一次。
 	seedOnce sync.Once
@@ -453,6 +459,18 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		trigger:      make(chan struct{}, 1),
 		nearbySeen:   make(map[string]time.Time),
 	}
+	d.serviceCtx, d.serviceCancel = context.WithCancel(ctx)
+	cooldown := 120 * time.Second
+	if d.memberTTL/3 < cooldown {
+		cooldown = d.memberTTL / 3
+	}
+	d.scheduler = newDiscoveryScheduler(d.serviceCtx, cooldown, d.connectAndIdentifyContext)
+	ready := false
+	defer func() {
+		if !ready {
+			_ = d.Close()
+		}
+	}()
 	// 种子交换的运行期字段在此统一初始化（Config 同名项只作初值）。
 	d.initSeedRuntime(cfg)
 	// 控制面协议 ID：默认按群密钥派生（异群 multistream 协商即失败，
@@ -508,11 +526,15 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		d.dhtPublic.Store(pub)
 	}
 
-	// 2. mDNS（可选）：NewMdnsService 创建即启动。
+	// 2. mDNS 必须显式启动，失败时由构造回滚释放已有资源。
 	if cfg.EnableMDNS {
 		tag := MdnsTag(d.groupKey)
-		d.mdnsSvc = mdns.NewMdnsService(h, tag, &mdnsNotifee{d: d})
+		d.mdnsSvc = newDiscoveryMDNS(h, tag, &mdnsNotifee{d: d})
+		if err := d.mdnsSvc.Start(); err != nil {
+			return nil, fmt.Errorf("serverless: start mdns: %w", err)
+		}
 	}
+	ready = true
 	return d, nil
 }
 
@@ -555,6 +577,13 @@ func newPublicDHT(ctx context.Context, h host.Host, logf func(string, ...any)) (
 
 // Start 完成引导连接、DHT 自举与信息协议注册。非阻塞部分尽力而为。
 func (d *Discovery) Start(ctx context.Context) error {
+	d.protocolMu.Lock()
+	if d.protocolsStarted {
+		d.protocolMu.Unlock()
+		return nil
+	}
+	d.protocolsStarted = true
+	d.protocolMu.Unlock()
 	for _, b := range parseBootstrapQuiet(ctx, d.cfg.Bootstrap) {
 		dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		if err := d.host.Connect(dialCtx, b); err != nil {
@@ -589,6 +618,11 @@ func (d *Discovery) Start(ctx context.Context) error {
 		pub := d.dhtPublic.Load()
 		d.mu.Unlock()
 		d.armPublicDHTTimeout(ctx, pub, d.cfg.PublicDHTTimeout)
+	}
+	d.protocolMu.Lock()
+	defer d.protocolMu.Unlock()
+	if d.serviceCtx != nil && d.serviceCtx.Err() != nil {
+		return d.serviceCtx.Err()
 	}
 	d.host.SetStreamHandler(d.protoInfo, d.gateControl("info", d.handleInfo))
 	d.host.SetStreamHandler(d.protoUnfriend, d.gateControl("unfriend", d.handleUnfriend))
@@ -721,7 +755,7 @@ func (d *Discovery) DialSeed(ctx context.Context, addrs []string) (string, error
 			continue
 		}
 		// 建连后立刻走 info 协议确认同群（拿到名称、校验渠道与密钥）。
-		if err := d.connectAndIdentify(ai.ID); err != nil {
+		if err := d.identifyExplicit(ctx, ai.ID); err != nil {
 			// 对方明确拒绝（未审批 / 已删除本机 / 不在同一网络）：这些是
 			// 对端给出的终局结论，不是链路抖动，换下一个地址重试也不会变，
 			// 直接原样上抛、保留可识别语义——跨群拒绝尤其不能套「拨号
@@ -898,7 +932,7 @@ func (d *Discovery) RequestConnect(ctx context.Context, ai peer.AddrInfo) (strin
 		}
 	}
 	d.mu.Unlock()
-	if err := d.connectAndIdentify(ai.ID); err != nil {
+	if err := d.identifyExplicit(ctx, ai.ID); err != nil {
 		return ai.ID.String(), err
 	}
 	return ai.ID.String(), nil
@@ -937,6 +971,16 @@ func (d *Discovery) Peers() []Member {
 // 每轮结束执行一次成员回收：超期无真实通讯的成员移出成员表，
 // 其虚拟 IP 派生占用随之释放（Roadmap：虚拟 IP 成员下线回收）。
 func (d *Discovery) Run(ctx context.Context) {
+	if !d.running.CompareAndSwap(false, true) {
+		return
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if d.serviceCtx != nil {
+		stop := context.AfterFunc(d.serviceCtx, cancel)
+		defer stop()
+	}
+	ctx = runCtx
 	// 无服务器模式下唯一会建立中继预约的地方（见 relay.go 文件头）：
 	// 不补这一步，纯 NAT 群永远既连不上也打不了洞。
 	d.startRelayReservation(ctx)
@@ -1264,7 +1308,7 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 	if len(addrs) > 0 {
 		m.Addrs = toStrings(addrs)
 	}
-	snapshot := *m
+	snapshot := cloneMember(*m)
 	d.mu.Unlock()
 
 	// peerstore 记录地址，供 Connect / 隧道直连使用。
@@ -1274,12 +1318,19 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 	if !ok {
 		d.emit(snapshot)
 	}
-	go d.connectAndIdentify(id)
+	if source == "pex" && ok && time.Since(snapshot.LastSeen) < time.Minute {
+		return
+	}
+	d.scheduleIdentify(id)
 }
 
 // connectAndIdentify 建连并交换成员信息；失败静默（下轮发现会重试）。
 // 返回 error 供主动拨号场景（DialSeed）判成败；周期发现路径忽略返回值。
 func (d *Discovery) connectAndIdentify(id peer.ID) error {
+	return d.identifyExplicit(context.Background(), id)
+}
+
+func (d *Discovery) connectAndIdentifyContext(ctx context.Context, id peer.ID) error {
 	// 审批门（出向）：未信任的陌生节点不建连。地址簿里的历史地址可以带过去
 	// 一起上报待审批，方便用户在控制台看到「谁在申请连我」。
 	if trusted, _ := d.trustPolicy(id.String(), toStrings(p2pkit.FilterUnderlayAddrs(d.host.Peerstore().Addrs(id))), ""); !trusted {
@@ -1288,7 +1339,7 @@ func (d *Discovery) connectAndIdentify(id peer.ID) error {
 		d.mu.Unlock()
 		return fmt.Errorf("对端尚未通过连接审批（已记入待审批列表）")
 	}
-	connCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	connCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if d.host.Network().Connectedness(id) != network.Connected {
 		if err := d.host.Connect(connCtx, peer.AddrInfo{ID: id}); err != nil {
@@ -1360,10 +1411,14 @@ func (d *Discovery) connectAndIdentify(id peer.ID) error {
 	d.mu.Unlock()
 	d.mu.RLock()
 	m := d.members[id.String()]
+	var snapshot Member
 	if m != nil {
-		d.emit(*m)
+		snapshot = cloneMember(*m)
 	}
 	d.mu.RUnlock()
+	if m != nil {
+		d.emit(snapshot)
+	}
 	return nil
 }
 
@@ -1427,11 +1482,17 @@ func (d *Discovery) pexAllow(remote string, now time.Time) bool {
 // 节点若不可信，addMember 会走「附近」上报路径，不会建连——PEX 不产生
 // 任何越权连接。
 func (d *Discovery) applyMemberHints(hints []memberHint) {
+	if len(hints) > pexMaxMembers {
+		hints = hints[:pexMaxMembers]
+	}
 	if len(hints) == 0 {
 		return
 	}
 	applied := 0
 	for _, h := range hints {
+		if len(h.Addrs) > pexMaxAddrs {
+			h.Addrs = h.Addrs[:pexMaxAddrs]
+		}
 		id, err := peer.Decode(h.PeerID)
 		if err != nil || id == d.host.ID() {
 			continue
@@ -1442,9 +1503,11 @@ func (d *Discovery) applyMemberHints(hints []memberHint) {
 				addrs = append(addrs, a)
 			}
 		}
-		before := len(d.members)
+		d.mu.RLock()
+		_, existed := d.members[id.String()]
+		d.mu.RUnlock()
 		d.addMember(id, addrs, "pex")
-		if len(d.members) > before {
+		if !existed {
 			applied++
 		}
 	}
@@ -1906,7 +1969,7 @@ func (d *Discovery) emit(m Member) {
 	for _, cb := range cbs {
 		func() {
 			defer func() { recover() }()
-			cb(m)
+			cb(cloneMember(m))
 		}()
 	}
 }
@@ -1916,8 +1979,34 @@ func (d *Discovery) emit(m Member) {
 // 网络资源（DHT kad 协议流处理 / mDNS 监听），避免进程退出后端口与 goroutine
 // 残留。重复/并发调用安全：closeOnce 保证资源只回收一次，不会双重关闭 DHT。
 func (d *Discovery) Close() error {
+	if d.serviceCancel != nil {
+		d.serviceCancel()
+	}
+	if d.scheduler != nil {
+		d.scheduler.close()
+	}
 	var firstErr error
 	d.closeOnce.Do(func() {
+		d.protocolMu.Lock()
+		if d.host != nil {
+			if d.protocolsStarted {
+				for _, p := range []libprotocol.ID{d.protoInfo, d.protoInfoAlt, d.protoUnfriend, d.protoUnfriendAlt} {
+					if p != "" {
+						d.host.RemoveStreamHandler(p)
+					}
+				}
+			}
+			d.seedMu.RLock()
+			seedRegistered := d.seedHandlers
+			d.seedMu.RUnlock()
+			if seedRegistered {
+				if d.protoSeedsGroup != "" {
+					d.host.RemoveStreamHandler(d.protoSeedsGroup)
+				}
+				d.host.RemoveStreamHandler(ProtocolSeedsGlobal)
+			}
+		}
+		d.protocolMu.Unlock()
 		d.mu.Lock()
 		// 加锁内置置 nil：与 retirePublicDHT / EnablePublicDHTRuntime 对
 		// dhtPublic 的读写都在 d.mu 下，配合 closeOnce 杜绝重复关闭同一实例。

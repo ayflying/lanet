@@ -7,13 +7,64 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ayflying/pvn/pkg/selfupdate"
 )
+
+type updateTestTransport func(*http.Request) (*http.Response, error)
+
+func (f updateTestTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestSharedUpdateCheckCancellation(t *testing.T) {
+	oldClient, oldState := http.DefaultClient, upd
+	defer func() { http.DefaultClient, upd = oldClient, oldState }()
+	upd = &updateState{current: "1.0.0"}
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	http.DefaultClient = &http.Client{Transport: updateTestTransport(func(r *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"tag_name":"v1.0.0"}`)), Header: make(http.Header)}, nil
+	})}
+	done := make(chan error, 1)
+	go func() { done <- sharedCheckUpdate(context.Background(), true) }()
+	<-started
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sharedCheckUpdate(ctx, true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("等待取消: %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("force重复请求%d次", calls.Load())
+	}
+}
+
+func TestUpdateHTTPBodyLimit(t *testing.T) {
+	if _, err := readUpdateHTTPBody(strings.NewReader("1234"), 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readUpdateHTTPBody(strings.NewReader("12345"), 4); err == nil {
+		t.Fatal("超限未拒绝")
+	}
+}
 
 // TestUpdateCacheStale 覆盖 /api/update 的缓存新鲜度判定：
 // 未检查过 → 过期；缓存窗口内 → 复用；超窗口 → 重查。

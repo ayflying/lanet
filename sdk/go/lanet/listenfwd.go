@@ -92,12 +92,7 @@ func (c *Client) fwdQuota() int {
 
 // startListenForwards 按当前转发表启动全部本地监听（New 与热更新共用）。
 func (c *Client) startListenForwards(ctx context.Context) {
-	c.fwMu.RLock()
-	fs := append([]LANForward(nil), c.forwards...)
-	c.fwMu.RUnlock()
-	for _, f := range fs {
-		c.startListenForward(ctx, f)
-	}
+	c.syncListenForwards(ctx)
 }
 
 // startListenForward 为单条映射启动监听；端口占用等失败仅记日志降级。
@@ -155,6 +150,10 @@ func (c *Client) stopListenForward(listen int) {
 // 关键修复：用监听器「实际」target（fl.target）比对期望 target，
 // 旧实现误用期望表填充 current，导致目标变更永远判定相等、从不重启监听。
 func (c *Client) syncListenForwards(ctx context.Context) {
+	// 在读取期望配置前串行化完整停/起流程，避免旧快照覆盖后到更新。
+	// fwMu 与 lfMu 不嵌套；Close 先取消 rootCtx 再取 lfMu，不等待调和锁。
+	c.lfReconcileMu.Lock()
+	defer c.lfReconcileMu.Unlock()
 	c.fwMu.RLock()
 	desired := make(map[int]string, len(c.forwards))
 	for _, f := range c.forwards {

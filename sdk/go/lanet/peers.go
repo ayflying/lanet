@@ -363,11 +363,11 @@ func (c *Client) hasKnownPeers() bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	list, err := c.peers.ListPeers(ctx, false)
+	exists, err := c.peers.HasPeers(ctx, false)
 	if err != nil {
 		return true
 	}
-	return len(list) > 0
+	return exists
 }
 
 // isUnfriendedPeer 供 serverless 审批门使用：本机是否主动删除过该节点

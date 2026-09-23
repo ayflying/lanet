@@ -6,8 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"fmt"
 	"github.com/ayflying/pvn/pkg/peersdb"
 	"github.com/ayflying/pvn/pkg/serverless"
+	"github.com/libp2p/go-libp2p"
 )
 
 // newSeedTestClient 造一个只带地址簿的最小 Client。
@@ -25,6 +27,35 @@ func newSeedTestClient(t *testing.T, peerID string) (*Client, *peersdb.DB) {
 	t.Cleanup(func() { _ = db.Close() })
 	c := &Client{peerID: peerID, peers: db}
 	return c, db
+}
+
+func TestSeedHarvestEnforcesCapacity(t *testing.T) {
+	c, db := newSeedTestClient(t, "self")
+	h, err := libp2p.New(libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	c.node = h
+	ctx := context.Background()
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("seed-%d", i)
+		if _, err := db.UpsertSeed(ctx, peersdb.SeedScopeGlobal, peersdb.Seed{PeerID: id}); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			if err := db.NoteSeedDialResult(ctx, peersdb.SeedScopeGlobal, id, true); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	c.harvestSeedCandidates(ctx, db, SeedSettings{GlobalEnabled: true, GlobalLimit: 3}, peersdb.SeedScopeGlobal)
+	if n, err := db.CountSeeds(ctx, peersdb.SeedScopeGlobal); err != nil || n != 3 {
+		t.Fatalf("自举容量闸: %d %v", n, err)
+	}
+	if seed, err := db.GetSeed(ctx, peersdb.SeedScopeGlobal, "seed-0"); err != nil || seed == nil {
+		t.Fatalf("已验证种子不应被未验证挤掉: %+v %v", seed, err)
+	}
 }
 
 // TestSeedSettingsDefaults 默认值：群内开、全域关、上限 1000。

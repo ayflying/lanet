@@ -448,7 +448,6 @@ func (c *Client) verifySeedsOnce(ctx context.Context, db *peersdb.DB) {
 		return
 	}
 	verified := 0
-	harvested := 0
 	for _, scope := range []string{serverless.SeedScopeGroup, serverless.SeedScopeGlobal} {
 		if !settings.enabledFor(scope) {
 			continue
@@ -483,14 +482,11 @@ func (c *Client) verifySeedsOnce(ctx context.Context, db *peersdb.DB) {
 
 		// 自举采集：把「当前已连上的公网对端」收进种子表。
 		hctx, hcancel := context.WithTimeout(ctx, 8*time.Second)
-		harvested += c.harvestSeedCandidates(hctx, db, settings, pScope)
+		c.harvestSeedCandidates(hctx, db, settings, pScope)
 		hcancel()
 	}
 	if verified > 0 {
 		c.logf("种子核对：%d 条种子由「已连接」升级为已验证", verified)
-	}
-	if harvested > 0 {
-		c.logf("种子自举：从当前已连对端收进 %d 个公网入口", harvested)
 	}
 }
 
@@ -527,8 +523,9 @@ func (c *Client) harvestSeedCandidates(ctx context.Context, db *peersdb.DB, sett
 	}
 
 	added := 0
+	observed := 0
 	for _, id := range ids {
-		if added >= seedHarvestBatch {
+		if observed >= seedHarvestBatch {
 			break
 		}
 		if id.String() == c.peerID {
@@ -548,20 +545,19 @@ func (c *Client) harvestSeedCandidates(ctx context.Context, db *peersdb.DB, sett
 			continue // 没有公网地址：当不了别人的入口
 		}
 		sort.Strings(raw)
-		wrote, err := db.UpsertSeed(ctx, scope, peersdb.Seed{
+		observed++
+		wrote, err := db.ObserveConnectedSeed(ctx, scope, peersdb.Seed{
 			PeerID: id.String(), Addrs: raw, PublicReachable: true, Source: "self",
 		})
 		if err != nil {
-			continue
-		}
-		// 已经连上了，就是「本机实测拨通过」——直接过验证门。
-		if err := db.NoteSeedDialResult(ctx, scope, id.String(), true); err != nil {
 			continue
 		}
 		if wrote {
 			added++
 		}
 	}
+	// 自举路径同交换路径一样执行容量治理，避免本地连接持续填满种子表。
+	_, _ = db.EvictSeeds(ctx, scope, settings.limitFor(string(scope)))
 	return added
 }
 

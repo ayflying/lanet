@@ -1,9 +1,172 @@
 package serverless
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/protocol"
 )
+
+type seedLifecycleHost struct {
+	host.Host
+	mu       sync.Mutex
+	handlers map[protocol.ID]network.StreamHandler
+}
+
+func (h *seedLifecycleHost) SetStreamHandler(p protocol.ID, f network.StreamHandler) {
+	h.mu.Lock()
+	h.handlers[p] = f
+	h.mu.Unlock()
+}
+func (h *seedLifecycleHost) RemoveStreamHandler(p protocol.ID) {
+	h.mu.Lock()
+	delete(h.handlers, p)
+	h.mu.Unlock()
+}
+func (h *seedLifecycleHost) handler(p protocol.ID) network.StreamHandler {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.handlers[p]
+}
+
+func TestSeedEnableBeforeStartCloseRemovesHandlers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := &seedLifecycleHost{Host: testHost(t, false), handlers: map[protocol.ID]network.StreamHandler{}}
+	d, err := New(ctx, h, Config{NetworkKey: "seed-before-start", Quiet: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.EnableSeedExchange(SeedExchangeOptions{GroupEnabled: true, GlobalEnabled: true})
+	for _, p := range []protocol.ID{d.protoSeedsGroup, ProtocolSeedsGlobal} {
+		if h.handler(p) == nil {
+			t.Fatalf("Start前未注册种子协议: %s", p)
+		}
+	}
+	if d.protocolsStarted {
+		t.Fatal("测试要求未调用Start")
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []protocol.ID{d.protoSeedsGroup, ProtocolSeedsGlobal} {
+		if h.handler(p) != nil {
+			t.Fatalf("Start前启用后Close仍残留种子协议: %s", p)
+		}
+	}
+}
+
+func TestSeedHandlersClosedOnHostReuse(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := &seedLifecycleHost{Host: testHost(t, false), handlers: map[protocol.ID]network.StreamHandler{}}
+	d, err := New(ctx, h, Config{NetworkKey: "seed-old", Quiet: true, GroupSeedsEnabled: true, GlobalSeedsEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = d.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	oldGroup := d.protoSeedsGroup
+	oldHandler := h.handler(oldGroup)
+	if oldHandler == nil || h.handler(ProtocolSeedsGlobal) == nil {
+		t.Fatal("种子入口未注册")
+	}
+	if err = d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []protocol.ID{oldGroup, ProtocolSeedsGlobal} {
+		if h.handler(p) != nil {
+			t.Fatalf("Close 后旧handler仍注册: %s", p)
+		}
+	}
+	var merged, sourced atomic.Int32
+	d.EnableSeedExchange(SeedExchangeOptions{GroupEnabled: true, GlobalEnabled: true, Merge: func(string, string, []SeedRecord) { merged.Add(1) }, Source: func(string, int) []SeedRecord { sourced.Add(1); return nil }})
+	if h.handler(oldGroup) != nil || h.handler(ProtocolSeedsGlobal) != nil {
+		t.Fatal("关闭后重注册")
+	}
+	stale := &controlTestStream{reader: strings.NewReader(`{}`)}
+	oldHandler(stale)
+	if stale.resets.Load() == 0 || stale.read != 0 || merged.Load() != 0 || sourced.Load() != 0 {
+		t.Fatal("旧在途handler在Close后仍处理")
+	}
+	newer, err := New(ctx, h, Config{NetworkKey: "seed-new", Quiet: true, GroupSeedsEnabled: true, GlobalSeedsEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newer.Close()
+	if err = newer.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if h.handler(oldGroup) != nil || h.handler(newer.protoSeedsGroup) == nil || h.handler(ProtocolSeedsGlobal) == nil {
+		t.Fatal("复用host后协议入口归属错误")
+	}
+}
+
+func TestSeedHandlerCloseDuringReadBlocksCallbacks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := testHost(t, false)
+	d, err := New(ctx, h, Config{NetworkKey: "seed-inflight", Quiet: true, GroupSeedsEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var merged, sourced atomic.Int32
+	d.EnableSeedExchange(SeedExchangeOptions{GroupEnabled: true, Merge: func(string, string, []SeedRecord) { merged.Add(1) }, Source: func(string, int) []SeedRecord { sourced.Add(1); return nil }})
+	reader, writer := io.Pipe()
+	s := &controlTestStream{reader: reader}
+	done := make(chan struct{})
+	go func() { d.handleSeeds(s, SeedScopeGroup); close(done) }()
+	payload, _ := json.Marshal(seedPayload{Scope: SeedScopeGroup, Fingerprint: d.seedFingerprint(SeedScopeGroup)})
+	if _, err = writer.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err = d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = writer.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("读完成后处理未退出")
+	}
+	if s.resets.Load() == 0 || merged.Load() != 0 || sourced.Load() != 0 {
+		t.Fatalf("Close后回调仍执行 reset=%d merge=%d source=%d", s.resets.Load(), merged.Load(), sourced.Load())
+	}
+}
+
+func TestSeedEnableCloseDoesNotReRegister(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := &seedLifecycleHost{Host: testHost(t, false), handlers: map[protocol.ID]network.StreamHandler{}}
+	d, err := New(ctx, h, Config{NetworkKey: "seed-race", Quiet: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			d.EnableSeedExchange(SeedExchangeOptions{GroupEnabled: true, GlobalEnabled: true})
+		}
+	}()
+	if err = d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	if h.handler(d.protoSeedsGroup) != nil || h.handler(ProtocolSeedsGlobal) != nil {
+		t.Fatal("Close并发重挂handler")
+	}
+}
 
 // TestSeedRateLimiter 限流器：同对端冷却、全局并发上限、退避。
 func TestSeedRateLimiter(t *testing.T) {

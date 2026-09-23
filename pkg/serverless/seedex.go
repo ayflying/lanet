@@ -213,6 +213,11 @@ type SeedExchangeOptions struct {
 // 重新注册，来回切换容易漏；而「关了就不处理」由 seedScopeEnabled 判定，
 // 关掉时入向请求直接 Reset，不产生任何处理开销）。
 func (d *Discovery) EnableSeedExchange(opt SeedExchangeOptions) {
+	d.protocolMu.Lock()
+	defer d.protocolMu.Unlock()
+	if d.serviceCtx != nil && d.serviceCtx.Err() != nil {
+		return
+	}
 	d.seedMu.Lock()
 	d.seedGroupOn = opt.GroupEnabled
 	d.seedGlobalOn = opt.GlobalEnabled
@@ -244,11 +249,14 @@ func (d *Discovery) EnableSeedExchange(opt SeedExchangeOptions) {
 	}
 }
 
-// registerSeedHandlers 注册种子交换协议 handler。重复调用无副作用。
+// registerSeedHandlers 在 protocolMu 内注册种子交换 handler；Close 同锁注销。
 func (d *Discovery) registerSeedHandlers() {
 	if d.host == nil {
 		return
 	}
+	d.seedMu.Lock()
+	d.seedHandlers = true
+	d.seedMu.Unlock()
 	if d.protoSeedsGroup != "" {
 		d.host.SetStreamHandler(d.protoSeedsGroup, d.handleSeedsGroup)
 	}
@@ -423,6 +431,8 @@ func (d *Discovery) mergeIncomingSeeds(scope, from string, payload seedPayload) 
 func (d *Discovery) handleSeedsGroup(s network.Stream)  { d.handleSeeds(s, SeedScopeGroup) }
 func (d *Discovery) handleSeedsGlobal(s network.Stream) { d.handleSeeds(s, SeedScopeGlobal) }
 
+func (d *Discovery) seedClosed() bool { return d.serviceCtx != nil && d.serviceCtx.Err() != nil }
+
 // handleSeeds 处理一次入向种子交换：读对端记录 → 校验合并 → 回自己的记录。
 //
 // 与信息握手不同，这里**不校验审批状态**：种子只是「谁能当入口」，
@@ -430,7 +440,7 @@ func (d *Discovery) handleSeedsGlobal(s network.Stream) { d.handleSeeds(s, SeedS
 // 隔离靠协议 ID（群内派生 / 全域开关）与 scope 校验，不靠审批门。
 func (d *Discovery) handleSeeds(s network.Stream, scope string) {
 	defer func() { _ = s.Close() }()
-	if !d.seedScopeEnabled(scope) {
+	if d.seedClosed() || !d.seedScopeEnabled(scope) {
 		_ = s.Reset()
 		return
 	}
@@ -459,8 +469,16 @@ func (d *Discovery) handleSeeds(s network.Stream, scope string) {
 	if err != nil {
 		return
 	}
+	if d.seedClosed() {
+		_ = s.Reset()
+		return
+	}
 	var payload seedPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
+		return
+	}
+	if d.seedClosed() {
+		_ = s.Reset()
 		return
 	}
 	res := d.mergeIncomingSeeds(scope, remote, payload)
@@ -470,6 +488,10 @@ func (d *Discovery) handleSeeds(s network.Stream, scope string) {
 	}
 
 	// 回自己的记录（本机已验证的），同样受限。
+	if d.seedClosed() {
+		_ = s.Reset()
+		return
+	}
 	records := d.localSeedRecords(scope, seedsMaxRecords)
 	if len(records) == 0 {
 		return

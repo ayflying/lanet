@@ -25,7 +25,8 @@ const (
 	maxPacketSize      = 65535
 	virtioNetHdrLen    = 10
 	outboundQueueSize  = 256
-	maxOutboundWorkers = 1024
+	maxOutboundWorkers = 256
+	streamIdleTimeout  = 5 * time.Minute
 	outboundWorkerIdle = time.Minute
 	// outboundQueueBudget 全局出向队列字节预算：所有目标 worker 队列里尚未
 	// 转发（在途）的包字节数之和上限。超过即丢弃新包（先判满再拷贝），由上层
@@ -38,7 +39,7 @@ const (
 	// outboundCooldownBase/Max 连续转发失败时的退避区间：对失效对端空转会打满
 	// 日志与资源，按失败次数指数退避、封顶 Max。
 	outboundCooldownBase = 5 * time.Millisecond
-	outboundCooldownMax  = 500 * time.Millisecond
+	outboundCooldownMax  = 320 * time.Millisecond
 	// maxConsecutiveReadErrors 连续「非瞬时」读错误上限：达到即判定设备
 	// 已失效并退出读循环。单包级瞬时错误（IsRecoverableReadError）不计入。
 	maxConsecutiveReadErrors = 100
@@ -92,7 +93,14 @@ type Router struct {
 	// 其余调用等待复用结果。没有它，TUN 读循环里每个丢包的 ping 都会
 	// 各自触发一次拨号，几十个并发拨号会打爆 libp2p 资源限制
 	// （观测到 resource limit exceeded / NO_RESERVATION），拖垮重连。
-	dialing map[string]*dialCall
+	dialing    map[string]*dialCall
+	closed     bool
+	cancel     context.CancelFunc
+	workers    sync.WaitGroup
+	pumps      sync.WaitGroup
+	streamIdle time.Duration
+	closeDone  chan struct{}
+	runDone    chan struct{}
 }
 
 // dialCall 一次拨号的结果广播。done 关闭后 err 可安全读取。
@@ -102,6 +110,7 @@ type dialCall struct {
 }
 
 type outboundWorker struct {
+	cancel  context.CancelFunc
 	packets chan []byte
 	dropped uint64
 }
@@ -109,8 +118,10 @@ type outboundWorker struct {
 // streamState 串行化同一字节流上的包写入。network.Stream 是字节流，若多个
 // goroutine 并发 Write，IP 包字节可能交错，接收端将无法按 IPv4 total_length 分帧。
 type streamState struct {
-	stream  network.Stream
-	writeMu sync.Mutex
+	stream       network.Stream
+	writeMu      sync.Mutex
+	lastActivity atomic.Int64
+	writing      atomic.Int32
 }
 
 func New(device Device, tunnelSvc *tunnel.Service) *Router {
@@ -123,6 +134,7 @@ func New(device Device, tunnelSvc *tunnel.Service) *Router {
 		outboundIdle:   outboundWorkerIdle,
 		dialing:        make(map[string]*dialCall),
 		writeBudgetMax: outboundQueueBudget,
+		streamIdle:     streamIdleTimeout,
 	}
 	r.forwardImpl = func(ctx context.Context, p []byte) error { return r.forwardPacket(ctx, p) }
 	return r
@@ -137,7 +149,28 @@ func (r *Router) SetLocalIP(fn func() netip.Addr) { r.onIP = fn }
 // Run 启动 TUN 读取循环，直到 ctx 取消或设备关闭。
 func (r *Router) Run(ctx context.Context) {
 	workerCtx, cancelWorkers := context.WithCancel(ctx)
-	defer cancelWorkers()
+	r.mu.Lock()
+	if r.closed || r.runDone != nil {
+		r.mu.Unlock()
+		cancelWorkers()
+		return
+	}
+	r.cancel = cancelWorkers
+	r.runDone = make(chan struct{})
+	r.workers.Add(1)
+	r.mu.Unlock()
+	stop := context.AfterFunc(workerCtx, func() { _ = r.device.Close() })
+	defer stop()
+	defer func() {
+		close(r.runDone)
+		r.mu.Lock()
+		closing := r.closed
+		r.mu.Unlock()
+		if !closing {
+			r.Close()
+		}
+	}()
+	go func() { defer r.workers.Done(); r.reapStreams(workerCtx) }()
 	bufs := [][]byte{make([]byte, maxPacketSize)}
 	sizes := make([]int, 1)
 	// consecutiveErrs / transientErrs 区分「偶发单包错误」与「设备失效」，
@@ -172,6 +205,9 @@ func (r *Router) Run(ctx context.Context) {
 				if transientErrs == 1 || transientErrs%1000 == 0 {
 					log.Printf("[router] tun 读取跳过瞬时错误 %d 次（读循环继续）: %v", transientErrs, err)
 				}
+				if !waitRouter(ctx, time.Millisecond) {
+					return
+				}
 				continue
 			}
 			// 其余错误：退避重试，连续超限才判定设备失效。
@@ -181,11 +217,16 @@ func (r *Router) Run(ctx context.Context) {
 				return
 			}
 			log.Printf("[router] tun read error (%d/%d，重试): %v", consecutiveErrs, maxConsecutiveReadErrors, err)
-			time.Sleep(time.Duration(consecutiveErrs) * 20 * time.Millisecond)
+			if !waitRouter(ctx, time.Duration(consecutiveErrs)*20*time.Millisecond) {
+				return
+			}
 			continue
 		}
 		consecutiveErrs = 0
 		if n == 0 || sizes[0] == 0 {
+			if !waitRouter(ctx, time.Millisecond) {
+				return
+			}
 			continue
 		}
 		packet := bufs[0][:sizes[0]]
@@ -250,6 +291,10 @@ func (r *Router) enqueuePacket(ctx context.Context, packet []byte) error {
 	destination := destinationAddr.String()
 
 	r.mu.Lock()
+	if r.closed || ctx.Err() != nil {
+		r.mu.Unlock()
+		return context.Canceled
+	}
 	worker, ok := r.outbound[destination]
 	if !ok {
 		if len(r.outbound) >= r.outboundLimit {
@@ -261,9 +306,11 @@ func (r *Router) enqueuePacket(ctx context.Context, packet []byte) error {
 			}
 			return nil
 		}
-		worker = &outboundWorker{packets: make(chan []byte, outboundQueueSize)}
+		workerCtx, workerCancel := context.WithCancel(ctx)
+		worker = &outboundWorker{cancel: workerCancel, packets: make(chan []byte, outboundQueueSize)}
 		r.outbound[destination] = worker
-		go r.runOutbound(ctx, destination, worker)
+		r.workers.Add(1)
+		go func() { defer r.workers.Done(); defer workerCancel(); r.runOutbound(workerCtx, destination, worker) }()
 	}
 
 	// 先判满再拷贝：队列或全局字节预算已满时直接丢弃，避免为必丢的包分配并
@@ -319,6 +366,93 @@ func (r *Router) releaseBudget(n int) {
 	atomic.AddInt64(&r.writeBudget, -int64(n))
 }
 
+// Close 停止本 Router 的任务；关闭设备解阻读写，不修改成员与好友信息。
+func (r *Router) Close() {
+	r.mu.Lock()
+	if r.closed {
+		done := r.closeDone
+		r.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		return
+	}
+	r.closed = true
+	r.closeDone = make(chan struct{})
+	cancel := r.cancel
+	streams := r.streams
+	r.streams = make(map[string]*streamState)
+	workers := make([]*outboundWorker, 0, len(r.outbound))
+	for _, worker := range r.outbound {
+		workers = append(workers, worker)
+	}
+	r.outbound = make(map[string]*outboundWorker)
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	for _, worker := range workers {
+		if worker.cancel != nil {
+			worker.cancel()
+		}
+	}
+	if r.device != nil {
+		_ = r.device.Close()
+	}
+	if r.runDone != nil {
+		<-r.runDone
+	}
+	for _, st := range streams {
+		_ = st.stream.Reset()
+	}
+	r.workers.Wait()
+	r.pumps.Wait()
+	close(r.closeDone)
+}
+
+func (r *Router) reapStreams(ctx context.Context) {
+	idle := r.streamIdle
+	if idle <= 0 {
+		idle = streamIdleTimeout
+	}
+	ticker := time.NewTicker(idle / 2)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			r.reapIdle(now, idle)
+		}
+	}
+}
+
+func (r *Router) reapIdle(now time.Time, idle time.Duration) {
+	var stale []*streamState
+	r.mu.Lock()
+	for ip, st := range r.streams {
+		if st.writing.Load() == 0 && now.Sub(time.Unix(0, st.lastActivity.Load())) >= idle {
+			delete(r.streams, ip)
+			stale = append(stale, st)
+		}
+	}
+	r.mu.Unlock()
+	for _, st := range stale {
+		_ = st.stream.Reset()
+	}
+}
+
+func waitRouter(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func (r *Router) runOutbound(ctx context.Context, destination string, worker *outboundWorker) {
 	timer := time.NewTimer(r.outboundIdle)
 	defer timer.Stop()
@@ -343,7 +477,7 @@ func (r *Router) runOutbound(ctx context.Context, destination string, worker *ou
 					log.Printf("[router] forward to %s failed (count=%d): %v", destination, failures, err)
 				}
 				if ctx.Err() == nil {
-					time.Sleep(r.failureCooldown(failures))
+					waitRouter(ctx, r.failureCooldown(failures))
 				}
 			} else {
 				failures = 0
@@ -414,22 +548,37 @@ func (r *Router) forwardPacket(ctx context.Context, packet []byte) error {
 	}
 	destination := fmt.Sprintf("%d.%d.%d.%d", packet[16], packet[17], packet[18], packet[19])
 
-	state, err := r.streamTo(ctx, destination)
-	if err != nil {
-		return err
+	var state *streamState
+	for {
+		var err error
+		state, err = r.streamTo(ctx, destination)
+		if err != nil {
+			return err
+		}
+		r.mu.Lock()
+		if r.streams[destination] == state && !r.closed {
+			state.writing.Add(1)
+			state.lastActivity.Store(time.Now().UnixNano())
+			r.mu.Unlock()
+			break
+		}
+		r.mu.Unlock()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 	}
+	defer state.writing.Add(-1)
 
-	// 写超时 + 取消即 Reset：对端不读时 Write 会无限挂起并拖垮整个串行 worker。
-	// 用 context.AfterFunc 在 ctx 取消时 Reset 流以打断阻塞写；写成功/失败后
-	// 立即取消该 AfterFunc（defer），避免误 Reset 一条健康、可复用的流。
-	resetFn := context.AfterFunc(ctx, func() {
-		_ = state.stream.Reset()
-	})
+	// 关闭/取消时 Reset 打断阻塞写；正常返回立刻撤销回调。
+	resetFn := context.AfterFunc(ctx, func() { _ = state.stream.Reset() })
 	defer resetFn()
 
 	state.writeMu.Lock()
 	state.stream.SetWriteDeadline(time.Now().Add(outboundWriteDeadline))
-	_, err = state.stream.Write(packet)
+	_, err := state.stream.Write(packet)
+	if err == nil {
+		state.lastActivity.Store(time.Now().UnixNano())
+	}
 	state.writeMu.Unlock()
 	if err != nil {
 		r.dropStream(destination, state)
@@ -444,6 +593,10 @@ func (r *Router) forwardPacket(ctx context.Context, packet []byte) error {
 func (r *Router) streamTo(ctx context.Context, virtualIP string) (*streamState, error) {
 	for {
 		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return nil, context.Canceled
+		}
 		if state, ok := r.streams[virtualIP]; ok {
 			r.mu.Unlock()
 			return state, nil
@@ -477,28 +630,38 @@ func (r *Router) streamTo(ctx context.Context, virtualIP string) (*streamState, 
 func (r *Router) dialStream(ctx context.Context, virtualIP string) (*streamState, error) {
 	stream, _, err := r.tunnel.OpenStreamToVirtualIP(ctx, virtualIP)
 	if err != nil {
-		// 失败时摘除可能残留的死流，让下一次拨号真正重建，
-		// 而不是继续向已断开的流写包（静默丢包）。
-		r.dropStream(virtualIP, nil)
+		// 本次拨号尚未注册流；并发入向流可能已被注册，不能误删。
 		return nil, err
 	}
 	state := &streamState{stream: stream}
+	state.lastActivity.Store(time.Now().UnixNano())
 
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		_ = stream.Reset()
+		return nil, context.Canceled
+	}
 	// 拨号期间对端可能已经建立了反向流。保留先注册的健康流，关闭重复流。
 	if existing, ok := r.streams[virtualIP]; ok {
 		r.mu.Unlock()
 		_ = stream.Close()
 		return existing, nil
 	}
+	if len(r.streams) >= maxOutboundWorkers {
+		r.mu.Unlock()
+		_ = stream.Reset()
+		return nil, fmt.Errorf("router stream limit reached")
+	}
 	r.streams[virtualIP] = state
+	r.pumps.Add(1)
 	r.mu.Unlock()
 
 	log.Printf("[router] tunnel established to %s via peer=%s remote=%s",
 		virtualIP, stream.Conn().RemotePeer().ShortString(), stream.Conn().RemoteMultiaddr())
 
 	// 入向：把对端发来的包写回 TUN。
-	go r.pumpFromStream(virtualIP, state)
+	go func() { defer r.pumps.Done(); r.pumpFromStream(virtualIP, state) }()
 	return state, nil
 }
 
@@ -512,12 +675,21 @@ func (r *Router) ServeInboundStream(virtualIP string, stream network.Stream) {
 		return
 	}
 	state := &streamState{stream: stream}
+	state.lastActivity.Store(time.Now().UnixNano())
 	r.mu.Lock()
-	if old, ok := r.streams[virtualIP]; ok && old.stream != stream {
-		_ = old.stream.Close()
+	if r.closed || (r.streams[virtualIP] == nil && len(r.streams) >= maxOutboundWorkers) {
+		r.mu.Unlock()
+		_ = stream.Reset()
+		return
 	}
+	old := r.streams[virtualIP]
 	r.streams[virtualIP] = state
+	r.pumps.Add(1)
 	r.mu.Unlock()
+	defer r.pumps.Done()
+	if old != nil && old.stream != stream {
+		_ = old.stream.Reset() // 旧 pump 的 dropStream 只摘自身，不能误删新流。
+	}
 	log.Printf("[router] inbound tunnel established from %s peer=%s",
 		virtualIP, stream.Conn().RemotePeer().ShortString())
 	r.pumpFromStream(virtualIP, state)
@@ -568,8 +740,10 @@ func (r *Router) pumpFromStream(virtualIP string, state *streamState) {
 			return
 		}
 		if n == 0 {
+			time.Sleep(time.Millisecond)
 			continue
 		}
+		state.lastActivity.Store(time.Now().UnixNano())
 		// 隧道是字节流，必须按 IP 包边界切分后再逐个写 TUN。
 		for _, pkt := range framer.feed(readBuf[:n]) {
 			r.writeInbound(bufs, sizes, pkt, writeOffset)
@@ -591,20 +765,15 @@ func protoName(n byte) string {
 
 func (r *Router) dropStream(virtualIP string, state *streamState) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	// state == nil：无条件摘除（拨号失败后清理残留死流）。
-	// state != nil：只删除触发清理的这一条流；若已有新流替换，
-	// 旧 goroutine 退出不能误删新流。
-	if state == nil {
-		if current, ok := r.streams[virtualIP]; ok {
-			_ = current.stream.Close()
-			delete(r.streams, virtualIP)
-		}
-		return
-	}
-	if current, ok := r.streams[virtualIP]; ok && current == state {
-		_ = current.stream.Close()
+	current := r.streams[virtualIP]
+	if current != nil && (state == nil || current == state) {
 		delete(r.streams, virtualIP)
+	} else {
+		current = nil
+	}
+	r.mu.Unlock()
+	if current != nil {
+		_ = current.stream.Reset()
 	}
 }
 

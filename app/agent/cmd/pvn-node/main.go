@@ -427,19 +427,7 @@ func runNode(parent context.Context, serviceMode bool) {
 	// 故固定 ID 也注册一个「仅已信任好友」的门禁版本，老→新探测不断。
 	echoP := echoProtoFor(node.GroupKey(), cfg.LegacyProtocols)
 	echoHandler := func(s network.Stream) {
-		defer s.Close()
-		buf := make([]byte, 4096)
-		for {
-			n, err := s.Read(buf)
-			if n > 0 {
-				if _, werr := s.Write(buf[:n]); werr != nil {
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
+		_ = serveEcho(ctx, s, s.Conn().RemotePeer().String(), &echoAdmission)
 	}
 	node.Host().SetStreamHandler(echoP, echoHandler)
 	if string(echoP) != string(echoProto) {
@@ -639,7 +627,7 @@ func shouldProbe(selfIP string, m netmapclient.Member) bool {
 // probeOnce 对单个成员做一次 echo 往返探测，返回是否成功（失败驱动退避）。
 func probeOnce(ctx context.Context, node *lanet.Client, name, virtualIP string) bool {
 	start := time.Now()
-	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	// 出向候选：派生 ID 优先（与新版对端匹配）；同群老版本只认固定 ID，
 	// 因此追加固定 ID 兜底（与 serverless/selfupdate 的迁移策略一致）。
@@ -652,38 +640,18 @@ func probeOnce(ctx context.Context, node *lanet.Client, name, virtualIP string) 
 		log.Printf("[probe] FAIL %s(%s): %v", name, virtualIP, err)
 		return false
 	}
-	defer stream.Close()
 	payload := fmt.Sprintf("probe-%d", start.UnixMilli())
-	if _, err = stream.Write([]byte(payload)); err != nil {
-		log.Printf("[probe] FAIL %s(%s): write: %v", name, virtualIP, err)
-		return false
-	}
-	_ = stream.CloseWrite()
-	buf := make([]byte, 4096)
-	n, err := readAll(stream, buf)
+	err = probeExchange(pctx, stream, []byte(payload))
 	via := "direct"
 	if viaRelay {
 		via = "relay"
 	}
-	if err != nil || string(buf[:n]) != payload {
-		log.Printf("[probe] FAIL %s(%s): 回显不匹配 (n=%d err=%v)", name, virtualIP, n, err)
+	if err != nil {
+		log.Printf("[probe] FAIL %s(%s): %v", name, virtualIP, err)
 		return false
 	}
 	log.Printf("[probe] OK %s(%s) via=%s rtt=%s", name, virtualIP, via, time.Since(start).Round(time.Millisecond))
 	return true
-}
-
-// readAll 读完直到 EOF 或缓冲满。
-func readAll(r interface{ Read([]byte) (int, error) }, buf []byte) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := r.Read(buf[total:])
-		total += n
-		if err != nil {
-			return total, nil // EOF 语义视为正常结束
-		}
-	}
-	return total, nil
 }
 
 // membersSignature 成员表摘要（稳定顺序）。

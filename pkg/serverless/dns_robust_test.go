@@ -10,6 +10,95 @@ import (
 	"time"
 )
 
+type dnsWatchContext struct {
+	context.Context
+	registered chan struct{}
+	stopped    chan struct{}
+}
+
+func (c *dnsWatchContext) AfterFunc(func()) func() bool {
+	close(c.registered)
+	return func() bool { close(c.stopped); return true }
+}
+
+func TestDNSIndependentCloseStopsContextWatcher(t *testing.T) {
+	// 非标准 Context 避免取消树内部优化，直接观察 AfterFunc 的解除。
+	parent := &dnsWatchContext{Context: context.Background(), registered: make(chan struct{}), stopped: make(chan struct{})}
+	ctx := &dnsWatchDoneContext{dnsWatchContext: parent, done: make(chan struct{})}
+	d := NewDNSServer(nil)
+	defer d.Close()
+	result := make(chan error, 1)
+	go func() { result <- d.ListenAndServeAddr(ctx, "127.0.0.1:0") }()
+	select {
+	case <-parent.registered:
+	case <-time.After(time.Second):
+		t.Fatal("未注册取消回调")
+	}
+	d.Close()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("独立关闭未退出")
+	}
+	select {
+	case <-parent.stopped:
+	default:
+		t.Fatal("父 context 未取消时回调仍残留")
+	}
+}
+
+type dnsWatchDoneContext struct {
+	*dnsWatchContext
+	done chan struct{}
+}
+
+func (c *dnsWatchDoneContext) Done() <-chan struct{} { return c.done }
+
+// 确定性模拟 net.Listen 成功后、发布前 Close 的窗口。
+func TestDNSCloseBeforeTCPPublish(t *testing.T) {
+	d := NewDNSServer(nil)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	d.Close()
+	if d.publishTCP(ln) {
+		t.Fatal("关闭后仍发布监听器")
+	}
+	if _, err := ln.Accept(); err == nil {
+		t.Fatal("未关闭迟到的监听器")
+	}
+	rebound, err := net.Listen("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebound.Close()
+}
+
+func TestDNSCloseBeforeTCPPublication(t *testing.T) {
+	d := NewDNSServer(nil)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+	// 确定性模拟 net.Listen 已返回、尚未发布 d.tcp 的窗口。
+	d.Close()
+	if d.publishTCP(ln) {
+		t.Fatal("关闭后仍发布监听")
+	}
+	rebound, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("监听未回收: %v", err)
+	}
+	rebound.Close()
+}
+
 // TestDNSConnLimit 验证并发连接上限生效：把 maxConns 调到 2，发起 3 条 TCP
 // 连接且每条都「保持打开」（连接成功后不关闭，使服务端活动表长期持有它），
 // 服务端应在达到上限后立即拒绝第 3 条（直接关闭，不进入活动连接表）。

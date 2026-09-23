@@ -6,6 +6,120 @@ import (
 	"time"
 )
 
+func TestSeedObservationWriteBudget(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	seed := Seed{PeerID: "observation", Name: "入口", Addrs: []string{"/ip4/1.1.1.1/tcp/4001"}}
+	var before, after int
+	if err := d.db.QueryRow(`SELECT total_changes()`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 120; i++ {
+		wrote, err := d.upsertSeedAt(ctx, SeedScopeGroup, seed, now.Add(time.Duration(i)*time.Second), true)
+		if err != nil || wrote != (i == 0) {
+			t.Fatalf("观察 %d: wrote=%v err=%v", i, wrote, err)
+		}
+	}
+	if err := d.db.QueryRow(`SELECT total_changes()`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after-before != 1 {
+		t.Fatalf("120 次观察应仅写 1 行，实际 %d", after-before)
+	}
+	if wrote, err := d.upsertSeedAt(ctx, SeedScopeGroup, seed, now.Add(2*time.Minute), true); err != nil || !wrote {
+		t.Fatalf("边界观察: %v %v", wrote, err)
+	}
+	got, err := d.GetSeed(ctx, SeedScopeGroup, seed.PeerID)
+	if err != nil || got.OKCount != 1 {
+		t.Fatalf("重复连接观察不能累加拨号次数: %+v %v", got, err)
+	}
+	seed.Addrs = []string{"/ip4/2.2.2.2/tcp/4001"}
+	if wrote, err := d.upsertSeedAt(ctx, SeedScopeGroup, seed, now.Add(121*time.Second), true); err != nil || !wrote {
+		t.Fatalf("地址变化须立即落库: %v %v", wrote, err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := d.NoteSeedDialResult(ctx, SeedScopeGroup, seed.PeerID, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.NoteSeedDialResult(ctx, SeedScopeGroup, seed.PeerID, false); err != nil {
+		t.Fatal(err)
+	}
+	got, err = d.GetSeed(ctx, SeedScopeGroup, seed.PeerID)
+	if err != nil || got.OKCount != 4 {
+		t.Fatalf("真实拨号计数丢失: %+v %v", got, err)
+	}
+}
+
+func TestSeedExplicitVersionWatermark(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	seed := Seed{PeerID: "versioned", Addrs: []string{"/ip4/1.1.1.1/tcp/4001"}, UpdatedAt: now}
+	if _, err := d.UpsertSeed(ctx, SeedScopeGroup, seed); err != nil {
+		t.Fatal(err)
+	}
+	seed.UpdatedAt = now.Add(time.Second)
+	if wrote, err := d.UpsertSeed(ctx, SeedScopeGroup, seed); err != nil || !wrote {
+		t.Fatalf("版本水位必须落库: %v %v", wrote, err)
+	}
+	seed.UpdatedAt = now.Add(500 * time.Millisecond)
+	seed.Addrs = []string{"/ip4/2.2.2.2/tcp/4001"}
+	if wrote, err := d.UpsertSeed(ctx, SeedScopeGroup, seed); err != nil || wrote {
+		t.Fatalf("旧地址不能穿透节流: %v %v", wrote, err)
+	}
+}
+
+func TestHasPeersAndNearbyObservation(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	if yes, err := d.HasPeers(ctx, false); err != nil || yes {
+		t.Fatalf("空库: %v %v", yes, err)
+	}
+	n := Nearby{PeerID: "nearby", Name: "设备", Addrs: []string{"/ip4/1.1.1.1/tcp/4001"}}
+	if err := d.UpsertNearby(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	var before, after int
+	if err := d.db.QueryRow(`SELECT total_changes()`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		if err := d.UpsertNearby(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.db.QueryRow(`SELECT total_changes()`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("附近重复观察产生 %d 次写入", after-before)
+	}
+	if err := d.UpsertPeer(ctx, Peer{PeerID: n.PeerID}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if yes, err := d.HasPeers(ctx, false); err != nil || !yes {
+		t.Fatalf("已有成员: %v %v", yes, err)
+	}
+	if yes, err := d.HasPeers(ctx, true); err != nil || yes {
+		t.Fatalf("未审批: %v %v", yes, err)
+	}
+	if err := d.SetTrusted(ctx, n.PeerID, true); err != nil {
+		t.Fatal(err)
+	}
+	if yes, err := d.HasPeers(ctx, true); err != nil || !yes {
+		t.Fatalf("审批必须即时: %v %v", yes, err)
+	}
+	if err := d.UpsertNearby(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	list, err := d.ListNearby(ctx)
+	if err != nil || len(list) != 0 {
+		t.Fatalf("好友不能再入附近: %+v %v", list, err)
+	}
+}
+
 // TestSeedScopeIsolation 两个范围的种子必须物理隔离：写一边，另一边看不到。
 func TestSeedScopeIsolation(t *testing.T) {
 	d := openTest(t)
@@ -73,7 +187,13 @@ func TestSeedRejectsFriend(t *testing.T) {
 		t.Error("好友不该被写进种子表")
 	}
 
-	// 存量行被自愈清理。
+	// 审批立即清理，周期清理仍能处理旧版本留下的记录。
+	if s, _ := d.GetSeed(ctx, SeedScopeGroup, pid); s != nil {
+		t.Fatal("审批后种子应立即移除")
+	}
+	if _, err := d.db.ExecContext(ctx, `INSERT INTO group_seeds (peer_id, first_seen, last_seen, updated_at) VALUES (?, ?, ?, ?)`, pid, time.Now(), time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	n, err := d.PruneTrustedSeeds(ctx)
 	if err != nil {
 		t.Fatalf("prune trusted seeds: %v", err)

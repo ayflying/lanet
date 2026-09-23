@@ -85,6 +85,11 @@ VALUES (?, ?, 1, 1, ?, ?)`, peerID, boolInt(trusted), time.Now(), time.Now()); e
 		if _, err := d.db.ExecContext(ctx, `DELETE FROM nearby WHERE peer_id = ?`, peerID); err != nil {
 			return fmt.Errorf("peersdb: clear nearby %s: %w", peerID, err)
 		}
+		for scope := range seedTables {
+			if err := d.DeleteSeed(ctx, scope, peerID); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -175,6 +180,20 @@ ON CONFLICT(peer_id, addr) DO UPDATE SET
 		return fmt.Errorf("peersdb: note dial %s: %w", peerID, err)
 	}
 	return nil
+}
+
+// HasPeers 判断地址簿是否至少存在一个节点。仅执行 EXISTS，避免为流控加载全部地址和记录。
+func (d *DB) HasPeers(ctx context.Context, trustedOnly bool) (bool, error) {
+	q := `SELECT EXISTS(SELECT 1 FROM peers`
+	if trustedOnly {
+		q += ` WHERE trusted = 1`
+	}
+	q += `)`
+	var exists bool
+	if err := d.db.QueryRowContext(ctx, q).Scan(&exists); err != nil {
+		return false, fmt.Errorf("peersdb: has peers: %w", err)
+	}
+	return exists, nil
 }
 
 // ListPeers 列出节点（trustedOnly=true 时只列已审批的）。
@@ -286,16 +305,25 @@ func (d *DB) UpsertNearby(ctx context.Context, n Nearby) error {
 			n.Name = known.String
 		}
 	}
-	if _, err = d.db.ExecContext(ctx, `
+	res, err := d.db.ExecContext(ctx, `
 INSERT INTO nearby (peer_id, name, addrs, source, first_seen, last_seen)
-VALUES (?, ?, ?, ?, ?, ?)
+SELECT ?, ?, ?, ?, ?, ?
+WHERE NOT EXISTS (SELECT 1 FROM peers WHERE peer_id = ? AND trusted = 1)
 ON CONFLICT(peer_id) DO UPDATE SET
 	name      = CASE WHEN excluded.name != '' THEN excluded.name ELSE nearby.name END,
 	addrs     = CASE WHEN excluded.addrs != '' THEN excluded.addrs ELSE nearby.addrs END,
 	source    = CASE WHEN excluded.source != '' THEN excluded.source ELSE nearby.source END,
-	last_seen = excluded.last_seen`,
-		n.PeerID, n.Name, strings.Join(FilterDialableAddrs(NormalizeAddrs(n.Addrs)), ","), n.Source, now, now); err != nil {
+	last_seen = excluded.last_seen
+WHERE (excluded.name != '' AND excluded.name != nearby.name)
+   OR (excluded.addrs != '' AND excluded.addrs != nearby.addrs)
+   OR (excluded.source != '' AND excluded.source != nearby.source)
+   OR nearby.last_seen <= ?`,
+		n.PeerID, n.Name, strings.Join(FilterDialableAddrs(NormalizeAddrs(n.Addrs)), ","), n.Source, now, now, n.PeerID, now.Add(-2*time.Minute))
+	if err != nil {
 		return fmt.Errorf("peersdb: upsert nearby %s: %w", n.PeerID, err)
+	}
+	if count, _ := res.RowsAffected(); count == 0 {
+		return nil
 	}
 	// 封顶修剪：只保留最近出现的 200 条。
 	if _, err = d.db.ExecContext(ctx, `

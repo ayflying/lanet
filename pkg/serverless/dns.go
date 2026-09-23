@@ -120,9 +120,9 @@ func (d *DNSServer) listenAndServe(ctx context.Context, addr string) error {
 	// TCP 可选：失败不影响 UDP 主通道（解析器 UDP 优先，响应超 512 字节
 	// 才需要 TCP，本服务应答极小，TCP 只是协议完备性兜底）。
 	if tcp, err := net.Listen("tcp", addr); err == nil {
-		d.mu.Lock()
-		d.tcp = tcp
-		d.mu.Unlock()
+		if !d.publishTCP(tcp) {
+			return nil
+		}
 		go func() {
 			for {
 				conn, err := tcp.Accept()
@@ -139,10 +139,10 @@ func (d *DNSServer) listenAndServe(ctx context.Context, addr string) error {
 		}()
 	}
 
-	go func() {
-		<-ctx.Done()
-		d.Close()
-	}()
+	// 服务主动关闭或读取失败时也解除取消回调，不等待父 context 结束。
+	stop := context.AfterFunc(ctx, d.Close)
+	defer stop()
+	defer d.Close()
 
 	buf := make([]byte, 1500)
 	for {
@@ -161,6 +161,18 @@ func (d *DNSServer) listenAndServe(ctx context.Context, addr string) error {
 			return nil
 		}
 	}
+}
+
+// publishTCP 与 Close 在同一把锁内决定监听器归属，关闭期间创建的监听立即释放。
+func (d *DNSServer) publishTCP(tcp net.Listener) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		_ = tcp.Close()
+		return false
+	}
+	d.tcp = tcp
+	return true
 }
 
 // Close 停止应答并释放端口（幂等）。

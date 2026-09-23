@@ -245,6 +245,10 @@ type Config struct {
 	// 重启——1~8 分钟的错峰重启窗口里可以反复发生（0.5.49 前实测存在）。
 	// nil = 不做此门（单测）。
 	UpdateInFlight func() bool
+	// AcquireUpdate/ReleaseUpdate 将宿主的跨来源闸门覆盖到下载前；成功回调负责保留或释放。
+	// 配置回调时，onUpdate 须在替换失败时自行释放；无需更新时由 Coordinator 释放。
+	AcquireUpdate func() bool
+	ReleaseUpdate func()
 	// Quiet 关闭日志。
 	Quiet bool
 }
@@ -304,7 +308,8 @@ type Coordinator struct {
 	mu   sync.Mutex
 	self *Manifest // 本地有效 head：验签通过且与本地 exe sha256 一致
 
-	attempts map[string]bool // 已尝试过下载的 sha256（进程内防重）
+	startOnce sync.Once
+	attempts  map[string]updateAttempt // 最多保留 64 个目标的退避状态
 
 	// limiter 入向分发限流（取代 0.5.34~0.5.48 的「同群好友门」）。
 	limiter *rateLimiter
@@ -319,7 +324,7 @@ func New(h host.Host, src PeerSource, cfg Config, onUpdate func(path string, m M
 		src:      src,
 		cfg:      cfg,
 		onUpdate: onUpdate,
-		attempts: make(map[string]bool),
+		attempts: make(map[string]updateAttempt),
 		limiter:  newRateLimiter(cfg.PerPeerMinInterval, cfg.FileDownloadCooldown, cfg.MaxInflightStreams),
 	}
 	// 协议 ID：有群密钥时按群派生（异群/未入网者在 multistream 协商阶段
@@ -372,20 +377,67 @@ func (c *Coordinator) SelfManifest() (Manifest, bool) {
 
 // Start 启动周期巡检，直到 ctx 取消。
 func (c *Coordinator) Start(ctx context.Context) {
-	go c.loop(ctx)
+	c.startOnce.Do(func() { go c.loop(ctx) })
 }
 
 func (c *Coordinator) loop(ctx context.Context) {
-	t := time.NewTicker(c.cfg.CheckInterval)
+	t := time.NewTimer(max(c.cfg.InitialDelay, 0))
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			if ctx.Err() != nil {
+				return
+			}
 			c.round(ctx)
+			t.Reset(c.cfg.CheckInterval)
 		}
 	}
+}
+
+type updateAttempt struct {
+	failures int
+	next     time.Time
+	done     bool
+}
+
+func (c *Coordinator) beginAttempt(sha string, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	a, exists := c.attempts[sha]
+	if exists && (a.done || now.Before(a.next)) {
+		return false
+	}
+	if !exists && len(c.attempts) >= 64 {
+		var oldest string
+		for key, entry := range c.attempts {
+			if oldest == "" || entry.next.Before(c.attempts[oldest].next) {
+				oldest = key
+			}
+		}
+		delete(c.attempts, oldest)
+	}
+	a.done = true // 在途同样禁止重复下载。
+	c.attempts[sha] = a
+	return true
+}
+
+func (c *Coordinator) clearAttempt(sha string) {
+	c.mu.Lock()
+	delete(c.attempts, sha)
+	c.mu.Unlock()
+}
+
+func (c *Coordinator) failAttempt(sha string, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	a := c.attempts[sha]
+	a.failures = min(a.failures+1, 5)
+	a.next = now.Add(min(time.Minute*time.Duration(1<<a.failures), 30*time.Minute))
+	a.done = false
+	c.attempts[sha] = a
 }
 
 // round 一轮巡检：统计更高版本 → 达票征询 → 共识 + 验签 → 下载。
@@ -451,19 +503,26 @@ func (c *Coordinator) round(ctx context.Context) {
 		c.logf("发现新版本 v%s 但平台是 %s（本机 %s），跳过", target.Version, target.Platform, c.cfg.Platform)
 		return
 	}
-	c.mu.Lock()
-	if c.attempts[target.SHA256] { // 本进程内同一版本只尝试一次
-		c.mu.Unlock()
+	if !c.beginAttempt(target.SHA256, time.Now()) {
 		return
 	}
-	c.attempts[target.SHA256] = true
-	c.mu.Unlock()
+	if c.cfg.AcquireUpdate != nil && !c.cfg.AcquireUpdate() {
+		c.clearAttempt(target.SHA256)
+		return
+	}
+	acquired := c.cfg.AcquireUpdate != nil
+	defer func() {
+		if acquired && c.cfg.ReleaseUpdate != nil {
+			c.cfg.ReleaseUpdate()
+		}
+	}()
 
 	c.logf("发现新版本 v%s（sha256=%s…，验签通过），开始下载",
 		target.Version, target.SHA256[:12])
 	path, err := c.download(ctx, target, sample)
 	if err != nil {
-		c.logf("P2P 更新下载失败（下轮巡检重试）: %v", err)
+		c.failAttempt(target.SHA256, time.Now())
+		c.logf("P2P 更新下载失败（退避后巡检重试）: %v", err)
 		return
 	}
 	// head 落盘：重启后本节点即可作为新版本分发源（启动时会重新校验
@@ -473,6 +532,7 @@ func (c *Coordinator) round(ctx context.Context) {
 	}
 	if c.onUpdate != nil {
 		c.onUpdate(path, target)
+		acquired = false // 宿主回调完成替换或自行释放失败闸门。
 	}
 }
 
@@ -623,6 +683,7 @@ type rateLimiter struct {
 	mu       sync.Mutex
 	last     map[string]time.Time // "bucket|remote" -> 上次放行时刻
 	inflight int
+	files    int
 	per      time.Duration // manifest 桶：单对端最小间隔
 	filePer  time.Duration // file 桶：单对端最小间隔（文件大，间隔更长）
 	maxIn    int
@@ -651,7 +712,7 @@ func newRateLimiter(per, filePer time.Duration, maxIn int) *rateLimiter {
 func (r *rateLimiter) allow(bucket, remote string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.inflight >= r.maxIn {
+	if r.inflight >= r.maxIn || (bucket == bucketFile && r.files >= min(2, max(1, r.maxIn-1))) {
 		return false
 	}
 	per := r.per
@@ -663,21 +724,35 @@ func (r *rateLimiter) allow(bucket, remote string) bool {
 	if t, ok := r.last[key]; ok && now.Sub(t) < per {
 		return false
 	}
-	r.last[key] = now
-	r.inflight++
-	if len(r.last) > 4096 {
-		// 防 map 无界增长：仅在超阈值时做一次惰性清理。
+	if _, exists := r.last[key]; !exists && len(r.last) >= 4096 {
+		// 每次至多检查 64 条，容量满时拒绝新身份，不逐请求扫描全表。
+		checked := 0
 		for k, t := range r.last {
-			if now.Sub(t) > 4*r.filePer {
+			if now.Sub(t) > max(r.per, r.filePer) {
 				delete(r.last, k)
 			}
+			checked++
+			if checked >= 64 {
+				break
+			}
 		}
+		if len(r.last) >= 4096 {
+			return false
+		}
+	}
+	r.last[key] = now
+	r.inflight++
+	if bucket == bucketFile {
+		r.files++
 	}
 	return true
 }
 
-func (r *rateLimiter) release() {
+func (r *rateLimiter) release(bucket ...string) {
 	r.mu.Lock()
+	if len(bucket) > 0 && bucket[0] == bucketFile && r.files > 0 {
+		r.files--
+	}
 	if r.inflight > 0 {
 		r.inflight--
 	}
@@ -692,7 +767,7 @@ func (c *Coordinator) gateRate(bucket string, next func(network.Stream)) func(ne
 			_ = s.Reset() // 超限：立即重置，零字节分发
 			return
 		}
-		defer c.limiter.release()
+		defer c.limiter.release(bucket)
 		next(s)
 	}
 }
@@ -712,7 +787,7 @@ func (c *Coordinator) streamDeadline(s network.Stream) {
 // 顺序与 info 协议一致：先读完请求（对端 CloseWrite 后 EOF）再回写。
 func (c *Coordinator) handleManifest(s network.Stream) {
 	defer s.Close()
-	c.streamDeadline(s)
+	_ = s.SetDeadline(time.Now().Add(min(c.cfg.StreamIOTimeout, 10*time.Second)))
 	var req struct {
 		Current string `json:"current"`
 	}
@@ -740,7 +815,7 @@ type fileReq struct {
 // handleFile 响应文件分发：帧格式 = [4 字节大端 JSON head 长度][head JSON][裸文件字节]。
 func (c *Coordinator) handleFile(s network.Stream) {
 	defer s.Close()
-	c.streamDeadline(s)
+	_ = s.SetDeadline(time.Now().Add(min(c.cfg.StreamIOTimeout, 10*time.Second)))
 	var req fileReq
 	// 请求体设尺寸上限：超限即视为恶意，直接丢弃连接。
 	if err := readUpdateJSON(s, maxRequestJSON, &req); err != nil {
@@ -752,6 +827,7 @@ func (c *Coordinator) handleFile(s network.Stream) {
 	if m == nil || req.SHA256 != m.SHA256 {
 		return
 	}
+	c.streamDeadline(s)
 	f, err := os.Open(c.cfg.ExePath)
 	if err != nil {
 		return

@@ -39,7 +39,28 @@ type Service struct {
 	netmapCli   GroupNetMap
 	relays      RelaySource
 	dialTimeout time.Duration
-	relayUsed   map[string]bool // 对端最近一次是否经中继
+	relayUsed   map[string]pathRecord
+	dials       map[peer.ID]*dialFlight
+	activeDials int
+	waiters     int
+}
+
+const (
+	maxConcurrentDials = 8
+	maxDialWaiters     = 32
+	totalDialTimeout   = 20 * time.Second
+	maxPathRecords     = 4096
+	pathRecordTTL      = 30 * time.Minute
+)
+
+type pathRecord struct {
+	relay bool
+	at    time.Time
+}
+
+type dialFlight struct {
+	done chan struct{}
+	err  error
 }
 
 func New(self host.Host, netmapCli GroupNetMap, relays RelaySource) *Service {
@@ -48,7 +69,8 @@ func New(self host.Host, netmapCli GroupNetMap, relays RelaySource) *Service {
 		netmapCli:   netmapCli,
 		relays:      relays,
 		dialTimeout: 8 * time.Second,
-		relayUsed:   make(map[string]bool),
+		relayUsed:   make(map[string]pathRecord),
+		dials:       make(map[peer.ID]*dialFlight),
 	}
 }
 
@@ -68,7 +90,9 @@ func (s *Service) OpenStreamToVirtualIPProtocol(ctx context.Context, virtualIP s
 // 传入多个候选协议 ID（按优先级）。multistream 会用对端实际支持的第一个：
 // 用于「同群新老版本混跑」过渡期（如探测协议既发派生 ID 又发历史固定 ID），
 // 省去协商失败后再拨一次的往返。
-func (s *Service) OpenStreamToVirtualIPProtocols(ctx context.Context, virtualIP string, protos []libprotocol.ID) (network.Stream, bool, error) {
+func (s *Service) OpenStreamToVirtualIPProtocols(ctx context.Context, virtualIP string, protos []libprotocol.ID) (_ network.Stream, _ bool, resultErr error) {
+	ctx, cancel := context.WithTimeout(ctx, totalDialTimeout)
+	defer cancel()
 	route, ok := s.netmapCli.Resolve(virtualIP)
 	if !ok {
 		return nil, false, fmt.Errorf("virtual IP %s not in group netmap", virtualIP)
@@ -77,6 +101,63 @@ func (s *Service) OpenStreamToVirtualIPProtocols(ctx context.Context, virtualIP 
 	if err != nil {
 		return nil, false, fmt.Errorf("decode peer id %q: %w", route.PeerID, err)
 	}
+
+	// 同目标复用建连结果，不共享应用流；等待人数同样有界。
+	s.mu.Lock()
+	if flight := s.dials[target]; flight != nil {
+		if s.waiters >= maxDialWaiters {
+			s.mu.Unlock()
+			return nil, false, fmt.Errorf("tunnel dial wait limit reached")
+		}
+		s.waiters++
+		s.mu.Unlock()
+		defer func() { s.mu.Lock(); s.waiters--; s.mu.Unlock() }()
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		case <-flight.done:
+		}
+		// 首个调用的协议协商失败不代表此调用的协议也不受支持；
+		// 只有本次上下文取消才停止，随后独立尝试所需协议。
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		if s.self.Network().Connectedness(target) != network.Connected {
+			if flight.err != nil {
+				return nil, false, flight.err
+			}
+			return nil, false, fmt.Errorf("tunnel connection to %s lost before opening stream", target)
+		}
+		s.mu.Lock()
+		if s.activeDials >= maxConcurrentDials {
+			s.mu.Unlock()
+			return nil, false, fmt.Errorf("tunnel concurrent dial limit reached")
+		}
+		s.activeDials++
+		s.mu.Unlock()
+		defer func() { s.mu.Lock(); s.activeDials--; s.mu.Unlock() }()
+		stream, err := s.openStream(ctx, target, protos...)
+		if err != nil {
+			return nil, false, err
+		}
+		return stream, hasCircuit(stream.Conn().RemoteMultiaddr()), nil
+	}
+	if s.activeDials >= maxConcurrentDials {
+		s.mu.Unlock()
+		return nil, false, fmt.Errorf("tunnel concurrent dial limit reached")
+	}
+	flight := &dialFlight{done: make(chan struct{})}
+	s.dials[target] = flight
+	s.activeDials++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		flight.err = resultErr
+		delete(s.dials, target)
+		s.activeDials--
+		close(flight.done)
+		s.mu.Unlock()
+	}()
 
 	dialCtx, cancel := context.WithTimeout(ctx, s.dialTimeout)
 	defer cancel()
@@ -131,8 +212,11 @@ func (s *Service) openViaRelay(ctx context.Context, target peer.ID, protos ...li
 		return nil, fmt.Errorf("no relay candidates available")
 	}
 	var lastErr error
+	if len(candidates) > 2 {
+		candidates = candidates[:2]
+	}
 	for _, candidate := range candidates {
-		if candidate.ID == target {
+		if candidate.ID == target || len(candidate.Addrs) == 0 {
 			continue // 目标自己不能当中继（直连都失败了，自我中继无意义）
 		}
 		reserveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -169,7 +253,22 @@ func (s *Service) openViaRelay(ctx context.Context, target peer.ID, protos ...li
 func (s *Service) markRelay(peerID string, viaRelay bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.relayUsed[peerID] = viaRelay
+	now := time.Now()
+	var oldest string
+	var oldestAt time.Time
+	for id, record := range s.relayUsed {
+		if now.Sub(record.at) >= pathRecordTTL {
+			delete(s.relayUsed, id)
+			continue
+		}
+		if oldest == "" || record.at.Before(oldestAt) {
+			oldest, oldestAt = id, record.at
+		}
+	}
+	if _, exists := s.relayUsed[peerID]; !exists && len(s.relayUsed) >= maxPathRecords {
+		delete(s.relayUsed, oldest)
+	}
+	s.relayUsed[peerID] = pathRecord{relay: viaRelay, at: now}
 }
 
 // LastPathUsed 返回对端最近一次链路类型：direct / relay / unknown。
@@ -178,12 +277,17 @@ func (s *Service) markRelay(peerID string, viaRelay bool) {
 // （未连接 = offline，经 /p2p-circuit = relay，否则 direct）。
 func (s *Service) LastPathUsed(peerID string) string {
 	s.mu.Lock()
-	if used, ok := s.relayUsed[peerID]; ok {
+	if used, ok := s.relayUsed[peerID]; ok && time.Since(used.at) < pathRecordTTL {
 		s.mu.Unlock()
-		if used {
+		if used.relay {
 			return "relay"
 		}
 		return "direct"
+	}
+	s.mu.Unlock()
+	s.mu.Lock()
+	if record, ok := s.relayUsed[peerID]; ok && time.Since(record.at) >= pathRecordTTL {
+		delete(s.relayUsed, peerID)
 	}
 	s.mu.Unlock()
 	return s.connPath(peerID)
