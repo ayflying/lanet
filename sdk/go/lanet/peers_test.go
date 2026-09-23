@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -133,10 +134,17 @@ func TestConnectPeerUnknownIDSearches(t *testing.T) {
 
 	a := newStandaloneClient(t, "node-solo", "grp-unknown", filepath.Join(t.TempDir(), "solo.db"))
 
-	// 一个格式合法但网络中不存在的节点 ID（取自另起的临时节点，随即关闭）。
-	ghost := newStandaloneClient(t, "ghost", "grp-unknown", filepath.Join(t.TempDir(), "g.db"))
-	ghostID := ghost.Info().PeerID
-	_ = ghost.Close()
+	// 只生成身份、不启动节点：关闭过的真实节点可能在 DHT/peerstore 留有可拨的
+	// 旧地址，此时测试会进入「历史地址拨号失败」分支，而不是待测的「查不到地址」。
+	ghostKey, _, err := crypto.GenerateEd25519Key(nil)
+	if err != nil {
+		t.Fatalf("生成不存在的节点身份: %v", err)
+	}
+	ghostPeer, err := peer.IDFromPrivateKey(ghostKey)
+	if err != nil {
+		t.Fatalf("生成节点 ID: %v", err)
+	}
+	ghostID := ghostPeer.String()
 
 	res, err := a.ConnectPeer(ctx, ghostID)
 	if err != nil {
