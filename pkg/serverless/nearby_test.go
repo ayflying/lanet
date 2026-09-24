@@ -134,7 +134,10 @@ func TestNearbyProbeRejectsForgedResponseAndReplay(t *testing.T) {
 		binary.BigEndian.PutUint16(response[1:3], uint16(len(name)))
 		copy(response[3:], name)
 		firstResponse <- response
-		_, _ = s.Write(response)
+		// 写网络用独立副本：libp2p 的流写路径可能异步持有传入切片，而测试
+		// 主 goroutine 拿到 channel 里的 response 后会原地改写签名段，两者
+		// 共享底层数组即 DATA RACE（CI Linux -race 实证）。副本隔离后互不相干。
+		_, _ = s.Write(append([]byte(nil), response...))
 	})
 	_, err = d.ProbeNearby(ctx, peer.AddrInfo{ID: b.ID(), Addrs: b.Addrs()})
 	if err == nil || !strings.Contains(err.Error(), "认证失败") {
