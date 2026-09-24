@@ -953,8 +953,7 @@ func defaultNodeConfig() *nodeConfig {
 // resolveTriBool 三态布尔解析：显式传值（"true"/"false"/"1"/"0"）优先，
 // 其次配置文件（nil = 未设置），最后默认值。用于审批这类「默认开启、
 // 允许关闭」的开关——不能用 flag.Bool，其零值 false 无法区分未传与显式 false。
-func resolveTriBool(flagVal string, cfgVal *bool, def bool) bool {
-	switch strings.ToLower(strings.TrimSpace(flagVal)) {
+func resolveTriBool(flagVal string, cfgVal *bool, def bool) bool {	switch strings.ToLower(strings.TrimSpace(flagVal)) {
 	case "true", "1", "yes", "on":
 		return true
 	case "false", "0", "no", "off":
@@ -1206,6 +1205,9 @@ func nodeConfigRoutes(path string, eff nodeRuntime, nodeRef func() *lanet.Client
 			// 混淆——控制台页面随二进制内嵌升级，不存在持久化的旧前端。
 			// 非法项直接拒绝而不静默跳过：这里写的是配置意图，错了该让用户
 			// 看到报错，而不是保存后无声回退自动枚举。
+			// 0.5.72 起控制台用多行文本框（一行一个地址）：换行在这里归一化
+			// 成逗号，配置文件/环境变量仍保持逗号分隔格式；校验与解析逻辑不变。
+			req.Advertise = normalizeAdvertiseInput(req.Advertise)
 			if req.Advertise != "" {
 				if err := p2pkit.ValidateAdvertiseSpec(req.Advertise); err != nil {
 					writeJSONLocal(w, http.StatusBadRequest, map[string]string{"error": "对外地址： " + err.Error()})

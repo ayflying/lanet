@@ -411,7 +411,7 @@
     <div class="kv"><b>控制台</b><input type="text" id="cConsole" placeholder="127.0.0.1:8900 = 仅本机，0.0.0.0:8900 = 允许远程，- = 关闭"></div>
     <div class="kv"><b>控制台密码</b><input type="password" id="cPassword" placeholder="未设置；远程访问时务必设置"></div>
     <div class="kv"><b>监听地址</b><input type="text" id="cListen" placeholder="留空 = tcp/ws/quic 随机端口"></div>
-    <div class="kv"><b>对外地址</b><input type="text" id="cAdvertise" placeholder="留空 = 系统自动获取（默认）">
+    <div class="kv"><b>对外地址</b><textarea id="cAdvertise" class="addr-input" rows="2" placeholder="留空 = 系统自动获取（默认）" oninput="autoGrow(this)"></textarea>
       <button class="ghost" id="cAdvertiseReset" onclick="resetAdvertise()" style="margin-left:8px;white-space:nowrap">恢复默认</button>
     </div>
     <div class="sub" id="cAdvertiseHint" style="display:none;color:#8a94a6;margin:-1px 0 6px 88px"></div>
@@ -942,6 +942,15 @@ function renderSeed() {
 // 此前「已退出」会把复选框取消勾选，导致「进程已退出但配置仍是开启」的状态
 // 被无声改写，且 3 秒保护窗口还会让同步时而失效——两者都不该发生。
 let cfgPublicDHT = false;   // 配置意图（下次启动是否自动开启），仅由配置读取/用户点击更新
+let cfgSystemAddrs = [];    // 页面加载时缓存的系统自动获取地址（「恢复默认」兜底数据源）
+
+// addrSetsEqual 按集合比较两组地址（顺序无关、去重）：判断对外地址框内容
+// 是否与系统自动获取一致（一致 = 等效默认，不显示「已自定义」警告）。
+function addrSetsEqual(a, b) {
+  const norm = arr => Array.from(new Set(arr.map(s => s.trim()).filter(Boolean))).sort();
+  const x = norm(a), y = norm(b);
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+}
 function fmtMMSS(sec) {
   sec = Math.max(0, Math.round(sec));
   const m = Math.floor(sec / 60), s = sec % 60;
@@ -1211,23 +1220,28 @@ async function loadNodeConfig() {
     $('cPassword').value = '';
     $('cPassword').placeholder = c.has_password ? '已设置（输入新值可覆盖）' : '未设置；远程访问时务必设置';
     $('cListen').value = c.listen || '';
-    // 对外地址（自定义 IP，替换语义）：默认填系统自动获取的地址（可手改、
-    // 可一键还原）；填了就整体替换连接码/连接种子/对外上报的地址。
+    // 对外地址（自定义 IP，替换语义）：多行文本框，一行一个地址。默认把系统
+    // 自动获取的本机地址**全部填进框里**（不是留空）；用户可直接增删改行，
+    // 「恢复默认」把框内容整体换回当前系统地址。保存时把换行归一化成逗号。
     const adv = c.advertise || '';
     const sysAddrs = c.system_addrs || [];
-    $('cAdvertise').value = adv;
+    cfgSystemAddrs = sysAddrs.slice();
+    const advLines = adv ? adv.split(',').map(s => s.trim()).filter(Boolean) : [];
+    const advShown = advLines.length ? advLines : sysAddrs.slice();
+    $('cAdvertise').value = advShown.join('\n');
+    autoGrow($('cAdvertise'));
     $('cAdvertise').placeholder = sysAddrs.length
-      ? ('留空 = 系统自动获取（默认）：' + sysAddrs.slice(0, 3).join(', ') + (sysAddrs.length > 3 ? ' …' : ''))
-      : '留空 = 系统自动获取（默认）';
+      ? '留空 = 系统自动获取（默认）：一行一个地址'
+      : '留空 = 系统自动获取（默认）；节点入网后可在此填本机地址（一行一个）';
     const advHint = $('cAdvertiseHint');
-    if (adv) {
+    if (advLines.length && !addrSetsEqual(advLines, sysAddrs)) {
       advHint.style.display = '';
-      advHint.innerHTML = '⚠ 已启用自定义：连接码、连接种子与对外上报将<b>只使用</b>这里填写的地址，系统检测到的地址不再对外出现。端口必须与实际监听一致（默认随机端口时请先在「监听地址」固定端口）。填错会导致新节点连不上本机（已在网好友不受影响）。';
+      advHint.innerHTML = '⚠ 已自定义（与系统自动获取不一致）：连接码、连接种子与对外上报将<b>只使用</b>这里填写的地址。端口必须与实际监听一致（默认随机端口时请先在「监听地址」固定端口）。填错会导致新节点连不上本机（已在网好友不受影响）。';
+    } else if (sysAddrs.length) {
+      advHint.style.display = '';
+      advHint.textContent = '系统当前自动获取：' + sysAddrs.join(', ') + '。以上内容与之一致 = 使用默认。';
     } else {
-      advHint.style.display = sysAddrs.length ? '' : 'none';
-      advHint.textContent = sysAddrs.length
-        ? '系统当前自动获取：' + sysAddrs.join(', ')
-        : '节点入网后这里会显示系统自动获取到的地址。';
+      advHint.style.display = 'none';
     }
     $('cBootstrap').value = (c.bootstrap && c.bootstrap !== 'none') ? c.bootstrap : '';
     $('cPublicMin').value = c.public_dht_minutes || 10;
@@ -1269,7 +1283,8 @@ async function saveNodeConfig() {
     console: $('cConsole').value.trim(),
     console_password: $('cPassword').value,
     listen: $('cListen').value.trim(),
-    advertise: $('cAdvertise').value.trim(),
+    // 对外地址多行输入框：换行归一化成逗号再提交（后端校验按逗号分隔）。
+    advertise: $('cAdvertise').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean).join(','),
     bootstrap: ($('cBootstrap').value.trim() || 'none'),
     enable_public_dht: cfgPublicDHT,
     public_dht_minutes: parseInt($('cPublicMin').value, 10) || 10,
@@ -1287,24 +1302,25 @@ async function saveNodeConfig() {
   if (r.ok) loadNodeConfig();
 }
 
-// resetAdvertise 把「对外地址」输入框还原为系统自动获取的地址（即清空自定义，
-// 交由系统枚举）。只改输入框与提示，不直接发请求——与页面其他配置一致，
-// 由用户点「保存节点配置」统一提交，避免半提交状态。
+// resetAdvertise 把「对外地址」输入框整体还原为系统自动获取的本机地址（一行
+// 一个，覆盖用户已填的全部内容）。只改输入框与提示，不直接发请求——与页面
+// 其他配置一致，由用户点「保存节点配置」统一提交，避免半提交状态。
 async function resetAdvertise() {
-  let sys = [];
+  let sys = cfgSystemAddrs.slice();
   try {
     const c = await (await fetch('/api/node-config', { cache: 'no-store' })).json();
-    sys = c.system_addrs || [];
-  } catch (e) { /* 拉不到就用空值：效果等于清空自定义 */ }
-  $('cAdvertise').value = '';
-  $('cAdvertise').placeholder = sys.length
-    ? ('留空 = 系统自动获取（默认）：' + sys.slice(0, 3).join(', ') + (sys.length > 3 ? ' …' : ''))
-    : '留空 = 系统自动获取（默认）';
+    if (Array.isArray(c.system_addrs) && c.system_addrs.length) {
+      sys = c.system_addrs.slice();
+      cfgSystemAddrs = sys;
+    }
+  } catch (e) { /* 拉不到就用页面加载时缓存的系统地址 */ }
+  $('cAdvertise').value = sys.join('\n');
+  autoGrow($('cAdvertise'));
   const hint = $('cAdvertiseHint');
   hint.style.display = sys.length ? '' : 'none';
   hint.textContent = sys.length
-    ? '已还原为系统自动获取：' + sys.join(', ') + '。点「保存节点配置」生效。'
-    : '已清空自定义，恢复系统自动获取。点「保存节点配置」生效。';
+    ? '已还原为系统自动获取的全部本机地址。点「保存节点配置」生效。'
+    : '节点入网后才能取到系统地址；当前已清空自定义。点「保存节点配置」生效。';
   flash('cfgMsg', '对外地址已还原为系统默认（未保存），请点「保存节点配置」生效', true);
 }
 
