@@ -403,15 +403,10 @@ func applyUpdate() (err error) {
 	}
 
 	log.Printf("[update] 替换程序并重启（%s -> %s）", assetName, exePath)
-	// 正在运行的 exe 不能直接覆盖：改名腾位 → 放入新程序 → 拉起新进程 → 退出。
-	oldPath := exePath + ".old"
-	_ = os.Remove(oldPath)
-	if err := os.Rename(exePath, oldPath); err != nil {
-		return fmt.Errorf("旧程序改名失败: %w", err)
-	}
-	if err := copyFile(newExe, exePath); err != nil {
-		_ = os.Rename(oldPath, exePath) // 回滚
-		return fmt.Errorf("写入新程序失败: %w", err)
+	// 正在运行的 exe 不能直接覆盖：Windows 上映像锁会拒绝删除/写入，需要
+	// 专门的替换策略（见 installNewBinary）；POSIX 直接改名腾位再写入。
+	if err := installNewBinary(newExe, exePath); err != nil {
+		return fmt.Errorf("替换程序失败: %w", err)
 	}
 	// 磁盘上已是新程序：保持闸门占住，直到进程重启（重启后版本号才更新）。
 	landed = true
@@ -657,6 +652,29 @@ func copyFile(src, dst string) error {
 	}
 	defer in.Close()
 	return writeAtomic(dst, in)
+}
+
+// installNewBinary 把解出的新程序落到 exePath，兼容「旧程序正在运行」场景。
+//
+// Windows：lanet.exe 被进程映像锁住（本节点/托盘伴侣都在跑它），Go 的
+// os.Rename 对已存在目标会先 os.Remove——删除需要目标的 DELETE 访问权，
+// 被锁即 Access denied（0.5.72 升级实证）。改用 Win32 MoveFileEx 的
+// REPLACE_EXISTING：它走目录项原子替换，不打开目标文件，正在运行的 exe
+// 也能换名（新程序下次启动生效）。非 Windows 无此锁，直接改名腾位再写入。
+func installNewBinary(newExe, exePath string) error {
+	if runtime.GOOS == "windows" {
+		return replaceLockedBinary(newExe, exePath)
+	}
+	oldPath := exePath + ".old"
+	_ = os.Remove(oldPath)
+	if err := os.Rename(exePath, oldPath); err != nil {
+		return fmt.Errorf("旧程序改名失败: %w", err)
+	}
+	if err := copyFile(newExe, exePath); err != nil {
+		_ = os.Rename(oldPath, exePath) // 回滚
+		return fmt.Errorf("写入新程序失败: %w", err)
+	}
+	return nil
 }
 
 func selfExe() string {
