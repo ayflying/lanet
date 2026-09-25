@@ -707,6 +707,29 @@ func (c *Client) connectPeerInner(ctx context.Context, address string) (*ConnRes
 		}
 		ai := peer.AddrInfo{ID: id, Addrs: addrs}
 		connectedID, cerr := c.disc.RequestConnect(ctx, ai)
+		if cerr != nil && !isTerminalConnectError(cerr) && ctx.Err() == nil {
+			// 显式连接码地址失败后，PeerID 仍作为私有 DHT 查找键；
+			// 通过强制 DHT 查询避开旧连接码和 peerstore 缓存地址。
+			findCtx, findCancel := context.WithTimeout(ctx, 20*time.Second)
+			found, findErr := c.disc.FindPeerInDHT(findCtx, id.String())
+			findCancel()
+			if findErr == nil && found.ID != id {
+				findErr = fmt.Errorf("私有 DHT 返回的节点 ID 与连接码不一致")
+			}
+			if findErr == nil {
+				foundID, retryErr := c.disc.RequestConnect(ctx, found)
+				if retryErr == nil {
+					c.noteDialSuccess(ctx, id.String(), found.Addrs)
+					res := c.resultFor(id.String(), "dht")
+					res.Message = "已连接（连接码地址失败，已通过私有 DHT 找到可用地址）"
+					return res, nil
+				}
+				connectedID, cerr = foundID, retryErr
+			}
+			if !isTerminalConnectError(cerr) && ctx.Err() == nil {
+				return nil, fmt.Errorf("连接码地址拨号失败；私有 DHT 查找/重试也未成功（DHT: %v）: %w", findErr, cerr)
+			}
+		}
 		if cerr != nil {
 			return pendingOrError(connectedID, "manual", cerr)
 		}
@@ -827,6 +850,16 @@ func (c *Client) connectByID(ctx context.Context, address string) (*ConnResult, 
 
 // pendingOrError 把建连错误归一化：Pending 中间态转成友好的 ConnResult，
 // 其余原样返回错误。
+func isTerminalConnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, serverless.ErrNotApproved) ||
+		errors.Is(err, serverless.ErrUnfriended) ||
+		errors.Is(err, serverless.ErrGroupMismatch) ||
+		strings.Contains(err.Error(), "等待对方同意")
+}
+
 func pendingOrError(peerID, via string, err error) (*ConnResult, error) {
 	// 对方已把本机删除好友：本机的同步移除已由协议层回调完成，
 	// 这里给出明确下一步指引（需对方主动添加本机）。

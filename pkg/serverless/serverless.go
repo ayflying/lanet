@@ -883,6 +883,16 @@ func (d *Discovery) validVirtualIPv6(peerID, value string) bool {
 //
 // 找不到时返回明确错误，调用方据此提示用户核对 ID 与网络密钥。
 func (d *Discovery) FindPeer(ctx context.Context, peerID string) (peer.AddrInfo, error) {
+	return d.findPeer(ctx, peerID, false)
+}
+
+// FindPeerInDHT 忽略本地 peerstore 缓存，直接查询私有 DHT 的最新记录。
+// 用于显式连接地址已失效、但其 PeerID 仍可在私有网络中发现的场景。
+func (d *Discovery) FindPeerInDHT(ctx context.Context, peerID string) (peer.AddrInfo, error) {
+	return d.findPeer(ctx, peerID, true)
+}
+
+func (d *Discovery) findPeer(ctx context.Context, peerID string, forceDHT bool) (peer.AddrInfo, error) {
 	id, err := peer.Decode(peerID)
 	if err != nil {
 		return peer.AddrInfo{}, fmt.Errorf("节点 ID 格式非法: %w", err)
@@ -894,9 +904,12 @@ func (d *Discovery) FindPeer(ctx context.Context, peerID string) (peer.AddrInfo,
 	if priv == nil {
 		return peer.AddrInfo{}, fmt.Errorf("私有 DHT 未就绪")
 	}
-	// 先看 peerstore 是否已有可用地址（此前连过、或对端主动握手留下）。
-	if addrs := p2pkit.CleanUnderlayAddrs(d.host.Peerstore().Addrs(id)); len(addrs) > 0 {
-		return peer.AddrInfo{ID: id, Addrs: addrs}, nil
+	// 普通按 ID 查找先看 peerstore（此前连过、或对端主动握手留下）；
+	// 显式连接码回退则强制读取 DHT，避免刚失败的连接码地址遮蔽新记录。
+	if !forceDHT {
+		if addrs := p2pkit.CleanUnderlayAddrs(d.host.Peerstore().Addrs(id)); len(addrs) > 0 {
+			return peer.AddrInfo{ID: id, Addrs: addrs}, nil
+		}
 	}
 	findCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
