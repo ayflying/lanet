@@ -3,6 +3,7 @@ package tundevice
 import (
 	"fmt"
 	"log"
+	"net/netip"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -119,4 +120,70 @@ func EnsureNeighbor(name, ip string) error {
 		return nil
 	}
 	return ensureNeighborNative(name, ip)
+}
+
+var lanetULAIPv6Prefix = netip.MustParsePrefix("fd00:6c61:6e65::/48")
+
+func validateULAIPv6(value string) error {
+	ip, err := netip.ParseAddr(value)
+	if err != nil || !ip.Is6() || ip.Zone() != "" || !lanetULAIPv6Prefix.Contains(ip) {
+		return fmt.Errorf("无效的 Lanet IPv6 ULA 地址 %q", value)
+	}
+	return nil
+}
+
+// ConfigureTUNIPv6 为 TUN 接口配置 Lanet 项目 /48 范围内的 IPv6 ULA；宿主接口地址使用 /128。
+// Windows 配置接口地址和成员主机路由；IPv6 路由使用未指定下一跳，避免伪造邻居项。
+func ConfigureTUNIPv6(name, ipv6 string) error {
+	if err := validateULAIPv6(ipv6); err != nil {
+		return err
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		if err := configureAddressIPv6Native(name, ipv6, 48); err != nil {
+			return fmt.Errorf("configure IPv6 address: %w", err)
+		}
+		return nil
+	case "linux":
+		if err := runCmd("ip", "-6", "addr", "replace", ipv6+"/128", "dev", name); err != nil {
+			return err
+		}
+		if err := runCmd("ip", "link", "set", name, "up"); err != nil {
+			return err
+		}
+		return addIPv6Route("ip", "-6", "route", "add", lanetULAIPv6Prefix.String(), "dev", name)
+	case "darwin":
+		if err := runCmd("ifconfig", name, "inet6", ipv6, "prefixlen", "128", "up"); err != nil {
+			return err
+		}
+		return addIPv6Route("route", "-n", "add", "-inet6", lanetULAIPv6Prefix.String(), "-interface", name)
+	default:
+		return fmt.Errorf("unsupported OS %q", runtime.GOOS)
+	}
+}
+
+// EnsureRouteIPv6 在 Windows 上为成员添加 /128 主机路由；Linux/macOS 使用接口连接的项目 /48 路由。
+func addIPv6Route(command string, args ...string) error {
+	if err := runCmd(command, args...); err != nil {
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "file exists") || strings.Contains(message, "already exists") {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func EnsureRouteIPv6(name, ipv6 string) error {
+	if err := validateULAIPv6(ipv6); err != nil {
+		return err
+	}
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	if err := ensureRouteIPv6Native(name, ipv6); err == nil {
+		return nil
+	}
+	return runCmd("netsh", "interface", "ipv6", "add", "route", ipv6+"/128", "interface="+name, "store=active", "metric=1")
 }

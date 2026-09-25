@@ -9,6 +9,14 @@ import (
 	"time"
 )
 
+func TestHandleQueryRejectsOversizedPacket(t *testing.T) {
+	d := NewDNSServer(nil)
+	query := make([]byte, dnsMaxMsgSize+1)
+	if resp := d.handleQuery(query); resp != nil {
+		t.Fatalf("超出 DNS 报文上限应丢弃，得到 %d 字节应答", len(resp))
+	}
+}
+
 func TestParseDNSName(t *testing.T) {
 	// "xa.lanet" -> 标签长度前缀格式
 	msg := []byte{2, 'x', 'a', 5, 'l', 'a', 'n', 'e', 't', 0, 0, 1, 0, 1}
@@ -67,6 +75,46 @@ func TestHandleQueryARecord(t *testing.T) {
 	}
 }
 
+func TestHandleQueryAAAARecord(t *testing.T) {
+	want := net.ParseIP("fd00:6c61:6e65::1").To16()
+	d := NewDNSServer(func() []MemberRef {
+		return []MemberRef{{PeerID: "p1", Name: "xa", VirtualIP: "10.7.89.31", VirtualIPv6: "fd00:6c61:6e65::1"}}
+	})
+	resp := d.handleQuery(buildQuery("xa.lanet", 28))
+	if resp == nil || binary.BigEndian.Uint16(resp[6:8]) != 1 {
+		t.Fatalf("AAAA 应答缺失: %v", resp)
+	}
+	if binary.BigEndian.Uint16(resp[len(resp)-18:len(resp)-16]) != 16 {
+		t.Fatal("AAAA RDLENGTH 应为 16")
+	}
+	if ttl := binary.BigEndian.Uint32(resp[len(resp)-22 : len(resp)-18]); ttl != 0 {
+		t.Fatalf("TTL 应为 0, got %d", ttl)
+	}
+	if !net.IP(resp[len(resp)-16:]).Equal(want) {
+		t.Fatalf("AAAA 地址错误: %v", resp[len(resp)-16:])
+	}
+}
+
+func TestHandleQueryAAAARejectsNonVirtualIPv6(t *testing.T) {
+	for _, addr := range []string{
+		"2001:db8::1",       // global
+		"fe80::1",           // link-local
+		"::ffff:192.0.2.1",  // IPv4-mapped
+		"fd12:3456:789a::1", // ULA outside Lanet's assigned prefix
+		"not-an-ip",
+	} {
+		t.Run(addr, func(t *testing.T) {
+			d := NewDNSServer(func() []MemberRef {
+				return []MemberRef{{PeerID: "p1", Name: "xa", VirtualIP: "10.7.89.31", VirtualIPv6: addr}}
+			})
+			resp := d.handleQuery(buildQuery("xa.lanet", 28))
+			if resp == nil || resp[3]&0xF != 0 || binary.BigEndian.Uint16(resp[6:8]) != 0 {
+				t.Fatalf("无效虚拟 IPv6 应返回 NODATA: %v", resp)
+			}
+		})
+	}
+}
+
 func TestHandleQueryCases(t *testing.T) {
 	d := NewDNSServer(func() []MemberRef {
 		return []MemberRef{{PeerID: "p1", Name: "xa", VirtualIP: "10.7.89.31"}}
@@ -79,9 +127,9 @@ func TestHandleQueryCases(t *testing.T) {
 	if r := d.handleQuery(buildQuery("example.com", 1)); r == nil || uint16(r[3]&0xF) != dnsRCODENXDomain {
 		t.Fatal("裸域名应 NXDOMAIN")
 	}
-	// AAAA 查询 NOTIMP
-	if r := d.handleQuery(buildQuery("xa.lanet", 28)); r == nil || uint16(r[3]&0xF) != dnsRCODENotImp {
-		t.Fatal("AAAA 应 NOTIMP")
+	// 成员名存在但旧成员未提供 IPv6：NOERROR + ANCOUNT=0（NODATA）
+	if r := d.handleQuery(buildQuery("xa.lanet", 28)); r == nil || r[3]&0xF != 0 || binary.BigEndian.Uint16(r[6:8]) != 0 {
+		t.Fatal("无 IPv6 的已存在成员应返回 NODATA")
 	}
 	// 畸形包丢弃
 	if r := d.handleQuery([]byte{1, 2, 3}); r != nil {

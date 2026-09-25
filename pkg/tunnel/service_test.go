@@ -29,12 +29,19 @@ func (f *fakeNetmap) Refresh(ctx context.Context) (netmapclient.Snapshot, error)
 func (f *fakeNetmap) Current() netmapclient.Snapshot { return netmapclient.Snapshot{} }
 func (f *fakeNetmap) Routes() []netmapclient.Route   { return f.routes }
 func (f *fakeNetmap) Resolve(virtualIP string) (netmapclient.Route, bool) {
+	var match netmapclient.Route
+	found := false
 	for _, route := range f.routes {
-		if route.VirtualIP == virtualIP {
-			return route, true
+		if route.VirtualIP != virtualIP && route.VirtualIPv6 != virtualIP {
+			continue
 		}
+		if found {
+			return netmapclient.Route{}, false
+		}
+		match = route
+		found = true
 	}
-	return netmapclient.Route{}, false
+	return match, found
 }
 func (f *fakeNetmap) Announce(ctx context.Context, addrs []string) error  { return nil }
 func (f *fakeNetmap) RunLoop(ctx context.Context, interval time.Duration) {}
@@ -165,6 +172,32 @@ func TestDialAdmissionRejectsThousandTargets(t *testing.T) {
 	if len(s.dials) != 0 || s.waiters != 0 {
 		t.Fatal("拒绝后残留排队任务")
 	}
+}
+
+func TestOpenStreamResolvesIPv6Destination(t *testing.T) {
+	self, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer self.Close()
+	remote, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	const targetIPv6 = "fd7a:115c:a1e0::2"
+	remote.SetStreamHandler(libprotocol.ID("/lanet/ipv6-route-test/1"), func(st network.Stream) { _ = st.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := self.Connect(ctx, peer.AddrInfo{ID: remote.ID(), Addrs: remote.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	s := New(self, &fakeNetmap{routes: []netmapclient.Route{{VirtualIPv6: targetIPv6, PeerID: remote.ID().String()}}}, fakeRelaySource{})
+	st, _, err := s.OpenStreamToVirtualIPProtocol(ctx, targetIPv6, libprotocol.ID("/lanet/ipv6-route-test/1"))
+	if err != nil {
+		t.Fatalf("open stream to IPv6 target: %v", err)
+	}
+	_ = st.Close()
 }
 
 func TestOpenStreamRejectsUnknownVirtualIP(t *testing.T) {

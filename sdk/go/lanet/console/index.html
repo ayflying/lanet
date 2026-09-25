@@ -1150,14 +1150,28 @@ async function saveForwards() {
 function flash(id, text, ok) { const el = $(id); if (!el) return; el.textContent = text; el.className = 'msg ' + (ok ? 'ok' : 'bad'); el.style.display = ''; }
 
 function copyText(text, el) {
-  const done = () => { if (!el) return; const old = el.style.color; el.style.color = '#2fa65a';
-    setTimeout(() => { el.style.color = old; }, 800); };
+  const done = () => {
+    if (el) {
+      const old = el.style.color; el.style.color = '#2fa65a';
+      setTimeout(() => { el.style.color = old; }, 800);
+    }
+    let toast = $('copyToast');
+    if (!toast) {
+      toast = document.createElement('div'); toast.id = 'copyToast';
+      toast.textContent = '已复制到剪贴板';
+      toast.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);padding:8px 14px;border-radius:6px;background:rgba(30,30,30,.82);color:#fff;font-size:13px;z-index:9999;pointer-events:none;';
+      document.body.appendChild(toast);
+    }
+    toast.style.display = '';
+    clearTimeout(toast._hideTimer);
+    toast._hideTimer = setTimeout(() => { toast.style.display = 'none'; }, 500);
+  };
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(done).catch(() => {});
   } else {
     const ta = document.createElement('textarea');
     ta.value = text; document.body.appendChild(ta); ta.select();
-    try { document.execCommand('copy'); done(); } catch (e) {}
+    try { if (document.execCommand('copy')) done(); } catch (e) {}
     ta.remove();
   }
 }
@@ -1494,7 +1508,8 @@ function renderInfoModal() {
     ${kv('主机名', i.os_hostname)}
     ${kv('节点名', i.node_name)}
     ${(!isSelf && findPeerDisplay(i.peer_id).notes) ? kv('备注', findPeerDisplay(i.peer_id).notes) : ''}
-    ${kv('虚拟 IP', i.virtual_ip, true)}
+    ${kv('虚拟 IPv4', i.virtual_ip, true)}
+    ${kv('虚拟 IPv6', i.virtual_ipv6, true)}
     ${kv('虚拟地址', i.virtual_host, true)}
     ${kv('节点 ID', i.peer_id)}
     ${kv('系统', (i.os || '—') + ' · ' + (i.platform || '—'))}

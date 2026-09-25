@@ -154,22 +154,27 @@ func (c *Client) enablePortFWD() {
 
 // virtualIPByPeer 由 PeerID 反查成员虚拟 IP（两种入网模式通用）。
 func (c *Client) virtualIPByPeer(peerID string) string {
+	v4, _ := c.virtualIPAliasesByPeer(peerID)
+	return v4
+}
+
+func (c *Client) virtualIPAliasesByPeer(peerID string) (string, string) {
 	if c.disc != nil {
 		for _, m := range c.disc.Peers() {
 			if m.PeerID == peerID {
-				return m.VirtualIP
+				return m.VirtualIP, m.VirtualIPv6
 			}
 		}
-		return ""
+		return "", ""
 	}
 	if c.netmapCli != nil {
 		for _, m := range c.netmapCli.Current().Members {
 			if m.PeerID == peerID {
-				return m.VirtualIP
+				return m.VirtualIP, m.VirtualIPv6
 			}
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // matchForward 端口命中局域网映射表时返回目标地址。

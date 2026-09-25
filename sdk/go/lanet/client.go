@@ -318,12 +318,12 @@ type Client struct {
 	sessionToken string       // 控制台会话令牌（设置 ConsolePassword 后生成）
 
 	lfReconcileMu sync.Mutex // 完整调和串行化；先于 fwMu/lfMu，Close 不获取此锁
-	lfMu        sync.Mutex
-	lfListeners map[int]*fwdListener // 端口转发本地监听表（listen 端口 → 监听器）
-	rootCtx     context.Context      // 节点生命周期 context（监听 goroutine 用）
-	cancel      context.CancelFunc   // 取消 rootCtx：触发全部生命周期 goroutine 退出
-	closeOnce   sync.Once            // Close 幂等保证
-	ready       chan struct{}        // 构造完成后关闭，安全发布初始化字段
+	lfMu          sync.Mutex
+	lfListeners   map[int]*fwdListener // 端口转发本地监听表（listen 端口 → 监听器）
+	rootCtx       context.Context      // 节点生命周期 context（监听 goroutine 用）
+	cancel        context.CancelFunc   // 取消 rootCtx：触发全部生命周期 goroutine 退出
+	closeOnce     sync.Once            // Close 幂等保证
+	ready         chan struct{}        // 构造完成后关闭，安全发布初始化字段
 
 	tunMu     sync.Mutex
 	tunDevice tundevice.Device  // TUN 虚拟网卡（cfg.Tun 且创建成功时非 nil）
@@ -341,10 +341,11 @@ type Client struct {
 
 // Info 节点入网后的身份信息。
 type Info struct {
-	PeerID    string `json:"peer_id"`
-	GroupID   string `json:"group_id"`
-	Group     string `json:"group"`
-	VirtualIP string `json:"virtual_ip"`
+	PeerID      string `json:"peer_id"`
+	GroupID     string `json:"group_id"`
+	Group       string `json:"group"`
+	VirtualIP   string `json:"virtual_ip"`
+	VirtualIPv6 string `json:"virtual_ipv6,omitempty"`
 	// Name 节点名称（Standalone 即配置名；常规模式为创建/加入时登记的名）。
 	Name string `json:"name,omitempty"`
 	// VirtualHost 本节点的虚拟地址（<规范化名>.lanet，组内重名自动带后缀）。
@@ -520,7 +521,7 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 		if keyLabel == "" {
 			keyLabel = "本机专属默认网络"
 		}
-		c.logf("无服务器模式入网：虚拟 IP=%s，网络密钥=%s", c.myIP, keyLabel)
+		c.logf("无服务器模式入网：虚拟 IPv4=%s，虚拟 IPv6=%s，网络密钥=%s", c.myIP, disc.SelfVirtualIPv6(), keyLabel)
 		if c.requireApproval() {
 			mode := "需要用户同意"
 			if cfg.AutoAccept {
@@ -603,11 +604,11 @@ func (c *Client) memberRefs() []serverless.MemberRef {
 	var members []serverless.MemberRef
 	if c.disc != nil {
 		for _, m := range c.disc.Peers() {
-			members = append(members, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+			members = append(members, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, VirtualIPv6: m.VirtualIPv6})
 		}
 	} else if c.netmapCli != nil {
 		for _, m := range c.netmapCli.Current().Members {
-			members = append(members, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+			members = append(members, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, VirtualIPv6: m.VirtualIPv6})
 		}
 	}
 	return members
@@ -639,11 +640,19 @@ func defaultListenAddrs() []string {
 	return addrs
 }
 
+func (c *Client) selfVirtualIPv6() string {
+	if c.disc != nil {
+		return c.disc.SelfVirtualIPv6()
+	}
+	return ""
+}
+
 // Info 返回节点身份信息。
 func (c *Client) Info() Info {
 	return Info{
 		PeerID: c.peerID, GroupID: c.groupID, Group: c.group,
 		VirtualIP:   c.myIP,
+		VirtualIPv6: c.selfVirtualIPv6(),
 		Name:        c.cfg.Name,
 		VirtualHost: c.selfHostname(),
 		Created:     c.created,
@@ -843,14 +852,14 @@ func (c *Client) selfHostname() string {
 	if c.cfg.Name == "" {
 		return ""
 	}
-	refs := []serverless.MemberRef{{PeerID: c.peerID, Name: c.cfg.Name, VirtualIP: c.myIP}}
+	refs := []serverless.MemberRef{{PeerID: c.peerID, Name: c.cfg.Name, VirtualIP: c.myIP, VirtualIPv6: c.selfVirtualIPv6()}}
 	if c.disc != nil {
 		for _, m := range c.disc.Peers() {
-			refs = append(refs, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+			refs = append(refs, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, VirtualIPv6: m.VirtualIPv6})
 		}
 	} else if c.netmapCli != nil {
 		for _, m := range c.netmapCli.Current().Members {
-			refs = append(refs, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+			refs = append(refs, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, VirtualIPv6: m.VirtualIPv6})
 		}
 	}
 	hosts := serverless.Hostnames(refs)
@@ -894,7 +903,18 @@ func (c *Client) resolveVirtualIP(target string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return m.VirtualIP, nil
+	return memberVirtualAddress(target, m), nil
+}
+
+func memberVirtualAddress(target string, member serverless.MemberRef) string {
+	// IP 字面量保留用户选择的地址族；名称目标仍兼容默认走 IPv4。
+	if ip, err := netip.ParseAddr(strings.TrimSpace(target)); err == nil && ip.Is6() {
+		if member.VirtualIPv6 == "" {
+			return ""
+		}
+		return member.VirtualIPv6
+	}
+	return member.VirtualIP
 }
 
 // resolveMember 把连接目标解析为成员（serverless.ResolveTarget 的两种入网模式适配）。
@@ -902,11 +922,11 @@ func (c *Client) resolveMember(target string) (serverless.MemberRef, error) {
 	var members []serverless.MemberRef
 	if c.disc != nil {
 		for _, m := range c.disc.Peers() {
-			members = append(members, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+			members = append(members, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, VirtualIPv6: m.VirtualIPv6})
 		}
 	} else if c.netmapCli != nil {
 		for _, m := range c.netmapCli.Current().Members {
-			members = append(members, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+			members = append(members, serverless.MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, VirtualIPv6: m.VirtualIPv6})
 		}
 	}
 	return serverless.ResolveTarget(members, target)
@@ -975,7 +995,7 @@ func (c *Client) NetMap() netmapclient.Snapshot {
 		members := make([]netmapclient.Member, 0)
 		for _, m := range c.disc.Peers() {
 			members = append(members, netmapclient.Member{
-				PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, Addrs: m.Addrs,
+				PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, VirtualIPv6: m.VirtualIPv6, Addrs: m.Addrs,
 				Hostname: m.Hostname, FirstSeen: m.FirstSeen, LastSeen: m.LastSeen,
 				Version: m.Version, Platform: m.Platform,
 				OSHostname: m.OSHostname, LocalIPs: m.LocalIPs,
@@ -1043,6 +1063,13 @@ func (c *Client) startTUN(ctx context.Context) {
 			c.logf("TUN 网卡地址配置失败（自动降级为仅应用层）: %v", err)
 			return
 		}
+		if ipv6 := c.selfVirtualIPv6(); ipv6 != "" {
+			if err = tundevice.ConfigureTUNIPv6(name, ipv6); err != nil {
+				c.logf("TUN 网卡 IPv6 地址配置失败（IPv4 TUN 仍可用）: %v", err)
+			} else {
+				c.logf("TUN 网卡 IPv6 地址已配置：%s", ipv6)
+			}
+		}
 	}
 	c.tunMu.Lock()
 	c.tunDevice = device
@@ -1067,20 +1094,31 @@ func (c *Client) startTUN(ctx context.Context) {
 	// Tunnel 协议（见 OnStream 注释），应用流场景请改用 DialProtocol+自定义协议。
 	c.node.SetStreamHandler(protocol.Tunnel, func(stream network.Stream) {
 		virtualIP := c.virtualIPByPeer(stream.Conn().RemotePeer().String())
-		router.ServeInboundStream(virtualIP, stream)
+		_, virtualIPv6 := c.virtualIPAliasesByPeer(stream.Conn().RemotePeer().String())
+		router.ServeInboundStreamAliases(virtualIP, virtualIPv6, stream)
 	})
 	// Windows Wintun 按成员维护 /32 on-link 路由，与 WireGuard 的 AllowedIPs
 	// 路由形态一致。L3 Wintun 没有二层 ARP，应同时写入永久邻居占位项；否则
 	// Windows 会把对端项变成 Unreachable，IP 包根本不会进入 TUN。只增量添加，
 	// 避免路由窗口，也避免每次刷新都重建邻居项。
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" || c.disc != nil {
 		go func() {
 			knownRoutes := make(map[string]struct{})
 			knownNeighbors := make(map[string]struct{})
+			knownIPv6Routes := make(map[string]struct{})
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
 			for {
 				for _, m := range c.NetMap().Members {
+					if m.VirtualIPv6 != "" && m.VirtualIPv6 != c.selfVirtualIPv6() {
+						if _, ok := knownIPv6Routes[m.VirtualIPv6]; !ok {
+							if err := tundevice.EnsureRouteIPv6(name, m.VirtualIPv6); err != nil {
+								c.logf("成员 IPv6 路由写入失败 %s: %v", m.VirtualIPv6, err)
+							} else {
+								knownIPv6Routes[m.VirtualIPv6] = struct{}{}
+							}
+						}
+					}
 					if m.VirtualIP == "" || m.VirtualIP == c.myIP {
 						continue
 					}

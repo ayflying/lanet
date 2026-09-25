@@ -589,9 +589,21 @@ func NormalizeAddrs(in []string) []string {
 // 地址清洗：结构过滤（与 NormalizeAddrs 分层，语义不同）
 // =================================================================================
 
-// lanetOverlayPrefix lanet 自身的隧道地址段（10.7.0.0/16）。与 p2pkit 侧
-// IsLanetOverlayAddr 同源：经自身隧道再拨号会成环，必须挡在地址簿之外。
-var lanetOverlayPrefix = netip.MustParsePrefix("10.7.0.0/16")
+// lanetOverlayPrefixes 是 lanet 自身的隧道地址段。与 p2pkit 侧保持一致，
+// 只包含项目规划地址，避免误过滤其他 ULA 网络。
+var lanetOverlayPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("10.7.0.0/16"),
+	netip.MustParsePrefix("fd00:6c61:6e65::/48"),
+}
+
+func isLanetOverlayIP(ip netip.Addr) bool {
+	for _, prefix := range lanetOverlayPrefixes {
+		if prefix.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
 
 // prunePeerAddrsKeep 每个节点在地址簿里保留的地址条数上限（见 PrunePeerAddrs）。
 const prunePeerAddrsKeep = 16
@@ -642,7 +654,7 @@ func isStructurallyDialable(addr string) bool {
 	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() {
 		return false
 	}
-	return !lanetOverlayPrefix.Contains(ip)
+	return !isLanetOverlayIP(ip)
 }
 
 // addrIP 从 multiaddr 文本里取出 IP，兼容带 zone 的 IPv6（fe80::1%12）与

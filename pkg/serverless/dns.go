@@ -11,8 +11,8 @@
 //   - Linux：glibc/nss 不识别 /etc/resolver，需要改 /etc/resolv.conf
 //     （侵入性强，官方程序不自动改，SDK 只启动服务供手动接入）。
 //
-// 协议范围：只应答 IN 类 A 查询（虚拟 IPv4）；其余类型/类别一律 NOTIMP；
-// 不认识的域名 NXDOMAIN。TTL=0：成员表实时变化，禁止中间层缓存。
+// 协议范围：应答 IN 类 A（虚拟 IPv4）和 AAAA（虚拟 IPv6）；其余类型/类别
+// 一律 NOTIMP；未解析或对应地址无效时 NXDOMAIN。TTL=0：成员表实时变化，禁止中间层缓存。
 package serverless
 
 import (
@@ -264,7 +264,7 @@ const (
 
 // handleQuery 解析查询并产出应答报文；畸形包返回 nil（静默丢弃）。
 func (d *DNSServer) handleQuery(query []byte) []byte {
-	if len(query) < 12 {
+	if len(query) < 12 || len(query) > dnsMaxMsgSize {
 		return nil
 	}
 	if binary.BigEndian.Uint16(query[4:6]) != 1 { // 只支持单问题段
@@ -292,64 +292,74 @@ func (d *DNSServer) handleQuery(query []byte) []byte {
 	// 问题段原样回显。
 	resp = append(resp, query[12:questionEnd]...)
 
-	// 非 IN 类或非 A 查询：NOTIMP（本服务只做 .lanet 的 A 应答）。
-	if qclass != 1 || qtype != 1 {
+	// 非 IN 类或非 A/AAAA 查询：NOTIMP。
+	if qclass != 1 || qtype != 1 && qtype != 28 {
 		binary.BigEndian.PutUint16(resp[2:4], 0x8400|dnsRCODENotImp)
 		return resp
 	}
 
-	ip := d.resolve(name)
-	if ip == "" {
+	member, ok := d.resolve(name)
+	if !ok {
 		binary.BigEndian.PutUint16(resp[2:4], 0x8400|dnsRCODENXDomain)
 		return resp
 	}
 
-	parsed := net.ParseIP(ip).To4()
+	var parsed net.IP
+	if qtype == 1 {
+		parsed = net.ParseIP(member.VirtualIP).To4()
+	} else {
+		parsed = net.ParseIP(member.VirtualIPv6).To16()
+		if parsed != nil && (parsed.To4() != nil || parsed[0] != 0xfd || parsed[1] != 0x00 || parsed[2] != 0x6c || parsed[3] != 0x61 || parsed[4] != 0x6e || parsed[5] != 0x65) {
+			parsed = nil
+		}
+	}
 	if parsed == nil {
+		if qtype == 28 {
+			return resp // 名字存在但没有有效 AAAA 记录：NOERROR + ANCOUNT=0（NODATA）。
+		}
 		binary.BigEndian.PutUint16(resp[2:4], 0x8400|dnsRCODENXDomain)
 		return resp
 	}
 
-	// A 应答：NAME 用压缩指针 0xC00C 指向问题段、Type=1、Class=IN、
-	// TTL=0（成员表实时变化，禁止缓存）、RDLENGTH=4。
-	ans := make([]byte, 16)
+	// A/AAAA 应答：压缩域名指针、IN 类、TTL=0；RDATA 长度分别为 4/16。
+	ans := make([]byte, 12+len(parsed))
 	binary.BigEndian.PutUint16(ans[0:2], 0xC00C)
-	binary.BigEndian.PutUint16(ans[2:4], 1)   // Type A
-	binary.BigEndian.PutUint16(ans[4:6], 1)   // Class IN
-	binary.BigEndian.PutUint32(ans[6:10], 0)  // TTL=0
-	binary.BigEndian.PutUint16(ans[10:12], 4) // RDLENGTH=4
-	copy(ans[12:16], parsed)
+	binary.BigEndian.PutUint16(ans[2:4], qtype)
+	binary.BigEndian.PutUint16(ans[4:6], 1)
+	binary.BigEndian.PutUint32(ans[6:10], 0)
+	binary.BigEndian.PutUint16(ans[10:12], uint16(len(parsed)))
+	copy(ans[12:], parsed)
 	resp = append(resp, ans...)
-	binary.BigEndian.PutUint16(resp[6:8], 1) // ANCOUNT=1
+	binary.BigEndian.PutUint16(resp[6:8], 1)
 	return resp
 }
 
-// resolve 把查询名解析为虚拟 IP；不属于本网络的名字返回空串。
+// resolve 把查询名解析为成员；不属于本网络的名字返回 false。
 // 只认 <label>.lanet / 短名（label）/ 虚拟 IP 三种形态，裸域名
 // （如 example.com）一律拒绝——NRPT 只路由 .lanet，但 macOS
 // /etc/resolver 也可能只挂了子域，防御面保持一致。
-func (d *DNSServer) resolve(name string) string {
+func (d *DNSServer) resolve(name string) (MemberRef, bool) {
 	if d.members == nil {
-		return ""
+		return MemberRef{}, false
 	}
 	members := d.members()
 	if len(members) == 0 {
-		return ""
+		return MemberRef{}, false
 	}
 	trimmed := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
 	if trimmed == "" {
-		return ""
+		return MemberRef{}, false
 	}
 	// 明确排除：既非 .lanet 后缀、也非纯短名/虚拟 IP 的查询
 	// （短名与虚拟 IP 是 ResolveTarget 的合法输入，保留支持）。
 	if !strings.HasSuffix(trimmed, "."+VirtualDomain) && strings.Contains(trimmed, ".") {
-		return ""
+		return MemberRef{}, false
 	}
 	m, err := ResolveTarget(members, name)
 	if err != nil {
-		return ""
+		return MemberRef{}, false
 	}
-	return m.VirtualIP
+	return m, true
 }
 
 // errorResponse 构造仅头部的错误应答（无问题段/应答段）。

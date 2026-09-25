@@ -98,6 +98,18 @@ func DeriveVirtualIP(groupKey []byte, peerID string) string {
 	return fmt.Sprintf("10.7.%d.%d", int(h[0])%254+1, int(h[1])%254+1)
 }
 
+// DeriveVirtualIPv6 按（群密钥, PeerID）派生稳定的 IPv6 ULA 地址。
+// 使用 fd00:6c61:6e65::/48 前缀（fd + “lane” 的十六进制编码），
+// 最后 80 位取域分离 SHA-256 摘要，避免影响已有 IPv4 派生结果.
+func DeriveVirtualIPv6(groupKey []byte, peerID string) string {
+	buf := make([]byte, 0, len("lanet-virtual-ipv6-v1:")+len(groupKey)+len(peerID))
+	buf = append(buf, "lanet-virtual-ipv6-v1:"...)
+	buf = append(buf, groupKey...)
+	buf = append(buf, peerID...)
+	h := sha256.Sum256(buf)
+	return fmt.Sprintf("fd00:6c61:6e65:%x:%x:%x:%x:%x", h[0:2], h[2:4], h[4:6], h[6:8], h[8:10])
+}
+
 // GroupFingerprint 群组指纹短串（展示/日志用，8 hex）。
 // 协议 ID 与私有 DHT 前缀的派生统一走 pkg/protocol（叶子包，避免
 // serverless ↔ selfupdate 循环依赖）：控制面协议 ID 见 protocol.GroupProtoID，

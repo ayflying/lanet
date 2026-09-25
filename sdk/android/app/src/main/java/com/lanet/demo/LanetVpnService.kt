@@ -11,6 +11,9 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import java.net.Inet6Address
+import java.net.InetAddress
+import java.net.UnknownHostException
 
 /**
  * 把 Go 节点核心接到 Android 的虚拟网卡上。
@@ -46,6 +49,8 @@ class LanetVpnService : VpnService() {
          */
         private const val VNET_NETWORK = "10.7.0.0"
         private const val VNET_PREFIX = 16
+        private const val VNET_IPV6_NETWORK = "fd00:6c61:6e65::"
+        private const val VNET_IPV6_PREFIX = 48
         private const val MTU = 1400
 
         @Volatile
@@ -149,6 +154,7 @@ class LanetVpnService : VpnService() {
             } catch (t: Throwable) {
                 Log.e(TAG, "连接失败", t)
                 lastError = t.message ?: t.toString()
+                teardown()
                 notify("连接失败：$lastError")
                 running = false
             }
@@ -161,8 +167,8 @@ class LanetVpnService : VpnService() {
      * 为什么不能一步到位：`Builder.addAddress` 必须在 `establish()` 之前确定
      * 虚拟 IP，而虚拟 IP 要入网后才由 SDK 派生（= f(群密钥, PeerID)）。
      * 于是：
-     *   阶段 1 以 tun_fd=0 入网，轮询拿到 virtual_ip；
-     *   阶段 2 用该 IP 建卡（地址 + 10.7.0.0/16 路由 + MTU），拿到 fd；
+     *   阶段 1 以 tun_fd=0 入网，轮询拿到 virtual_ip 和（若节点支持）virtual_ipv6；
+     *   阶段 2 用这些 IP 建卡（地址 + 对应虚拟网段路由 + MTU），拿到 fd；
      *   阶段 3 停止节点、带 fd 重启 —— 虚拟 IP 是确定性派生的，重启后不变，
      *          所以阶段 1 算出的地址与实际接管后的地址完全一致。
      *
@@ -179,9 +185,10 @@ class LanetVpnService : VpnService() {
 
         LanetBridge.start(dir, name, key, bootstrap, tunFd = 0, autoAccept = autoAccept)
         notify("正在获取虚拟 IP…")
-        val virtualIp = waitForVirtualIp(30_000)
+        val virtualIps = waitForVirtualIps(30_000)
             ?: throw IllegalStateException("30 秒内未取到虚拟 IP（请核对网络密钥与引导种子）")
-        Log.i(TAG, "阶段 1 完成，虚拟 IP = $virtualIp")
+        val (virtualIp, virtualIpv6) = virtualIps
+        Log.i(TAG, "阶段 1 完成，虚拟 IP = $virtualIp，IPv6 = ${virtualIpv6 ?: "未分配"}")
 
         val builder = Builder()
             .setSession("lanet")
@@ -189,6 +196,10 @@ class LanetVpnService : VpnService() {
             .addAddress(virtualIp, VNET_PREFIX)
             .addRoute(VNET_NETWORK, VNET_PREFIX)
             .setBlocking(false)
+        if (!virtualIpv6.isNullOrBlank()) {
+            builder.addAddress(virtualIpv6, VNET_IPV6_PREFIX)
+                .addRoute(VNET_IPV6_NETWORK, VNET_IPV6_PREFIX)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             // 虚拟网不该被系统当作计费网络来限制后台流量。
             builder.setMetered(false)
@@ -203,19 +214,43 @@ class LanetVpnService : VpnService() {
         notify("已连接：$virtualIp")
     }
 
-    private fun waitForVirtualIp(timeoutMs: Long): String? {
+    private fun waitForVirtualIps(timeoutMs: Long): Pair<String, String?>? {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
-            val ip = try {
-                LanetBridge.status().optString("virtual_ip", "")
+            val status = try {
+                LanetBridge.status()
             } catch (t: Throwable) {
                 Log.w(TAG, "读取状态失败", t)
-                ""
+                null
             }
-            if (ip.isNotEmpty()) return ip
+            val ip = status?.optString("virtual_ip", "").orEmpty()
+            if (ip.isNotEmpty()) {
+                // virtual_ipv6 在旧节点上不存在；保留 IPv4-only 建卡兼容。
+                val ipv6 = status?.optString("virtual_ipv6", "")
+                    ?.takeIf { it.isNotEmpty() }
+                    ?.also { requireLanetIpv6(it) }
+                return ip to ipv6
+            }
             Thread.sleep(500)
         }
         return null
+    }
+
+    private fun requireLanetIpv6(value: String) {
+        require(':' in value) { "虚拟 IPv6 地址格式无效：$value" }
+        val address = try {
+            InetAddress.getByName(value)
+        } catch (e: UnknownHostException) {
+            throw IllegalArgumentException("虚拟 IPv6 地址格式无效：$value", e)
+        }
+        require(address is Inet6Address && address.address.size == 16) {
+            "虚拟 IPv6 地址格式无效：$value"
+        }
+        val bytes = address.address
+        val prefix = byteArrayOf(0xfd.toByte(), 0x00, 0x6c, 0x61, 0x6e, 0x65)
+        require(prefix.indices.all { bytes[it] == prefix[it] }) {
+            "虚拟 IPv6 地址不属于 Lanet ULA 网段：$value"
+        }
     }
 
     private fun teardown() {

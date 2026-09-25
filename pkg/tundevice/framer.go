@@ -2,7 +2,7 @@ package tundevice
 
 import "encoding/binary"
 
-// ipFramer 把隧道字节流切成一个个完整 IPv4 包。
+// ipFramer 把隧道字节流切成一个个完整 IPv4/IPv6 包。
 //
 // libp2p stream 是字节流（yamux/mplex），对端连续 Write 多个 IP 包时会被
 // 粘包：一次 Read 可能拿到 N 个包拼成的整块。直接把它写进 TUN，等于向内核
@@ -22,25 +22,55 @@ func (f *ipFramer) feed(b []byte) [][]byte {
 		f.buf = append(f.buf, b...)
 	}
 	var out [][]byte
-	for len(f.buf) >= 20 {
-		if f.buf[0]>>4 != 4 {
-			// 非 IPv4（隧道里混入了别的东西）：丢弃缓冲，避免整条流错乱
+	for len(f.buf) > 0 {
+		version := f.buf[0] >> 4
+		headerLen := 0
+		total := 0
+		switch version {
+		case 4:
+			if len(f.buf) < 20 {
+				break
+			}
+			headerLen = int(f.buf[0]&0x0f) * 4
+			if headerLen < 20 {
+				f.buf = f.buf[:0]
+				return out
+			}
+			if len(f.buf) < headerLen {
+				break
+			}
+			total = int(binary.BigEndian.Uint16(f.buf[2:4]))
+			if total < headerLen || total > maxPacketSize {
+				f.buf = f.buf[:0]
+				return out
+			}
+		case 6:
+			if len(f.buf) < 40 {
+				break
+			}
+			headerLen = 40
+			payloadLen := int(binary.BigEndian.Uint16(f.buf[4:6]))
+			if payloadLen == 0 && f.buf[6] == 0 {
+				// Hop-by-Hop Options 可能包含 Jumbo Payload option；本实现不支持
+				// 大于 65535 字节的 jumbogram，无法安全确定帧边界，故拒绝该流。
+				f.buf = f.buf[:0]
+				return out
+			}
+			total = headerLen + payloadLen
+			if total > maxPacketSize {
+				f.buf = f.buf[:0]
+				return out
+			}
+		default:
 			f.buf = f.buf[:0]
-			break
+			return out
 		}
-		total := int(binary.BigEndian.Uint16(f.buf[2:4]))
-		if total < 20 || total > maxPacketSize {
-			// 非法长度：流已错乱，丢弃缓冲重新同步
-			f.buf = f.buf[:0]
+		if total == 0 || len(f.buf) < total {
 			break
-		}
-		if len(f.buf) < total {
-			break // 包未收全，等下一批数据
 		}
 		out = append(out, f.buf[:total])
 		f.buf = f.buf[total:]
 	}
-	// 长期凑不出一个完整包说明流已错乱，防止缓冲无限增长
 	if len(f.buf) > maxPacketSize {
 		f.buf = f.buf[:0]
 	}

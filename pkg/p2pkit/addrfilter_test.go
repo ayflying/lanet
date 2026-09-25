@@ -52,14 +52,17 @@ func TestFilterUnderlayAddrsDropsUnreachable(t *testing.T) {
 		"/ip6/fe80::1/tcp/4001",              // 链路本地 v6
 		"/ip4/0.0.0.0/tcp/4001",              // 未指定（监听通配）
 		"/ip4/10.7.207.102/tcp/4001",         // lanet overlay
+		"/ip6/fd00:6c61:6e65::1234/tcp/4001", // lanet overlay ULA
 		"/ip4/3.3.3.3/tcp/4001/p2p-circuit",  // 中继路径
 		"/ip4/192.168.50.170/tcp/52854",      // 私网：保留
+		"/ip6/fd00::1234/tcp/4001",           // 其他 ULA：保留
 		"/ip4/43.136.124.167/tcp/4001",       // 公网：保留
 		"/ip4/192.168.50.170/udp/65067/quic-v1",
 	)
 	got := maStrings(FilterUnderlayAddrs(in))
 	want := []string{
 		"/ip4/192.168.50.170/tcp/52854",
+		"/ip6/fd00::1234/tcp/4001",
 		"/ip4/43.136.124.167/tcp/4001",
 		"/ip4/192.168.50.170/udp/65067/quic-v1",
 	}
@@ -82,6 +85,7 @@ func TestFilterUnderlayAddrsKeepsWeakAddrWhenNothingElse(t *testing.T) {
 func TestFilterUnderlayAddrsNeverRestoresOverlayOrCircuit(t *testing.T) {
 	got := FilterUnderlayAddrs(maList(t,
 		"/ip4/10.7.0.5/tcp/4001",
+		"/ip6/fd00:6c61:6e65::5/tcp/4001",
 		"/ip4/3.3.3.3/tcp/4001/p2p-circuit",
 	))
 	if len(got) != 0 {

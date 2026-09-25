@@ -27,9 +27,10 @@ var dnsLabelCollapse = regexp.MustCompile(`-{2,}`)
 
 // MemberRef 成员解析所需的最小视图（serverless.Member / netmapclient.Member 均可转换）。
 type MemberRef struct {
-	PeerID    string
-	Name      string
-	VirtualIP string
+	PeerID      string
+	Name        string
+	VirtualIP   string
+	VirtualIPv6 string `json:"virtual_ipv6,omitempty"`
 }
 
 // DNSLabel 把节点名规范化为 DNS 标签（不含后缀）。无法规范化返回 ""。
@@ -89,7 +90,7 @@ func Hostnames(members []MemberRef) map[string]string {
 }
 
 // ResolveTarget 解析连接目标为成员：
-//   - 虚拟 IP（如 10.7.92.241）→ 按虚拟 IP 匹配；
+//   - 虚拟 IPv4/IPv6 → 按成员表中的对应虚拟地址精确匹配；
 //   - 完整虚拟地址（如 yunloli.lanet）/ 短名（yunloli）→ 按规范化名匹配；
 //   - 原始成员名 → 兼容旧行为的精确匹配兜底。
 //
@@ -101,13 +102,28 @@ func ResolveTarget(members []MemberRef, target string) (MemberRef, error) {
 	}
 
 	// 1. 虚拟 IP 直配。
-	if net.ParseIP(target) != nil {
+	if ip := net.ParseIP(target); ip != nil {
+		var hits []MemberRef
 		for _, m := range members {
-			if m.VirtualIP == target {
-				return m, nil
+			if ip.To4() != nil && net.ParseIP(m.VirtualIP) != nil && net.ParseIP(m.VirtualIP).To4().Equal(ip.To4()) {
+				hits = append(hits, m)
+				continue
+			}
+			if ip.To4() == nil {
+				memberIP := net.ParseIP(m.VirtualIPv6)
+				if memberIP != nil && memberIP.To16().Equal(ip.To16()) {
+					hits = append(hits, m)
+				}
 			}
 		}
-		return MemberRef{}, fmt.Errorf("lanet: 虚拟 IP %s 不在成员表中（成员可能尚未被发现或已下线）", target)
+		switch len(hits) {
+		case 1:
+			return hits[0], nil
+		case 0:
+			return MemberRef{}, fmt.Errorf("lanet: 虚拟 IP %s 不在成员表中（成员可能尚未被发现或已下线）", target)
+		default:
+			return MemberRef{}, fmt.Errorf("lanet: 虚拟 IP %s 命中多个成员，拒绝歧义选路", target)
+		}
 	}
 
 	// 2. 虚拟地址 / 短名：去掉 .lanet 后缀后按规范化名匹配。

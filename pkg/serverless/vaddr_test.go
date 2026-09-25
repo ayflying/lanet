@@ -79,11 +79,19 @@ func TestHostnamesDeterministic(t *testing.T) {
 
 func TestResolveTarget(t *testing.T) {
 	m := members()
+	m[1].VirtualIPv6 = "fd00:6c61:6e65::1"
+	m[2].VirtualIPv6 = "fd00:6c61:6e65::2"
 
 	// 虚拟 IP。
 	got, err := ResolveTarget(m, "10.7.92.241")
 	if err != nil || got.PeerID != "peerAaaaa" {
 		t.Fatalf("虚拟 IP 解析失败: %v %+v", err, got)
+	}
+
+	// IPv6 地址直配，解析结果保留双栈成员信息。
+	got, err = ResolveTarget(m, "fd00:6c61:6e65::2")
+	if err != nil || got.PeerID != "peerBbbbb" || got.VirtualIPv6 != "fd00:6c61:6e65::2" {
+		t.Fatalf("虚拟 IPv6 解析失败: %v %+v", err, got)
 	}
 
 	// 完整虚拟地址（大小写不敏感、允许结尾点）。

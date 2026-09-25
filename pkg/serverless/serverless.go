@@ -283,13 +283,14 @@ type Config struct {
 
 // Member 成员表中的一项。
 type Member struct {
-	PeerID    string    `json:"peer_id"`
-	Name      string    `json:"name"`
-	VirtualIP string    `json:"virtual_ip"`
-	Addrs     []string  `json:"addrs"`
-	Source    string    `json:"source"`     // dht / dht-private / mdns
-	FirstSeen time.Time `json:"first_seen"` // 首次发现时间（即上线时间）
-	LastSeen  time.Time `json:"last_seen"`  // 最近一次出现（发现/握手/入向信息）时间
+	PeerID      string    `json:"peer_id"`
+	Name        string    `json:"name"`
+	VirtualIP   string    `json:"virtual_ip"`
+	VirtualIPv6 string    `json:"virtual_ipv6,omitempty"`
+	Addrs       []string  `json:"addrs"`
+	Source      string    `json:"source"`     // dht / dht-private / mdns
+	FirstSeen   time.Time `json:"first_seen"` // 首次发现时间（即上线时间）
+	LastSeen    time.Time `json:"last_seen"`  // 最近一次出现（发现/握手/入向信息）时间
 	// Hostname 本成员的虚拟主机名（含 .lanet 后缀，如 yunloli.lanet）。
 	// 由当前成员表确定性推导，重名自动追加后缀。
 	Hostname string `json:"hostname,omitempty"`
@@ -314,6 +315,7 @@ type Discovery struct {
 	cfg              Config
 	groupKey         []byte
 	selfIP           string
+	selfIPv6         string
 	serviceCtx       context.Context
 	serviceCancel    context.CancelFunc
 	scheduler        *discoveryScheduler
@@ -494,6 +496,7 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 	}
 	d.protoNearby = lproto.GroupProtoID("nearby-name", d.groupKey)
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
+	d.selfIPv6 = DeriveVirtualIPv6(d.groupKey, h.ID().String())
 
 	// 1. DHT：每台节点都是 server（客户端即服务端）。
 	//    双 DHT：私有（/lanet 前缀，全网 lanet 节点共享一张路由表）优先发现，
@@ -864,6 +867,13 @@ func shortID(id string) string {
 // SelfVirtualIP 本节点在无服务器模式下的虚拟 IP。
 func (d *Discovery) SelfVirtualIP() string { return d.selfIP }
 
+// SelfVirtualIPv6 本节点在无服务器模式下的虚拟 IPv6 ULA。
+func (d *Discovery) SelfVirtualIPv6() string { return d.selfIPv6 }
+
+func (d *Discovery) validVirtualIPv6(peerID, value string) bool {
+	return value == DeriveVirtualIPv6(d.groupKey, peerID)
+}
+
 // FindPeer 按节点 ID 在本群内查找对端地址（仅私有 DHT，绝不出公网）。
 //
 // 查找顺序由调用方负责（本地地址簿优先）。本方法只做「私有 DHT 查找」这一
@@ -927,12 +937,13 @@ func (d *Discovery) RequestConnect(ctx context.Context, ai peer.AddrInfo) (strin
 	delete(d.unfriendedAt, ai.ID.String())
 	if _, ok := d.members[ai.ID.String()]; !ok {
 		d.members[ai.ID.String()] = &Member{
-			PeerID:    ai.ID.String(),
-			VirtualIP: DeriveVirtualIP(d.groupKey, ai.ID.String()),
-			Source:    "manual",
-			Addrs:     toStrings(addrs),
-			FirstSeen: time.Now(),
-			LastSeen:  time.Now(),
+			PeerID:      ai.ID.String(),
+			VirtualIP:   DeriveVirtualIP(d.groupKey, ai.ID.String()),
+			VirtualIPv6: DeriveVirtualIPv6(d.groupKey, ai.ID.String()),
+			Source:      "manual",
+			Addrs:       toStrings(addrs),
+			FirstSeen:   time.Now(),
+			LastSeen:    time.Now(),
 		}
 	}
 	d.mu.Unlock()
@@ -960,7 +971,7 @@ func (d *Discovery) Peers() []Member {
 	refs := make([]MemberRef, 0, len(d.members))
 	for _, m := range d.members {
 		out = append(out, *m)
-		refs = append(refs, MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP})
+		refs = append(refs, MemberRef{PeerID: m.PeerID, Name: m.Name, VirtualIP: m.VirtualIP, VirtualIPv6: m.VirtualIPv6})
 	}
 	hosts := Hostnames(refs)
 	for i := range out {
@@ -1298,11 +1309,12 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 			return // 刚被删除好友的节点，迟到的发现记录不复活成员、也不上报附近
 		}
 		m = &Member{
-			PeerID:    id.String(),
-			VirtualIP: DeriveVirtualIP(d.groupKey, id.String()),
-			Source:    source,
-			FirstSeen: time.Now(),
-			LastSeen:  time.Now(),
+			PeerID:      id.String(),
+			VirtualIP:   DeriveVirtualIP(d.groupKey, id.String()),
+			VirtualIPv6: DeriveVirtualIPv6(d.groupKey, id.String()),
+			Source:      source,
+			FirstSeen:   time.Now(),
+			LastSeen:    time.Now(),
 		}
 		d.members[id.String()] = m
 	} else if m.Source == "inbound" && source != "" && source != "inbound" {
@@ -1401,6 +1413,9 @@ func (d *Discovery) connectAndIdentifyContext(ctx context.Context, id peer.ID) e
 	d.mu.Lock()
 	if m, ok := d.members[id.String()]; ok {
 		m.Name = info.Name
+		if d.validVirtualIPv6(id.String(), info.VirtualIPv6) {
+			m.VirtualIPv6 = info.VirtualIPv6
+		}
 		m.Version = info.Version
 		m.Platform = info.Platform
 		m.OSHostname = info.OSHostname
@@ -1536,7 +1551,8 @@ type infoPayload struct {
 	// 同群成员的节点 ID 与地址分享给对端，解决「唯一种子一挂全网失联」
 	// ——种子恢复前，先恢复的成员把其他成员的地址带给还没恢复的。
 	// 只含 ID+地址（无名称/主机名等身份细节），接收方仍走完整审批门。
-	Members []memberHint `json:"members,omitempty"`
+	Members     []memberHint `json:"members,omitempty"`
+	VirtualIPv6 string       `json:"virtual_ipv6,omitempty"` // IPv6 ULA（旧节点省略）
 }
 
 // memberHint 成员地址同步的单条摘要。Addrs 已按 underlay 清洗（无回环/
@@ -1627,17 +1643,21 @@ func (d *Discovery) handleInfo(s network.Stream) {
 			return
 		}
 		m = &Member{
-			PeerID:    remote.String(),
-			VirtualIP: DeriveVirtualIP(d.groupKey, remote.String()),
-			Source:    "inbound",
-			Addrs:     toStrings(addrs),
-			FirstSeen: time.Now(),
-			LastSeen:  time.Now(),
+			PeerID:      remote.String(),
+			VirtualIP:   DeriveVirtualIP(d.groupKey, remote.String()),
+			VirtualIPv6: DeriveVirtualIPv6(d.groupKey, remote.String()),
+			Source:      "inbound",
+			Addrs:       toStrings(addrs),
+			FirstSeen:   time.Now(),
+			LastSeen:    time.Now(),
 		}
 		d.members[remote.String()] = m
 	}
 	if req.Name != "" {
 		m.Name = req.Name
+	}
+	if d.validVirtualIPv6(remote.String(), req.VirtualIPv6) {
+		m.VirtualIPv6 = req.VirtualIPv6
 	}
 	m.Version = req.Version
 	m.Platform = req.Platform
@@ -1666,13 +1686,14 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	}
 	d.maybeRetirePublicDHT()
 	resp := infoPayload{
-		Name:       d.cfg.Name,
-		Group:      GroupFingerprint(d.groupKey),
-		Version:    d.cfg.Version,
-		Platform:   d.cfg.Platform,
-		OSHostname: d.cfg.OSHostname,
-		LocalIPs:   d.cfg.LocalIPs,
-		Members:    d.pexSnapshot(),
+		Name:        d.cfg.Name,
+		Group:       GroupFingerprint(d.groupKey),
+		VirtualIPv6: d.selfIPv6,
+		Version:     d.cfg.Version,
+		Platform:    d.cfg.Platform,
+		OSHostname:  d.cfg.OSHostname,
+		LocalIPs:    d.cfg.LocalIPs,
+		Members:     d.pexSnapshot(),
 	}
 	_ = json.NewEncoder(s).Encode(resp)
 }
@@ -1708,13 +1729,14 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 	// 真实流截止时间：携带更短 ctx 截止时取 ctx，否则用默认握手超时。
 	_ = stream.SetDeadline(infoStreamDeadline(ctx))
 	req := infoPayload{
-		Name:       d.cfg.Name,
-		Group:      GroupFingerprint(d.groupKey),
-		Version:    d.cfg.Version,
-		Platform:   d.cfg.Platform,
-		OSHostname: d.cfg.OSHostname,
-		LocalIPs:   d.cfg.LocalIPs,
-		Members:    d.pexSnapshot(),
+		Name:        d.cfg.Name,
+		Group:       GroupFingerprint(d.groupKey),
+		VirtualIPv6: d.selfIPv6,
+		Version:     d.cfg.Version,
+		Platform:    d.cfg.Platform,
+		OSHostname:  d.cfg.OSHostname,
+		LocalIPs:    d.cfg.LocalIPs,
+		Members:     d.pexSnapshot(),
 	}
 	if err = json.NewEncoder(stream).Encode(req); err != nil {
 		return infoPayload{}, err
@@ -1889,16 +1911,30 @@ func (d *Discovery) reportNearby(id peer.ID, addrs []ma.Multiaddr, source string
 	go d.cfg.OnSeenUntrusted(key, toStrings(addrs), source)
 }
 
-// Resolve 实现 tunnel.GroupNetMap：按虚拟 IP 解析成员。
+// Resolve 实现 tunnel.GroupNetMap：按 IPv4 或 IPv6 虚拟地址解析成员。
+// 若成员表中出现重复地址，拒绝路由，避免 map 遍历顺序决定流量去向。
 func (d *Discovery) Resolve(virtualIP string) (netmapclient.Route, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	var matched *Member
 	for _, m := range d.members {
-		if m.VirtualIP == virtualIP {
-			return netmapclient.Route{VirtualIP: m.VirtualIP, PeerID: m.PeerID, Addrs: m.Addrs}, true
+		if m.VirtualIP != virtualIP && (m.VirtualIPv6 == "" || m.VirtualIPv6 != virtualIP) {
+			continue
 		}
+		if matched != nil {
+			return netmapclient.Route{}, false
+		}
+		matched = m
 	}
-	return netmapclient.Route{}, false
+	if matched == nil {
+		return netmapclient.Route{}, false
+	}
+	return netmapclient.Route{
+		VirtualIP:   matched.VirtualIP,
+		VirtualIPv6: matched.VirtualIPv6,
+		PeerID:      matched.PeerID,
+		Addrs:       append([]string(nil), matched.Addrs...),
+	}, true
 }
 
 // Candidates 实现 tunnel.RelaySource 与 autorelay 候选来源：返回中继候选。

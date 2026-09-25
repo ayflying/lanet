@@ -68,6 +68,35 @@ func configureAddressNative(name, ipStr string, prefixBits int) error {
 	return nil
 }
 
+func configureAddressIPv6Native(name, ipStr string, prefixBits int) error {
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return fmt.Errorf("interface %s: %w", name, err)
+	}
+	ip := net.ParseIP(ipStr).To16()
+	if ip == nil || net.ParseIP(ipStr).To4() != nil {
+		return fmt.Errorf("not ipv6 %q", ipStr)
+	}
+	var luid uint64
+	if ret, _, _ := procConvertIfaceIdxToLuid.Call(uintptr(uint32(iface.Index)), uintptr(unsafe.Pointer(&luid))); ret != 0 {
+		return fmt.Errorf("ConvertInterfaceIndexToLuid: status 0x%x", ret)
+	}
+	var row windows.MibUnicastIpAddressRow
+	procInitializeUnicastIPAddressEntry.Call(uintptr(unsafe.Pointer(&row)))
+	row.InterfaceLuid = luid
+	address := (*windows.RawSockaddrInet6)(unsafe.Pointer(&row.Address))
+	address.Family = windows.AF_INET6
+	copy(address.Addr[:], ip)
+	row.OnLinkPrefixLength = uint8(prefixBits)
+	row.DadState = 4
+	row.ValidLifetime = ^uint32(0)
+	row.PreferredLifetime = ^uint32(0)
+	if ret, _, _ := procCreateUnicastIPAddressEntry.Call(uintptr(unsafe.Pointer(&row))); ret != 0 && ret != errObjectAlreadyExists {
+		return fmt.Errorf("CreateUnicastIpAddressEntry(%s): status 0x%x", ipStr, ret)
+	}
+	return nil
+}
+
 // configureInterfaceNative sets the kernel-side MTU and metric. The Windows
 // wireguard/tun MTU is otherwise only an in-process value.
 func configureInterfaceNative(name string) error {

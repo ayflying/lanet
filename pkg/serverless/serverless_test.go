@@ -3,6 +3,8 @@ package serverless
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +35,55 @@ func testHost(t *testing.T, relayService bool) host.Host {
 	}
 	t.Cleanup(func() { _ = h.Close() })
 	return h
+}
+
+func TestDeriveVirtualIPv6(t *testing.T) {
+	groupA := GroupKey("", "group-a")
+	groupB := GroupKey("", "group-b")
+	got := DeriveVirtualIPv6(groupA, "peer-a")
+	if got != DeriveVirtualIPv6(groupA, "peer-a") {
+		t.Fatalf("IPv6 derivation is not deterministic: %q", got)
+	}
+	if got == DeriveVirtualIPv6(groupB, "peer-a") {
+		t.Fatalf("same peer in different groups got identical IPv6 %q", got)
+	}
+	addr, err := netip.ParseAddr(got)
+	if err != nil || !addr.Is6() || addr.As16()[0] != 0xfd {
+		t.Fatalf("derived address %q is not a valid ULA", got)
+	}
+}
+
+func TestValidVirtualIPv6Declaration(t *testing.T) {
+	groupKey := GroupKey("", "ipv6-validation")
+	d := &Discovery{groupKey: groupKey}
+	peerID := "remote-peer"
+	derived := DeriveVirtualIPv6(groupKey, peerID)
+	if !d.validVirtualIPv6(peerID, derived) {
+		t.Fatal("valid deterministic IPv6 declaration was rejected")
+	}
+	for _, declared := range []string{"", "fd00::1", DeriveVirtualIPv6(groupKey, "other-peer")} {
+		if d.validVirtualIPv6(peerID, declared) {
+			t.Fatalf("invalid declaration %q was accepted", declared)
+		}
+	}
+}
+
+func TestInfoPayloadVirtualIPv6Compatibility(t *testing.T) {
+	oldPayload := `{"name":"legacy","group":"abcd"}`
+	var old infoPayload
+	if err := json.Unmarshal([]byte(oldPayload), &old); err != nil {
+		t.Fatalf("unmarshal legacy payload: %v", err)
+	}
+	if old.VirtualIPv6 != "" {
+		t.Fatalf("legacy payload VirtualIPv6 = %q, want empty", old.VirtualIPv6)
+	}
+	encoded, err := json.Marshal(infoPayload{Name: "legacy", Group: "abcd"})
+	if err != nil {
+		t.Fatalf("marshal legacy payload: %v", err)
+	}
+	if strings.Contains(string(encoded), "virtual_ipv6") {
+		t.Fatalf("empty IPv6 field should be omitted: %s", encoded)
+	}
 }
 
 // TestInfoExchange 验证 info 协议往返（回写响应不得先于写完成半关闭）。

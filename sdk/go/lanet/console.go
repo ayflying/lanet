@@ -252,17 +252,18 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		rules = []FirewallRule{}
 	}
 	type memberView struct {
-		PeerID    string `json:"peer_id"`
-		Name      string `json:"name"`
-		Notes     string `json:"notes,omitempty"` // 本机手写备注（展示时优先于 name）
-		VirtualIP string `json:"virtual_ip"`
-		Hostname  string `json:"hostname"` // 虚拟地址（如 yunloli.lanet），可能为空
-		Online    bool   `json:"online"`
-		Path      string `json:"path"`
-		FirstSeen int64  `json:"first_seen,omitempty"` // Unix 秒，0 = 未知（仅排序用，页面不展示）
-		LastSeen  int64  `json:"last_seen"`
-		Version   string `json:"version,omitempty"`  // 程序版本号（info 协议交换；旧节点为空）
-		Platform  string `json:"platform,omitempty"` // 运行平台（如 windows/amd64）
+		PeerID      string `json:"peer_id"`
+		Name        string `json:"name"`
+		Notes       string `json:"notes,omitempty"` // 本机手写备注（展示时优先于 name）
+		VirtualIP   string `json:"virtual_ip"`
+		VirtualIPv6 string `json:"virtual_ipv6,omitempty"`
+		Hostname    string `json:"hostname"` // 虚拟地址（如 yunloli.lanet），可能为空
+		Online      bool   `json:"online"`
+		Path        string `json:"path"`
+		FirstSeen   int64  `json:"first_seen,omitempty"` // Unix 秒，0 = 未知（仅排序用，页面不展示）
+		LastSeen    int64  `json:"last_seen"`
+		Version     string `json:"version,omitempty"`  // 程序版本号（info 协议交换；旧节点为空）
+		Platform    string `json:"platform,omitempty"` // 运行平台（如 windows/amd64）
 	}
 	// 本地名称 / 备注索引：成员表的 name 是运行时态（进程重启、对端长期离线
 	// 之后就没了），用本地库兜底，列表才能在对方不在线时照样显示「这是谁」；
@@ -283,10 +284,10 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		}
 		mv := memberView{
 			PeerID: m.PeerID, Name: name, Notes: notes, VirtualIP: m.VirtualIP,
-			Hostname: m.Hostname,
-			Online:   online,
-			Path:     c.LastPathUsed(m.PeerID),
-			Version:  m.Version, Platform: m.Platform,
+			VirtualIPv6: m.VirtualIPv6, Hostname: m.Hostname,
+			Online:  online,
+			Path:    c.LastPathUsed(m.PeerID),
+			Version: m.Version, Platform: m.Platform,
 		}
 		if !m.FirstSeen.IsZero() {
 			mv.FirstSeen = m.FirstSeen.Unix()
@@ -770,6 +771,7 @@ func (c *Client) apiLocalInfo(w http.ResponseWriter, r *http.Request) {
 		"version":      c.cfg.Version,
 		"node_name":    c.cfg.Name,
 		"virtual_ip":   c.myIP,
+		"virtual_ipv6": c.Info().VirtualIPv6,
 		"virtual_host": c.selfHostname(),
 		"peer_id":      c.peerID,
 		"ips":          ips,
@@ -801,6 +803,7 @@ func (c *Client) apiMemberInfo(w http.ResponseWriter, r *http.Request) {
 		"peer_id":      m.PeerID,
 		"node_name":    m.Name,
 		"virtual_ip":   m.VirtualIP,
+		"virtual_ipv6": m.VirtualIPv6,
 		"virtual_host": m.Hostname,
 		"os":           m.OS,
 		"platform":     m.Platform,

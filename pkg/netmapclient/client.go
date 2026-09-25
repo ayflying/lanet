@@ -20,11 +20,12 @@ import (
 // - 本地维护"虚拟 IP → PeerID + 地址"路由表，供隧道直连或经中继转发。
 
 type Member struct {
-	PeerID    string   `json:"peer_id"`
-	Name      string   `json:"name"`
-	OS        string   `json:"os"`
-	VirtualIP string   `json:"virtual_ip"`
-	Addrs     []string `json:"addrs"`
+	PeerID      string   `json:"peer_id"`
+	Name        string   `json:"name"`
+	OS          string   `json:"os"`
+	VirtualIP   string   `json:"virtual_ip"`
+	VirtualIPv6 string   `json:"virtual_ipv6,omitempty"`
+	Addrs       []string `json:"addrs"`
 	// Hostname 虚拟主机名（含 .lanet 后缀，如 yunloli.lanet）。
 	// 仅 Standalone（本地发现）模式由成员表推导填充；控制面模式暂无。
 	Hostname string `json:"hostname,omitempty"`
@@ -52,9 +53,10 @@ type Snapshot struct {
 
 // Route 虚拟 IP 到对端的路由条目。
 type Route struct {
-	VirtualIP string
-	PeerID    string
-	Addrs     []string
+	VirtualIP   string
+	VirtualIPv6 string
+	PeerID      string
+	Addrs       []string
 }
 
 type Client struct {
@@ -131,9 +133,10 @@ func (c *Client) Routes() []Route {
 	routes := make([]Route, 0, len(snapshot.Members))
 	for _, member := range snapshot.Members {
 		routes = append(routes, Route{
-			VirtualIP: member.VirtualIP,
-			PeerID:    member.PeerID,
-			Addrs:     append([]string(nil), member.Addrs...),
+			VirtualIP:   member.VirtualIP,
+			VirtualIPv6: member.VirtualIPv6,
+			PeerID:      member.PeerID,
+			Addrs:       append([]string(nil), member.Addrs...),
 		})
 	}
 	for i := 1; i < len(routes); i++ {
@@ -146,12 +149,19 @@ func (c *Client) Routes() []Route {
 
 // Resolve 根据目标虚拟 IP 查找对端 PeerID 与地址。
 func (c *Client) Resolve(virtualIP string) (Route, bool) {
+	var match Route
+	found := false
 	for _, route := range c.Routes() {
-		if route.VirtualIP == virtualIP {
-			return route, true
+		if route.VirtualIP != virtualIP && route.VirtualIPv6 != virtualIP {
+			continue
 		}
+		if found {
+			return Route{}, false
+		}
+		match = route
+		found = true
 	}
-	return Route{}, false
+	return match, found
 }
 
 // Announce 向控制面通告本节点可达地址（multiaddr）。

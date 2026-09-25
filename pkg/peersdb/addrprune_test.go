@@ -29,10 +29,12 @@ func TestPruneUnreachableAddrs(t *testing.T) {
 		"/ip4/127.0.0.1/tcp/52854",
 		"/ip4/169.254.153.138/tcp/52854",
 		"/ip4/10.7.207.102/tcp/4001",
+		"/ip6/fd00:6c61:6e65::1234/tcp/4001",
 		"/ip4/3.3.3.3/tcp/4001/p2p-circuit",
 	}
 	keep := "/ip4/43.136.124.167/tcp/4001"
-	seedRawAddrs(t, d, "peer-a", append(append([]string{}, dirty...), keep)...)
+	otherULA := "/ip6/fd00::1234/tcp/4001"
+	seedRawAddrs(t, d, "peer-a", append(append([]string{}, dirty...), keep, otherULA)...)
 
 	n, err := d.PruneUnreachableAddrs(ctx)
 	if err != nil {
@@ -45,8 +47,8 @@ func TestPruneUnreachableAddrs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("known addrs: %v", err)
 	}
-	if len(got) != 1 || got[0] != keep {
-		t.Fatalf("剩余地址 = %v, want 仅 %s", got, keep)
+	if len(got) != 2 || got[0] != keep || got[1] != otherULA {
+		t.Fatalf("剩余地址 = %v, want %s 与其他 ULA %s", got, keep, otherULA)
 	}
 	// 幂等：再清一次不应再删。
 	if n, err = d.PruneUnreachableAddrs(ctx); err != nil || n != 0 {
@@ -66,6 +68,7 @@ func TestNoteDialResultRejectsUnreachable(t *testing.T) {
 		"/ip4/127.0.0.1/tcp/4001",
 		"/ip4/169.254.1.1/tcp/4001",
 		"/ip4/10.7.1.1/tcp/4001",
+		"/ip6/fd00:6c61:6e65::1/tcp/4001",
 		"/ip4/3.3.3.3/tcp/4001/p2p-circuit",
 	} {
 		if err := d.NoteDialResult(ctx, "peer-a", a, false); err != nil {

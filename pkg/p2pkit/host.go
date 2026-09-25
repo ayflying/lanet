@@ -23,7 +23,19 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-var lanetOverlayPrefix = netip.MustParsePrefix("10.7.0.0/16")
+var lanetOverlayPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("10.7.0.0/16"),
+	netip.MustParsePrefix("fd00:6c61:6e65::/48"),
+}
+
+func isLanetOverlayIP(ip netip.Addr) bool {
+	for _, prefix := range lanetOverlayPrefixes {
+		if prefix.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
 
 type HostSpec struct {
 	ListenAddrs  []string
@@ -121,7 +133,7 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 // a libp2p transport endpoint: dialing the tunnel through itself creates a loop.
 func IsLanetOverlayAddr(addr ma.Multiaddr) bool {
 	ip, ok := AddrIP(addr)
-	return ok && lanetOverlayPrefix.Contains(ip)
+	return ok && isLanetOverlayIP(ip)
 }
 
 // isCircuitAddr 报告地址是否为 Circuit Relay v2 路径（含 /p2p-circuit 段）。
@@ -153,7 +165,7 @@ func isDialableUnderlay(addr ma.Multiaddr) bool {
 	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() {
 		return false
 	}
-	return !lanetOverlayPrefix.Contains(ip)
+	return !isLanetOverlayIP(ip)
 }
 
 // FilterUnderlayAddrs 只保留值得承载 libp2p 的地址，顺序不变。

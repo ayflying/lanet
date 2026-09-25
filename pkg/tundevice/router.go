@@ -21,6 +21,8 @@ import (
 
 // virtioNetHdrLen Linux 端 wireguard/tun 以 IFF_VNET_HDR 打开 TUN 时的
 // virtio 网络头长度（库源码 offload_linux.go: unsafe.Sizeof(virtioNetHdr{})）。
+var lanetVirtualIPv6Prefix = netip.MustParsePrefix("fd00:6c61:6e65::/48")
+
 const (
 	maxPacketSize      = 65535
 	virtioNetHdrLen    = 10
@@ -278,17 +280,17 @@ func (r *Router) Run(ctx context.Context) {
 // 同一目标仍保持内核交付顺序，避免 TCP 包乱序。队列满或全局字节预算满时丢弃新包，
 // 由上层协议重传。
 func (r *Router) enqueuePacket(ctx context.Context, packet []byte) error {
-	if len(packet) < 20 {
-		return fmt.Errorf("packet too short: %d", len(packet))
+	destination, err := packetDestination(packet)
+	if err != nil {
+		return err
 	}
-	if packet[0]>>4 != 4 {
+	if destination == "" {
 		return nil
 	}
-	destinationAddr := netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]})
-	if !destinationAddr.IsGlobalUnicast() {
+	destinationAddr, err := netip.ParseAddr(destination)
+	if err != nil || (!destinationAddr.IsGlobalUnicast() && !lanetVirtualIPv6Prefix.Contains(destinationAddr)) || (destinationAddr.Is6() && destinationAddr.IsPrivate() && !lanetVirtualIPv6Prefix.Contains(destinationAddr)) {
 		return nil
 	}
-	destination := destinationAddr.String()
 
 	r.mu.Lock()
 	if r.closed || ctx.Err() != nil {
@@ -428,16 +430,20 @@ func (r *Router) reapStreams(ctx context.Context) {
 }
 
 func (r *Router) reapIdle(now time.Time, idle time.Duration) {
-	var stale []*streamState
+	stale := make(map[*streamState]struct{})
 	r.mu.Lock()
-	for ip, st := range r.streams {
+	for _, st := range r.streams {
 		if st.writing.Load() == 0 && now.Sub(time.Unix(0, st.lastActivity.Load())) >= idle {
+			stale[st] = struct{}{}
+		}
+	}
+	for ip, st := range r.streams {
+		if _, ok := stale[st]; ok {
 			delete(r.streams, ip)
-			stale = append(stale, st)
 		}
 	}
 	r.mu.Unlock()
-	for _, st := range stale {
+	for st := range stale {
 		_ = st.stream.Reset()
 	}
 }
@@ -535,18 +541,56 @@ func (r *Router) removeOutboundWorker(destination string, worker *outboundWorker
 	}
 }
 
+// packetDestination 校验 IP 头并返回目的地址；空字符串表示不支持的版本，静默丢弃。
+func packetDestination(packet []byte) (string, error) {
+	if len(packet) == 0 {
+		return "", fmt.Errorf("packet too short: 0")
+	}
+	switch packet[0] >> 4 {
+	case 4:
+		if len(packet) < 20 {
+			return "", fmt.Errorf("IPv4 packet too short: %d", len(packet))
+		}
+		headerLen := int(packet[0]&0x0f) * 4
+		if headerLen < 20 || len(packet) < headerLen {
+			return "", fmt.Errorf("invalid or truncated IPv4 header: ihl=%d length=%d", headerLen, len(packet))
+		}
+		totalLen := int(packet[2])<<8 | int(packet[3])
+		if totalLen < headerLen || totalLen > len(packet) {
+			return "", fmt.Errorf("invalid or truncated IPv4 packet: total length=%d length=%d", totalLen, len(packet))
+		}
+		addr, ok := netip.AddrFromSlice(packet[16:20])
+		if !ok {
+			return "", fmt.Errorf("invalid IPv4 destination")
+		}
+		return addr.String(), nil
+	case 6:
+		if len(packet) < 40 {
+			return "", fmt.Errorf("IPv6 packet too short: %d", len(packet))
+		}
+		payloadLen := int(packet[4])<<8 | int(packet[5])
+		if payloadLen == 0 && packet[6] == 0 && len(packet) > 40 {
+			return "", nil // Hop-by-Hop 包的 jumbogram option 链由分帧器拒绝。
+		}
+		if payloadLen+40 > len(packet) {
+			return "", fmt.Errorf("truncated IPv6 packet: payload length=%d length=%d", payloadLen, len(packet))
+		}
+		addr, ok := netip.AddrFromSlice(packet[24:40])
+		if !ok {
+			return "", fmt.Errorf("invalid IPv6 destination")
+		}
+		return addr.String(), nil
+	default:
+		return "", nil
+	}
+}
+
 // forwardPacket 解析目的 IP，找到对端路由并经隧道发送。
 func (r *Router) forwardPacket(ctx context.Context, packet []byte) error {
-	if len(packet) < 20 {
-		return fmt.Errorf("packet too short: %d", len(packet))
+	destination, err := packetDestination(packet)
+	if err != nil || destination == "" {
+		return err
 	}
-	version := packet[0] >> 4
-	if version != 4 {
-		// 非 IPv4 包（Windows/macOS 会向 TUN 发 IPv6 多播与邻居发现等）
-		// 属正常噪音，静默丢弃，避免日志刷屏。
-		return nil
-	}
-	destination := fmt.Sprintf("%d.%d.%d.%d", packet[16], packet[17], packet[18], packet[19])
 
 	var state *streamState
 	for {
@@ -575,7 +619,7 @@ func (r *Router) forwardPacket(ctx context.Context, packet []byte) error {
 
 	state.writeMu.Lock()
 	state.stream.SetWriteDeadline(time.Now().Add(outboundWriteDeadline))
-	_, err := state.stream.Write(packet)
+	_, err = state.stream.Write(packet)
 	if err == nil {
 		state.lastActivity.Store(time.Now().UnixNano())
 	}
@@ -665,11 +709,21 @@ func (r *Router) dialStream(ctx context.Context, virtualIP string) (*streamState
 	return state, nil
 }
 
-// ServeInboundStream 处理对端主动拨入的隧道流（内含 IP 包）。virtualIP 必须是
-// 该 PeerID 对应的虚拟 IP；注册后，本机协议栈产生的 Reply 会沿同一条双工流返回，
-// 避免 NAT/拨号 backoff 令回程包等待数秒甚至直接丢失。
+// ServeInboundStream 处理仅有 IPv4 地址的旧节点入向流。
 func (r *Router) ServeInboundStream(virtualIP string, stream network.Stream) {
-	if virtualIP == "" {
+	r.ServeInboundStreamAliases(virtualIP, "", stream)
+}
+
+// ServeInboundStreamAliases 注册一个对端流，使 IPv4/IPv6 地址都复用同一双工流。
+func (r *Router) ServeInboundStreamAliases(v4, v6 string, stream network.Stream) {
+	aliases := make([]string, 0, 2)
+	if v4 != "" {
+		aliases = append(aliases, v4)
+	}
+	if v6 != "" && v6 != v4 {
+		aliases = append(aliases, v6)
+	}
+	if len(aliases) == 0 {
 		log.Printf("[router] inbound tunnel stream ignored: unknown peer=%s", stream.Conn().RemotePeer().ShortString())
 		_ = stream.Reset()
 		return
@@ -677,22 +731,42 @@ func (r *Router) ServeInboundStream(virtualIP string, stream network.Stream) {
 	state := &streamState{stream: stream}
 	state.lastActivity.Store(time.Now().UnixNano())
 	r.mu.Lock()
-	if r.closed || (r.streams[virtualIP] == nil && len(r.streams) >= maxOutboundWorkers) {
+	oldStates := make(map[*streamState]struct{})
+	for _, ip := range aliases {
+		if old := r.streams[ip]; old != nil && old != state {
+			oldStates[old] = struct{}{}
+		}
+	}
+	newCount := 0
+	for _, ip := range aliases {
+		if r.streams[ip] == nil {
+			newCount++
+		}
+	}
+	if r.closed || len(r.streams)+newCount > maxOutboundWorkers {
 		r.mu.Unlock()
 		_ = stream.Reset()
 		return
 	}
-	old := r.streams[virtualIP]
-	r.streams[virtualIP] = state
+	for old := range oldStates {
+		for ip, mapped := range r.streams {
+			if mapped == old {
+				delete(r.streams, ip)
+			}
+		}
+	}
+	for _, ip := range aliases {
+		r.streams[ip] = state
+	}
 	r.pumps.Add(1)
 	r.mu.Unlock()
 	defer r.pumps.Done()
-	if old != nil && old.stream != stream {
-		_ = old.stream.Reset() // 旧 pump 的 dropStream 只摘自身，不能误删新流。
+	for old := range oldStates {
+		_ = old.stream.Reset()
 	}
 	log.Printf("[router] inbound tunnel established from %s peer=%s",
-		virtualIP, stream.Conn().RemotePeer().ShortString())
-	r.pumpFromStream(virtualIP, state)
+		aliases[0], stream.Conn().RemotePeer().ShortString())
+	r.pumpFromStream(aliases[0], state)
 }
 
 // writeInbound 把一个完整的 IP 包过防火墙后写回 TUN。
@@ -700,9 +774,9 @@ func (r *Router) writeInbound(bufs [][]byte, sizes []int, pkt []byte, writeOffse
 	n := len(pkt)
 	// 统一入向防火墙：源虚拟 IP + 协议 + 目标端口，拒绝即丢包。
 	if !CheckPacket(r.fw, pkt) {
-		if r.fw != nil && n >= 20 {
-			src := fmt.Sprintf("%d.%d.%d.%d", pkt[12], pkt[13], pkt[14], pkt[15])
-			dropLog(src, protoName(pkt[9]), 0)
+		if r.fw != nil {
+			src, proto, port := firewallPacketLogFields(pkt)
+			dropLog(src, proto, port)
 		}
 		return
 	}
@@ -765,15 +839,21 @@ func protoName(n byte) string {
 
 func (r *Router) dropStream(virtualIP string, state *streamState) {
 	r.mu.Lock()
-	current := r.streams[virtualIP]
-	if current != nil && (state == nil || current == state) {
+	var removed *streamState
+	if state == nil {
+		removed = r.streams[virtualIP]
 		delete(r.streams, virtualIP)
 	} else {
-		current = nil
+		for ip, current := range r.streams {
+			if current == state {
+				delete(r.streams, ip)
+				removed = current
+			}
+		}
 	}
 	r.mu.Unlock()
-	if current != nil {
-		_ = current.stream.Reset()
+	if removed != nil {
+		_ = removed.stream.Reset()
 	}
 }
 

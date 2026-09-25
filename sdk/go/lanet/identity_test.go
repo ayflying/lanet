@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/ayflying/pvn/pkg/serverless"
 )
 
 // TestLoadOrCreateIdentity 身份密钥：首次生成、复用一致。
@@ -34,5 +36,24 @@ func TestResolveVirtualIP_Empty(t *testing.T) {
 	c := &Client{}
 	if _, err := c.resolveVirtualIP("  "); err == nil {
 		t.Fatal("空目标必须报错")
+	}
+}
+
+func TestMemberVirtualAddress_PreservesIPv6Literal(t *testing.T) {
+	member := serverless.MemberRef{
+		VirtualIP:   "10.7.0.2",
+		VirtualIPv6: "fd00:6c61:6e65::2",
+	}
+	for _, target := range []string{"fd00:6c61:6e65::2", " fd00:6c61:6e65:0:0:0:0:2 "} {
+		if got := memberVirtualAddress(target, member); got != member.VirtualIPv6 {
+			t.Errorf("memberVirtualAddress(%q) = %q, want IPv6 %q", target, got, member.VirtualIPv6)
+		}
+	}
+	if got := memberVirtualAddress("peer-name", member); got != member.VirtualIP {
+		t.Errorf("名称目标地址 = %q, want IPv4 %q", got, member.VirtualIP)
+	}
+	member.VirtualIPv6 = ""
+	if got := memberVirtualAddress("fd00:6c61:6e65::2", member); got != "" {
+		t.Errorf("缺少IPv6的成员返回地址 = %q, want empty", got)
 	}
 }

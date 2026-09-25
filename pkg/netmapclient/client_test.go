@@ -26,8 +26,8 @@ func TestRefreshParsesGroupSnapshot(t *testing.T) {
 				"cidr":       "10.7.0.0/24",
 				"version":    3,
 				"members": []map[string]any{
-					{"peer_id": "peer-a", "name": "a", "os": "windows", "virtual_ip": "10.7.0.2", "addrs": []string{}},
-					{"peer_id": "peer-b", "name": "b", "os": "linux", "virtual_ip": "10.7.0.3", "addrs": []string{"/ip4/203.0.113.5/udp/4001/quic-v1"}},
+					{"peer_id": "peer-a", "name": "a", "os": "windows", "virtual_ip": "10.7.0.2", "virtual_ipv6": "fd7a:115c:a1e0::2", "addrs": []string{}},
+					{"peer_id": "peer-b", "name": "b", "os": "linux", "virtual_ip": "10.7.0.3", "virtual_ipv6": "fd7a:115c:a1e0::3", "addrs": []string{"/ip4/203.0.113.5/udp/4001/quic-v1"}},
 				},
 			},
 		})
@@ -50,6 +50,25 @@ func TestRefreshParsesGroupSnapshot(t *testing.T) {
 	route, ok := client.Resolve("10.7.0.3")
 	if !ok || route.PeerID != "peer-b" || len(route.Addrs) != 1 {
 		t.Fatalf("resolve failed: %+v ok=%v", route, ok)
+	}
+	if route, ok = client.Resolve("fd7a:115c:a1e0::3"); !ok || route.PeerID != "peer-b" || route.VirtualIPv6 != "fd7a:115c:a1e0::3" {
+		t.Fatalf("IPv6 resolve failed: %+v ok=%v", route, ok)
+	}
+}
+
+func TestResolveRejectsAmbiguousAddress(t *testing.T) {
+	client := NewClient("", "peer-a")
+	client.snapshot = Snapshot{Members: []Member{
+		{PeerID: "peer-a", VirtualIP: "10.7.0.2", VirtualIPv6: "fd7a::2"},
+		{PeerID: "peer-b", VirtualIP: "10.7.0.3", VirtualIPv6: "fd7a::2"},
+	}}
+	if route, ok := client.Resolve("fd7a::2"); ok {
+		t.Fatalf("ambiguous IPv6 resolved to %+v", route)
+	}
+	client.snapshot.Members[1].VirtualIPv6 = ""
+	client.snapshot.Members[1].VirtualIP = "10.7.0.2"
+	if route, ok := client.Resolve("10.7.0.2"); ok {
+		t.Fatalf("ambiguous IPv4 resolved to %+v", route)
 	}
 }
 
