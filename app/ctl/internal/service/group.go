@@ -39,6 +39,7 @@ type GroupInfo struct {
 	Name          string     `json:"name"`
 	CreatorPeerID string     `json:"creator_peer_id"`
 	CIDR          string     `json:"cidr"`
+	CIDRv6        string     `json:"cidr_v6,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
 	Version       uint64     `json:"version"`
 	InviteExpires *time.Time `json:"invite_expires_at,omitempty"`
@@ -49,6 +50,7 @@ type NetMapInfo struct {
 	GroupID   string             `json:"group_id"`
 	GroupName string             `json:"group_name"`
 	CIDR      string             `json:"cidr"`
+	CIDRv6    string             `json:"cidr_v6,omitempty"`
 	Version   uint64             `json:"version"`
 	Members   []model.MemberView `json:"members"`
 }

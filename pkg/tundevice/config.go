@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+
+	"github.com/ayflying/pvn/pkg/protocol"
 )
 
 // ConfigureTUN 给 TUN 网卡配置虚拟 IP：Windows 走 netsh，Linux 走 ip，macOS 走 ifconfig。
@@ -122,7 +124,10 @@ func EnsureNeighbor(name, ip string) error {
 	return ensureNeighborNative(name, ip)
 }
 
-var lanetULAIPv6Prefix = netip.MustParsePrefix("fd00:6c61:6e65::/48")
+// lanetULAIPv6Prefix 是节点侧对 protocol.LanetULAIPv6Prefix 的本地别名。
+// 单一来源放在 pkg/protocol：控制面（app/ctl）分配成员虚拟 IPv6 时用的是同一套
+// 规则，两处各写一份常量必然漂移。
+var lanetULAIPv6Prefix = protocol.LanetULAIPv6Prefix
 
 func validateULAIPv6(value string) error {
 	ip, err := netip.ParseAddr(value)

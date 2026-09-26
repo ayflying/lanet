@@ -63,6 +63,13 @@ CREATE TABLE IF NOT EXISTS announced_addrs (
 	},
 	// 后续 schema 变更在此追加 {version: 2, name: "...", up: "..."}。
 	// 禁止修改已发布的迁移，只允许追加新版本。
+	{
+		version: 2,
+		name:    "members.virtual_ipv6",
+		// 只加列、不改数据：老成员在首次加载时按 IPv4 主机号补齐并落库
+		// （见 store.backfillMemberIPv6），因此升级不需要停机重建。
+		up: `ALTER TABLE members ADD COLUMN virtual_ipv6 TEXT NOT NULL DEFAULT '';`,
+	},
 }
 
 // schemaMigrationsMeta 迁移账本表。

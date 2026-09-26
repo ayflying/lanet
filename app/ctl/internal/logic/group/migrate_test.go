@@ -76,26 +76,7 @@ func TestLegacyDBCompat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open legacy: %v", err)
 	}
-	legacySchema := `
-CREATE TABLE groups (
-	id TEXT PRIMARY KEY, name TEXT NOT NULL, creator_peer_id TEXT NOT NULL,
-	invite_code TEXT NOT NULL UNIQUE, invite_expires_at DATETIME,
-	cidr TEXT NOT NULL, subnet_index INTEGER NOT NULL UNIQUE,
-	version INTEGER NOT NULL DEFAULT 1,
-	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE members (
-	group_id TEXT NOT NULL REFERENCES groups(id), peer_id TEXT PRIMARY KEY,
-	name TEXT NOT NULL, os TEXT NOT NULL DEFAULT '', virtual_ip TEXT NOT NULL,
-	role TEXT NOT NULL DEFAULT 'member',
-	enrolled_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX idx_members_group ON members(group_id);
-CREATE TABLE announced_addrs (
-	peer_id TEXT NOT NULL REFERENCES members(peer_id) ON DELETE CASCADE,
-	addr TEXT NOT NULL, PRIMARY KEY (peer_id, addr)
-);`
-	if _, err := raw.Exec(legacySchema); err != nil {
+	if _, err := raw.Exec(legacySchemaV1); err != nil {
 		t.Fatalf("legacy schema: %v", err)
 	}
 	if _, err := raw.Exec(`INSERT INTO groups (id, name, creator_peer_id, invite_code, cidr, subnet_index)
@@ -298,6 +279,82 @@ func TestRepairCorruptDB(t *testing.T) {
 	defer fresh.Close()
 	if _, err := fresh.Version(ctx); err != nil {
 		t.Fatalf("Version on repaired: %v", err)
+	}
+}
+
+// legacySchemaV1 是 v2 之前的完整 schema（无 schema_migrations 账本、members 无
+// virtual_ipv6 列），供「旧库升级」类用例复用。
+const legacySchemaV1 = `
+CREATE TABLE groups (
+	id TEXT PRIMARY KEY, name TEXT NOT NULL, creator_peer_id TEXT NOT NULL,
+	invite_code TEXT NOT NULL UNIQUE, invite_expires_at DATETIME,
+	cidr TEXT NOT NULL, subnet_index INTEGER NOT NULL UNIQUE,
+	version INTEGER NOT NULL DEFAULT 1,
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE members (
+	group_id TEXT NOT NULL REFERENCES groups(id), peer_id TEXT PRIMARY KEY,
+	name TEXT NOT NULL, os TEXT NOT NULL DEFAULT '', virtual_ip TEXT NOT NULL,
+	role TEXT NOT NULL DEFAULT 'member',
+	enrolled_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_members_group ON members(group_id);
+CREATE TABLE announced_addrs (
+	peer_id TEXT NOT NULL REFERENCES members(peer_id) ON DELETE CASCADE,
+	addr TEXT NOT NULL, PRIMARY KEY (peer_id, addr)
+);`
+
+// TestLegacyDBBackfillsMemberIPv6 v2 之前的库只有 virtual_ip：打开后老成员必须
+// 按 IPv4 主机号补齐 IPv6，并把补齐结果写回库里（库自描述，下次启动不再推算）。
+func TestLegacyDBBackfillsMemberIPv6(t *testing.T) {
+	ctx := context.Background()
+	path := tempDBPath(t)
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	if _, err := raw.Exec(legacySchemaV1); err != nil {
+		t.Fatalf("legacy schema: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO groups (id, name, creator_peer_id, invite_code, cidr, subnet_index)
+		VALUES ('g0','legacy','peer-a','CODE123456','10.7.0.0/24',0)`); err != nil {
+		t.Fatalf("insert legacy group: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO members (group_id, peer_id, name, virtual_ip, role)
+		VALUES ('g0','peer-a','owner-a','10.7.0.2','owner')`); err != nil {
+		t.Fatalf("insert legacy member: %v", err)
+	}
+	raw.Close()
+
+	registry, err := NewPersistentRegistry(ctx, path)
+	if err != nil {
+		t.Fatalf("open legacy with new code: %v", err)
+	}
+	defer registry.Close()
+	netmap, err := registry.NetMapFor(ctx, "peer-a")
+	if err != nil {
+		t.Fatalf("netmap: %v", err)
+	}
+	if len(netmap.Members) != 1 || netmap.Members[0].VirtualIPv6 != "fd00:6c61:6e65::2" {
+		t.Fatalf("老成员 IPv6 补齐结果 = %+v，期望 fd00:6c61:6e65::2", netmap.Members)
+	}
+	if netmap.CIDRv6 != "fd00:6c61:6e65::/64" {
+		t.Fatalf("老群组 cidr_v6 = %s", netmap.CIDRv6)
+	}
+
+	// 补齐结果必须落库：直接读列（不经过恢复逻辑）也能看到。
+	check, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("reopen raw: %v", err)
+	}
+	defer check.Close()
+	var stored string
+	if err := check.QueryRow(`SELECT virtual_ipv6 FROM members WHERE peer_id = 'peer-a'`).Scan(&stored); err != nil {
+		t.Fatalf("读取 virtual_ipv6: %v", err)
+	}
+	if stored != "fd00:6c61:6e65::2" {
+		t.Fatalf("库里的 virtual_ipv6 = %q，期望 fd00:6c61:6e65::2", stored)
 	}
 }
 

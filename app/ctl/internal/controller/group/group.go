@@ -25,6 +25,7 @@ func groupView(info service.GroupInfo) v1.GroupView {
 		Name:          info.Name,
 		CreatorPeerID: info.CreatorPeerID,
 		CIDR:          info.CIDR,
+		CIDRv6:        info.CIDRv6,
 		CreatedAt:     info.CreatedAt,
 		Version:       info.Version,
 		InviteExpires: info.InviteExpires,
@@ -83,9 +84,10 @@ func (c *ControllerV1) Kick(ctx context.Context, req *v1.KickReq) (res *v1.KickR
 		return nil, err
 	}
 	return &v1.KickRes{
-		Kicked:    req.TargetPeerID,
-		VirtualIP: removed.VirtualIP,
-		Status:    "removed",
+		Kicked:      req.TargetPeerID,
+		VirtualIP:   removed.VirtualIP,
+		VirtualIPv6: removed.VirtualIPv6,
+		Status:      "removed",
 	}, nil
 }
 
@@ -99,6 +101,7 @@ func (c *ControllerV1) NetMap(ctx context.Context, req *v1.NetMapReq) (res *v1.N
 		GroupID:   info.GroupID,
 		GroupName: info.GroupName,
 		CIDR:      info.CIDR,
+		CIDRv6:    info.CIDRv6,
 		Version:   info.Version,
 		Members:   info.Members,
 	}, nil

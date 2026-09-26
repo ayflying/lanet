@@ -6,7 +6,7 @@ import (
 )
 
 func TestEnrollAllocatesStableVirtualIP(t *testing.T) {
-	registry, err := NewRegistry("10.7.10.0/24", []string{"valid-token"})
+	registry, err := NewRegistry("10.7.10.0/24", "fd00:6c61:6e65:a::/64", []string{"valid-token"})
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestEnrollAllocatesStableVirtualIP(t *testing.T) {
 }
 
 func TestEnrollRejectsInvalidToken(t *testing.T) {
-	registry, err := NewRegistry("10.7.10.0/24", []string{"valid-token"})
+	registry, err := NewRegistry("10.7.10.0/24", "fd00:6c61:6e65:a::/64", []string{"valid-token"})
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestEnrollRejectsInvalidToken(t *testing.T) {
 }
 
 func TestNewRegistryRejectsNon24CIDR(t *testing.T) {
-	if _, err := NewRegistry("10.7.10.0/16", []string{"token"}); err == nil {
+	if _, err := NewRegistry("10.7.10.0/16", "fd00:6c61:6e65:a::/64", []string{"token"}); err == nil {
 		t.Fatal("expected non-/24 CIDR to be rejected for MVP")
 	}
 }

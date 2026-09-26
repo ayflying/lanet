@@ -124,7 +124,7 @@ func TestPersistentRegistryRestoresAfterReopen(t *testing.T) {
 }
 
 func TestRestoreNodeRejectsForeignIP(t *testing.T) {
-	registry, err := node.NewRegistry("10.7.7.0/24", []string{"token"})
+	registry, err := node.NewRegistry("10.7.7.0/24", "fd00:6c61:6e65:7::/64", []string{"token"})
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}

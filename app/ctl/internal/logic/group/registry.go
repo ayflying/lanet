@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ayflying/pvn/app/ctl/internal/logic/node"
+	"github.com/ayflying/pvn/pkg/protocol"
 	"github.com/gogf/gf/v2/errors/gerror"
 )
 
@@ -72,26 +73,31 @@ type Group struct {
 	InviteCode    string     `json:"invite_code"`
 	InviteExpires *time.Time `json:"invite_expires_at,omitempty"`
 	CIDR          string     `json:"cidr"`
-	CreatedAt     time.Time  `json:"created_at"`
-	Version       uint64     `json:"version"`
+	// CIDRv6 本群组的虚拟 IPv6 /64（与 CIDR 一一对应，见 pkg/protocol.GroupIPv6Prefix）。
+	CIDRv6    string    `json:"cidr_v6,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	Version   uint64    `json:"version"`
 
 	registry    *node.Registry
 	enrollToken string
 }
 
 type MemberView struct {
-	PeerID    string   `json:"peer_id"`
-	Name      string   `json:"name"`
-	OS        string   `json:"os"`
-	VirtualIP string   `json:"virtual_ip"`
-	Role      string   `json:"role"`
-	Addrs     []string `json:"addrs"`
+	PeerID    string `json:"peer_id"`
+	Name      string `json:"name"`
+	OS        string `json:"os"`
+	VirtualIP string `json:"virtual_ip"`
+	// VirtualIPv6 成员在群组 /64 内的地址，主机号与 VirtualIP 相同。
+	VirtualIPv6 string   `json:"virtual_ipv6,omitempty"`
+	Role        string   `json:"role"`
+	Addrs       []string `json:"addrs"`
 }
 
 type NetMap struct {
 	GroupID   string       `json:"group_id"`
 	GroupName string       `json:"group_name"`
 	CIDR      string       `json:"cidr"`
+	CIDRv6    string       `json:"cidr_v6,omitempty"`
 	Version   uint64       `json:"version"`
 	Members   []MemberView `json:"members"`
 }
@@ -176,7 +182,7 @@ func (r *Registry) restore(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := r.rebuildGroup(grp, members); err != nil {
+		if err := r.rebuildGroup(ctx, grp, members); err != nil {
 			return err
 		}
 		if row.SubnetIndex > r.nextSubnet-1 {
@@ -194,18 +200,29 @@ func (r *Registry) restore(ctx context.Context) error {
 }
 
 // rebuildGroup 依据已加载的成员行重建群组的节点注册表（含已用 IP 状态）。
-func (r *Registry) rebuildGroup(grp *Group, members []memberRow) error {
+func (r *Registry) rebuildGroup(ctx context.Context, grp *Group, members []memberRow) error {
 	token := "grp-" + randomString(24)
-	registry, err := node.NewRegistry(grp.CIDR, []string{token})
+	prefix6, err := ipv6PrefixForCIDR(grp.CIDR)
+	if err != nil {
+		return fmt.Errorf("derive IPv6 prefix for group %s: %w", grp.ID, err)
+	}
+	registry, err := node.NewRegistry(grp.CIDR, prefix6, []string{token})
 	if err != nil {
 		return fmt.Errorf("rebuild registry for group %s: %w", grp.ID, err)
 	}
+	grp.CIDRv6 = prefix6
 	// 直接按已分配的虚拟 IP 恢复成员，避免 IPAM 重新分配导致漂移。
+	// 老库没有 virtual_ipv6 列时由 node.Registry 按 IPv4 主机号补齐。
+	missingIPv6 := make(map[string]bool, len(members))
 	for _, m := range members {
 		if err := registry.RestoreNode(node.Node{
 			PeerID: m.PeerID, Name: m.Name, OS: m.OS, VirtualIP: m.VirtualIP,
+			VirtualIPv6: m.VirtualIPv6,
 		}); err != nil {
 			return fmt.Errorf("restore member %s of group %s: %w", m.PeerID, grp.ID, err)
+		}
+		if m.VirtualIPv6 == "" {
+			missingIPv6[m.PeerID] = true
 		}
 		r.groupByPeer[m.PeerID] = grp.ID
 		role := m.Role
@@ -217,6 +234,17 @@ func (r *Registry) rebuildGroup(grp *Group, members []memberRow) error {
 			}
 		}
 		r.memberRole[m.PeerID] = role
+	}
+	// 把补齐结果写回老行，让库自描述（下次启动直接读到，不再依赖推算）。
+	if r.store != nil && len(missingIPv6) > 0 {
+		for _, item := range registry.List(ctx) {
+			if !missingIPv6[item.PeerID] || item.VirtualIPv6 == "" {
+				continue
+			}
+			if err := r.store.backfillMemberIPv6(ctx, grp.ID, item.PeerID, item.VirtualIPv6); err != nil {
+				return err
+			}
+		}
 	}
 	grp.registry = registry
 	grp.enrollToken = token
@@ -248,8 +276,12 @@ func (r *Registry) Create(ctx context.Context, input CreateInput) (*Group, node.
 	}
 
 	cidr := fmt.Sprintf("%s.%d.0/24", subnetBase(r.base), r.nextSubnet)
+	prefix6, err := ipv6PrefixForCIDR(cidr)
+	if err != nil {
+		return nil, node.Node{}, err
+	}
 	token := "grp-" + randomString(24)
-	registry, err := node.NewRegistry(cidr, []string{token})
+	registry, err := node.NewRegistry(cidr, prefix6, []string{token})
 	if err != nil {
 		return nil, node.Node{}, err
 	}
@@ -261,6 +293,7 @@ func (r *Registry) Create(ctx context.Context, input CreateInput) (*Group, node.
 		CreatorPeerID: input.PeerID,
 		InviteCode:    inviteCode,
 		CIDR:          cidr,
+		CIDRv6:        prefix6,
 		CreatedAt:     time.Now(),
 		Version:       1,
 		registry:      registry,
@@ -290,7 +323,7 @@ func (r *Registry) Create(ctx context.Context, input CreateInput) (*Group, node.
 		}
 		if err := r.store.insertMember(ctx, grp.ID, memberRow{
 			PeerID: creator.PeerID, Name: creator.Name, OS: creator.OS,
-			VirtualIP: creator.VirtualIP, Role: roleOwner,
+			VirtualIP: creator.VirtualIP, VirtualIPv6: creator.VirtualIPv6, Role: roleOwner,
 		}); err != nil {
 			return nil, node.Node{}, err
 		}
@@ -333,7 +366,7 @@ func (r *Registry) Join(ctx context.Context, input JoinInput) (*Group, node.Node
 	if r.store != nil {
 		if err := r.store.insertMember(ctx, grp.ID, memberRow{
 			PeerID: member.PeerID, Name: member.Name, OS: member.OS,
-			VirtualIP: member.VirtualIP, Role: roleMember,
+			VirtualIP: member.VirtualIP, VirtualIPv6: member.VirtualIPv6, Role: roleMember,
 		}); err != nil {
 			return nil, node.Node{}, err
 		}
@@ -474,18 +507,20 @@ func (r *Registry) NetMapFor(ctx context.Context, peerID string) (*NetMap, error
 			role = roleMember
 		}
 		members = append(members, MemberView{
-			PeerID:    item.PeerID,
-			Name:      item.Name,
-			OS:        item.OS,
-			VirtualIP: item.VirtualIP,
-			Role:      role,
-			Addrs:     append([]string(nil), r.announcedAddrs[item.PeerID]...),
+			PeerID:      item.PeerID,
+			Name:        item.Name,
+			OS:          item.OS,
+			VirtualIP:   item.VirtualIP,
+			VirtualIPv6: item.VirtualIPv6,
+			Role:        role,
+			Addrs:       append([]string(nil), r.announcedAddrs[item.PeerID]...),
 		})
 	}
 	return &NetMap{
 		GroupID:   grp.ID,
 		GroupName: grp.Name,
 		CIDR:      grp.CIDR,
+		CIDRv6:    grp.CIDRv6,
 		Version:   grp.Version,
 		Members:   members,
 	}, nil
@@ -515,6 +550,25 @@ func (r *Registry) GroupOf(peerID string) (*Group, bool) {
 func subnetBase(base netip.Prefix) string {
 	addr := base.Addr().As4()
 	return fmt.Sprintf("%d.%d", addr[0], addr[1])
+}
+
+// ipv6PrefixForCIDR 由群组的 IPv4 /24 算出对应的虚拟 IPv6 /64：
+// 第三段就是子网序号（10.7.<n>.0/24 ↔ fd00:6c61:6e65:<n>::/64）。
+// 地址方案本身在 pkg/protocol，这里只做「从 CIDR 取序号」的桥接。
+func ipv6PrefixForCIDR(cidr string) (string, error) {
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return "", fmt.Errorf("parse group CIDR %s: %w", cidr, err)
+	}
+	if !prefix.Addr().Is4() || prefix.Bits() != 24 {
+		return "", fmt.Errorf("group CIDR %s 不是 IPv4 /24", cidr)
+	}
+	raw := prefix.Addr().As4()
+	prefix6, err := protocol.GroupIPv6Prefix(int(raw[2]))
+	if err != nil {
+		return "", err
+	}
+	return prefix6.String(), nil
 }
 
 func randomString(length int) string {

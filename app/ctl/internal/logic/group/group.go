@@ -46,6 +46,7 @@ func (g *GroupService) infoOf(grp *GroupRow) service.GroupInfo {
 		Name:          grp.Name,
 		CreatorPeerID: grp.CreatorPeerID,
 		CIDR:          grp.CIDR,
+		CIDRv6:        grp.CIDRv6,
 		CreatedAt:     grp.CreatedAt,
 		Version:       grp.Version,
 		InviteExpires: grp.InviteExpires,
@@ -101,6 +102,7 @@ func (g *GroupService) NetMapFor(ctx context.Context, peerID string) (service.Ne
 		GroupID:   nm.GroupID,
 		GroupName: nm.GroupName,
 		CIDR:      nm.CIDR,
+		CIDRv6:    nm.CIDRv6,
 		Version:   nm.Version,
 		Members:   memberViews(nm.Members),
 	}, nil
@@ -124,12 +126,13 @@ func memberViews(items []MemberRow) []model.MemberView {
 	out := make([]model.MemberView, 0, len(items))
 	for _, m := range items {
 		out = append(out, model.MemberView{
-			PeerID:    m.PeerID,
-			Name:      m.Name,
-			OS:        m.OS,
-			VirtualIP: m.VirtualIP,
-			Role:      m.Role,
-			Addrs:     append([]string(nil), m.Addrs...),
+			PeerID:      m.PeerID,
+			Name:        m.Name,
+			OS:          m.OS,
+			VirtualIP:   m.VirtualIP,
+			VirtualIPv6: m.VirtualIPv6,
+			Role:        m.Role,
+			Addrs:       append([]string(nil), m.Addrs...),
 		})
 	}
 	return out
@@ -138,11 +141,12 @@ func memberViews(items []MemberRow) []model.MemberView {
 // nodeView 把内部 node.Node 转成对外视图。
 func nodeView(n node.Node) model.NodeView {
 	return model.NodeView{
-		PeerID:     n.PeerID,
-		Name:       n.Name,
-		OS:         n.OS,
-		VirtualIP:  n.VirtualIP,
-		EnrolledAt: n.EnrolledAt,
+		PeerID:      n.PeerID,
+		Name:        n.Name,
+		OS:          n.OS,
+		VirtualIP:   n.VirtualIP,
+		VirtualIPv6: n.VirtualIPv6,
+		EnrolledAt:  n.EnrolledAt,
 	}
 }
 

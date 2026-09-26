@@ -18,6 +18,7 @@ type GroupView struct {
 	Name          string     `json:"name"`
 	CreatorPeerID string     `json:"creator_peer_id"`
 	CIDR          string     `json:"cidr"`
+	CIDRv6        string     `json:"cidr_v6,omitempty" dc:"本群组的虚拟 IPv6 /64"`
 	CreatedAt     time.Time  `json:"created_at"`
 	Version       uint64     `json:"version"`
 	InviteExpires *time.Time `json:"invite_expires_at,omitempty"`
@@ -102,7 +103,9 @@ type KickReq struct {
 type KickRes struct {
 	Kicked    string `json:"kicked" dc:"被踢成员 PeerID"`
 	VirtualIP string `json:"virtual_ip" dc:"被回收的虚拟 IP"`
-	Status    string `json:"status"`
+	// VirtualIPv6 被回收的虚拟 IPv6（群组 /64 内）。
+	VirtualIPv6 string `json:"virtual_ipv6,omitempty" dc:"被回收的虚拟 IPv6"`
+	Status      string `json:"status"`
 }
 
 // NetMapReq 查询自己所在群组的成员目录。
@@ -113,10 +116,11 @@ type NetMapReq struct {
 
 // NetMapRes NetMap 响应：仅包含同群成员。
 type NetMapRes struct {
-	GroupID   string            `json:"group_id"`
-	GroupName string            `json:"group_name"`
-	CIDR      string            `json:"cidr"`
-	Version   uint64            `json:"version"`
+	GroupID   string             `json:"group_id"`
+	GroupName string             `json:"group_name"`
+	CIDR      string             `json:"cidr"`
+	CIDRv6    string             `json:"cidr_v6,omitempty" dc:"本群组的虚拟 IPv6 /64"`
+	Version   uint64             `json:"version"`
 	Members   []model.MemberView `json:"members"`
 }
 

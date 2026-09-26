@@ -33,7 +33,9 @@ type memberRow struct {
 	Name      string
 	OS        string
 	VirtualIP string
-	Role      string // "owner" 或 "member"
+	// VirtualIPv6 群组 /64 内的成员地址；v2 之前的库为空，加载时按主机号补齐。
+	VirtualIPv6 string
+	Role        string // "owner" 或 "member"
 }
 
 func openStore(path string) (*store, error) {
@@ -133,9 +135,9 @@ func (s *store) insertMember(ctx context.Context, groupID string, row memberRow)
 		role = "member"
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO members (group_id, peer_id, name, os, virtual_ip, role)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		groupID, row.PeerID, row.Name, row.OS, row.VirtualIP, role)
+		`INSERT INTO members (group_id, peer_id, name, os, virtual_ip, virtual_ipv6, role)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		groupID, row.PeerID, row.Name, row.OS, row.VirtualIP, row.VirtualIPv6, role)
 	if err != nil {
 		return fmt.Errorf("insert member %s: %w", row.PeerID, err)
 	}
@@ -154,7 +156,7 @@ func (s *store) deleteMember(ctx context.Context, groupID, peerID string) error 
 
 func (s *store) loadMembersByGroup(ctx context.Context, groupID string) ([]memberRow, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT peer_id, name, os, virtual_ip, role FROM members WHERE group_id = ? ORDER BY virtual_ip`, groupID)
+		`SELECT peer_id, name, os, virtual_ip, virtual_ipv6, role FROM members WHERE group_id = ? ORDER BY virtual_ip`, groupID)
 	if err != nil {
 		return nil, fmt.Errorf("load members of %s: %w", groupID, err)
 	}
@@ -162,12 +164,25 @@ func (s *store) loadMembersByGroup(ctx context.Context, groupID string) ([]membe
 	var items []memberRow
 	for rows.Next() {
 		var row memberRow
-		if err := rows.Scan(&row.PeerID, &row.Name, &row.OS, &row.VirtualIP, &row.Role); err != nil {
+		if err := rows.Scan(&row.PeerID, &row.Name, &row.OS, &row.VirtualIP, &row.VirtualIPv6, &row.Role); err != nil {
 			return nil, fmt.Errorf("scan member row: %w", err)
 		}
 		items = append(items, row)
 	}
 	return items, rows.Err()
+}
+
+// backfillMemberIPv6 给「升级前入库、virtual_ipv6 为空」的老成员补上地址。
+// 迁移只加列不改数据，因此老成员在首次加载时按 IPv4 主机号补齐并落库，
+// 保证库本身自描述（下次启动直接读到，不再依赖推算）。
+func (s *store) backfillMemberIPv6(ctx context.Context, groupID, peerID, ipv6 string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE members SET virtual_ipv6 = ? WHERE group_id = ? AND peer_id = ? AND virtual_ipv6 = ''`,
+		ipv6, groupID, peerID)
+	if err != nil {
+		return fmt.Errorf("backfill member %s ipv6: %w", peerID, err)
+	}
+	return nil
 }
 
 // --- 通告地址 ---

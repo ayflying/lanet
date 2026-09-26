@@ -16,16 +16,20 @@ type NodeView struct {
 	OS         string    `json:"os"`
 	VirtualIP  string    `json:"virtual_ip"`
 	EnrolledAt time.Time `json:"enrolled_at"`
+	// VirtualIPv6 群组 IPv6 /64 内的成员地址（主机号与 VirtualIP 相同）。
+	VirtualIPv6 string `json:"virtual_ipv6,omitempty"`
 }
 
 // MemberView NetMap 中的成员视图。
 type MemberView struct {
-	PeerID    string   `json:"peer_id"`
-	Name      string   `json:"name"`
-	OS        string   `json:"os"`
-	VirtualIP string   `json:"virtual_ip"`
-	Role      string   `json:"role"`
-	Addrs     []string `json:"addrs"`
+	PeerID    string `json:"peer_id"`
+	Name      string `json:"name"`
+	OS        string `json:"os"`
+	VirtualIP string `json:"virtual_ip"`
+	// VirtualIPv6 群组 IPv6 /64 内的成员地址（主机号与 VirtualIP 相同）。
+	VirtualIPv6 string   `json:"virtual_ipv6,omitempty"`
+	Role        string   `json:"role"`
+	Addrs       []string `json:"addrs"`
 }
 
 // RelayCandidate 中继候选。
