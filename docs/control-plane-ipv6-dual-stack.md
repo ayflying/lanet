@@ -1,6 +1,6 @@
 # 控制面 IPv6 双栈：验收方案（P1-6）
 
-> 状态：**已实施（L1 本地验证通过），待 L2/L3 实机验收**。范围：`app/ctl` 控制面 + `sdk/go/lanet` 自身地址来源。
+> 状态：**已实施并完成 L1/L2/L3 验收，随 0.5.84 发布**。范围：`app/ctl` 控制面 + `sdk/go/lanet` 自身地址来源。
 > 交接遗留项 P1-6 原文含义：0.5.74「Standalone 虚拟 IPv6 双栈」只做了**节点/TUN 侧**，
 > 控制面（`app/ctl`）与 Android 客户端仍是 IPv4-only。
 >
@@ -138,28 +138,42 @@
 `go test -count=1 ./...`、`tools/run-node-tests.ps1 -LinuxVet` 通过；`-race` 本机
 `CGO_ENABLED=0` 且无 gcc 无法本地跑，由 CI 的 ubuntu stability 任务覆盖。
 
-**L2 控制面真机（必须）**
+**L2 结果（0.5.84，真控制面进程 `PVN_CTL_ADDR=:18000` + 临时库）**
 
-1. 本地起控制面：`PVN_CTL_DB=<临时库> go run ./app/ctl`（监听 `:8000`）。
-2. `POST /v1/groups/create`（peer A）→ 响应 `creator.virtual_ipv6` 形如 `fd00:6c61:6e65:0::2`。
-3. `POST /v1/groups/join`（peer B，用返回的邀请码）→ `member.virtual_ipv6` 形如 `fd00:6c61:6e65:0::3`。
-4. `GET /v1/groups/netmap?peer_id=A` → 两名成员都有 IPv6，且与 create/join 返回一致。
-5. 重启控制面进程 → 同一 netmap 的 IPv4/IPv6 与重启前**逐字节一致**。
-6. `POST /v1/groups/kick`（踢 B）→ 响应带被回收的 `virtual_ipv6`；再 join 新 peer → 复用到同一地址。
-7. 用一个真连本地控制面的 `netmapclient.Refresh` 拉取（真 HTTP，不是假服务）→ `Members[i].VirtualIPv6` 非空且可在
-   `netmapclient.Resolve` 里命中。
+| 步骤 | 实测 |
+|---|---|
+| create | `group: 10.7.0.0/24` + `cidr_v6: fd00:6c61:6e65::/64`；`creator: 10.7.0.2 / fd00:6c61:6e65::2` |
+| join | `member: 10.7.0.3 / fd00:6c61:6e65::3` |
+| netmap | 两名成员的 `virtual_ip`/`virtual_ipv6` 与 create/join 完全一致 |
+| 重启控制面 | netmap JSON **逐字节一致**（`cidr_v6`、两名成员地址均不变） |
+| 老库模拟（`UPDATE members SET virtual_ipv6=''` 后重启） | netmap 仍给出 `::2`/`::3`，且库内该列**已被补齐写回**；`dbversion` 打印 `version=2` |
+| kick B | 响应 `virtual_ip=10.7.0.3` + `virtual_ipv6=fd00:6c61:6e65::3`；随后 join 的新成员**复用了同一对地址** |
+| 真 `netmapclient.Refresh` | 两成员 `VirtualIPv6` 非空；`Resolve("fd00:6c61:6e65::3")` 与 `Resolve("10.7.0.3")` 都命中同一 peer |
 
-**L3 SDK 数据面真机（必须，决定「IPv6 真的通了」）**
+**L3 结果（0.5.84，WSL Docker 内两个托管模式 SDK 客户端 + 真实 TUN + `ping6`）**
 
-- 用 `sdk/go/lanet` 起两个控制面模式客户端（同一台机器，管理员权限，TUN 名称不同），断言：
-  1. 两端控制台/`Info()` 显示的虚拟 IPv6 与 netmap 分配一致；
-  2. 本机 `netsh interface ipv6 show address` / `ip -6 addr` 能在 TUN 上看到该 /128；
-  3. `ping6 fd00:6c61:6e65:0::3`（从 A 打 B）→ **有回应**；
-  4. 反向 `ping6` 也通；杀掉 B 后 A 的 `ping6` 失败（确认不是本机自环假通）。
+环境：`sdk/go/lanet` 临时客户端（`Tun=true`，TUN 名 `lanet-p1-6-a/b`，`FirewallMode=allow-all`）
+跑在 WSL2 的两个容器里（`--cap-add NET_ADMIN --device /dev/net/tun`），控制面跑在 Windows 宿主
+（`http://172.25.64.1:18000`），群组由 A 创建、B 凭邀请码加入。
+
+| 断言 | 实测 |
+|---|---|
+| `Info()` 与 netmap 分配一致 | A `fd00:6c61:6e65::2`、B `fd00:6c61:6e65::3`，与 netmap 逐字段一致 |
+| TUN 上的 /128 | `ip -6 addr`：A `fd00:6c61:6e65::2/128`、B `fd00:6c61:6e65::3/128`；`ip -6 route` 有 `fd00:6c61:6e65::/48 dev lanet-p1-6-*` |
+| A → B `ping6` | **4/4 收到，0% 丢包**（rtt 1.7~2.6ms） |
+| B → A `ping6` | **4/4 收到，0% 丢包**（rtt 0.5~0.8ms） |
+| IPv4 基线对照 | A → B `ping 10.7.0.3` 2/2 收到，确认两条栈走同一隧道 |
+| 隧道证据 | `[router] tunnel established to fd00:6c61:6e65::3 via peer=… remote=/ip4/172.20.0.3/udp/…/quic-v1` |
+| 杀掉 B 后 A `ping6` | 3 发 0 收、100% 丢包；`[router] forward to fd00:6c61:6e65::3 failed … all dials failed` —— 确认不是本机自环假通 |
+
+> 说明：本环境控制面没有可用 relay，而托管模式下 SDK 只在中继连接后经 identify 学到对端地址
+> （`pkg/tunnel` 主动拨号刻意不带 Addrs，见其注释）。因此验收时由临时客户端按 NetMap 通告地址
+> 显式 `Host().Connect` 一次（IPv4 同样需要）；这是环境前置条件，与 IPv6 无关。
 
 **L4 Android（说明项，不在本仓库）**
 
 - 只验证 API 兼容性：Android 旧版本对新控制面仍能建组、加入、拿到 IPv4 并通信（不做 IPv6）。
+  本次未做（无 Android 环境）；新字段全部 `omitempty`，旧客户端忽略即可。
 
 ## 7. 风险与对策
 
@@ -176,15 +190,21 @@
 2. 控制面 IPAM/模型/存储/迁移/API/文档 + 单测（1~2 提交）
 3. SDK 控制面模式自身 IPv6 + 单测（1 提交）
 4. 文档（README + 本文档状态与真机证据）（1 提交）
-5. VERSION → 0.5.84；推送后确认 release/docker 两条流水线全绿、资产齐全
-6. 生产节点（本机 0.5.83）再走一次 `/api/update/apply` 升到 0.5.84，记录 sha256 与发行包对账
+5. VERSION → 0.5.84；推送后确认 release/docker 两条流水线全绿、资产齐全 ✅
+   （`78d1054`：release/docker 均 success；v0.5.84 五个资产齐全，windows zip sha256 `22dfcb66…`）
+6. 生产节点（本机 0.5.83）再走一次 `/api/update/apply` 升到 0.5.84，记录 sha256 与发行包对账 ✅
+   - 日志：`[update] sha256 校验通过 22dfcb66d8c9a272…`（= 发布页 windows zip 哈希）；
+     `[service-restart] 已在服务启动前切换到暂存版本` → `服务已重新启动`；
+     `[node] 启动 … version=0.5.84`；
+   - 服务 Running；虚拟 IP `10.7.207.102`、PeerID `12D3KooWJVB9…` 均未变；
+   - 已安装 `lanet.exe` 哈希 `3756d1f0478cb1496342864a34a9907559156133628cac4fc48f19e76c0812ed`
+     **等于**发布包内 exe 哈希；`.rollback` 保留。
 
-## 9. 待确认的决策点
+## 9. 决策点（已确认，记录结论）
 
-- **D1 地址方案**：`fd00:6c61:6e65:<subnetIndex>::<host>`（与 IPv4 主机号同值）是否认可？
-  备选：组内独立分配（不与 IPv4 对齐，可读性差但解耦）。
-- **D2 常量位置**：放 `pkg/protocol` 并让 `pkg/tundevice` 引用（单一来源）是否认可？
-- **D3 SDK 采用控制面地址**：控制面模式下自身 IPv6 改为「控制面分配，缺省回退派生值」，是否认可？
-  （不改这一条，控制面返回的 IPv6 只是装饰，数据面依旧不通。）
-- **D4 验收强度**：L3「真机 ping6 互通」是否作为必须项？（需要两个 SDK 客户端实例 + 管理员权限）
-- **D5 版本号**：按 0.5.84 发布，可以吗？
+- **D1 地址方案**：`fd00:6c61:6e65:<subnetIndex>::<host>`（与 IPv4 主机号同值）—— 已采用。
+- **D2 常量位置**：`pkg/protocol` 为唯一来源，`pkg/tundevice` 引用 —— 已采用。
+- **D3 SDK 采用控制面地址**：托管模式自身 IPv6 = 控制面分配值；控制面未返回时为空
+  （该模式没有本地派生来源），退化为仅 IPv4 —— 已采用。
+- **D4 验收强度**：L1 + L2 + L3（真机 `ping6` 双向）均为必须项 —— 已全部完成。
+- **D5 版本号**：0.5.84 —— 已发布。
