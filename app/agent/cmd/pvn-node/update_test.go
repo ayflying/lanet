@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -63,6 +64,72 @@ func TestUpdateHTTPBodyLimit(t *testing.T) {
 	}
 	if _, err := readUpdateHTTPBody(strings.NewReader("12345"), 4); err == nil {
 		t.Fatal("超限未拒绝")
+	}
+}
+
+func TestStagePendingUpdateAndVerifyChecksum(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "lanet.exe")
+	candidate := filepath.Join(dir, "candidate.exe")
+	if err := os.WriteFile(exe, []byte("old-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(candidate, []byte("new-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := stageNewBinary(candidate, exe); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "old-binary" {
+		t.Fatalf("暂存时改动了当前程序: %q", got)
+	}
+	if got, _ := os.ReadFile(pendingUpdatePath(exe)); string(got) != "new-binary" {
+		t.Fatalf("候选暂存错误: %q", got)
+	}
+	if _, err := applyPendingUpdate(exe); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "new-binary" {
+		t.Fatalf("切换结果错误: %q", got)
+	}
+	if _, err := os.Stat(pendingUpdateMarkerPath(exe)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("切换成功后标记未清理: %v", err)
+	}
+	if got, err := os.ReadFile(exe + ".rollback"); err != nil || string(got) != "old-binary" {
+		t.Fatalf("旧版本备份缺失: %q %v", got, err)
+	}
+}
+
+func TestApplyPendingUpdateRejectsChecksumMismatch(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "lanet.exe")
+	candidate := pendingUpdatePath(exe)
+	if err := os.WriteFile(exe, []byte("old-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(candidate, []byte("tampered"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker, _ := json.Marshal(pendingUpdateMarker{SHA256: strings.Repeat("0", 64)})
+	if err := os.WriteFile(pendingUpdateMarkerPath(exe), marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := applyPendingUpdate(exe); err == nil {
+		t.Fatal("摘要不匹配未拒绝")
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "old-binary" {
+		t.Fatalf("摘要错误时改动了当前程序: %q", got)
+	}
+}
+
+func TestVerifySHA256FailsClosedOnTransportError(t *testing.T) {
+	oldClient := http.DefaultClient
+	t.Cleanup(func() { http.DefaultClient = oldClient })
+	http.DefaultClient = &http.Client{Transport: updateTestTransport(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("network unavailable")
+	})}
+	if err := verifySHA256("https://example.invalid/sha256sums.txt", "lanet.zip", make([]byte, 32), ""); err == nil {
+		t.Fatal("获取校验和失败时必须拒绝更新")
 	}
 }
 

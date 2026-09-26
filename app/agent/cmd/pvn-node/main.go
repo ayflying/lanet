@@ -57,6 +57,7 @@ func echoProtoFor(groupKey []byte, legacy bool) libprotocol.ID {
 var version = "dev"
 
 func main() {
+	if runUpdateHelper() { return }
 	// 服务重启辅助进程必须先于 SCM 入口处理。它由正在运行的服务派生，等待
 	// HTTP 响应送达后通过服务管理器执行 stop/start，避免绕过 SCM 拉起孤儿进程。
 	if handled, err := handleWindowsServiceCommand(); handled {

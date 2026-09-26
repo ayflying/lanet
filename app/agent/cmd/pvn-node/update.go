@@ -174,8 +174,8 @@ func updateRoutes(cancel context.CancelFunc) map[string]http.HandlerFunc {
 				writeJSONLocal(w, status, map[string]string{"error": err.Error()})
 				return
 			}
-			writeJSONLocal(w, http.StatusOK, map[string]any{"restarting": true})
-			restartSelf(1500 * time.Millisecond) // 留出响应送达时间
+			writeJSONLocal(w, http.StatusOK, map[string]any{"restarting": true, "update_pending": true})
+			restartSelf(1500 * time.Millisecond) // 留出响应送达时间；启动入口消费暂存更新
 		},
 		"POST /api/restart": func(w http.ResponseWriter, r *http.Request) {
 			writeJSONLocal(w, http.StatusOK, map[string]any{"restarting": true})
@@ -266,6 +266,9 @@ func checkUpdate(ctx context.Context) error {
 		}
 		if res.assetAPIURL == "" {
 			res.errMsg = fmt.Sprintf("最新版 %s 未提供 %s/%s 的发行包", latest, runtime.GOOS, runtime.GOARCH)
+			res.hasUpdate = false
+		} else if res.sumsAPIURL == "" {
+			res.errMsg = "最新版缺少 sha256sums.txt，拒绝不完整发行包"
 			res.hasUpdate = false
 		}
 	}
@@ -388,13 +391,14 @@ func applyUpdate() (err error) {
 	if err != nil {
 		return fmt.Errorf("下载失败: %w", err)
 	}
-	// sha256 校验（对比发行包内 sha256sums.txt）。
-	if sumsAPI != "" {
-		if err = verifySHA256(sumsAPI, assetName, sum, upd.token); err != nil {
-			return fmt.Errorf("校验失败: %w", err)
-		}
-		log.Printf("[update] sha256 校验通过 %s", hex.EncodeToString(sum)[:16]+"…")
+	// sha256 校验（对比发行包内 sha256sums.txt）；自动更新安全要求 fail-closed。
+	if sumsAPI == "" {
+		return fmt.Errorf("最新版缺少 sha256sums.txt，拒绝更新")
 	}
+	if err = verifySHA256(sumsAPI, assetName, sum, upd.token); err != nil {
+		return fmt.Errorf("校验失败: %w", err)
+	}
+	log.Printf("[update] sha256 校验通过 %s", hex.EncodeToString(sum)[:16]+"…")
 
 	// 解出 lanet(.exe)（Windows 同时解出 wintun.dll，若被占用则跳过）。
 	newExe := filepath.Join(workDir, "lanet-new"+extOf())
@@ -402,13 +406,13 @@ func applyUpdate() (err error) {
 		return fmt.Errorf("解压失败: %w", err)
 	}
 
-	log.Printf("[update] 替换程序并重启（%s -> %s）", assetName, exePath)
-	// 正在运行的 exe 不能直接覆盖：Windows 上映像锁会拒绝删除/写入，需要
-	// 专门的替换策略（见 installNewBinary）；POSIX 直接改名腾位再写入。
-	if err := installNewBinary(newExe, exePath); err != nil {
-		return fmt.Errorf("替换程序失败: %w", err)
+	// 更新先落到安装目录的确定性暂存名；运行中的程序不替换自身。
+	// 下次进程启动（普通重启或 Windows 服务重启）时会消费该候选。
+	stagedPath := pendingUpdatePath(exePath)
+	if err := stageNewBinary(newExe, exePath); err != nil {
+		return fmt.Errorf("暂存更新失败: %w", err)
 	}
-	// 磁盘上已是新程序：保持闸门占住，直到进程重启（重启后版本号才更新）。
+	log.Printf("[update] 新程序已校验并暂存：%s（安装包 %s）；将在下次启动时切换", stagedPath, assetName)
 	landed = true
 	return nil
 }
@@ -429,7 +433,7 @@ func verifySHA256(sumsURL, assetName string, sum []byte, token string) error {
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err // 拿不到校验和时不阻断更新（下载本身走 HTTPS）
+		return fmt.Errorf("获取 sha256sums.txt 失败: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -677,6 +681,151 @@ func installNewBinary(newExe, exePath string) error {
 	return nil
 }
 
+func restoreBackup(exePath string) error {
+	backup := exePath + ".rollback"
+	if _, err := os.Stat(backup); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		return replaceLockedBinary(backup, exePath)
+	}
+	if err := os.Remove(exePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.Rename(backup, exePath)
+}
+
+// stageNewBinary 将候选程序原子落到安装目录并写待更新标记；旧程序不被触碰。
+// 候选及标记同目录，避免跨卷 rename 导致非原子复制。
+//
+// 一致性：先清掉上一轮标记，再发布候选，最后原子写新标记。任何一步中途失败
+// 都只留下「无标记」状态，绝不会残留「标记指向已被覆盖/删除的候选」——那种
+// 残留会让之后每次启动都判为待更新、却永远应用失败，形成无法自愈的启动循环
+// （旧实现在写新标记失败时删候选却留着旧标记，正是这个坑）。
+// 失败即放弃这一轮：当前版本继续运行，下次检查会重新下载暂存。
+func stageNewBinary(newExe, exePath string) error {
+	pendingExe := pendingUpdatePath(exePath)
+	if err := removeIfExists(pendingUpdateMarkerPath(exePath)); err != nil {
+		return fmt.Errorf("清理上一轮待更新标记失败: %w", err)
+	}
+	tmp := pendingExe + ".part"
+	if err := copyFile(newExe, tmp); err != nil {
+		return fmt.Errorf("复制待更新程序失败: %w", err)
+	}
+	if err := os.Rename(tmp, pendingExe); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("发布待更新程序失败: %w", err)
+	}
+	data, err := os.ReadFile(pendingExe)
+	if err != nil {
+		_ = os.Remove(pendingExe)
+		return err
+	}
+	sum := sha256.Sum256(data)
+	marker, err := json.Marshal(pendingUpdateMarker{SHA256: hex.EncodeToString(sum[:])})
+	if err != nil {
+		_ = os.Remove(pendingExe)
+		return err
+	}
+	if err := writeAtomicBytes(pendingUpdateMarkerPath(exePath), marker, 0o600); err != nil {
+		_ = os.Remove(pendingExe)
+		return fmt.Errorf("写入待更新标记失败: %w", err)
+	}
+	return nil
+}
+
+func removeIfExists(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// dropPendingUpdate 丢弃一对「标记 + 候选」残留。只在确认无法应用时调用：
+// 保留它们毫无意义，只会让每次启动都白跑一趟更新辅助进程。
+func dropPendingUpdate(exePath string) {
+	_ = removeIfExists(pendingUpdateMarkerPath(exePath))
+	_ = removeIfExists(pendingUpdatePath(exePath))
+	_ = removeIfExists(pendingUpdatePath(exePath) + ".part")
+}
+
+type pendingUpdateMarker struct {
+	SHA256 string `json:"sha256"`
+}
+
+func pendingUpdatePath(exePath string) string       { return exePath + ".pending" }
+func pendingUpdateMarkerPath(exePath string) string { return exePath + ".pending.json" }
+
+func writeAtomicBytes(path string, data []byte, mode os.FileMode) error {
+	tmp := path + ".part"
+	if err := os.WriteFile(tmp, data, mode); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// applyPendingUpdate 在旧程序已退出的更新辅助进程中调用；摘要不匹配时拒绝切换。
+//
+// 自愈：标记损坏、标记非法、候选缺失都属于「永远应用不了」的残留状态，直接丢弃
+// （不安装任何东西，因此仍然 fail-closed），否则每次启动都会被判为待更新。
+// 摘要不匹配则相反——保留现场供排查，只拒绝切换。
+func applyPendingUpdate(exePath string) (bool, error) {
+	markerPath, candidate := pendingUpdateMarkerPath(exePath), pendingUpdatePath(exePath)
+	markerBytes, err := os.ReadFile(markerPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var marker pendingUpdateMarker
+	if err := json.Unmarshal(markerBytes, &marker); err != nil {
+		dropPendingUpdate(exePath)
+		return false, fmt.Errorf("待更新标记损坏，已丢弃: %w", err)
+	}
+	if len(marker.SHA256) != sha256.Size*2 {
+		dropPendingUpdate(exePath)
+		return false, errors.New("待更新标记非法（摘要长度错误），已丢弃")
+	}
+	f, err := os.Open(candidate)
+	if err != nil {
+		dropPendingUpdate(exePath)
+		return false, fmt.Errorf("待更新程序缺失，已丢弃: %w", err)
+	}
+	h := sha256.New()
+	_, copyErr := io.Copy(h, f)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return false, copyErr
+	}
+	if closeErr != nil {
+		return false, closeErr
+	}
+	if !strings.EqualFold(hex.EncodeToString(h.Sum(nil)), marker.SHA256) {
+		return false, errors.New("待更新程序 SHA256 不匹配，拒绝切换（保留现场待排查）")
+	}
+	backup := exePath + ".rollback"
+	if err := copyFile(exePath, backup); err != nil {
+		return false, fmt.Errorf("备份旧程序失败: %w", err)
+	}
+	if err := installNewBinary(candidate, exePath); err != nil {
+		_ = os.Remove(backup)
+		return false, err
+	}
+	if err := os.Remove(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if rollbackErr := restoreBackup(exePath); rollbackErr != nil {
+			return false, fmt.Errorf("清理待更新标记失败且回滚失败（%v）: %w", rollbackErr, err)
+		}
+		return false, fmt.Errorf("清理待更新标记失败，已回滚: %w", err)
+	}
+	_ = os.Remove(candidate)
+	return true, nil
+}
+
 func selfExe() string {
 	exe, err := os.Executable()
 	if err != nil {
@@ -718,6 +867,14 @@ func restartSelf(delay time.Duration) {
 		}
 		exe := selfExe()
 		log.Printf("[node] 重启程序: %s %v", exe, os.Args[1:])
+		if _, err := os.Stat(pendingUpdateMarkerPath(exe)); err == nil {
+			if err := spawnUpdateHelper(); err != nil {
+				log.Printf("[node] 更新辅助进程启动失败: %v", err)
+				return
+			}
+			activeSingleton.release()
+			os.Exit(0)
+		}
 		// 必须先放单实例锁再拉起新进程：spawnSelf 是 Start 后立刻返回、本进程
 		// 紧接着 os.Exit，新进程起来时旧进程往往还活着几十毫秒，不提前释放会
 		// 让新进程把自己判成「双开」而拒绝启动——重启直接变成彻底停服。

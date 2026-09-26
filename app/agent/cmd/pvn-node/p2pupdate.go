@@ -163,28 +163,25 @@ func StartP2PUpdate(ctx context.Context, c *lanet.Client, version string, exeDir
 	return ""
 }
 
+var (
+	installP2PBinary  = stageNewBinary
+	restartP2PProcess = restartSelf
+)
+
 // applyP2PUpdateLocked 接收下载前已取得的闸门，不再次 acquire。
 func applyP2PUpdateLocked(newPath string, m selfupdate.Manifest, exePath string) {
 	log.Printf("[p2p-update] 新版本 v%s 下载校验完成，替换程序", m.Version)
-	oldPath := exePath + ".old"
-	_ = os.Remove(oldPath)
-	if err := os.Rename(exePath, oldPath); err != nil {
-		log.Printf("[p2p-update] 旧程序改名失败（不中断运行）: %v", err)
+	if err := installP2PBinary(newPath, exePath); err != nil {
+		log.Printf("[p2p-update] 替换程序失败（不中断运行）: %v", err)
 		releaseUpdate() // 没落地，允许下轮重试
 		return
 	}
-	if err := copyFile(newPath, exePath); err != nil {
-		_ = os.Rename(oldPath, exePath) // 回滚
-		log.Printf("[p2p-update] 写入新程序失败（已回滚）: %v", err)
-		releaseUpdate()
-		return
-	}
-	_ = os.Remove(newPath)
-	// 注意：此处**不释放闸门**。磁盘上已经是 vN，重启前本进程绝不再开始第二轮
+	// stageNewBinary 以复制方式落盘，不删除 coordinator 管理的下载源文件。
+	// 注意：此处**不释放闸门**。待重启进程不应再开始第二轮
 	// 更新——否则升级窗口里再出现更新版本时会反复替换、反复排重启。
 	// 随机 1~8 分钟后重启：升级节点天然错峰，DHT 网络始终有大量节点在线。
 	delay := time.Duration(60+rand.Intn(7*60)) * time.Second
 	log.Printf("[p2p-update] 已更新到 v%s，%s 后重启生效（更新锁已持有，重启前不再接受新的更新轮次）",
 		m.Version, delay.Truncate(time.Second))
-	restartSelf(delay)
+	restartP2PProcess(delay)
 }

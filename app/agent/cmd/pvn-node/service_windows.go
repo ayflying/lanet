@@ -87,8 +87,29 @@ func handleWindowsServiceCommand() (bool, error) {
 			return true, errors.New("等待服务停止超时")
 		}
 	}
+	// applyPendingUpdate 自己会在替换前把当前程序备份到 lanet.exe.rollback，
+	// 这里不再另做一次备份：多出来的那份在应用失败（标记损坏/候选缺失/校验不过）
+	// 时不会被清理，会留下指向「当前仍在运行的版本」的假回滚点，污染后续状态判断。
+	exePath := selfExe()
+	updated, updateErr := applyPendingUpdate(exePath)
+	if updateErr != nil {
+		log.Printf("[service-restart] 待更新程序无法应用，保留当前版本并继续启动: %v", updateErr)
+	} else if updated {
+		log.Printf("[service-restart] 已在服务启动前切换到暂存版本")
+	}
 	if err = s.Start(); err != nil {
 		log.Printf("[service-restart] 启动服务失败: %v", err)
+		if updated {
+			if rollbackErr := restoreBackup(selfExe()); rollbackErr != nil {
+				return true, fmt.Errorf("启动新版本服务失败: %w（恢复旧版本失败: %v）", err, rollbackErr)
+			}
+			log.Printf("[service-restart] 已恢复旧版本，重试启动服务")
+			if retryErr := s.Start(); retryErr != nil {
+				return true, fmt.Errorf("启动新版本服务失败: %w；恢复旧版本后启动仍失败: %v", err, retryErr)
+			}
+			log.Printf("[service-restart] 旧版本服务已启动")
+			return true, nil
+		}
 		return true, fmt.Errorf("启动服务失败: %w", err)
 	}
 	log.Printf("[service-restart] 服务已重新启动")
