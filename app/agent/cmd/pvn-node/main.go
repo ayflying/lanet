@@ -1187,6 +1187,18 @@ func nodeConfigRoutes(path string, eff nodeRuntime, nodeRef func() *lanet.Client
 				req.PublicDHTMinutes = publicDHTMinutesOr(prev.PublicDHTMinutes)
 			}
 			prev := read()
+			// 网络密钥：nil = 请求体没带该字段 → 保留原值。整份保存会把未提供
+			// 的字段按零值落盘，而 network_key 一旦丢了节点就会切到「按身份
+			// 派生的本机专属网络」（虚拟 IP 变、成员表清空），代价极大；
+			// 显式空串才是用户意图（清空 = 回到专属默认网络）。
+			if req.NetworkKey == nil {
+				req.NetworkKey = prev.NetworkKey
+			}
+			// 私有仓库更新令牌：控制台不提供该输入框，空串一律保留原值
+			// （否则每次「保存节点配置」都会把令牌抹掉）。
+			if req.GitHubToken == "" {
+				req.GitHubToken = prev.GitHubToken
+			}
 			// 连接种子：nil = 页面未提供（保留原值）；显式空串 = 清空（用户把
 			// 输入框删空就是「不配自定义种子」，必须能落盘）；非空必须过校验，
 			// 误填（如 public / 裸节点 ID / 缺 /p2p 组件）在保存那一刻报错，
