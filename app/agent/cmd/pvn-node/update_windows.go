@@ -3,32 +3,37 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"syscall"
-
-	"golang.org/x/sys/windows"
+	"time"
 )
 
-// replaceLockedBinary 用 MoveFileEx 原子替换（可能正被映像锁定的）exe。
+// replaceLockedBinary 替换「可能正被映像锁定的」exe。
 //
-// 为什么不用「改名腾位 + 写入」：lanet.exe 被运行中的节点/托盘进程映射，
-// 删除目标需要 DELETE 访问权，会被 Access is denied 拒绝。MoveFileEx 的
-// REPLACE_EXISTING 在目录项层面原子换名，不打开目标文件，运行中的 exe
-// 也能被替换——新程序在下次进程启动时生效，正在跑的实例不受影响。
-// 残留的 lanet.exe.old 不再需要（没有腾位环节），顺手清掉。
+// 实测（2026-09-26，Windows 11 + go1.26）：
+//   - MoveFileEx(REPLACE_EXISTING) 覆盖一个正被映射的 exe 一律返回 Access is denied，
+//     与调用方是否自己映射它无关（另一个进程映射也一样拒）；
+//   - 纯改名（MoveFile，目标名不存在）对正被映射的 exe **允许**。
+//
+// 所以「原子换名」在自更新场景走不通，只能改名腾位 + 写入：把运行中的旧程序改成
+// 另一个名字，腾出原路径后把新程序写进去。正在跑的实例继续用旧映像，新程序下次
+// 启动生效。
+//
+// 腾位名优先 lanet.exe.old（启动时清理）；若旧名仍被别的进程占用删不掉，就退到
+// 带时间戳的唯一名字——否则 rename 的目标已存在又会触发 REPLACE_EXISTING 被拒。
 func replaceLockedBinary(newExe, exePath string) error {
-	from, err := syscall.UTF16PtrFromString(newExe)
-	if err != nil {
-		return fmt.Errorf("新程序路径非法: %w", err)
+	old := exePath + ".old"
+	if err := os.Remove(old); err != nil && !errors.Is(err, os.ErrNotExist) {
+		old = fmt.Sprintf("%s.old-%d", exePath, time.Now().Unix())
 	}
-	to, err := syscall.UTF16PtrFromString(exePath)
-	if err != nil {
-		return fmt.Errorf("目标路径非法: %w", err)
+	if err := os.Rename(exePath, old); err != nil {
+		return fmt.Errorf("旧程序改名腾位失败: %w", err)
 	}
-	if err := windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
-		return fmt.Errorf("MoveFileEx 替换失败: %w", err)
+	// copyFile 写的是 exePath.part 再改名，同目录内原子落位，不会留下写了一半的程序。
+	if err := copyFile(newExe, exePath); err != nil {
+		_ = os.Rename(old, exePath) // 回滚：旧程序改回原路径
+		return fmt.Errorf("写入新程序失败（已回滚）: %w", err)
 	}
-	_ = os.Remove(exePath + ".old") // 历史版本遗留，替换成功后已无用途
 	return nil
 }
