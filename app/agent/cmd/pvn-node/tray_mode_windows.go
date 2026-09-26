@@ -262,7 +262,7 @@ func readTrayConfig(path string) *trayConfigView {
 		return nil
 	}
 	var cfg trayConfigView
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	if err := decodeConfigJSON(data, &cfg); err != nil {
 		return nil
 	}
 	return &cfg

@@ -57,7 +57,9 @@ func echoProtoFor(groupKey []byte, legacy bool) libprotocol.ID {
 var version = "dev"
 
 func main() {
-	if runUpdateHelper() { return }
+	if runUpdateHelper() {
+		return
+	}
 	// 服务重启辅助进程必须先于 SCM 入口处理。它由正在运行的服务派生，等待
 	// HTTP 响应送达后通过服务管理器执行 stop/start，避免绕过 SCM 拉起孤儿进程。
 	if handled, err := handleWindowsServiceCommand(); handled {
@@ -865,8 +867,8 @@ type nodeConfig struct {
 	// 多网卡噪音。端口必须与实际监听一致——默认随机端口时需先固定 -listen。
 	// 填错的代价：新节点拿不到本机真实地址（已在网好友不受影响，地址簿有
 	// 历史真实地址），控制台 UI 提示了这一点。
-	Advertise       string  `json:"advertise,omitempty"`
-	EnablePublicDHT bool    `json:"enable_public_dht"` // 公共 DHT 兜底开关（默认关闭，v0.5.16 起语义反转）
+	Advertise       string `json:"advertise,omitempty"`
+	EnablePublicDHT bool   `json:"enable_public_dht"` // 公共 DHT 兜底开关（默认关闭，v0.5.16 起语义反转）
 	// PublicDHTMinutes 公共 DHT 临时引导的最长运行分钟数（默认 10）。
 	// 开启公共 DHT 后：连上第一个同群成员立即退出；超时仍未连上也退出。
 	// 控制台可改，重启生效。
@@ -896,23 +898,6 @@ type nodeConfig struct {
 	LegacyProtocols *bool `json:"legacy_protocols,omitempty"`
 
 	bootstrapAddrs []string `json:"-"` // 运行时由 Bootstrap 解析而来
-}
-
-// loadNodeConfig 读取配置文件；不存在或损坏时返回默认配置并尽力生成模板文件。
-// 返回值 created 表示本次是否新生成了模板。
-func loadNodeConfig(path string) (*nodeConfig, bool) {
-	if data, err := os.ReadFile(path); err == nil {
-		var nc nodeConfig
-		if json.Unmarshal(data, &nc) == nil {
-			return &nc, false
-		}
-		log.Printf("[node] 配置文件解析失败（按默认值运行，可删除该文件重新生成）: %s", path)
-	}
-	nc := defaultNodeConfig()
-	if err := nc.save(path); err != nil {
-		log.Printf("[node] 默认配置文件生成失败（不影响启动）: %v", err)
-	}
-	return nc, true
 }
 
 // defaultNodeConfig 开箱即用默认值：节点名、无引导（私有 DHT + mDNS，
@@ -954,7 +939,8 @@ func defaultNodeConfig() *nodeConfig {
 // resolveTriBool 三态布尔解析：显式传值（"true"/"false"/"1"/"0"）优先，
 // 其次配置文件（nil = 未设置），最后默认值。用于审批这类「默认开启、
 // 允许关闭」的开关——不能用 flag.Bool，其零值 false 无法区分未传与显式 false。
-func resolveTriBool(flagVal string, cfgVal *bool, def bool) bool {	switch strings.ToLower(strings.TrimSpace(flagVal)) {
+func resolveTriBool(flagVal string, cfgVal *bool, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(flagVal)) {
 	case "true", "1", "yes", "on":
 		return true
 	case "false", "0", "no", "off":
@@ -992,10 +978,10 @@ func (nc *nodeConfig) save(path string) error {
 // nodeRuntime 当前进程实际生效的运行参数。可能来自命令行/环境变量，
 // 与 lanet.json 保存值不一致（配置页据此提示「重启后才切换」）。
 type nodeRuntime struct {
-	Name             string
-	NetworkKey       string
-	Console          string
-	Listen           string
+	Name       string
+	NetworkKey string
+	Console    string
+	Listen     string
 	// Advertise 自定义对外地址（0.5.66，替换语义；空 = 自动枚举）。
 	Advertise        string
 	Firewall         string
@@ -1026,11 +1012,11 @@ func networkID(networkKey string) string {
 // 它仍返回自动枚举结果（SDK 侧刻意绕开替换），保证用户始终能看到系统默认。
 func nodeConfigRoutes(path string, eff nodeRuntime, nodeRef func() *lanet.Client) map[string]http.HandlerFunc {
 	read := func() nodeConfig {
-		var nc nodeConfig
-		if data, err := os.ReadFile(path); err == nil {
-			_ = json.Unmarshal(data, &nc)
+		nc, err := readNodeConfigFile(path)
+		if err != nil {
+			return nodeConfig{}
 		}
-		return nc
+		return *nc
 	}
 	return map[string]http.HandlerFunc{
 		"GET /api/node-config": func(w http.ResponseWriter, r *http.Request) {
@@ -1050,12 +1036,12 @@ func nodeConfigRoutes(path string, eff nodeRuntime, nodeRef func() *lanet.Client
 				// network_key_env 标记当前进程的网络密钥来自环境变量
 				// LANET_NETWORK_KEY（容器编排常见）：lanet.json 里可能没有该值，
 				// 前端据此把输入框回填为实际生效值，避免「容器里填了密钥、页面上是空的」。
-				"network_key_env":    os.Getenv("LANET_NETWORK_KEY") != "",
-				"bootstrap":          nc.Bootstrap,
-				"console":            nc.Console,
-				"has_password":       nc.ConsolePassword != "",
-				"firewall":           nc.Firewall,
-				"listen":             nc.Listen,
+				"network_key_env": os.Getenv("LANET_NETWORK_KEY") != "",
+				"bootstrap":       nc.Bootstrap,
+				"console":         nc.Console,
+				"has_password":    nc.ConsolePassword != "",
+				"firewall":        nc.Firewall,
+				"listen":          nc.Listen,
 				// advertise 自定义对外地址（替换语义）：文件保存值；空 = 自动枚举。
 				// system_addrs 系统自动枚举的分享地址（IP:端口），供输入框默认
 				// 填充与「恢复默认」；runtime.advertise 当前进程实际生效值。

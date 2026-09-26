@@ -117,9 +117,9 @@ func sharedCheckUpdate(ctx context.Context, force bool) error {
 
 // readConfigToken 从 lanet.json 读 github_token（检查私有仓库更新用）。
 func readConfigToken(path string) string {
-	var nc nodeConfig
-	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &nc)
+	nc, err := readNodeConfigFile(path)
+	if err != nil {
+		return ""
 	}
 	return nc.GitHubToken
 }
