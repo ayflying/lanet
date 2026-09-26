@@ -460,6 +460,9 @@ ICMP 没有端口：`deny-all` 或没有匹配协议规则的 `allow-list` 会�
 需要手工换一次程序（把旧 exe 改名腾位后放入新版），此后即可正常自更新。
 
 手工复现「暂存 → 重启切换」：`tools/lanet-stage-update.ps1 -Candidate <新程序> -InstallDir <安装目录>`。
+0.5.77 及更早的 Windows 节点自更新必然失败，用
+`tools/lanet-bootstrap-upgrade.ps1 -ReleaseZip <发行包> -InstallDir <安装目录> -Restart`
+手工换一次：脚本按包内 `manifest.json` 校验摘要，旧程序改名留作回滚，换完后自更新恢复正常。
 
 ### P2P 自动更新
 

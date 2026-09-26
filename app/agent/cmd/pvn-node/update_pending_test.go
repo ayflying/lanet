@@ -353,6 +353,20 @@ func TestApplyPendingUpdateRollsBackWhenMarkerCleanupFails(t *testing.T) {
 	}
 }
 
+// TestWriteAtomicCleansTempOnRenameFailure 原子写入的改名失败（目标被占用：真机
+// 上就是运行中进程锁住的 wintun.dll）不能把 .part 残留在安装目录里。
+func TestWriteAtomicCleansTempOnRenameFailure(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "wintun.dll")
+	if err := os.Mkdir(dest, 0o755); err != nil { // 目标是目录：改名必然失败
+		t.Fatal(err)
+	}
+	if err := writeAtomic(dest, strings.NewReader("dll-bytes")); err == nil {
+		t.Fatal("目标是目录时必须报错")
+	}
+	assertNotExist(t, dest+".part")
+}
+
 func envHas(env []string, want string) bool {
 	for _, e := range env {
 		if e == want {

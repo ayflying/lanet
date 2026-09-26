@@ -646,7 +646,12 @@ func writeAtomic(dest string, r io.Reader) error {
 	if err = fh.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, dest)
+	if err = os.Rename(tmp, dest); err != nil {
+		// 目标被占用（如运行中进程锁定的 wintun.dll）时不能把 .part 留在安装目录。
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func copyFile(src, dst string) error {
