@@ -58,6 +58,28 @@ func TestPruneUnreachableAddrs(t *testing.T) {
 
 // 写入侧闸门：拨号失败结果里的不可达地址连记录都不该留（它们永远拨不通，
 // 留着只会让每次「按 ID 连接」多试一条）。
+func TestFilterDialableAddrsNeverRestoresOverlayOrCircuit(t *testing.T) {
+	got := FilterDialableAddrs([]string{
+		"/ip4/10.7.1.2/tcp/4001",
+		"/ip6/fd00:6c61:6e65::1234/tcp/4001",
+		"/ip4/43.136.124.167/tcp/4001/p2p-circuit",
+	})
+	if len(got) != 0 {
+		t.Fatalf("overlay/circuit 不得经保底回退，实际 %v", got)
+	}
+}
+
+func TestFilterDialableAddrsKeepsWeakAddressFallback(t *testing.T) {
+	weak := "/ip6/fe80::1/tcp/4001"
+	got := FilterDialableAddrs([]string{
+		"/ip6/fd00:6c61:6e65::1234/tcp/4001",
+		weak,
+	})
+	if len(got) != 1 || got[0] != weak {
+		t.Fatalf("应回退到非 overlay 的弱地址，实际 %v", got)
+	}
+}
+
 func TestNoteDialResultRejectsUnreachable(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()

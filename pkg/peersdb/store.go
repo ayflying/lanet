@@ -634,9 +634,22 @@ func FilterDialableAddrs(in []string) []string {
 		out = append(out, a)
 	}
 	if len(out) == 0 && len(in) > 0 {
-		return []string{in[0]}
+		// 仅对可尝试的弱地址保底；绝不能把 overlay/circuit 重新放回拨号列表。
+		for _, a := range in {
+			if !isOverlayOrCircuitAddr(a) {
+				return []string{a}
+			}
+		}
 	}
 	return out
+}
+
+func isOverlayOrCircuitAddr(addr string) bool {
+	if strings.Contains(addr, "/p2p-circuit") {
+		return true
+	}
+	ip, ok := addrIP(addr)
+	return ok && isLanetOverlayIP(ip)
 }
 
 // isStructurallyDialable 判断单个地址文本是否值得尝试拨号（无 IP 段者一律保留，
