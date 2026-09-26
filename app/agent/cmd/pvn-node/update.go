@@ -768,6 +768,13 @@ func writeAtomicBytes(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
+// 失败路径的注入点：替换失败、标记清理失败都会走回滚，必须能被测试人为触发
+// （与 p2pupdate.go 的 installP2PBinary / distManifestInstaller 同一套做法）。
+var (
+	installPendingBinary = installNewBinary
+	removePendingMarker  = os.Remove
+)
+
 // applyPendingUpdate 在旧程序已退出的更新辅助进程中调用；摘要不匹配时拒绝切换。
 //
 // 自愈：标记损坏、标记非法、候选缺失都属于「永远应用不了」的残留状态，直接丢弃
@@ -812,11 +819,11 @@ func applyPendingUpdate(exePath string) (bool, error) {
 	if err := copyFile(exePath, backup); err != nil {
 		return false, fmt.Errorf("备份旧程序失败: %w", err)
 	}
-	if err := installNewBinary(candidate, exePath); err != nil {
+	if err := installPendingBinary(candidate, exePath); err != nil {
 		_ = os.Remove(backup)
 		return false, err
 	}
-	if err := os.Remove(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := removePendingMarker(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		if rollbackErr := restoreBackup(exePath); rollbackErr != nil {
 			return false, fmt.Errorf("清理待更新标记失败且回滚失败（%v）: %w", rollbackErr, err)
 		}

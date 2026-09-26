@@ -277,6 +277,82 @@ func TestUpdateHelperDoneEnvBreaksSpawnStorm(t *testing.T) {
 	}
 }
 
+// TestApplyPendingUpdateBackupFailureKeepsState 备份旧程序失败时不得切换：
+// 既不能改动当前程序，也不能清掉候选与标记（下一轮还能重试）。
+func TestApplyPendingUpdateBackupFailureKeepsState(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "lanet.exe")
+	if err := os.Mkdir(exe, 0o755); err != nil { // exe 是目录 → 备份复制必然失败
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "v2.exe"), "v2-binary")
+	if err := stageNewBinary(filepath.Join(dir, "v2.exe"), exe); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := applyPendingUpdate(exe)
+	if err == nil || updated {
+		t.Fatalf("备份失败必须拒绝切换：updated=%v err=%v", updated, err)
+	}
+	if got := readFile(t, pendingUpdatePath(exe)); got != "v2-binary" {
+		t.Fatalf("备份失败不应丢弃候选：%q", got)
+	}
+	if _, err := os.Stat(pendingUpdateMarkerPath(exe)); err != nil {
+		t.Fatalf("备份失败不应丢弃标记：%v", err)
+	}
+}
+
+// TestApplyPendingUpdateCleansBackupOnInstallFailure 替换失败要清掉本轮备份：
+// 留着它就是一个「指向旧版本」的假回滚点，下次启动失败回滚会误用。
+func TestApplyPendingUpdateCleansBackupOnInstallFailure(t *testing.T) {
+	dir, exe := seedPendingDir(t)
+	writeFile(t, filepath.Join(dir, "v2.exe"), "v2-binary")
+	if err := stageNewBinary(filepath.Join(dir, "v2.exe"), exe); err != nil {
+		t.Fatal(err)
+	}
+	orig := installPendingBinary
+	t.Cleanup(func() { installPendingBinary = orig })
+	installPendingBinary = func(_, _ string) error { return errors.New("替换失败") }
+
+	updated, err := applyPendingUpdate(exe)
+	if err == nil || updated {
+		t.Fatalf("替换失败必须拒绝切换：updated=%v err=%v", updated, err)
+	}
+	if got := readFile(t, exe); got != "old-binary" {
+		t.Fatalf("替换失败时改动了当前程序：%q", got)
+	}
+	assertNotExist(t, exe+".rollback")
+	if got := readFile(t, pendingUpdatePath(exe)); got != "v2-binary" {
+		t.Fatalf("替换失败应保留候选以便重试：%q", got)
+	}
+}
+
+// TestApplyPendingUpdateRollsBackWhenMarkerCleanupFails 程序已换成新版、但标记
+// 清理失败时必须回滚：否则「磁盘是新版、标记还在」会让下一轮再替换一次。
+func TestApplyPendingUpdateRollsBackWhenMarkerCleanupFails(t *testing.T) {
+	dir, exe := seedPendingDir(t)
+	writeFile(t, filepath.Join(dir, "v2.exe"), "v2-binary")
+	if err := stageNewBinary(filepath.Join(dir, "v2.exe"), exe); err != nil {
+		t.Fatal(err)
+	}
+	orig := removePendingMarker
+	t.Cleanup(func() { removePendingMarker = orig })
+	removePendingMarker = func(path string) error {
+		if path == pendingUpdateMarkerPath(exe) {
+			return errors.New("标记清理失败")
+		}
+		return os.Remove(path)
+	}
+
+	updated, err := applyPendingUpdate(exe)
+	if err == nil || updated {
+		t.Fatalf("标记清理失败必须报错并回滚：updated=%v err=%v", updated, err)
+	}
+	if got := readFile(t, exe); got != "old-binary" {
+		t.Fatalf("标记清理失败后未回滚：%q", got)
+	}
+}
+
 func envHas(env []string, want string) bool {
 	for _, e := range env {
 		if e == want {
