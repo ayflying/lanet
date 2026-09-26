@@ -659,24 +659,38 @@ func copyFile(src, dst string) error {
 }
 
 // installNewBinary 把解出的新程序落到 exePath，兼容「旧程序正在运行」场景。
-//
-// Windows：lanet.exe 被进程映像锁住（本节点/托盘伴侣都在跑它），Go 的
-// os.Rename 对已存在目标会先 os.Remove——删除需要目标的 DELETE 访问权，
-// 被锁即 Access denied（0.5.72 升级实证）。改用 Win32 MoveFileEx 的
-// REPLACE_EXISTING：它走目录项原子替换，不打开目标文件，正在运行的 exe
-// 也能换名（新程序下次启动生效）。非 Windows 无此锁，直接改名腾位再写入。
+// 平台差异全部收敛在 replaceLockedBinary（见该函数注释里的 Windows 实测记录）。
 func installNewBinary(newExe, exePath string) error {
-	if runtime.GOOS == "windows" {
-		return replaceLockedBinary(newExe, exePath)
+	return replaceLockedBinary(newExe, exePath)
+}
+
+// replaceLockedBinary 替换「可能正被映像锁定的」exe：改名腾位 + 写入。
+//
+// Windows 实测（2026-09-26，Windows 11 + go1.26，直接对正被进程映射的 exe 调 Win32）：
+//   - MoveFileEx(REPLACE_EXISTING) 覆盖被映射的 exe 一律返回 Access is denied，
+//     与调用方自己是否映射它无关（另一个进程映射也一样拒）；
+//   - 纯改名（MoveFile，目标名不存在）对正被映射的 exe **允许**。
+//
+// 所以「目录项原子换名」在自更新里走不通（0.5.72~0.5.77 押注它能换运行中的 exe，
+// 结果是凡目标正在运行就替换失败、点更新升不上去）：只能先把运行中的旧程序改成
+// 别的名字腾出原路径，再把新程序写进去。正在跑的实例继续用旧映像，新程序下次启动
+// 生效。
+//
+// 腾位名优先 exePath+".old"（启动时清理）；该名字仍被别的进程占用删不掉时，退到带
+// 时间戳的唯一名字——否则 rename 的目标已存在，又会走 REPLACE_EXISTING 被映像锁
+// 拒绝。写入失败把旧程序改回原路径回滚。
+func replaceLockedBinary(newExe, exePath string) error {
+	old := exePath + ".old"
+	if err := os.Remove(old); err != nil && !errors.Is(err, os.ErrNotExist) {
+		old = fmt.Sprintf("%s.old-%d", exePath, time.Now().Unix())
 	}
-	oldPath := exePath + ".old"
-	_ = os.Remove(oldPath)
-	if err := os.Rename(exePath, oldPath); err != nil {
-		return fmt.Errorf("旧程序改名失败: %w", err)
+	if err := os.Rename(exePath, old); err != nil {
+		return fmt.Errorf("旧程序改名腾位失败: %w", err)
 	}
+	// copyFile 写的是 exePath.part 再改名，同目录内原子落位，不会留下写了一半的程序。
 	if err := copyFile(newExe, exePath); err != nil {
-		_ = os.Rename(oldPath, exePath) // 回滚
-		return fmt.Errorf("写入新程序失败: %w", err)
+		_ = os.Rename(old, exePath) // 回滚：旧程序改回原路径
+		return fmt.Errorf("写入新程序失败（已回滚）: %w", err)
 	}
 	return nil
 }
@@ -686,13 +700,7 @@ func restoreBackup(exePath string) error {
 	if _, err := os.Stat(backup); err != nil {
 		return err
 	}
-	if runtime.GOOS == "windows" {
-		return replaceLockedBinary(backup, exePath)
-	}
-	if err := os.Remove(exePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return os.Rename(backup, exePath)
+	return replaceLockedBinary(backup, exePath)
 }
 
 // stageNewBinary 将候选程序原子落到安装目录并写待更新标记；旧程序不被触碰。

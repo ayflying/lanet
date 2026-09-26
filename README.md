@@ -440,6 +440,27 @@ ICMP 没有端口：`deny-all` 或没有匹配协议规则的 `allow-list` 会�
   `.2`、`.3`，最旧的一份删除（最多约 40MB）。为避免「一启动就写爆」，启动时若
   历史日志已超限会先轮转一次——升级后首次启动即会把遗留的巨型日志挪走。
 
+### GitHub 在线更新（控制台一键升级）
+
+控制台「更新」弹框走 GitHub Releases：查最新版本 → 下载本平台发行包 → 用发行包内
+`sha256sums.txt` 校验 SHA-256（**缺清单即拒绝**，fail-closed）→ **先暂存、后切换**
+（0.5.76 起）：
+
+1. 校验通过的程序落到安装目录的固定暂存名 `lanet.exe.pending`，并写
+   `lanet.exe.pending.json`（候选 SHA-256）；
+2. 重启时消费：普通模式由更新辅助进程（`-update-helper`）完成替换；Windows 服务
+   模式由 `-service-restart` 在 SCM stop 之后、start 之前替换；
+3. 替换前把当前程序备份成 `lanet.exe.rollback`；服务模式启动失败自动回滚重试。
+
+替换**正在运行**的 exe 在 Windows 上只能「改名腾位 + 写入」（0.5.78 起，真机实测）：
+`MoveFileEx(REPLACE_EXISTING)` 覆盖被进程映射的 exe 一律 `Access is denied`（与调用方
+是否自己映射无关），而纯改名允许——旧程序因此留在 `lanet.exe.old`，下次启动时清理。
+暂存件损坏、候选缺失、摘要不符都会自愈（丢掉不可用状态、继续启动当前版本），不会把
+节点卡在「更新失败又起不来」的状态；0.5.73 及更早版本的程序替换逻辑本身就是坏的，
+需要手工换一次程序（把旧 exe 改名腾位后放入新版），此后即可正常自更新。
+
+手工复现「暂存 → 重启切换」：`tools/lanet-stage-update.ps1 -Candidate <新程序> -InstallDir <安装目录>`。
+
 ### P2P 自动更新
 
 官方裸机二进制强制启用签名 P2P 更新。节点发现同平台新版本后，从一个已持有该
@@ -606,6 +627,7 @@ pkg/
   gatewayproto/             ws-gateway 二进制帧协议
 build/                      容器镜像 Dockerfile
 packaging/                  发行包说明、图标与 Windows 清单
+tools/                      运维脚本（节点测试包装、暂存更新注入）
 ```
 
 主要依赖：Go 1.25、GoFrame v2、go-libp2p v0.49、kad-dht v0.42、wireguard/tun。
