@@ -415,7 +415,8 @@
       <button class="ghost" id="cAdvertiseReset" onclick="resetAdvertise()" style="margin-left:8px;white-space:nowrap">恢复默认</button>
     </div>
     <div class="sub" id="cAdvertiseHint" style="display:none;color:#8a94a6;margin:-1px 0 6px 88px"></div>
-    <div class="kv"><b>连接种子</b><input type="text" id="cBootstrap" placeholder="已在网成员的连接种子（多行 / 逗号分隔）；留空或 none = 仅私有 DHT + mDNS"></div>
+    <div class="kv"><b>连接种子</b><input type="text" id="cBootstrap" placeholder="留空 = 不使用自定义种子（仅私有 DHT + mDNS）；填已在网成员的连接种子，多个用逗号分隔" oninput="bootstrapPasteHint()"></div>
+    <div class="sub" id="cBootstrapHint" style="display:none;margin:-1px 0 6px 88px"></div>
     <div class="row" style="margin-top:10px;flex-wrap:wrap;gap:12px;align-items:center">
       <label style="display:flex;gap:6px;align-items:center">
         <input type="checkbox" id="cEnablePublic" onchange="togglePublicDHT()"> 启用公共 DHT 临时引导
@@ -873,6 +874,40 @@ function seedCheck(seed) {
   return '看不出这是连接种子。请让对方在控制台复制「我的连接码」（lanet://…）粘贴到这里，或粘贴 /ip4/ 开头的完整连接种子。';
 }
 
+// seedSpecCheck 校验「节点配置 → 连接种子」输入：逗号分隔的 multiaddr，允许留空。
+// 与后端 p2pkit.ValidateSeedSpec 同一套规则（前端先拦一道，少一次往返）：
+// 只接受能确定对端身份的地址，历史字面量 none / public 判为非法并指向
+// 「公共 DHT 临时引导」开关。返回错误文案，OK 返回空串。
+function seedSpecCheck(spec) {
+  for (const raw of String(spec).split(',')) {
+    const s = raw.trim();
+    if (!s) continue;
+    if (s === 'none' || s === 'public') {
+      return '「' + s + '」不是连接种子地址：留空即可；跨网冷启动请用上面的「公共 DHT 临时引导」开关。';
+    }
+    if (!s.startsWith('/')) {
+      return '「' + s + '」不是连接种子地址：应以 /ip4/、/ip6/、/dns4/ 或 /dnsaddr/ 开头。';
+    }
+    if (s.startsWith('/dnsaddr/')) continue; // dnsaddr 由 DNS TXT 展开，展开项自带 /p2p
+    if (!s.includes('/p2p/')) {
+      return '「' + s + '」缺少 /p2p/<节点ID> 组件，无法确定对端身份。';
+    }
+  }
+  return '';
+}
+
+// bootstrapPasteHint 连接种子输入框的即时反馈（与运行时「添加节点」的
+// seedCheck 区分：那里引导用户改用连接码，这里只判断是不是一条种子地址）。
+function bootstrapPasteHint() {
+  const el = $('cBootstrapHint');
+  const s = $('cBootstrap').value.trim();
+  if (!s) { el.style.display = 'none'; return; }
+  const bad = seedSpecCheck(s);
+  el.style.display = '';
+  el.style.color = bad ? '#d9534f' : '#2fa65a';
+  el.textContent = bad || '格式看起来正确，点「保存节点配置」并重启程序后生效。';
+}
+
 // seedPasteHint 粘贴后即时给出反馈，减少「粘了但不敢点」的犹豫。
 function seedPasteHint() {
   const s = $('seedInput').value.trim();
@@ -1257,7 +1292,21 @@ async function loadNodeConfig() {
     } else {
       advHint.style.display = 'none';
     }
-    $('cBootstrap').value = (c.bootstrap && c.bootstrap !== 'none') ? c.bootstrap : '';
+    const bs = (c.bootstrap || '').trim();
+    // 连接种子只认地址或留空：历史配置里的 none / public 不再是合法值
+    // （公共引导改由「公共 DHT 临时引导」开关决定），这里按留空显示并说明，
+    // 避免用户看到 public 以为它还在生效。
+    const bsLegacy = (bs === 'none' || bs === 'public');
+    $('cBootstrap').value = bsLegacy ? '' : bs;
+    const bsHint = $('cBootstrapHint');
+    if (bsLegacy) {
+      bsHint.style.display = '';
+      bsHint.style.color = '#d9534f';
+      bsHint.textContent = '配置里的连接种子是「' + bs + '」，已不再生效（连接种子只接受地址或留空）；' +
+        '跨网冷启动请改用上面的「公共 DHT 临时引导」。保存本页即按留空落盘。';
+    } else {
+      bsHint.style.display = 'none';
+    }
     $('cPublicMin').value = c.public_dht_minutes || 10;
     // 复选框 = 配置意图（下次启动是否自动开启），与运行时状态解耦：
     // 运行中/已退出只影响徽标，不再回写复选框。
@@ -1299,7 +1348,8 @@ async function saveNodeConfig() {
     listen: $('cListen').value.trim(),
     // 对外地址多行输入框：换行归一化成逗号再提交（后端校验按逗号分隔）。
     advertise: $('cAdvertise').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean).join(','),
-    bootstrap: ($('cBootstrap').value.trim() || 'none'),
+    // 连接种子只提交地址本身：空串 = 清空（不再写 none 这类字面量）。
+    bootstrap: $('cBootstrap').value.trim(),
     enable_public_dht: cfgPublicDHT,
     public_dht_minutes: parseInt($('cPublicMin').value, 10) || 10,
     tun: $('cTun').checked,
@@ -1308,6 +1358,13 @@ async function saveNodeConfig() {
     autorun: $('cAutorunRow').style.display !== 'none' ? $('cAutorun').checked : undefined,
   };
   if (!body.name || !body.console) { flash('cfgMsg', '节点名称与控制台地址不能为空', false); return; }
+  // 连接种子：非法输入就地拦下（后端同样会校验，这里让错误出现在点击处）。
+  const seedErr = seedSpecCheck(body.bootstrap);
+  if (seedErr) {
+    bootstrapPasteHint();
+    flash('cfgMsg', '连接种子：' + seedErr, false);
+    return;
+  }
   delete body.autorun; // 自启独立即时生效，不随节点配置保存
   const r = await fetch('/api/node-config', { method: 'PUT',
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
