@@ -1,11 +1,12 @@
 # Lanet SDK 总览
 
-Lanet（群组制 P2P 虚拟局域网）对外提供六套 SDK / 接入形态，按运行环境选择：
+Lanet（群组制 P2P 虚拟局域网）对外提供七套 SDK / 接入形态，按运行环境选择：
 
 | SDK | 运行环境 | 接入方式 | 是否真 P2P | 典型场景 |
 |---|---|---|---|---|
 | [Go SDK](./go/lanet/README.md) | Go 程序 / 服务器 | **libp2p 直接入群**（Standalone 或托管模式） | ✅ 端到端 | 后端服务互联、可选 TUN、端口转发节点 |
-| [Web SDK](./web/README.md) | 浏览器 / Node ≥20 | **libp2p 直接入群**（js-libp2p） | ✅ 端到端 | 网页与后端服务直接互开流 |
+| [Web SDK](./web/README.md) | 浏览器 / Node ≥20（需打包器） | **libp2p 直接入群**（js-libp2p） | ✅ 端到端 | 网页与后端服务直接互开流 |
+| [H5 SDK](./h5/README.md) | H5 页面 / 静态站点（免 npm、免打包器） | **libp2p 直接入群**（单文件直引包） | ✅ 端到端 | H5 零构建接入、uni-app 编译到 H5 |
 | [Unity SDK](./unity/README.md) | Unity 2021.3+ | **ws-gateway 网关**（跨平台）／**AAR 直接入群**（仅 Android） | ⚠️ 网关中转 ／ ✅ Android 端到端 | 游戏客户端、桌面应用、手机联机 |
 | [C# SDK](./csharp/README.md) | .NET 8 / MAUI / 任意 .NET | **经 ws-gateway 接入**（WebSocket 帧协议） | ⚠️ 网关中转 | 桌面 / 服务端 .NET 应用 |
 | [uniapp SDK](./uniapp/README.md) | uniapp / 微信小程序 / H5 / App | **经 ws-gateway 接入**（WebSocket 帧协议） | ⚠️ 网关中转 | 小程序、跨端移动应用 |
@@ -14,10 +15,13 @@ Lanet（群组制 P2P 虚拟局域网）对外提供六套 SDK / 接入形态，
 > Unity 包（`sdk/unity`）与 Android 插件包（`sdk/android-plugin`）**共用同一份
 > `lanet-plugin.aar`**：宿主无关逻辑在 `com.lanet.plugin.LanetNode`，uni-app 侧只是
 > DCloud 薄壳，Unity 侧直接 `CallStatic`。改行为只需改一处。
+>
+> H5 包（`sdk/h5`）与 Web SDK（`sdk/web`）同理：**底层 P2P 只有一份实现**，
+> H5 包是它的单文件产物 + H5 便利层（请求-响应、分帧、超时、页面卸载自动下线）。
 
 ## 三种接入链路
 
-### 1. libp2p 直连（Go / Web SDK）
+### 1. libp2p 直连（Go / Web / H5 SDK）
 
 ```
 节点 A ──────────── 直连（ws / webrtc-direct / webtransport / quic）──────────── 节点 B
@@ -78,7 +82,7 @@ Android 本地节点（`sdk/android-plugin`、`sdk/unity` 的链路 2）同样�
 - 小程序场景网关必须走 **wss + 备案域名**（微信平台要求），并在小程序后台配置 socket 合法域名。
 - 网页 SDK 场景：ctl 已内置 CORS 放行；页面为 HTTPS 时 ctl / relay 需配 TLS。
 
-## 通用概念（四个 SDK 一致）
+## 通用概念（各 SDK 一致）
 
 - **群组（Group）**：托管模式中一个群组独占一个 `/24` 子网；Standalone
   不创建中心群组，成员在 `10.7.0.0/16` 内确定性派生虚拟 IP。

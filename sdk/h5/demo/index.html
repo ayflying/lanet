@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lanet H5 SDK demo（单文件直引）</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 24px auto; padding: 0 16px; background: #141414; color: #e6e6e6; }
+  h1 { font-size: 18px; }
+  fieldset { border: 1px solid #333; border-radius: 8px; margin: 12px 0; }
+  legend { font-size: 13px; color: #9ca3af; padding: 0 6px; }
+  label { display: block; margin: 8px 0 4px; font-size: 13px; color: #aaa; }
+  input { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #333; border-radius: 6px; background: #1e1e1e; color: #eee; }
+  button { padding: 8px 16px; margin: 8px 8px 0 0; border: 0; border-radius: 6px; background: #2563eb; color: white; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.ghost { background: #333; }
+  #log { white-space: pre-wrap; background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 12px; min-height: 180px; font: 12px/1.6 ui-monospace, monospace; }
+  .info { font-size: 13px; color: #9ca3af; }
+  code { background: #222; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .warn { border: 1px solid #7f1d1d; background: #2a1516; color: #fca5a5; padding: 12px 14px; border-radius: 8px; font-size: 13px; line-height: 1.8; margin: 12px 0; }
+  .warn a { color: #93c5fd; }
+  .ok { color: #86efac; }
+  .bad { color: #fca5a5; }
+</style>
+</head>
+<body>
+<h1>Lanet H5 节点 demo（单文件直引）</h1>
+<p class="info">
+  本页只引一个文件：<code>../dist/lanet-h5.min.js</code>，加载后全局 <code>Lanet</code> 即可用——
+  免 npm、免打包器、免 importmap。服务端配合 Go echo 节点：
+  <code>go run ./app/agent/cmd/pvn-web-echo</code>（启动日志里会打印邀请码）。
+</p>
+
+<div id="missing" class="warn" hidden>
+  <strong>没找到 dist/lanet-h5.min.js</strong>（<span id="missingDetail"></span>）<br>
+  先在 <code>sdk/h5</code> 目录里构建一次：<br>
+  <code>npm install &amp;&amp; npm run build</code><br>
+  然后刷新本页。若不想构建，改用 <a href="./importmap.html">importmap.html</a>（零构建，依赖走 CDN）。
+</div>
+
+<fieldset>
+  <legend>入网</legend>
+  <label>控制面地址 ctlURL</label>
+  <input id="ctl" value="http://127.0.0.1:8000">
+  <label>邀请码 inviteCode</label>
+  <input id="invite" placeholder="来自 Go echo 节点启动日志">
+  <label>节点名 name（可空）</label>
+  <input id="name" placeholder="h5-demo">
+  <button id="join">加入群组</button>
+  <button id="leave" class="ghost" disabled>下线</button>
+  <div id="status" class="info" style="margin-top:8px"></div>
+</fieldset>
+
+<fieldset>
+  <legend>按虚拟 IP 发请求</legend>
+  <label>目标虚拟 IP（同群 Go echo 节点）</label>
+  <input id="target" placeholder="10.7.0.2">
+  <label>消息</label>
+  <input id="msg" value="hello from h5">
+  <button id="reqText" disabled>requestText（文本）</button>
+  <button id="reqJson" class="ghost" disabled>requestJSON（对象）</button>
+  <button id="dial" class="ghost" disabled>低层 dial（看链路）</button>
+</fieldset>
+
+<fieldset>
+  <legend>成员列表（NetMap）</legend>
+  <button id="refresh" class="ghost" disabled>刷新</button>
+  <pre id="members" class="info" style="margin:10px 0 0">（入网后点刷新）</pre>
+</fieldset>
+
+<div id="log"></div>
+
+<script src="../dist/lanet-h5.min.js"></script>
+<script>
+  const log = line => {
+    const el = document.getElementById('log')
+    const ts = new Date().toTimeString().slice(0, 8)
+    el.textContent += `${ts}  ${line}\n`
+    el.scrollTop = el.scrollHeight
+  }
+  const $ = id => document.getElementById(id)
+
+  // 产物缺失时给出可执行的修复指引，而不是静默失败
+  const Lanet = window.Lanet
+  if (!Lanet) {
+    $('missing').hidden = false
+    $('missingDetail').textContent = '脚本加载失败或文件不存在'
+    log('未检测到全局 Lanet —— 请先构建 dist（见页面顶部提示）')
+    throw new Error('lanet-h5: dist not built')
+  }
+  log(`Lanet H5 SDK v${Lanet.version} 已加载`)
+
+  let node = null
+
+  $('join').onclick = async () => {
+    const ctlURL = $('ctl').value.trim()
+    const inviteCode = $('invite').value.trim()
+    const name = $('name').value.trim() || undefined
+    if (!ctlURL || !inviteCode) { log('ctlURL 与 inviteCode 都要填'); return }
+
+    $('join').disabled = true
+    $('status').textContent = '加入中…'
+    try {
+      node = await Lanet.connect({
+        ctlURL,
+        inviteCode,
+        name,
+        autoClose: true,
+        // 入向流：对端 Go 节点主动 Dial 过来时，这里回个 echo
+        onStream: stream => {
+          log(`[入向流] protocol=${stream.protocol} viaRelay=${stream.viaRelay}`)
+          const chunks = []
+          stream.onMessage(c => chunks.push(c))
+          setTimeout(async () => {
+            const total = chunks.reduce((n, c) => n + c.length, 0)
+            const out = new Uint8Array(total)
+            let off = 0
+            for (const c of chunks) { out.set(c, off); off += c.length }
+            stream.send(out)
+            await stream.closeWrite()
+          }, 300)
+        }
+      })
+      $('status').innerHTML =
+        `<span class="ok">已入网</span> peerId=${node.peerId} 虚拟IP=<b>${node.virtualIP}</b>`
+      log(`[入网] peerId=${node.peerId} virtualIP=${node.virtualIP}`)
+      for (const id of ['leave', 'reqText', 'reqJson', 'dial', 'refresh']) $(id).disabled = false
+    } catch (err) {
+      $('status').innerHTML = `<span class="bad">入网失败：${err.message}</span>`
+      $('join').disabled = false
+      log('[错误] ' + (err.stack ?? err.message))
+    }
+  }
+
+  $('leave').onclick = async () => {
+    try {
+      await node.close()
+      log('[下线] 已关闭节点')
+    } catch (err) {
+      log('[下线错误] ' + err.message)
+    } finally {
+      node = null
+      $('status').textContent = '已下线'
+      $('join').disabled = false
+      for (const id of ['leave', 'reqText', 'reqJson', 'dial', 'refresh']) $(id).disabled = true
+    }
+  }
+
+  // 请求-响应：封装层内部会「发送 → 半关闭写端 → 等对端 EOF」再返回
+  async function doRequest (kind) {
+    const target = $('target').value.trim()
+    if (!target) { log('先填目标虚拟 IP'); return }
+    let viaRelay = null
+    const t0 = performance.now()
+    try {
+      let reply
+      if (kind === 'text') {
+        reply = await node.requestText(target, $('msg').value, { onStream: s => { viaRelay = s.viaRelay } })
+      } else {
+        reply = await node.requestJSON(target, { cmd: 'ping', msg: $('msg').value, ts: Date.now() },
+          { onStream: s => { viaRelay = s.viaRelay } })
+      }
+      const ms = (performance.now() - t0).toFixed(0)
+      const link = viaRelay === null ? '未知' : (viaRelay ? '经中继' : '直连')
+      log(`[${kind === 'text' ? 'requestText' : 'requestJSON'} ${target}] ${link} ${ms}ms 响应=${JSON.stringify(reply)}`)
+    } catch (err) {
+      log(`[${kind} ${target} 失败] ${err.message}`)
+    }
+  }
+  $('reqText').onclick = () => doRequest('text')
+  $('reqJson').onclick = () => doRequest('json')
+
+  // 低层用法：直接拿流，能看清协议号与链路类型
+  $('dial').onclick = async () => {
+    const target = $('target').value.trim()
+    if (!target) { log('先填目标虚拟 IP'); return }
+    const t0 = performance.now()
+    try {
+      const stream = await node.dial(target)
+      log(`[dial ${target}] protocol=${stream.protocol} viaRelay=${stream.viaRelay} 建流耗时=${(performance.now() - t0).toFixed(0)}ms`)
+      const msg = $('msg').value
+      const chunks = []
+      stream.onMessage(c => chunks.push(c))
+      stream.send(new TextEncoder().encode(msg))
+      await stream.closeWrite()
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('echo 超时（10s）')), 10000)
+        const iv = setInterval(() => {
+          const n = chunks.reduce((a, c) => a + c.length, 0)
+          if (n >= new TextEncoder().encode(msg).length) { clearTimeout(t); clearInterval(iv); resolve() }
+        }, 50)
+      })
+      const total = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0))
+      let off = 0
+      for (const c of chunks) { total.set(c, off); off += c.length }
+      log(`[dial] 回显=${JSON.stringify(new TextDecoder().decode(total))} 往返=${(performance.now() - t0).toFixed(0)}ms`)
+      stream.abort()
+    } catch (err) {
+      log('[dial 错误] ' + (err.stack ?? err.message))
+    }
+  }
+
+  $('refresh').onclick = async () => {
+    try {
+      const nm = await node.netmap()
+      const rows = (nm?.members ?? []).map(m => `${m.virtual_ip.padEnd(12)} ${m.name}  (${m.os})`)
+      $('members').textContent = rows.length ? rows.join('\n') : '（无成员）'
+      log(`[netmap] ${rows.length} 个成员`)
+    } catch (err) {
+      log('[netmap 错误] ' + err.message)
+    }
+  }
+</script>
+</body>
+</html>

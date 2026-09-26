@@ -126,9 +126,9 @@ DNS 与 NRPT 规则强制开启、无需任何配置（0.5.11 起，控制台不
 保留，0.5.16 起从成员行按钮改为独立入口）。
 
 **端口转发本地监听（0.5.13 起）**：「端口转发」映射（listen → target）里的每个
-端口会在本节点上真实监听并代理到目标。此前容器节点（如 217 的 lanet-node）只有
+端口会在本节点上真实监听并代理到目标。此前容器节点（如 原构建机 的 lanet-node）只有
 TUN 虚拟 IP 可达，虚拟 IP 上的端口没有进程监听，群内成员访问会被内核直接拒绝
-（ping 通但 TCP 连不上）；现在控制台添加转发 `7860 → 192.168.50.217:7860` 即可
+（ping 通但 TCP 连不上）；现在控制台添加转发 `7860 → <原构建机>:7860` 即可
 让 `http://<虚拟IP>:7860` 直接可用。转发映射热更新，监听随映射增删同步启停。
 
 命令行参数会覆盖 `lanet.json`。`bootstrap` 默认 `none`（不接触任何公共设施）；
@@ -469,20 +469,22 @@ ICMP 没有端口：`deny-all` 或没有匹配协议规则的 `allow-list` 会�
 
 ## SDK
 
-Lanet 提供六套 SDK / 接入形态：
+Lanet 提供七套 SDK / 接入形态：
 
 | SDK | 接入方式 | TUN | 典型场景 |
 |---|---|:---:|---|
 | [Go SDK](./sdk/go/lanet/README.md) | libp2p 直连；支持 Standalone 或托管模式 | 可选 | Go 服务、原生节点、端口转发 |
-| [Web SDK](./sdk/web/README.md) | 浏览器/Node 直接运行 js-libp2p | 否 | 网页与 Go 节点互开流 |
+| [Web SDK](./sdk/web/README.md) | 浏览器/Node 直接运行 js-libp2p（需打包器） | 否 | 网页与 Go 节点互开流 |
+| [H5 SDK](./sdk/h5/README.md) | libp2p 直连；**单文件 `<script>` 直引，免 npm / 免打包器** | 否 | H5 页面、静态站点、uni-app 编译到 H5 |
 | [Unity SDK](./sdk/unity/README.md) | ws-gateway 网关（跨平台）；或 AAR 直接入群（仅 Android） | Android 是 | Unity 游戏客户端、手机联机 |
 | [C# SDK](./sdk/csharp/README.md) | 经 ws-gateway 接入 | 否 | .NET、MAUI、桌面应用 |
 | [uniapp SDK](./sdk/uniapp/README.md) | 经 ws-gateway 接入 | 否 | 小程序、H5、跨端应用 |
 | [Android 原生插件](./sdk/android-plugin/README.md) | AAR 直接入群（VpnService + gomobile） | 是 | 手机成为网络成员、uni-app 云打包 |
 
-选择指南和三种接入链路见 [`sdk/README.md`](./sdk/README.md)。浏览器、C# 和
+选择指南和三种接入链路见 [`sdk/README.md`](./sdk/README.md)。浏览器、H5、C# 和
 uniapp 当前使用托管模式；Go SDK 可直接创建与官方节点同能力的 Standalone 节点；
-Android 插件与 Unity 的 Android 链路复用同一份 `lanet-plugin.aar`，**无需任何服务端组件**。
+Android 插件与 Unity 的 Android 链路复用同一份 `lanet-plugin.aar`，**无需任何服务端组件**；
+H5 SDK（`sdk/h5`）是 Web SDK 的单文件产物 + H5 便利层，底层 P2P 同样只有一份实现。
 
 ## 托管模式运维
 
@@ -587,6 +589,7 @@ app/
 sdk/
   go/lanet/                 Go SDK
   web/                      浏览器/Node SDK
+  h5/                       H5 单文件直引包（Web SDK 的产物 + H5 便利层）
   csharp/                   .NET/MAUI SDK（ws-gateway 客户端）
   uniapp/                   uniapp/小程序 SDK（ws-gateway 客户端）
   android/                  gomobile 绑定层（com.lanet.mobile.Node）

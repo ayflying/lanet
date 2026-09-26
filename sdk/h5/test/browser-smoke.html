@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>browser-smoke-pending</title>
+<style>
+  body { font: 14px/1.6 ui-monospace, Consolas, monospace; padding: 16px; }
+  #out { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<pre id="out">启动中…</pre>
+<script src="../dist/lanet-h5.min.js"></script>
+<script>
+/*
+ * H5 浏览器端到端冒烟测试页。
+ *
+ * 用法：起一个静态服务器托管 sdk/h5，然后用无头浏览器打开
+ *   test/browser-smoke.html?ctl=http://127.0.0.1:8000&code=<邀请码>&ip=<目标虚拟IP>
+ *
+ * 结果同时写到 document.title、页面 DOM，以及回传给服务器的
+ * `/__smoke_result?status=…&msg=…` 请求（服务器日志里能看到，便于无头环境取证）。
+ */
+(function () {
+  var q = new URLSearchParams(location.search)
+  var out = document.getElementById('out')
+  var lines = []
+
+  function log (m) {
+    lines.push(m)
+    out.textContent = lines.join('\n')
+    console.log('[smoke] ' + m)
+  }
+
+  function report (status, msg) {
+    document.title = status + ': ' + msg
+    try {
+      fetch('/__smoke_result?status=' + status + '&msg=' + encodeURIComponent(msg),
+        { mode: 'no-cors' }).catch(function () {})
+    } catch (e) { /* 忽略 */ }
+  }
+
+  async function main () {
+    var L = window.Lanet
+    log('window.Lanet = ' + typeof L)
+    if (!L) { report('FAIL', 'no-global-Lanet'); return }
+    log('包版本 VERSION = ' + L.VERSION)
+
+    // 本机测试环境全是「内网地址 + 明文 ws」，浏览器默认闸门会全拒 —— 显式开豁免。
+    var node = await L.connect({
+      ctlURL: q.get('ctl'),
+      inviteCode: q.get('code'),
+      name: q.get('name') || 'h5-browser-smoke',
+      allowPrivateAddresses: true,
+      allowInsecureWebSockets: true,
+      retries: 6,
+      retryDelay: 4000,
+      requestTimeout: 8000,
+      retryOnTimeout: true
+    })
+    log('入网成功，虚拟 IP = ' + node.virtualIP + '，peerId = ' + node.peerId)
+
+    var t0 = Date.now()
+    var r = await node.requestText(q.get('ip'), 'browser-hello-' + Date.now())
+    log('requestText 往返 ' + (Date.now() - t0) + 'ms -> ' + JSON.stringify(r))
+    report('PASS', r)
+
+    await node.close()
+    log('close() 返回，测试结束')
+  }
+
+  main().catch(function (e) {
+    log('FAIL ' + (e && e.message))
+    report('FAIL', (e && e.message) || 'unknown')
+  })
+})()
+</script>
+</body>
+</html>

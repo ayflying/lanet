@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lanet H5 SDK demo（零构建 / importmap）</title>
+
+<!--
+  零构建版：不依赖 dist/，直接跑 sdk/h5/src 源码。
+  裸模块名由 importmap 解析：lanet 自家包走本地相对路径，libp2p 全家桶走 esm.sh CDN。
+  必须经 HTTP 打开（ESM + importmap 在 file:// 下会被 CORS 拦）：
+      cd sdk/h5 && npx serve .
+  然后访问 /demo/importmap.html
+-->
+<script type="importmap">
+{
+  "imports": {
+    "@lanet/sdk-web": "../../web/src/index.js",
+    "@lanet/sdk-h5": "../src/index.js",
+    "libp2p": "https://esm.sh/libp2p@3.3.11",
+    "@chainsafe/libp2p-noise": "https://esm.sh/@chainsafe/libp2p-noise@17.0.0",
+    "@chainsafe/libp2p-yamux": "https://esm.sh/@chainsafe/libp2p-yamux@8.0.1",
+    "@libp2p/circuit-relay-v2": "https://esm.sh/@libp2p/circuit-relay-v2@4.2.13",
+    "@libp2p/identify": "https://esm.sh/@libp2p/identify@4.1.14",
+    "@libp2p/webrtc": "https://esm.sh/@libp2p/webrtc@6.0.32",
+    "@libp2p/webtransport": "https://esm.sh/@libp2p/webtransport@6.0.39",
+    "@libp2p/websockets": "https://esm.sh/@libp2p/websockets@10.1.21",
+    "@multiformats/multiaddr": "https://esm.sh/@multiformats/multiaddr@13.0.3"
+  }
+}
+</script>
+
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 24px auto; padding: 0 16px; background: #141414; color: #e6e6e6; }
+  h1 { font-size: 18px; }
+  fieldset { border: 1px solid #333; border-radius: 8px; margin: 12px 0; }
+  legend { font-size: 13px; color: #9ca3af; padding: 0 6px; }
+  label { display: block; margin: 8px 0 4px; font-size: 13px; color: #aaa; }
+  input { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #333; border-radius: 6px; background: #1e1e1e; color: #eee; }
+  button { padding: 8px 16px; margin: 8px 8px 0 0; border: 0; border-radius: 6px; background: #2563eb; color: white; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.ghost { background: #333; }
+  #log { white-space: pre-wrap; background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 12px; min-height: 180px; font: 12px/1.6 ui-monospace, monospace; }
+  .info { font-size: 13px; color: #9ca3af; }
+  code { background: #222; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>Lanet H5 节点 demo（零构建 / importmap）</h1>
+<p class="info">
+  本页不依赖 <code>dist/</code>，直接跑 <code>src/</code> 源码：<code>@lanet/sdk-web</code> 指向
+  <code>../../web/src/index.js</code>，libp2p 全家桶指向 esm.sh CDN。
+  <b>首屏要多等一会</b>（CDN 拉 200+ 模块）。生产环境请用 <a href="./index.html">index.html</a>（单文件产物）。
+</p>
+
+<fieldset>
+  <legend>入网</legend>
+  <label>控制面地址 ctlURL</label>
+  <input id="ctl" value="http://127.0.0.1:8000">
+  <label>邀请码 inviteCode</label>
+  <input id="invite" placeholder="来自 Go echo 节点启动日志">
+  <button id="join">加入群组</button>
+  <button id="leave" class="ghost" disabled>下线</button>
+  <div id="status" class="info" style="margin-top:8px"></div>
+</fieldset>
+
+<fieldset>
+  <legend>请求-响应</legend>
+  <label>目标虚拟 IP</label>
+  <input id="target" placeholder="10.7.0.2">
+  <label>消息</label>
+  <input id="msg" value="hello from h5 (importmap)">
+  <button id="reqText" disabled>requestText</button>
+  <button id="reqJson" class="ghost" disabled>requestJSON</button>
+</fieldset>
+
+<div id="log"></div>
+
+<script type="module">
+  const log = line => {
+    const el = document.getElementById('log')
+    el.textContent += `${new Date().toTimeString().slice(0, 8)}  ${line}\n`
+    el.scrollTop = el.scrollHeight
+  }
+  const $ = id => document.getElementById(id)
+
+  let connect, VERSION
+  try {
+    const mod = await import('@lanet/sdk-h5')
+    connect = mod.connect
+    VERSION = mod.VERSION
+    log(`已从源码加载 H5 SDK v${VERSION}（零构建模式）`)
+  } catch (err) {
+    log('加载失败：' + err.message)
+    log('请确认：1) 经 HTTP 打开（npx serve .）2) 能访问 esm.sh')
+    throw err
+  }
+
+  let node = null
+
+  $('join').onclick = async () => {
+    const ctlURL = $('ctl').value.trim()
+    const inviteCode = $('invite').value.trim()
+    if (!ctlURL || !inviteCode) { log('ctlURL 与 inviteCode 都要填'); return }
+    $('join').disabled = true
+    $('status').textContent = '加入中…'
+    try {
+      node = await connect({ ctlURL, inviteCode, name: 'h5-importmap' })
+      $('status').textContent = `已入网 peerId=${node.peerId} 虚拟IP=${node.virtualIP}`
+      log(`[入网] peerId=${node.peerId} virtualIP=${node.virtualIP}`)
+      $('leave').disabled = false
+      $('reqText').disabled = false
+      $('reqJson').disabled = false
+    } catch (err) {
+      $('status').textContent = '入网失败：' + err.message
+      $('join').disabled = false
+      log('[错误] ' + (err.stack ?? err.message))
+    }
+  }
+
+  $('leave').onclick = async () => {
+    await node.close()
+    node = null
+    $('status').textContent = '已下线'
+    $('join').disabled = false
+    $('leave').disabled = true
+    $('reqText').disabled = true
+    $('reqJson').disabled = true
+  }
+
+  async function doRequest (kind) {
+    const target = $('target').value.trim()
+    if (!target) { log('先填目标虚拟 IP'); return }
+    let viaRelay = null
+    const t0 = performance.now()
+    try {
+      const reply = kind === 'text'
+        ? await node.requestText(target, $('msg').value, { onStream: s => { viaRelay = s.viaRelay } })
+        : await node.requestJSON(target, { cmd: 'ping', ts: Date.now() }, { onStream: s => { viaRelay = s.viaRelay } })
+      const link = viaRelay === null ? '未知' : (viaRelay ? '经中继' : '直连')
+      log(`[${kind} ${target}] ${link} ${(performance.now() - t0).toFixed(0)}ms 响应=${JSON.stringify(reply)}`)
+    } catch (err) {
+      log(`[${kind} ${target} 失败] ${err.message}`)
+    }
+  }
+  $('reqText').onclick = () => doRequest('text')
+  $('reqJson').onclick = () => doRequest('json')
+</script>
+</body>
+</html>

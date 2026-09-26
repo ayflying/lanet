@@ -32,10 +32,22 @@ export const PROTOCOL_TUNNEL = '/pvn/tunnel/1.0.0'
  * @param {string} [options.name]       节点名称（默认随机）
  * @param {string} [options.os]         OS 标识（默认 "browser"）
  * @param {string[]} [options.relayAddrs] 显式 relay 地址（默认从控制面自动发现）
+ * @param {boolean} [options.allowPrivateAddresses]  允许拨内网地址（默认 false，遵循浏览器安全策略）
+ * @param {boolean} [options.allowInsecureWebSockets] 允许拨明文 ws://（默认 false，遵循浏览器安全策略）
+ * @param {object}  [options.connectionGater]        完全自定义拨号闸门（高级用法，传入即接管默认策略）
  * @returns {Promise<LanetNode>}
  */
 export async function createNode (options) {
-  const { ctlURL, inviteCode, name, os = 'browser', relayAddrs } = options ?? {}
+  const {
+    ctlURL,
+    inviteCode,
+    name,
+    os = 'browser',
+    relayAddrs,
+    allowPrivateAddresses = false,
+    allowInsecureWebSockets = false,
+    connectionGater
+  } = options ?? {}
   if (!ctlURL) throw new Error('lanet: ctlURL is required')
   if (!inviteCode) throw new Error('lanet: inviteCode is required（网页节点暂不支持建群）')
 
@@ -57,12 +69,29 @@ export async function createNode (options) {
     transports.splice(1, 0, webRTC())
   }
 
+  // 拨号闸门：浏览器内核默认**拒绝明文 ws:// 与内网地址**（libp2p 的
+  // connection-gater.browser.js）—— 公网 https 部署下这是必要的保护；但内网部署的
+  // H5 页面（页面自身就在 http / 内网）其实是允许 ws:// 与内网地址的，用
+  // allowPrivateAddresses / allowInsecureWebSockets 显式放开。
+  // 不传任何豁免时**不注入**，完全沿用 libp2p 内置策略（Node 下全放行、浏览器下保守）。
+  const dialGater = connectionGater ?? (
+    (allowPrivateAddresses || allowInsecureWebSockets)
+      ? {
+          denyDialMultiaddr: (ma) => {
+            if (!allowInsecureWebSockets && isInsecureWebSocket(ma)) return true
+            return !allowPrivateAddresses && isPrivateAddress(ma)
+          }
+        }
+      : undefined
+  )
+
   const node = await createLibp2p({
     addresses: { listen: [] },
     transports,
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
-    services: { identify: identify() }
+    services: { identify: identify() },
+    ...(dialGater ? { connectionGater: dialGater } : {})
   })
 
   // 3. 连接 relay 并完成电路预约（保证可被组内成员访问）。
@@ -218,6 +247,68 @@ export class LanetStream {
 
 function wrapStream (stream, connection) {
   return new LanetStream(stream, connection)
+}
+
+// --------------------------------------------------------------------
+// 拨号闸门：浏览器默认安全策略与内网部署的豁免
+// --------------------------------------------------------------------
+
+/**
+ * 把 multiaddr 按 `/` 拆成协议段（无值协议如 ws / quic-v1 同样成段）。
+ *
+ * 不用正则：multiaddr 的段结构天然就是 `/` 分隔，直接拆分比正则更稳且更好读。
+ */
+function addrParts (ma) {
+  return ma.toString().split('/').filter(Boolean)
+}
+
+/**
+ * multiaddr 是否为「明文 WebSocket」：有 ws 段且无 wss 段。
+ *
+ * 浏览器内核（libp2p 的 connection-gater.browser.js）默认拒拨明文 ws，用于防止
+ * https 页面降级到不安全连接；内网 http 部署时可按需放开。
+ */
+function isInsecureWebSocket (ma) {
+  const parts = addrParts(ma)
+  return parts.includes('ws') && !parts.includes('wss')
+}
+
+/**
+ * multiaddr 指向的 IP 是否属于「浏览器默认不允许直拨」的段：
+ * 回环、RFC1918 私网、链路本地、CGNAT 与 IPv6 ULA / 回环 / 链路本地。
+ * dns4 / dns6 不做判定（交给浏览器自行解析与拦截）。
+ */
+function isPrivateAddress (ma) {
+  const parts = addrParts(ma)
+  const i4 = parts.indexOf('ip4')
+  if (i4 >= 0 && parts[i4 + 1] != null) return isPrivateIPv4(parts[i4 + 1])
+  const i6 = parts.indexOf('ip6')
+  if (i6 >= 0 && parts[i6 + 1] != null) return isPrivateIPv6(parts[i6 + 1])
+  return false
+}
+
+/** IPv4 是否属于不可公网直达的段。 */
+function isPrivateIPv4 (raw) {
+  const nums = String(raw).split('.').map(Number)
+  if (nums.length !== 4) return false
+  if (nums.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return false
+  const [a, b] = nums
+  if (a === 0 || a === 10 || a === 127) return true      // 0/8、10/8、127/8
+  if (a === 172 && b >= 16 && b <= 31) return true       // 172.16/12
+  if (a === 192 && b === 168) return true                // 192.168/16
+  if (a === 169 && b === 254) return true                // 169.254/16（链路本地）
+  if (a === 100 && b >= 64 && b <= 127) return true      // 100.64/10（CGNAT）
+  return false
+}
+
+/** IPv6 是否属于不可公网直达的段（zone id 会被剥离，如 fe80::1%eth0）。 */
+function isPrivateIPv6 (raw) {
+  const s = String(raw).toLowerCase().split('%')[0]
+  if (s === '::1' || s === '::') return true
+  if (s.startsWith('fc') || s.startsWith('fd')) return true      // fc00::/7（ULA）
+  if (s.startsWith('fe8') || s.startsWith('fe9')) return true    // fe80::/10
+  if (s.startsWith('fea') || s.startsWith('feb')) return true    // fe80::/10
+  return false
 }
 
 async function discoverRelays (base) {

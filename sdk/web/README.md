@@ -63,6 +63,9 @@ await stream.closeWrite() // 请求体发送完毕，等对端回包后 EOF
 | `name` | string | — | `web-xxxxxx` | NetMap 中显示的节点名 |
 | `os` | string | — | `browser` | OS 标识 |
 | `relayAddrs` | string[] | — | 自动发现 | 显式指定 relay multiaddr（默认从 ctl `/v1/relays/candidates` 拉取，tcp 地址自动补 `/ws`） |
+| `allowPrivateAddresses` | boolean | — | `false` | 允许拨内网地址（浏览器默认策略禁止，见「浏览器沙箱」） |
+| `allowInsecureWebSockets` | boolean | — | `false` | 允许拨明文 `ws://`（浏览器默认策略禁止，见「浏览器沙箱」） |
+| `connectionGater` | object | — | — | 完全自定义拨号闸门（高级用法，传入即接管默认策略；需自带 `denyDialMultiaddr`） |
 
 ### `LanetNode`
 
@@ -97,7 +100,9 @@ async function request(node, virtualIP, payload) {
   const chunks = []
   const done = new Promise(resolve => {
     stream.onMessage(d => chunks.push(d))
-    stream.raw.addEventListener('close', resolve) // 对端回写完毕
+    // ️ 必须用 remoteCloseWrite（对端半关闭写端），不能用 close：
+    // close 在本端 closeWrite() 之后、或对端复位流时都会触发，会导致回包还没读完就 resolve。
+    stream.raw.addEventListener('remoteCloseWrite', resolve)
   })
   stream.send(payload)
   await stream.closeWrite()          // 我方发送完毕
@@ -127,6 +132,31 @@ async function request(node, virtualIP, payload) {
 - **页面为 HTTPS 时，ctl 与 relay 也必须 HTTPS/WSS**（浏览器混合内容策略），
   本地 `http://localhost` 联调无此要求；
 - WebTransport 直连要求 relay/Go 节点侧 TLS 证书有效；仅 WebSocket 链路无此要求。
+
+### 浏览器沙箱：默认只允许「公网 + wss」
+
+浏览器内核有一道默认闸门（libp2p 的 `connection-gater.browser.js`）：**拒绝拨明文
+`ws://`、拒绝拨内网地址**（回环 / RFC1918 / 链路本地 / CGNAT / IPv6 ULA）。前者防止
+https 页面降级到不安全连接，后者与浏览器的 Private Network Access 策略呼应。
+
+按部署形态二选一：
+
+- **公网 HTTPS 部署**：ctl 走 `https://`、relay 用公网可解析地址并暴露 `wss://`，
+  按默认策略即可（推荐）。
+- **内网 / HTTP 部署**（页面自身在内网或走 http）：浏览器**实际允许** `ws://` 与内网
+  地址，但需要显式开豁免，否则所有拨号会被拦下（报
+  `DialDeniedError: The connection gater denied all addresses in the dial request`）：
+
+  ```js
+  const node = await createNode({
+    ctlURL, inviteCode,
+    allowPrivateAddresses: true,    // 允许拨内网地址
+    allowInsecureWebSockets: true   // 允许拨明文 ws://
+  })
+  ```
+
+两个开关默认 `false`，**公网页面不要开**：会失去混合内容保护。需要完全自控时传
+`connectionGater` 直接接管（传入即覆盖默认策略）。
 
 ## 联调与验证
 
@@ -159,3 +189,8 @@ node test/interop.mjs http://127.0.0.1:8000 <邀请码> <目标虚拟IP>
 - **onMessage 收到的数据不完整 / 粘包**：libp2p 流无消息边界，按应用协议分帧
   （长度前缀等）。demo 的 echo 场景例外（单请求单响应 + EOF 界定）。
 - **入网报 CORS / mixed content**：见上方部署要求。
+- **所有拨号都被拒（`DialDeniedError: … connection gater denied all addresses`）**：
+  撞上浏览器默认闸门（拒明文 `ws://` + 拒内网地址）。按部署形态决定改走 `wss` /
+  公网地址，还是显式开豁免 —— 见「部署要求 · 浏览器沙箱」。
+- **刚入网第一次请求就失败**：同群成员要等下一轮 NetMap 刷新（Go SDK 默认 15s 一轮）
+  才能解析出你的虚拟 IP，之前入向流会被对端防火墙复位。稍等重试即可，属时序现象。

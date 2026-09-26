@@ -15,7 +15,7 @@ Lanet ws-gateway 客户端：让 **uniapp / 微信小程序 / H5 / App / Node** 
 | **小程序**（微信/支付宝等） | ❌ 不能 | 小程序没有 `RTCPeerConnection`/WebTransport，只有受限的 `wx.connectSocket`（还要求 wss+备案域名），跑不了 libp2p 协议栈 |
 | **App - Android** | ✅ 可以（**用原生插件**） | JS 引擎本身跑不了 libp2p，但 Android App 可挂 [lanet 原生插件](../android-plugin/README.md)：插件内是 gomobile 编的 Go 核心 + VpnService，App **自己成为网络成员**（可 ping 虚拟 IP、被 mDNS 发现），JS 层经 `requireNativePlugin` 调用 |
 | **App - iOS** | ❌ 尚未支持 | 需要 NetworkExtension 实现，当前没有对应原生插件 |
-| **H5** | ✅ 可以 | H5 就是浏览器，直接改用 [@lanet/sdk-web](../web/README.md) 走真 P2P（webrtc-direct 直连 Go 节点 + relay 兜底） |
+| **H5** | ✅ 可以 | H5 就是浏览器，改用 [@lanet/sdk-h5](../h5/README.md)（`<script>` 单文件直引，免 npm / 免打包器）或 [@lanet/sdk-web](../web/README.md)（npm / 打包器引入）走真 P2P（webrtc-direct 直连 Go 节点 + relay 兜底） |
 
 **本 SDK 的定位**：小程序/App 这类「跑不了 libp2p 的端」，经 **ws-gateway** 接入群组：
 
@@ -198,7 +198,9 @@ PortFWD TCP 回显往返 3ms → 心跳，全链路 PASS。
 ## 常见问题
 
 **Q：H5 端想要真 P2P？**
-用 [@lanet/sdk-web](../web/README.md)，H5 就是浏览器环境，支持 webrtc-direct 直连 Go 节点。
+用 [@lanet/sdk-h5](../h5/README.md)（`<script>` 单文件直引，免 npm / 免打包器；内网部署需开
+拨号豁免，见其 README）或 [@lanet/sdk-web](../web/README.md)（npm / 打包器引入）。
+H5 就是浏览器环境，支持 webrtc-direct 直连 Go 节点。
 
 **Q：dial 报「开流失败」？**
 目标虚拟 IP 不在群内 / 对端离线 / 目标端口未监听；DIAL_ERR 帧的 payload 是错误文本，监听 onError 查看。

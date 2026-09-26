@@ -54,3 +54,8 @@ sdk/unity/**/*.meta
 sdk/unity/**/*.meta.meta
 # Python 构建脚本产生的字节码缓存
 sdk/android-plugin/__pycache__/
+# H5 单文件直引包：dist/ 是 `npm run build` 的产物（含 3.4MB sourcemap），
+# node_modules/ 是 esbuild + 从 sdk/web 复用的依赖，都不入库；
+# 构建方式见 sdk/h5/README.md（与 Android 的 lanet.aar 同理，现场构建）
+sdk/h5/dist/
+sdk/h5/node_modules/

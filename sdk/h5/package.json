@@ -1,0 +1,40 @@
+{
+  "name": "@lanet/sdk-h5",
+  "version": "0.1.0",
+  "description": "Lanet H5 SDK — 单文件直引包：让 H5 页面免 npm、免打包器就成为真正的 P2P 网络成员（js-libp2p 直连 + relay 兜底）",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "unpkg": "dist/lanet-h5.min.js",
+  "jsdelivr": "dist/lanet-h5.min.js",
+  "files": [
+    "src",
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "demo": "npx serve .",
+    "test:interop": "node test/interop.mjs"
+  },
+  "keywords": [
+    "lanet",
+    "h5",
+    "browser",
+    "libp2p",
+    "p2p",
+    "vpn",
+    "webrtc",
+    "webtransport"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@lanet/sdk-web": "file:../web"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
