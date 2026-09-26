@@ -305,6 +305,10 @@ type Client struct {
 	groupID string
 	group   string
 	myIP    string
+	// myIPv6 控制面分配的虚拟 IPv6（常规模式）；Standalone 模式的 IPv6 由
+	// 本地发现服务按（群密钥, PeerID）派生，不写这里。构造期（create/join）
+	// 一次性写入，之后只读，因此无需加锁。
+	myIPv6  string
 	created bool // 是否为本 SDK 创建的群组
 
 	handlers []Handler
@@ -540,6 +544,17 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 				return nil, err
 			}
 		}
+		// 首次 NetMap 校准：创建/加入响应里没带 IPv6（控制面版本较旧或该字段
+		// 只在 netmap 上）时，从成员表里补上自身的 IPv6。不补的话整段 IPv6
+		// 数据面会静默失效——TUN 不配 v6 地址、也不写成员 v6 路由。
+		if c.myIPv6 == "" {
+			if _, err := c.netmapCli.Refresh(c.rootCtx); err != nil {
+				c.logf("首次刷新 NetMap 失败（IPv4 入网不受影响，运行期会周期重试）: %v", err)
+			} else if own := c.ownIPv6FromNetMap(); own != "" {
+				c.myIPv6 = own
+				c.logf("已从 NetMap 采用控制面分配的虚拟 IPv6：%s", own)
+			}
+		}
 	}
 
 	// 3. 隧道服务（standalone 用本地发现实现 NetMap/中继候选接口）。
@@ -640,9 +655,28 @@ func defaultListenAddrs() []string {
 	return addrs
 }
 
+// selfVirtualIPv6 本节点的虚拟 IPv6：
+//   - Standalone：由本地发现服务按（群密钥, PeerID）派生，不依赖控制面；
+//   - 常规模式：用控制面分配的地址（控制面按群组 /64 与 IPv4 主机号分配）。
+//
+// 控制面没返回地址时（旧版控制面，或成员 IPv6 尚未分配）返回空串：此时不配
+// TUN 的 IPv6、也不写成员 IPv6 路由，行为与只有 IPv4 的旧版本完全一致。
 func (c *Client) selfVirtualIPv6() string {
 	if c.disc != nil {
 		return c.disc.SelfVirtualIPv6()
+	}
+	return c.myIPv6
+}
+
+// ownIPv6FromNetMap 从当前 NetMap 快照里取本节点的虚拟 IPv6（控制面模式用）。
+func (c *Client) ownIPv6FromNetMap() string {
+	if c.netmapCli == nil {
+		return ""
+	}
+	for _, m := range c.netmapCli.Current().Members {
+		if m.PeerID == c.peerID {
+			return m.VirtualIPv6
+		}
 	}
 	return ""
 }
@@ -1302,7 +1336,8 @@ func (c *Client) createGroup(ctx context.Context) error {
 			Name string `json:"name"`
 		} `json:"group"`
 		Creator struct {
-			VirtualIP string `json:"virtual_ip"`
+			VirtualIP   string `json:"virtual_ip"`
+			VirtualIPv6 string `json:"virtual_ipv6"`
 		} `json:"creator"`
 		InviteCode string `json:"invite_code"`
 	}
@@ -1313,9 +1348,11 @@ func (c *Client) createGroup(ctx context.Context) error {
 		return fmt.Errorf("lanet: 创建群组: %w", err)
 	}
 	c.groupID, c.group, c.myIP = resp.Group.ID, resp.Group.Name, resp.Creator.VirtualIP
+	c.myIPv6 = resp.Creator.VirtualIPv6
 	c.cfg.InviteCode = resp.InviteCode
 	c.created = true
-	c.logf("群组 %s 已创建，虚拟 IP=%s，邀请码=%s", c.group, c.myIP, resp.InviteCode)
+	c.logf("群组 %s 已创建，虚拟 IP=%s，虚拟 IPv6=%s，邀请码=%s",
+		c.group, c.myIP, virtualIPv6Label(c.myIPv6), resp.InviteCode)
 	return nil
 }
 
@@ -1327,7 +1364,8 @@ func (c *Client) joinGroup(ctx context.Context) error {
 			Name string `json:"name"`
 		} `json:"group"`
 		Member struct {
-			VirtualIP string `json:"virtual_ip"`
+			VirtualIP   string `json:"virtual_ip"`
+			VirtualIPv6 string `json:"virtual_ipv6"`
 		} `json:"member"`
 	}
 	payload := map[string]any{
@@ -1337,8 +1375,18 @@ func (c *Client) joinGroup(ctx context.Context) error {
 		return fmt.Errorf("lanet: 加入群组: %w", err)
 	}
 	c.groupID, c.group, c.myIP = resp.Group.ID, resp.Group.Name, resp.Member.VirtualIP
-	c.logf("已加入群组 %s，虚拟 IP=%s", c.group, c.myIP)
+	c.myIPv6 = resp.Member.VirtualIPv6
+	c.logf("已加入群组 %s，虚拟 IP=%s，虚拟 IPv6=%s", c.group, c.myIP, virtualIPv6Label(c.myIPv6))
 	return nil
+}
+
+// virtualIPv6Label 日志用的 IPv6 展示：未分配时明确写出来，避免日志里
+// 出现空字段让人误判「配了但没生效」。
+func virtualIPv6Label(v6 string) string {
+	if v6 == "" {
+		return "未分配（仅 IPv4）"
+	}
+	return v6
 }
 
 // post 调用控制面 JSON 接口（gf 标准响应包装）。

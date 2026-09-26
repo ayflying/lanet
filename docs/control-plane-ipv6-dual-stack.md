@@ -1,8 +1,12 @@
 # 控制面 IPv6 双栈：验收方案（P1-6）
 
-> 状态：**待确认**（确认后才动代码）。范围：`app/ctl` 控制面 + `sdk/go/lanet` 自身地址来源。
+> 状态：**已实施（L1 本地验证通过），待 L2/L3 实机验收**。范围：`app/ctl` 控制面 + `sdk/go/lanet` 自身地址来源。
 > 交接遗留项 P1-6 原文含义：0.5.74「Standalone 虚拟 IPv6 双栈」只做了**节点/TUN 侧**，
 > 控制面（`app/ctl`）与 Android 客户端仍是 IPv4-only。
+>
+> 实施记录（0.5.84）：地址方案与字段名按 §3/§4 落地；控制面侧见提交
+> 「控制面分配虚拟 IPv6」；SDK 侧除 create/join 响应外，还加了「首次 NetMap 校准」
+> （响应缺字段但 netmap 有时采用 netmap 值），避免 IPv6 数据面静默失效。
 
 ## 1. 现状（已核对到文件与行号）
 
@@ -101,7 +105,9 @@
 ## 5. 兼容性与迁移
 
 - **旧客户端 → 新控制面**：忽略新字段即可，IPv4 行为不变（新字段可省略、旧字段不动）。
-- **新客户端 → 旧控制面**：`virtual_ipv6` 为空 → 回退 Standalone 派生值（即今天的行为），不报错。
+- **新客户端 → 旧控制面**：`virtual_ipv6` 为空。注意控制面模式没有本地派生来源
+  （`c.disc == nil`，`selfVirtualIPv6()` 只能拿到空串），因此自身 IPv6 保持为空：
+  不配 TUN v6、不写成员 v6 路由，行为与升级前完全一致（仅 IPv4），不报错。
 - **旧库 → 新库**：schema v1 自动升 v2（`ALTER TABLE ADD COLUMN ... DEFAULT ''`），已有成员保留 IPv4 分配，
   IPv6 在首次加载/续期时按 `host` 规则补齐并落库；`dbversion` 应打印 2。
 - **回滚**：新库用旧二进制打开仍可读写（旧代码的 INSERT 列出显式列，不会碰到新列）；
@@ -119,6 +125,18 @@
 - `pkg/protocol`：`GroupIPv6Prefix`/`MemberIPv6` 的表驱动用例（边界：0、255、host 2/254）。
 - `sdk/go/lanet`：控制面模式自身地址取控制面值、为空时回退派生值（用 httptest 假控制面）。
 - 全仓 `go vet ./...` + `go test -count=1 ./...` 通过；`GOOS=linux go vet`（`tools/run-node-tests.ps1 -LinuxVet`）通过。
+
+**L1 结果（0.5.84，本地实跑）**
+
+| 包 | 用例 | 结果 |
+|---|---|---|
+| `pkg/protocol` | `TestGroupIPv6Prefix`、`TestMemberIPv6MirrorsIPv4Host`、`TestMemberIPv6DistinctAcrossGroups` | PASS |
+| `app/ctl/internal/logic/node` | `TestEnrollAllocatesPairedIPv6`、`TestRestoreNodeBackfillsMissingIPv6`、`TestRemoveNodeReclaimsIPv6Pair`、`TestNewRegistryRejectsBadIPv6Prefix`、`TestEnrollPoolExhaustionKeepsPoolsInSync` | PASS |
+| `app/ctl/internal/logic/group` | `TestNetMapExposesVirtualIPv6`、`TestKickReclaimsIPv6ForNextMember`、`TestPersistentRegistryKeepsIPv6AcrossRestart`、`TestLegacyDBBackfillsMemberIPv6`（v1 库 → 迁移 → 补齐并落库） | PASS |
+| `sdk/go/lanet` | `TestNewCreatesGroup`、`TestNewJoinsGroupWithInvite`（采用控制面分配值）、`TestNewAdoptsIPv6FromNetMapWhenResponseLacksIt`、`TestNewWithoutControlPlaneIPv6FallsBackToIPv4Only` | PASS |
+
+`go test -count=1 ./...`、`tools/run-node-tests.ps1 -LinuxVet` 通过；`-race` 本机
+`CGO_ENABLED=0` 且无 gcc 无法本地跑，由 CI 的 ubuntu stability 任务覆盖。
 
 **L2 控制面真机（必须）**
 

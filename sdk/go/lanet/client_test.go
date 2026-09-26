@@ -35,7 +35,7 @@ func newFakeCTL(t *testing.T, invite string) *httptest.Server {
 		}
 		write(w, map[string]any{
 			"group":       map[string]any{"id": "grp-1", "name": req.GroupName},
-			"creator":     map[string]any{"peer_id": req.PeerID, "virtual_ip": "10.7.0.1"},
+			"creator":     map[string]any{"peer_id": req.PeerID, "virtual_ip": "10.7.0.1", "virtual_ipv6": "fd00:6c61:6e65::2"},
 			"invite_code": "grp-test-invite-code",
 		})
 	})
@@ -53,7 +53,7 @@ func newFakeCTL(t *testing.T, invite string) *httptest.Server {
 		}
 		write(w, map[string]any{
 			"group":  map[string]any{"id": "grp-1", "name": "fake-group"},
-			"member": map[string]any{"peer_id": req.PeerID, "virtual_ip": "10.7.0.2"},
+			"member": map[string]any{"peer_id": req.PeerID, "virtual_ip": "10.7.0.2", "virtual_ipv6": "fd00:6c61:6e65::3"},
 		})
 	})
 
@@ -101,6 +101,9 @@ func TestNewCreatesGroup(t *testing.T) {
 	if info.VirtualIP != "10.7.0.1" {
 		t.Errorf("virtual ip = %q, want 10.7.0.1", info.VirtualIP)
 	}
+	if info.VirtualIPv6 != "fd00:6c61:6e65::2" {
+		t.Errorf("virtual ipv6 = %q, want fd00:6c61:6e65::2（应采用控制面分配值）", info.VirtualIPv6)
+	}
 	if !info.Created || info.InviteCode == "" {
 		t.Errorf("created = %v, invite = %q; want created with invite", info.Created, info.InviteCode)
 	}
@@ -129,8 +132,106 @@ func TestNewJoinsGroupWithInvite(t *testing.T) {
 	if info.VirtualIP != "10.7.0.2" {
 		t.Errorf("virtual ip = %q, want 10.7.0.2", info.VirtualIP)
 	}
+	if info.VirtualIPv6 != "fd00:6c61:6e65::3" {
+		t.Errorf("virtual ipv6 = %q, want fd00:6c61:6e65::3（应采用控制面分配值）", info.VirtualIPv6)
+	}
 	if info.Created {
 		t.Error("join mode should not be marked as created")
+	}
+}
+
+// TestNewAdoptsIPv6FromNetMapWhenResponseLacksIt 创建响应没带 IPv6、但 NetMap 里
+// 有本节点地址时（控制面只在该字段上补数据的情况），必须采用 NetMap 的值，
+// 否则 TUN 不会配 v6 地址、也不会写成员 v6 路由——IPv6 数据面会静默失效。
+func TestNewAdoptsIPv6FromNetMapWhenResponseLacksIt(t *testing.T) {
+	mux := http.NewServeMux()
+	write := func(w http.ResponseWriter, data any) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "message": "ok", "data": data})
+	}
+	mux.HandleFunc("/v1/groups/create", func(w http.ResponseWriter, r *http.Request) {
+		write(w, map[string]any{
+			"group":       map[string]any{"id": "grp-1", "name": "netmap-only"},
+			"creator":     map[string]any{"virtual_ip": "10.7.0.1"},
+			"invite_code": "grp-netmap",
+		})
+	})
+	mux.HandleFunc("/v1/groups/netmap", func(w http.ResponseWriter, r *http.Request) {
+		peerID := r.URL.Query().Get("peer_id")
+		write(w, map[string]any{
+			"group_id": "grp-1", "cidr": "10.7.0.0/24", "cidr_v6": "fd00:6c61:6e65::/64", "version": 1,
+			"members": []any{map[string]any{
+				"peer_id": peerID, "name": "netmap-only",
+				"virtual_ip": "10.7.0.1", "virtual_ipv6": "fd00:6c61:6e65::2",
+			}},
+		})
+	})
+	mux.HandleFunc("/v1/groups/announce", func(w http.ResponseWriter, r *http.Request) {
+		write(w, map[string]any{"status": "announced"})
+	})
+	mux.HandleFunc("/v1/relays/candidates", func(w http.ResponseWriter, r *http.Request) {
+		write(w, map[string]any{"candidates": []any{}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client, err := New(ctx, Config{
+		CTLURL: srv.URL, Name: "sdk-netmap", GroupName: "netmap-only",
+		ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0", "/ip4/127.0.0.1/udp/0/quic-v1"},
+	})
+	if err != nil {
+		t.Fatalf("New(create): %v", err)
+	}
+	defer client.Close()
+	if got := client.Info().VirtualIPv6; got != "fd00:6c61:6e65::2" {
+		t.Errorf("virtual ipv6 = %q，期望从 NetMap 采用 fd00:6c61:6e65::2", got)
+	}
+}
+
+// TestNewWithoutControlPlaneIPv6FallsBackToIPv4Only 旧版控制面不返回 virtual_ipv6
+// 时必须保持旧行为：不报错、不配 IPv6（而不是把空地址当成有效地址）。
+func TestNewWithoutControlPlaneIPv6FallsBackToIPv4Only(t *testing.T) {
+	mux := http.NewServeMux()
+	write := func(w http.ResponseWriter, data any) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "message": "ok", "data": data})
+	}
+	mux.HandleFunc("/v1/groups/create", func(w http.ResponseWriter, r *http.Request) {
+		write(w, map[string]any{
+			"group":       map[string]any{"id": "grp-1", "name": "old-ctl"},
+			"creator":     map[string]any{"virtual_ip": "10.7.0.1"},
+			"invite_code": "grp-old",
+		})
+	})
+	mux.HandleFunc("/v1/groups/netmap", func(w http.ResponseWriter, r *http.Request) {
+		write(w, map[string]any{"group_id": "grp-1", "cidr": "10.7.0.0/24", "version": 1, "members": []any{}})
+	})
+	mux.HandleFunc("/v1/groups/announce", func(w http.ResponseWriter, r *http.Request) {
+		write(w, map[string]any{"status": "announced"})
+	})
+	mux.HandleFunc("/v1/relays/candidates", func(w http.ResponseWriter, r *http.Request) {
+		write(w, map[string]any{"candidates": []any{}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client, err := New(ctx, Config{
+		CTLURL: srv.URL, Name: "sdk-old-ctl", GroupName: "old-ctl",
+		ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0", "/ip4/127.0.0.1/udp/0/quic-v1"},
+	})
+	if err != nil {
+		t.Fatalf("New(create, 旧控制面): %v", err)
+	}
+	defer client.Close()
+	if got := client.Info().VirtualIPv6; got != "" {
+		t.Errorf("旧控制面下 virtual ipv6 = %q，期望空串（仅 IPv4）", got)
+	}
+	if got := client.selfVirtualIPv6(); got != "" {
+		t.Errorf("selfVirtualIPv6() = %q，期望空串", got)
 	}
 }
 
