@@ -133,10 +133,11 @@ func TestNearbyProbeRejectsForgedResponseAndReplay(t *testing.T) {
 		response[0] = 1
 		binary.BigEndian.PutUint16(response[1:3], uint16(len(name)))
 		copy(response[3:], name)
-		firstResponse <- response
-		// 写网络用独立副本：libp2p 的流写路径可能异步持有传入切片，而测试
-		// 主 goroutine 拿到 channel 里的 response 后会原地改写签名段，两者
-		// 共享底层数组即 DATA RACE（CI Linux -race 实证）。副本隔离后互不相干。
+		// 交给主 goroutine 的必须是独立副本：主 goroutine 收到后会在原地改写签名段
+		// （见下面 copy(first[...])），若与 handler 自己的 response 共享底层数组，
+		// 就会和本 goroutine 随后的读并发——CI Linux -race 实证的 DATA RACE。
+		firstResponse <- append([]byte(nil), response...)
+		// 写网络同样用独立副本：libp2p 的流写路径可能异步持有传入切片。
 		_, _ = s.Write(append([]byte(nil), response...))
 	})
 	_, err = d.ProbeNearby(ctx, peer.AddrInfo{ID: b.ID(), Addrs: b.Addrs()})
