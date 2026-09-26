@@ -15,8 +15,13 @@
 #       ↑ go test 参数整体作为一个逗号分隔字符串传入。两条 PowerShell 限制：
 #         1) 直接写 -v 会被 PowerShell 当成自己的 -Verbose 吃掉；
 #         2) 把数组写成 -count=1,-v,... 会被外层解析器当成参数列表而报错。
+#   powershell -File tools/run-node-tests.ps1 -LinuxVet
+#       ↑ 追加 GOOS=linux 的类型检查（go vet）。本包有 windows-only 文件
+#         （tray_mode_windows.go 等），测试若引用其中的类型，Windows 本地全绿、
+#         Linux CI 却 [build failed]——0.5.82 就这样被 CI 拦下过一次。
 param(
     [string[]]$TestArgs,
+    [switch]$LinuxVet,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$Rest
 )
 
@@ -37,10 +42,17 @@ if (Test-Path $resource) {
 
 try {
     Push-Location $root
+    if ($LinuxVet) {
+        $env:GOOS = 'linux'
+        & go vet ./app/agent/cmd/pvn-node/ ./pkg/... ./sdk/go/lanet/...
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Remove-Item Env:GOOS -ErrorAction SilentlyContinue
+    }
     & go test @goArgs
     $code = $LASTEXITCODE
 } finally {
     Pop-Location
+    Remove-Item Env:GOOS -ErrorAction SilentlyContinue
     if ($moved) { Move-Item $backup $resource -Force }
 }
 

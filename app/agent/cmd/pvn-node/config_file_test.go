@@ -120,14 +120,19 @@ func TestReadNodeConfigFileErrors(t *testing.T) {
 	}
 }
 
-// TestDecodeConfigJSONTrayView 托盘读的是另一份精简结构，同样要吃 BOM。
-func TestDecodeConfigJSONTrayView(t *testing.T) {
+// TestDecodeConfigJSONTolerantAnyStruct decodeConfigJSON 是通用入口（节点配置与
+// 托盘精简结构都走它），这里用测试本地结构断言 BOM 容忍与字段解析：不能引用
+// 托盘那边的类型，它是 windows-only 文件里的（曾因此在 Linux CI 上构建失败）。
+func TestDecodeConfigJSONTolerantAnyStruct(t *testing.T) {
+	var cfg struct {
+		Console         string `json:"console"`
+		ConsolePassword string `json:"console_password"`
+	}
 	raw := append(append([]byte(nil), utf8BOM...), []byte(`{"console":"127.0.0.1:8900","console_password":"pw"}`)...)
-	var cfg trayConfigView
 	if err := decodeConfigJSON(raw, &cfg); err != nil {
-		t.Fatalf("托盘配置应容忍 BOM: %v", err)
+		t.Fatalf("带 BOM 的配置应能解析: %v", err)
 	}
 	if cfg.Console != "127.0.0.1:8900" || cfg.ConsolePassword != "pw" {
-		t.Fatalf("托盘配置解析结果不对: %+v", cfg)
+		t.Fatalf("解析结果不对: %+v", cfg)
 	}
 }
