@@ -415,8 +415,14 @@
       <button class="ghost" id="cAdvertiseReset" onclick="resetAdvertise()" style="margin-left:8px;white-space:nowrap">恢复默认</button>
     </div>
     <div class="sub" id="cAdvertiseHint" style="display:none;color:#8a94a6;margin:-1px 0 6px 88px"></div>
-    <div class="kv"><b>连接种子</b><input type="text" id="cBootstrap" placeholder="留空 = 不使用自定义种子（仅私有 DHT + mDNS）；填已在网成员的连接种子，多个用逗号分隔" oninput="bootstrapPasteHint()"></div>
+    <div class="kv"><b>连接种子</b><input type="text" id="cBootstrap" placeholder="留空 = 使用内置入口种子（跨网零配置入网）；填已入网成员的连接种子，多个用逗号分隔" oninput="bootstrapPasteHint()"></div>
     <div class="sub" id="cBootstrapHint" style="display:none;margin:-1px 0 6px 88px"></div>
+    <div class="row" style="margin-top:2px">
+      <label style="display:flex;gap:6px;align-items:center">
+        <input type="checkbox" id="cNoDefaultSeed" onchange="bootstrapPasteHint()"> 不使用内置入口种子
+      </label>
+    </div>
+    <div class="sub" style="margin:2px 0 0">连接种子留空时使用内置入口种子做首次接触（跨网零配置入网）；填入自定义种子则完全覆盖内置入口，不会叠加。勾选上面的开关可彻底关闭内置入口——此时只走私有 DHT + mDNS，同局域网仍能自动发现，跨网必须手填一条已在网成员的种子。</div>
     <div class="row" style="margin-top:10px;flex-wrap:wrap;gap:12px;align-items:center">
       <label style="display:flex;gap:6px;align-items:center">
         <input type="checkbox" id="cEnablePublic" onchange="togglePublicDHT()"> 启用公共 DHT 临时引导
@@ -876,14 +882,14 @@ function seedCheck(seed) {
 
 // seedSpecCheck 校验「节点配置 → 连接种子」输入：逗号分隔的 multiaddr，允许留空。
 // 与后端 p2pkit.ValidateSeedSpec 同一套规则（前端先拦一道，少一次往返）：
-// 只接受能确定对端身份的地址，历史字面量 none / public 判为非法并指向
-// 「公共 DHT 临时引导」开关。返回错误文案，OK 返回空串。
+// 只接受能确定对端身份的地址，历史字面量 none / public 判为非法并指向「留空」。
+// 返回错误文案，OK 返回空串。
 function seedSpecCheck(spec) {
   for (const raw of String(spec).split(',')) {
     const s = raw.trim();
     if (!s) continue;
     if (s === 'none' || s === 'public') {
-      return '「' + s + '」不是连接种子地址：留空即可；跨网冷启动请用上面的「公共 DHT 临时引导」开关。';
+      return '「' + s + '」不是连接种子地址：留空即可（留空会使用内置入口种子做首次接触）。';
     }
     if (!s.startsWith('/')) {
       return '「' + s + '」不是连接种子地址：应以 /ip4/、/ip6/、/dns4/ 或 /dnsaddr/ 开头。';
@@ -898,12 +904,21 @@ function seedSpecCheck(spec) {
 
 // bootstrapPasteHint 连接种子输入框的即时反馈（与运行时「添加节点」的
 // seedCheck 区分：那里引导用户改用连接码，这里只判断是不是一条种子地址）。
+// 留空时也要给反馈：留空不是「什么都不做」，而是「用内置入口种子」，这是
+// 跨网零配置入网的关键，必须让用户看得见（否则会以为留空 = 不连任何节点）。
 function bootstrapPasteHint() {
   const el = $('cBootstrapHint');
   const s = $('cBootstrap').value.trim();
-  if (!s) { el.style.display = 'none'; return; }
-  const bad = seedSpecCheck(s);
   el.style.display = '';
+  if (!s) {
+    el.style.color = '#8a94a6';
+    el.textContent = cfgNoDefaultSeed
+      ? '已关闭内置入口：只走私有 DHT + mDNS（同局域网可自动发现，跨网需手填种子）。'
+      : ('留空 = 使用内置入口种子 ' + (cfgDefaultEntrySeed || '（未提供）') +
+         ' 做首次接触；也可填入自己的种子覆盖它。');
+    return;
+  }
+  const bad = seedSpecCheck(s);
   el.style.color = bad ? '#d9534f' : '#2fa65a';
   el.textContent = bad || '格式看起来正确，点「保存节点配置」并重启程序后生效。';
 }
@@ -978,6 +993,8 @@ function renderSeed() {
 // 被无声改写，且 3 秒保护窗口还会让同步时而失效——两者都不该发生。
 let cfgPublicDHT = false;   // 配置意图（下次启动是否自动开启），仅由配置读取/用户点击更新
 let cfgSystemAddrs = [];    // 页面加载时缓存的系统自动获取地址（「恢复默认」兜底数据源）
+let cfgNoDefaultSeed = false;  // 是否关闭内置入口种子（留空连接种子时是否仍连内置入口）
+let cfgDefaultEntrySeed = '';  // 后端返回的内置入口种子（只读，用于留空提示展示）
 
 // addrSetsEqual 按集合比较两组地址（顺序无关、去重）：判断对外地址框内容
 // 是否与系统自动获取一致（一致 = 等效默认，不显示「已自定义」警告）。
@@ -1294,18 +1311,23 @@ async function loadNodeConfig() {
     }
     const bs = (c.bootstrap || '').trim();
     // 连接种子只认地址或留空：历史配置里的 none / public 不再是合法值
-    // （公共引导改由「公共 DHT 临时引导」开关决定），这里按留空显示并说明，
-    // 避免用户看到 public 以为它还在生效。
+    // （留空 = 用内置入口种子），这里按留空显示并说明，避免用户看到 public
+    // 以为它还在生效。
     const bsLegacy = (bs === 'none' || bs === 'public');
     $('cBootstrap').value = bsLegacy ? '' : bs;
+    // 内置入口：勾选状态 + 入口地址（只读展示，让「留空会连哪里」可见）。
+    cfgNoDefaultSeed = !!c.disable_default_seed;
+    cfgDefaultEntrySeed = c.default_entry_seed || '';
+    $('cNoDefaultSeed').checked = cfgNoDefaultSeed;
     const bsHint = $('cBootstrapHint');
     if (bsLegacy) {
       bsHint.style.display = '';
       bsHint.style.color = '#d9534f';
       bsHint.textContent = '配置里的连接种子是「' + bs + '」，已不再生效（连接种子只接受地址或留空）；' +
-        '跨网冷启动请改用上面的「公共 DHT 临时引导」。保存本页即按留空落盘。';
+        '保存本页即按留空落盘，留空会使用内置入口种子。';
     } else {
-      bsHint.style.display = 'none';
+      // 非历史字面量：交给统一提示（留空时说明会用内置入口，填了则校验格式）。
+      bootstrapPasteHint();
     }
     $('cPublicMin').value = c.public_dht_minutes || 10;
     // 复选框 = 配置意图（下次启动是否自动开启），与运行时状态解耦：
@@ -1348,8 +1370,10 @@ async function saveNodeConfig() {
     listen: $('cListen').value.trim(),
     // 对外地址多行输入框：换行归一化成逗号再提交（后端校验按逗号分隔）。
     advertise: $('cAdvertise').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean).join(','),
-    // 连接种子只提交地址本身：空串 = 清空（不再写 none 这类字面量）。
+    // 连接种子只提交地址本身：空串 = 清空（留空即使用内置入口种子）。
     bootstrap: $('cBootstrap').value.trim(),
+    // 内置入口开关：留空种子时是否仍连内置入口（false = 使用内置入口）。
+    disable_default_seed: $('cNoDefaultSeed').checked,
     enable_public_dht: cfgPublicDHT,
     public_dht_minutes: parseInt($('cPublicMin').value, 10) || 10,
     tun: $('cTun').checked,
