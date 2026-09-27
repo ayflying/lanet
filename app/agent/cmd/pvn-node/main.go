@@ -942,8 +942,8 @@ type nodeConfig struct {
 	bootstrapAddrs []string `json:"-"` // 运行时由 Bootstrap 解析而来
 }
 
-// defaultNodeConfig 开箱即用默认值：节点名、无引导（私有 DHT + mDNS，
-// 不接触公共 DHT）、控制台全开。
+// defaultNodeConfig 开箱即用默认值：节点名、连接种子留空（= 使用内置入口种子做
+// 首次接触，见 p2pkit.ResolveSeedSpec）、不接触公共 DHT、控制台全开。
 //
 // 节点名优先取环境变量 LANET_NAME（容器编排里显式指定的名字），否则退回主机名。
 // 容器里 os.Hostname() 通常是容器短 ID（12 位十六进制，如 52b57e329f43），既没
