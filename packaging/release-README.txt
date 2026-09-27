@@ -37,8 +37,10 @@ DHT 自动发现，优先打洞直连，失败时经网络内可达成员的 Cir
   -config            配置文件路径
   -name              节点名称
   -key               网络密钥
-  -bootstrap         逗号分隔的成员连接种子 multiaddr（须带 /p2p/<节点ID>；
-                     推荐，纯私有无公共流量）；留空 = 不配种子，只走私有 DHT + mDNS
+  -bootstrap         逗号分隔的成员连接种子 multiaddr（须带 /p2p/<节点ID>）；
+                     留空 = 使用内置入口种子（0.5.87 起，跨网零配置入网）
+  -no-default-seed   true / false，默认 false；置 true = 关闭内置入口，
+                     留空种子时只走私有 DHT + mDNS（跨网需手填种子）
   -public-dht        启用公共 DHT 临时引导（默认关闭以省流量）
   -public-dht-minutes 公共 DHT 最长运行分钟数（默认 10，连上同群成员或超时自动退出）
   -listen            逗号分隔的 libp2p 监听地址
