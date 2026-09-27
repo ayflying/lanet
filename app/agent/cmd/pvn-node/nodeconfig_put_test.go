@@ -73,3 +73,67 @@ func TestNodeConfigPutKeepsUnspecifiedFields(t *testing.T) {
 		t.Fatalf("② network_key 应被显式清空，实际 %v", derefStr(got.NetworkKey))
 	}
 }
+
+// TestNodeConfigPutDisableDefaultSeed 内置入口开关要能落盘，且未提供时保留原值。
+//
+// 语义要点：清空连接种子（bootstrap=""）= 使用内置入口；再勾上
+// disable_default_seed 才是「真的不连任何入口，只走私有 DHT + mDNS」。
+// 两者是两件事，不能互相覆盖。
+func TestNodeConfigPutDisableDefaultSeed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lanet.json")
+	base := defaultNodeConfig()
+	base.Name = "seed-switch"
+	base.NetworkKey = strPtr("yunloli")
+	if err := base.save(path); err != nil {
+		t.Fatalf("准备配置失败: %v", err)
+	}
+	h := nodeConfigRoutes(path, nodeRuntime{}, func() *lanet.Client { return nil })["PUT /api/node-config"]
+	put := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodPut, "/api/node-config", strings.NewReader(body)))
+		return rec
+	}
+	full := func(extra string) string {
+		return `{"name":"seed-switch","console":"127.0.0.1:8900"` + extra + `}`
+	}
+
+	// ① 勾选开关 + 清空种子：两者都要落盘（清空不等于关闭内置入口）。
+	if rec := put(full(`,"bootstrap":"","disable_default_seed":true`)); rec.Code != http.StatusOK {
+		t.Fatalf("① 保存失败 code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	got, err := readNodeConfigFile(path)
+	if err != nil {
+		t.Fatalf("① 读回失败: %v", err)
+	}
+	if got.DisableDefaultSeed == nil || !*got.DisableDefaultSeed {
+		t.Fatalf("① disable_default_seed 应为 true，实际 %v", got.DisableDefaultSeed)
+	}
+	if got.Bootstrap != nil && *got.Bootstrap != "" {
+		t.Fatalf("① bootstrap 应被清空，实际 %q", derefStr(got.Bootstrap))
+	}
+
+	// ② 请求体没带该字段（旧版控制台）：必须保留 true，不能被零值覆盖。
+	if rec := put(full(``)); rec.Code != http.StatusOK {
+		t.Fatalf("② 保存失败 code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	got, err = readNodeConfigFile(path)
+	if err != nil {
+		t.Fatalf("② 读回失败: %v", err)
+	}
+	if got.DisableDefaultSeed == nil || !*got.DisableDefaultSeed {
+		t.Fatalf("② 未提供该字段时应保留 true，实际 %v", got.DisableDefaultSeed)
+	}
+
+	// ③ 显式取消勾选：回到「留空即用内置入口」。
+	if rec := put(full(`,"disable_default_seed":false`)); rec.Code != http.StatusOK {
+		t.Fatalf("③ 保存失败 code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	got, err = readNodeConfigFile(path)
+	if err != nil {
+		t.Fatalf("③ 读回失败: %v", err)
+	}
+	if got.DisableDefaultSeed != nil && *got.DisableDefaultSeed {
+		t.Fatalf("③ disable_default_seed 应为 false/nil，实际 %v", got.DisableDefaultSeed)
+	}
+}

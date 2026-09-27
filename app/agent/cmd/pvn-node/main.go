@@ -102,8 +102,11 @@ func runNode(parent context.Context, serviceMode bool) {
 			"网络密钥：留空 = 按本机身份派生的专属默认网络（开箱即用但默认不与他人同网）；"+
 				"填相同值才能与对方互通；不传则读配置文件")
 		bootstrap = flag.String("bootstrap", envOr("LANET_BOOTSTRAP", ""),
-			"连接种子：逗号分隔的成员 multiaddr（须带 /p2p/<节点ID>）；留空 = 不配种子，"+
-				"只走私有 DHT + mDNS。跨网冷启动请另开「公共 DHT 临时引导」开关；不传则读配置文件")
+			"连接种子：逗号分隔的成员 multiaddr（须带 /p2p/<节点ID>）；留空 = 使用内置入口种子"+
+				"（跨网零配置入网）；不传则读配置文件")
+		noDefaultSeed = flag.String("no-default-seed", envOr("LANET_NO_DEFAULT_SEED", "@@unset@@"),
+			"关闭内置默认入口种子（true/false，默认 false）：连接种子留空时不再使用内置入口，"+
+				"回到「只走私有 DHT + mDNS」（仅同局域网可自动发现，跨网需手动填种子）")
 		console = flag.String("console", envOr("LANET_CONSOLE", ""),
 			"控制台监听地址；不传则读配置文件（默认 127.0.0.1:8900 仅本机，0.0.0.0:8900 = 允许远程）")
 		consolePW = flag.String("console-password", envOr("LANET_CONSOLE_PASSWORD", ""),
@@ -214,12 +217,14 @@ func runNode(parent context.Context, serviceMode bool) {
 		}
 	}
 	effKey, effLegacyKey := resolveNetworkKey(*key, nc.NetworkKey)
-	// 连接种子（bootstrap）：只接受「种子地址」或留空。历史字面量 none / public
-	// 不再作为地址：public 曾表示「公共引导」，但公共引导完全由「公共 DHT 临时
-	// 引导」开关决定（pkg/serverless 在公共 DHT 开启时自带 DefaultBootstrap），
-	// 留在种子字段里只会让人误以为已经挂上了公共网络。老配置按未配置种子处理，
-	// 并在日志里给出改法（不静默改变行为：公共 DHT 关闭时它本来就被丢弃）。
+	// 连接种子（bootstrap）：自定义种子 > 内置默认入口 > 无种子。
+	// 留空不再等于「没有入口」——留空时用 p2pkit.DefaultEntrySeed 做首次接触，
+	// 否则私有 DHT 路由表为空，节点只能广播自己、无法查找他人，跨网冷启动
+	// 必然「看不到设备」。历史字面量 none / public 被归一为未填写，老配置因此
+	// 平滑落到内置入口；确实不想连任何入口时用 -no-default-seed 关闭。
 	effBootstrap := strings.TrimSpace(firstNonEmpty(*bootstrap, derefStr(nc.Bootstrap)))
+	effNoDefaultSeed := resolveTriBool(*noDefaultSeed, nc.DisableDefaultSeed, false)
+	effSeedSpec, effSeedSource := p2pkit.ResolveSeedSpec(effBootstrap, effNoDefaultSeed)
 	// 身份文件路径固定：配置文件同目录 node.key（Windows）/ /data/node.key
 	// （其他平台），不读配置、不暴露到控制台；文件不存在即新用户，SDK 自动
 	// 创建新身份。锚点必须是配置目录的绝对路径：服务/计划任务的 CWD 不是
@@ -277,19 +282,20 @@ func runNode(parent context.Context, serviceMode bool) {
 	// P2P 自动更新强制开启：签名信任锚保证安全，无需用户决策。
 	// 仅 dev 构建与容器环境自动禁用（见 StartP2PUpdate 返回值）。
 	eff := nodeRuntime{
-		Name:             effName,
-		NetworkKey:       effKey,
-		Console:          effConsole,
-		Listen:           effListen,
-		Advertise:        effAdvertise,
-		Firewall:         effFW,
-		EnablePublicDHT:  effPublic,
-		PublicDHTMinutes: effPublicMin,
-		Tun:              effTun,
-		AutoAccept:       effAutoAccept,
-		RequireApproval:  effRequireApproval,
-		DBPath:           effDBPath,
-		LegacyProtocols:  effLegacyProto,
+		Name:               effName,
+		NetworkKey:         effKey,
+		Console:            effConsole,
+		Listen:             effListen,
+		Advertise:          effAdvertise,
+		Firewall:           effFW,
+		EnablePublicDHT:    effPublic,
+		PublicDHTMinutes:   effPublicMin,
+		Tun:                effTun,
+		AutoAccept:         effAutoAccept,
+		RequireApproval:    effRequireApproval,
+		DBPath:             effDBPath,
+		LegacyProtocols:    effLegacyProto,
+		DisableDefaultSeed: effNoDefaultSeed,
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -299,10 +305,18 @@ func runNode(parent context.Context, serviceMode bool) {
 		effRequireApproval, effAutoAccept, effDBPath)
 
 	var legacySeeds []string
-	nc.bootstrapAddrs, legacySeeds = parseBootstrapSeeds(effBootstrap)
+	nc.bootstrapAddrs, legacySeeds = parseBootstrapSeeds(effSeedSpec)
 	if len(legacySeeds) > 0 {
-		log.Printf("[node] 连接种子里的 %s 不是地址，已忽略：留空即可；跨网冷启动请开启「公共 DHT 临时引导」开关",
+		log.Printf("[node] 连接种子里的 %s 不是地址，已忽略：留空即可（留空会使用内置入口种子）",
 			strings.Join(legacySeeds, "、"))
+	}
+	// 种子来源写进日志：内置入口是隐式行为，出问题时必须一眼看出到底连了哪个入口。
+	switch effSeedSource {
+	case p2pkit.SeedSourceDefault:
+		log.Printf("[node] 未填写连接种子，使用内置入口种子 %s（如需只走私有 DHT + mDNS，用 -no-default-seed 关闭）",
+			p2pkit.DefaultEntrySeed)
+	case p2pkit.SeedSourceNone:
+		log.Printf("[node] 未填写连接种子且已关闭内置入口：只走私有 DHT + mDNS（仅同局域网可自动发现，跨网需手填种子）")
 	}
 	// 更新 / 重启 / 退出 控制台接口（与节点配置同一组扩展路由）。
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
@@ -872,15 +886,22 @@ type nodeConfig struct {
 	NetworkKey *string `json:"network_key,omitempty"`
 	// Bootstrap 连接种子（*string 以便区分「未提供」与「显式留空」）：
 	//   - nil = 老配置/页面未提供 → 沿用原值（或按未配置种子处理）；
-	//   - ""  = 用户显式留空 → 不配自定义种子，只走私有 DHT + mDNS；
+	//   - ""  = 用户显式留空 → 使用内置入口种子（DisableDefaultSeed 为 true
+	//     时才真的是「无种子」，只走私有 DHT + mDNS）；
 	//   - 非空 = 逗号分隔的成员 multiaddr（须带 /p2p/<节点ID>，见 p2pkit.ValidateSeedSpec）。
-	// 历史字面量 none / public 不再是合法值：公共引导由「公共 DHT 临时引导」
-	// 开关（EnablePublicDHT）单独决定，与种子字段无关。
-	Bootstrap       *string `json:"bootstrap,omitempty"`
-	Console         string  `json:"console"`
-	ConsolePassword string  `json:"console_password,omitempty"`
-	Firewall        string  `json:"firewall"`
-	Listen          string  `json:"listen"`
+	// 历史字面量 none / public 不再是合法值，且被归一为「未填写」（见
+	// p2pkit.StripLegacySeedLiterals）：公共引导由「公共 DHT 临时引导」开关
+	// （EnablePublicDHT）单独决定，与种子字段无关。
+	Bootstrap *string `json:"bootstrap,omitempty"`
+	// DisableDefaultSeed 关闭内置默认入口种子（默认 false = 使用内置入口）：
+	// 留空连接种子时是否仍用 p2pkit.DefaultEntrySeed 做首次接触。仅在同局域网
+	// 自发现、或需要完全离线运行时才需要关闭。nil = 未设置（按默认 false）。
+	// 解析规则见 p2pkit.ResolveSeedSpec。
+	DisableDefaultSeed *bool  `json:"disable_default_seed,omitempty"`
+	Console            string `json:"console"`
+	ConsolePassword    string `json:"console_password,omitempty"`
+	Firewall           string `json:"firewall"`
+	Listen             string `json:"listen"`
 	// Advertise 自定义对外地址（0.5.66，替换语义）：逗号分隔 "IP:端口" 或
 	// 完整 multiaddr。设置后连接码 / 连接种子 / 对外通告只使用这批地址，
 	// 自动枚举的网卡地址不再对外出现；留空 = 系统自动获取（默认）。
@@ -943,7 +964,7 @@ func defaultNodeConfig() *nodeConfig {
 		// 显式写空串（而非省略字段）：新生成的配置文件明确表达「使用按身份
 		// 派生的本机专属默认网络」，避免日后被迁移逻辑误判为老配置。
 		// 要与他人互通，把这里改成双方约定的相同密钥即可。
-		NetworkKey:       strPtr(""),
+		NetworkKey: strPtr(""),
 		// 连接种子留空（nil = 不写该键）：私有 DHT + mDNS 发现，不接触公共设施。
 		Console:          "127.0.0.1:8900",
 		Firewall:         "allow-all",
@@ -1016,6 +1037,8 @@ type nodeRuntime struct {
 	DBPath          string
 	// LegacyProtocols 迁移逃生开关（0.5.34）：true = 退回历史固定协议 ID。
 	LegacyProtocols bool
+	// DisableDefaultSeed 关闭内置默认入口种子（留空连接种子时不再连内置入口）。
+	DisableDefaultSeed bool
 }
 
 // networkID 运行时网络标识（与 SDK/控制台页眉一致）：standalone- + 群组指纹。
@@ -1059,10 +1082,15 @@ func nodeConfigRoutes(path string, eff nodeRuntime, nodeRef func() *lanet.Client
 				// 前端据此把输入框回填为实际生效值，避免「容器里填了密钥、页面上是空的」。
 				"network_key_env": os.Getenv("LANET_NETWORK_KEY") != "",
 				"bootstrap":       derefStr(nc.Bootstrap),
-				"console":         nc.Console,
-				"has_password":    nc.ConsolePassword != "",
-				"firewall":        nc.Firewall,
-				"listen":          nc.Listen,
+				// default_entry_seed 内置入口种子（只读）：连接种子留空时实际
+				// 使用的入口。前端在留空提示里展示它，让用户知道留空会连哪里。
+				"default_entry_seed": p2pkit.DefaultEntrySeed,
+				// disable_default_seed 是否关闭内置入口（留空 = 只走私有 DHT + mDNS）。
+				"disable_default_seed": nc.DisableDefaultSeed != nil && *nc.DisableDefaultSeed,
+				"console":              nc.Console,
+				"has_password":         nc.ConsolePassword != "",
+				"firewall":             nc.Firewall,
+				"listen":               nc.Listen,
 				// advertise 自定义对外地址（替换语义）：文件保存值；空 = 自动枚举。
 				// system_addrs 系统自动枚举的分享地址（IP:端口），供输入框默认
 				// 填充与「恢复默认」；runtime.advertise 当前进程实际生效值。
@@ -1083,20 +1111,21 @@ func nodeConfigRoutes(path string, eff nodeRuntime, nodeRef func() *lanet.Client
 				// 仅编辑 lanet.json / 环境变量 LANET_LEGACY_PROTOCOLS 可改。
 				"legacy_protocols": nc.LegacyProtocols != nil && *nc.LegacyProtocols,
 				"runtime": map[string]any{
-					"name":               eff.Name,
-					"network_key":        eff.NetworkKey,
-					"network_id":         networkID(eff.NetworkKey),
-					"network_text":       networkLabel(eff.NetworkKey),
-					"console":            eff.Console,
-					"listen":             eff.Listen,
-					"advertise":          eff.Advertise,
-					"firewall":           eff.Firewall,
-					"enable_public_dht":  eff.EnablePublicDHT,
-					"public_dht_minutes": eff.PublicDHTMinutes,
-					"tun":                eff.Tun,
-					"require_approval":   eff.RequireApproval,
-					"auto_accept":        eff.AutoAccept,
-					"db_path":            eff.DBPath,
+					"name":                 eff.Name,
+					"network_key":          eff.NetworkKey,
+					"network_id":           networkID(eff.NetworkKey),
+					"network_text":         networkLabel(eff.NetworkKey),
+					"console":              eff.Console,
+					"listen":               eff.Listen,
+					"advertise":            eff.Advertise,
+					"firewall":             eff.Firewall,
+					"enable_public_dht":    eff.EnablePublicDHT,
+					"public_dht_minutes":   eff.PublicDHTMinutes,
+					"tun":                  eff.Tun,
+					"require_approval":     eff.RequireApproval,
+					"auto_accept":          eff.AutoAccept,
+					"db_path":              eff.DBPath,
+					"disable_default_seed": eff.DisableDefaultSeed,
 				},
 			}
 			// 系统自动枚举的分享地址（IP:端口）：入网成功后才有——启动早期
@@ -1212,6 +1241,12 @@ func nodeConfigRoutes(path string, eff nodeRuntime, nodeRef func() *lanet.Client
 				return
 			} else {
 				req.Bootstrap = strPtr(spec)
+			}
+			// 内置入口开关：页面未提供（旧版控制台）时保留原值。显式 true 表示
+			// 「留空就真的不连任何入口」，因此它和「清空连接种子」是两件事：
+			// 清空 = 用内置入口，清空 + 勾选 = 只走私有 DHT + mDNS。
+			if req.DisableDefaultSeed == nil {
+				req.DisableDefaultSeed = prev.DisableDefaultSeed
 			}
 			if req.Tun == nil {
 				req.Tun = prev.Tun // 页面未提供（旧版控制台）时保留原值
