@@ -188,6 +188,28 @@ func TestNewAdoptsIPv6FromNetMapWhenResponseLacksIt(t *testing.T) {
 	if got := client.Info().VirtualIPv6; got != "fd00:6c61:6e65::2" {
 		t.Errorf("virtual ipv6 = %q，期望从 NetMap 采用 fd00:6c61:6e65::2", got)
 	}
+	// Exercise the real console handler, not only Info(), so the member-table
+	// API cannot silently drop IPv6 between NetMap and the frontend.
+	recorder := httptest.NewRecorder()
+	client.apiState(recorder, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("console state status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var state struct {
+		Members []struct {
+			VirtualIP   string `json:"virtual_ip"`
+			VirtualIPv6 string `json:"virtual_ipv6"`
+		} `json:"members"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Members) != 1 {
+		t.Fatalf("console members = %d, want 1", len(state.Members))
+	}
+	if m := state.Members[0]; m.VirtualIP != "10.7.0.1" || m.VirtualIPv6 != "fd00:6c61:6e65::2" {
+		t.Fatalf("console member addresses = %+v", m)
+	}
 }
 
 // TestNewWithoutControlPlaneIPv6FallsBackToIPv4Only 旧版控制面不返回 virtual_ipv6

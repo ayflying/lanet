@@ -80,6 +80,7 @@
   .kvstack > b { display:block; font-weight:500; color:var(--muted); margin-bottom:6px; }
   .kvstack .row { margin:0; }
   .kvstack .sub { margin:6px 0 0; }
+  .m-ipv6 { color:var(--muted); font-size:12px; margin-top:2px; cursor:pointer; }
   button { padding:7px 14px; border:0; border-radius:6px; background:var(--accent); color:#fff;
            font-size:13px; cursor:pointer; }
   button.ghost { background:#eef0f3; color:var(--txt); }
@@ -291,7 +292,7 @@
   <div class="card">
     <h2>成员与链路 <button class="ghost" style="float:right;font-size:12px;padding:2px 10px" onclick="openInfoModal()">本机信息</button></h2>
     <div class="row" style="margin:0 0 10px">
-      <input type="text" id="mSearch" placeholder="搜索：设备名 / 备注 / 虚拟地址 / 虚拟 IP / PeerID" oninput="mPage=1;renderMembers()">
+      <input type="text" id="mSearch" placeholder="搜索：设备名 / 备注 / 虚拟地址 / IPv4 / IPv6 / PeerID" oninput="mPage=1;renderMembers()">
       <select id="mFilter" style="flex:0 0 140px" onchange="mPage=1;renderMembers()">
         <option value="all">全部状态</option>
         <option value="online">仅在线</option>
@@ -1082,7 +1083,7 @@ function filteredMembers() {
     if (f === 'online' && !m.online) return false;
     if (f === 'offline' && m.online) return false;
     if (!q) return true;
-    return [m.notes, m.name, m.virtual_ip, m.hostname, m.peer_id]
+    return [m.notes, m.name, m.virtual_ip, m.virtual_ipv6, m.hostname, m.peer_id]
       .some(v => (v || '').toLowerCase().includes(q));
   });
 }
@@ -1121,7 +1122,9 @@ function renderMembers() {
         ? '<span class="tag unknown" title="' + esc(m.platform || '') + '">' + esc(m.version) + '</span>'
         : '<span class="tag unknown" title="旧版本节点，未上报版本号">—</span>';
       const last = m.last_seen ? relTime(m.last_seen) : '—';
-      return `<tr><td class="mname">${esc(label)}${realName}${pid}</td><td>${host}</td><td>${esc(m.virtual_ip)}</td>` +
+      const vip = `<div>${esc(m.virtual_ip || '—')}</div>` + (m.virtual_ipv6
+        ? `<div class="m-ipv6" title="点击复制" onclick="copyText('${esc(m.virtual_ipv6)}', this)">${esc(m.virtual_ipv6)}</div>` : '');
+      return `<tr><td class="mname">${esc(label)}${realName}${pid}</td><td>${host}</td><td>${vip}</td>` +
         `<td><span class="tag ${m.online ? 'online' : 'offline'}"><span class="dot ${m.online ? 'on' : 'off'}"></span>${m.online ? '在线' : '离线'}</span></td>` +
         `<td>${path}</td><td>${ver}</td><td>${esc(last)}</td>` +
         `<td><button class="ghost mdetail" onclick="openMemberModal('${esc(m.peer_id)}')">详情</button>` +
