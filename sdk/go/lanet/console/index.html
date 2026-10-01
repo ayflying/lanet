@@ -1122,7 +1122,8 @@ function renderMembers() {
         ? '<span class="tag unknown" title="' + esc(m.platform || '') + '">' + esc(m.version) + '</span>'
         : '<span class="tag unknown" title="旧版本节点，未上报版本号">—</span>';
       const last = m.last_seen ? relTime(m.last_seen) : '—';
-      const vip = `<div>${esc(m.virtual_ip || '—')}</div>` + (m.virtual_ipv6
+      const vip = (m.virtual_ip
+        ? `<div style="cursor:pointer" title="点击复制" onclick="copyText('${esc(m.virtual_ip)}', this)">${esc(m.virtual_ip)}</div>` : '<div>—</div>') + (m.virtual_ipv6
         ? `<div class="m-ipv6" title="点击复制" onclick="copyText('${esc(m.virtual_ipv6)}', this)">${esc(m.virtual_ipv6)}</div>` : '');
       return `<tr><td class="mname">${esc(label)}${realName}${pid}</td><td>${host}</td><td>${vip}</td>` +
         `<td><span class="tag ${m.online ? 'online' : 'offline'}"><span class="dot ${m.online ? 'on' : 'off'}"></span>${m.online ? '在线' : '离线'}</span></td>` +
