@@ -7,7 +7,7 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-// ValidateSeedSpec 校验「连接种子」输入：逗号分隔的引导地址，允许留空。
+// ValidateSeedSpec 校验「连接种子」输入：支持逗号、换行、空格或制表符分隔，允许留空。
 //
 // 连接种子是「一条已在网成员的 multiaddr」，语义上只有两种合法状态：填地址，
 // 或者留空（留空 = 不配自定义种子，只走私有 DHT + mDNS）。历史实现里
@@ -18,7 +18,7 @@ import (
 // 地址本身要求能确定对端身份：普通 multiaddr 必须带 /p2p/<节点ID>；
 // /dnsaddr/… 由 DNS TXT 展开，展开项自带 /p2p，故豁免。
 func ValidateSeedSpec(spec string) error {
-	for _, item := range strings.Split(spec, ",") {
+	for _, item := range strings.FieldsFunc(spec, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\r' || r == '\n' }) {
 		item = strings.TrimSpace(item)
 		if item == "" {
 			continue
@@ -73,7 +73,7 @@ const (
 // 丢弃，故一律按「未配置种子」处理，不改变实际连接行为。
 func StripLegacySeedLiterals(spec string) (string, []string) {
 	var clean, legacy []string
-	for _, item := range strings.Split(spec, ",") {
+	for _, item := range strings.FieldsFunc(spec, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\r' || r == '\n' }) {
 		item = strings.TrimSpace(item)
 		if item == "" {
 			continue

@@ -19,4 +19,18 @@ assert.equal(vm.runInContext('filteredMembers().length', ctx), 1);
 el('mSearch').value = '';
 vm.runInContext('delete S.members[0].virtual_ipv6; renderMembers();', ctx);
 assert.doesNotMatch(el('members').innerHTML, /undefined|class="m-ipv6"/);
-console.log('PASS: full script syntax, dual-stack rendering, IPv6 search, IPv4 fallback');
+vm.runInContext(extract('function seedSpecCheck', '// bootstrapPasteHint') + extract('function copySeedMine', '// ---- 连接种子') + extract('function renderSeed', 'let cfg'), ctx);
+const seeds = ['/ip4/43.136.124.167/tcp/4001/p2p/12D3KooWD1RmFbKp7sEmmeRepvQnfpZcLRxQXXGabin21k5zm8Kf', '/ip4/43.136.124.167/udp/4001/quic-v1/p2p/12D3KooWD1RmFbKp7sEmmeRepvQnfpZcLRxQXXGabin21k5zm8Kf'];
+ctx.autoGrow = () => {}; ctx.flash = () => {}; let copied;
+ctx.copyText = text => { copied = text; };
+ctx.seeds = seeds;
+vm.runInContext('S.seed_addrs = seeds; renderSeed(); copySeedMine();', ctx);
+assert.equal(copied, el('seedMine').value);
+assert.match(html, /<textarea id="cBootstrap"/);
+for (const separator of ['\n', '\r\n', ' ', '\t', ',']) {
+  el('cBootstrap').value = seeds.join(separator);
+  assert.equal(vm.runInContext("seedSpecCheck($('cBootstrap').value)", ctx), '');
+  const submission = script.match(/bootstrap: ([^\n]+),/)[1];
+  assert.equal(vm.runInContext(submission, ctx), seeds.join(','));
+}
+console.log('PASS: script syntax, IPv6 rendering/search, seed display-copy-paste-submit');

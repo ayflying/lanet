@@ -416,7 +416,7 @@
       <button class="ghost" id="cAdvertiseReset" onclick="resetAdvertise()" style="margin-left:8px;white-space:nowrap">恢复默认</button>
     </div>
     <div class="sub" id="cAdvertiseHint" style="display:none;color:#8a94a6;margin:-1px 0 6px 88px"></div>
-    <div class="kv"><b>连接种子</b><input type="text" id="cBootstrap" placeholder="留空 = 使用内置入口种子（跨网零配置入网）；填已入网成员的连接种子，多个用逗号分隔" oninput="bootstrapPasteHint()"></div>
+    <div class="kvstack"><b>连接种子</b><textarea id="cBootstrap" class="addr-input" rows="2" placeholder="直接粘贴对方复制的连接种子，一行一条；也支持逗号或空格分隔。留空使用内置入口种子" oninput="autoGrow(this);bootstrapPasteHint()"></textarea></div>
     <div class="sub" id="cBootstrapHint" style="display:none;margin:-1px 0 6px 88px"></div>
     <div class="row" style="margin-top:2px">
       <label style="display:flex;gap:6px;align-items:center">
@@ -886,7 +886,7 @@ function seedCheck(seed) {
 // 只接受能确定对端身份的地址，历史字面量 none / public 判为非法并指向「留空」。
 // 返回错误文案，OK 返回空串。
 function seedSpecCheck(spec) {
-  for (const raw of String(spec).split(',')) {
+  for (const raw of String(spec).split(/[,\s]+/)) {
     const s = raw.trim();
     if (!s) continue;
     if (s === 'none' || s === 'public') {
@@ -1317,7 +1317,8 @@ async function loadNodeConfig() {
     // （留空 = 用内置入口种子），这里按留空显示并说明，避免用户看到 public
     // 以为它还在生效。
     const bsLegacy = (bs === 'none' || bs === 'public');
-    $('cBootstrap').value = bsLegacy ? '' : bs;
+    $('cBootstrap').value = bsLegacy ? '' : bs.split(/[,\s]+/).filter(Boolean).join('\n');
+    autoGrow($('cBootstrap'));
     // 内置入口：勾选状态 + 入口地址（只读展示，让「留空会连哪里」可见）。
     cfgNoDefaultSeed = !!c.disable_default_seed;
     cfgDefaultEntrySeed = c.default_entry_seed || '';
@@ -1374,7 +1375,7 @@ async function saveNodeConfig() {
     // 对外地址多行输入框：换行归一化成逗号再提交（后端校验按逗号分隔）。
     advertise: $('cAdvertise').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean).join(','),
     // 连接种子只提交地址本身：空串 = 清空（留空即使用内置入口种子）。
-    bootstrap: $('cBootstrap').value.trim(),
+    bootstrap: $('cBootstrap').value.split(/[,\s]+/).filter(Boolean).join(','),
     // 内置入口开关：留空种子时是否仍连内置入口（false = 使用内置入口）。
     disable_default_seed: $('cNoDefaultSeed').checked,
     enable_public_dht: cfgPublicDHT,
