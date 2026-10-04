@@ -54,6 +54,11 @@ func ConfigureTUN(name, ip string, prefixBits int) error {
 		_ = runCmd("netsh", "interface", "ipv4", "delete", "neighbors", "name="+name)
 		_ = runCmd("netsh", "interface", "ipv4", "delete", "route",
 			"prefix=10.7.0.0/16", "interface="+name)
+		// 系统防火墙放行（异步尽力而为）：新建 Wintun 网卡默认落「未识别网络」
+		// =公用配置文件，公用配置拦一切入站——「成员在线、回显正常，但所有节点
+		// ping/TCP 它的虚拟 IP 全部超时」的根因（生产实测 tianzong-pc）。节点每次
+		// 启动（含 P2P 自更新重启）都会走到这里，幂等补齐放行规则与专用类别。
+		go configureOSFirewall(name)
 		return nil
 	case "linux":
 		// 注意顺序：先配地址再 UP。Linux 下 `ip addr add` 不会自动拉起接口，
