@@ -471,6 +471,7 @@ func runNode(parent context.Context, serviceMode bool) {
 	cold := true
 	coldStart := time.Now()
 	backoff := newProbeBackoff()
+	probeLog := newProbeLogThrottle()
 	for {
 		select {
 		case <-ctx.Done():
@@ -510,7 +511,7 @@ func runNode(parent context.Context, serviceMode bool) {
 			go func(i int, t probeTarget) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				results[i] = probeOnce(ctx, node, t.name, t.virtualIP)
+				results[i] = probeOnce(ctx, node, probeLog, t.name, t.virtualIP)
 				backoff.record(t.virtualIP, results[i], effProbe)
 			}(i, t)
 		}
@@ -530,6 +531,7 @@ func runNode(parent context.Context, serviceMode bool) {
 		}
 		// 成员表里已消失的目标不再保留退避状态，避免 map 随成员更替增长。
 		backoff.retain(members)
+		probeLog.retain(members)
 	}
 }
 
@@ -636,7 +638,8 @@ func shouldProbe(selfIP string, m netmapclient.Member) bool {
 }
 
 // probeOnce 对单个成员做一次 echo 往返探测，返回是否成功（失败驱动退避）。
-func probeOnce(ctx context.Context, node *lanet.Client, name, virtualIP string) bool {
+// 日志输出经 probeLogThrottle 降噪：只记状态变化与周期心跳。
+func probeOnce(ctx context.Context, node *lanet.Client, plog *probeLogThrottle, name, virtualIP string) bool {
 	start := time.Now()
 	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
@@ -648,7 +651,7 @@ func probeOnce(ctx context.Context, node *lanet.Client, name, virtualIP string) 
 	}
 	stream, viaRelay, err := node.DialProtocols(pctx, virtualIP, protos)
 	if err != nil {
-		log.Printf("[probe] FAIL %s(%s): %v", name, virtualIP, err)
+		plog.report(name, virtualIP, "", false, 0, err)
 		return false
 	}
 	payload := fmt.Sprintf("probe-%d", start.UnixMilli())
@@ -658,11 +661,87 @@ func probeOnce(ctx context.Context, node *lanet.Client, name, virtualIP string) 
 		via = "relay"
 	}
 	if err != nil {
-		log.Printf("[probe] FAIL %s(%s): %v", name, virtualIP, err)
+		plog.report(name, virtualIP, via, false, 0, err)
 		return false
 	}
-	log.Printf("[probe] OK %s(%s) via=%s rtt=%s", name, virtualIP, via, time.Since(start).Round(time.Millisecond))
+	plog.report(name, virtualIP, via, true, time.Since(start), nil)
 	return true
+}
+
+// probeHeartbeatInterval 成员状态持续不变时 probe 日志的最低输出间隔。
+// 期间用户仍可在控制台成员页看到实时在线/rtt，日志不必每轮复述。
+const probeHeartbeatInterval = 10 * time.Minute
+
+// probeLogThrottle probe 日志降噪。稳态探测 5s 一轮，每个可达成员都打一条
+// OK 会把运行日志刷满（10 成员 ≈ 120 行/分钟）且几乎全是重复信息。规则：
+//   - 状态变化（OK↔FAIL、direct↔relay）：立即输出——这才是需要看见的事件；
+//   - 状态不变：每 probeHeartbeatInterval 输出一条心跳并附已持续时长，
+//     证明成员仍被持续探测且可达；
+//   - FAIL 与 OK 同规则：持续失败由 probeBackoff 限频（最坏 1 次/分钟），
+//     进入持续失败后降为心跳节奏。
+// 探测与保温节奏不受影响，只影响日志输出。
+type probeLogThrottle struct {
+	mu    sync.Mutex
+	state map[string]*probeLogState
+}
+
+type probeLogState struct {
+	ok      bool
+	via     string
+	since   time.Time // 当前状态开始时刻
+	lastLog time.Time // 上次实际输出时刻
+}
+
+func newProbeLogThrottle() *probeLogThrottle {
+	return &probeLogThrottle{state: make(map[string]*probeLogState)}
+}
+
+// report 按状态变化/心跳规则决定是否输出一条 probe 日志。
+func (p *probeLogThrottle) report(name, virtualIP, via string, ok bool, rtt time.Duration, err error) {
+	now := time.Now()
+	p.mu.Lock()
+	st, exists := p.state[virtualIP]
+	if !exists || st.ok != ok || (ok && st.via != via) {
+		p.state[virtualIP] = &probeLogState{ok: ok, via: via, since: now, lastLog: now}
+		p.mu.Unlock()
+		if ok {
+			log.Printf("[probe] OK %s(%s) via=%s rtt=%s", name, virtualIP, via, rtt.Round(time.Millisecond))
+		} else {
+			log.Printf("[probe] FAIL %s(%s): %v", name, virtualIP, err)
+		}
+		return
+	}
+	heartbeat := now.Sub(st.lastLog) >= probeHeartbeatInterval
+	if heartbeat {
+		st.lastLog = now
+	}
+	dur := now.Sub(st.since).Round(time.Second)
+	p.mu.Unlock()
+	if !heartbeat {
+		return
+	}
+	if ok {
+		log.Printf("[probe] OK %s(%s) via=%s rtt=%s（已持续 %s）", name, virtualIP, via, rtt.Round(time.Millisecond), dur)
+	} else {
+		log.Printf("[probe] FAIL %s(%s): %v（已持续 %s）", name, virtualIP, err, dur)
+	}
+}
+
+// retain 丢弃已不在成员表里的目标的日志状态。
+func (p *probeLogThrottle) retain(members []netmapclient.Member) {
+	alive := make(map[string]bool, len(members))
+	for _, m := range members {
+		if m.VirtualIP != "" {
+			alive[m.VirtualIP] = true
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for k := range p.state {
+		if !alive[k] {
+			delete(p.state, k)
+		}
+	}
 }
 
 // membersSignature 成员表摘要（稳定顺序）。

@@ -387,7 +387,8 @@ type Discovery struct {
 	// pexLast/pexMu 成员地址同步（PEX）的入向消化节流：对端 → 上次消化时刻。
 	pexMu        sync.Mutex
 	pexLast      map[string]time.Time
-	advFailCount int // 连续「路由表空」失败次数
+	advFailCount int    // 连续同一失败模式的次数
+	advFailLast  string // 上一次失败错误文案（变化即视为新失败模式，重新计数）
 
 	// cbMu 保护 onDiscovered 切片：OnDiscovered 追加与 emit 迭代并发时需安全，
 	// 否则一个 goroutine 在迭代、另一个在 append 会触发 data race。
@@ -1141,24 +1142,33 @@ func (d *Discovery) dhtRound(ctx context.Context, dht *kaddht.IpfsDHT, source st
 	}
 }
 
-// logAdvFailure DHT 广播失败日志降噪：路由表为空（冷启动、无种子）时
-// 每轮都失败且每次都是同一句噪音，每 15s 刷屏毫无信息量。改为递增间隔
-// 提醒：前 2 次每条都记，之后每 20 次失败记一次（30s 周期 ≈ 10 分钟
-// 一条），恢复成功即清零。
+// logAdvFailure DHT 广播失败日志降噪：广播按固定周期重试，持续失败时错误
+// 基本不变（路由表空 / context deadline exceeded 等），每轮都记就是纯刷屏
+// （20s 周期 ≈ 180 条/小时）。规则：
+//   - 错误文案变化（新的失败模式）立即记录并重新计数；
+//   - 文案不变则前 2 次每条都记，之后每 20 次记一次（20s 周期 ≈ 7 分钟一条）；
+//   - 路由表空仍附带冷启动提示。
 func (d *Discovery) logAdvFailure(source string, err error) {
+	text := ""
+	if err != nil {
+		text = err.Error()
+	}
 	d.advFailMu.Lock()
 	defer d.advFailMu.Unlock()
-	if err == nil || !strings.Contains(err.Error(), "failed to find any peer in table") {
-		// 其他错误（网络抖动等）不吞，照常记录并清零计数。
+	if text != d.advFailLast {
+		d.advFailLast = text
 		d.advFailCount = 0
-		d.logf("DHT 广播失败（%s，下轮重试）: %v", source, err)
-		return
 	}
 	d.advFailCount++
-	if d.advFailCount <= 2 || d.advFailCount%20 == 0 {
+	if d.advFailCount > 2 && d.advFailCount%20 != 0 {
+		return
+	}
+	if strings.Contains(text, "failed to find any peer in table") {
 		d.logf("DHT 广播失败（%s，第 %d 次，多为路由表空/无种子的冷启动状态，下轮重试）: %v",
 			source, d.advFailCount, err)
+		return
 	}
+	d.logf("DHT 广播失败（%s，第 %d 次，下轮重试）: %v", source, d.advFailCount, err)
 }
 
 // publicRetireThreshold 达到该数量的同群节点后，公共 DHT 视为
