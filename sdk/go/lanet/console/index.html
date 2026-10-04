@@ -1183,6 +1183,16 @@ function resetLogView() {
   logRows = []; logBytes = 0;
   $('logOutput').replaceChildren();
 }
+// releaseLogs 离开日志页时连缓存一起释放：stopLogs 只停流（切窗口、页面
+// 隐藏时用，回来还能接着看），这里把 DOM 与数组也清掉，内存立即归还浏览器。
+// 游标一并归零，回到本页时由 startLogs 的页签守卫从头重放保留的历史，
+// 与首次进入一致。
+function releaseLogs() {
+  stopLogs();
+  logCursor = 0; logGeneration = 0;
+  resetLogView();
+  $('logStatus').textContent = '已释放日志缓存，回到本页自动重新加载';
+}
 function appendLogBatch(batch) {
   if (batch.reset) resetLogView();
   logCursor = batch.cursor; logGeneration = batch.generation;
@@ -1273,6 +1283,7 @@ function switchTab(btn) {
   if (btn.dataset.panel === 'pEntry') loadSeedSettings();
   else entryPoll.pause();
   if (btn.dataset.panel === 'pLogs') startLogs();
+  else releaseLogs();   // 切离日志页：停流并释放缓存，内存不白占
 }
 function renderRules() {
   $('ruleList').innerHTML = S.rules.length === 0
