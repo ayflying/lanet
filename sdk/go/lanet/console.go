@@ -112,6 +112,7 @@ func (c *Client) startConsole() error {
 	mux.HandleFunc("POST /api/peer-notes", c.apiSetPeerNotes)
 	// 种子表接口（实现在 console_seeds.go，避免与内嵌 UI 的改动面重叠）。
 	c.registerSeedRoutes(mux)
+	c.registerLogRoutes(mux)
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		if logo, err := consoleFS.ReadFile("console/logo.png"); err == nil {

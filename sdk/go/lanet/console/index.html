@@ -164,6 +164,7 @@
   <button class="tab" data-panel="pFirewall" onclick="switchTab(this)">入向防火墙 <span class="badge" id="bRules">0</span></button>
   <button class="tab" data-panel="pForwards" onclick="switchTab(this)">端口转发 <span class="badge" id="bForwards">0</span></button>
   <button class="tab" data-panel="pEntry" onclick="switchTab(this)">公网入口 <span class="badge" id="bEntries">0</span></button>
+  <button class="tab" data-panel="pLogs" onclick="switchTab(this)">运行日志</button>
   <button class="tab" data-panel="pConfig" id="tabConfig" onclick="switchTab(this)" style="display:none">节点配置</button>
 </div>
 
@@ -396,6 +397,19 @@
       <span class="sub" id="sStats" style="margin:0"></span>
     </div>
     <div id="seedList"></div>
+  </div>
+</div>
+
+<div class="panel" id="pLogs">
+  <div class="card">
+    <h2>运行日志</h2>
+    <div class="row" style="gap:10px;flex-wrap:wrap;margin-bottom:10px">
+      <button class="ghost" onclick="refreshLogs()">刷新</button>
+      <button class="ghost" id="clearLogs" onclick="clearConsoleLogs()">清空控制台缓存</button>
+      <span class="sub" id="logStatus" role="status">打开页签后分批加载</span>
+    </div>
+    <div class="sub" style="margin-bottom:10px">节点与中继运行日志，分批实时加载，不自动滚动。缓存最多 2048 条 / 2 MiB；单条最多 4 KiB。清空只影响控制台内存，不删除系统、Docker 或日志文件。</div>
+    <div id="logOutput" tabindex="0" aria-label="运行日志内容" style="height:55vh;min-height:240px;overflow:auto;overflow-anchor:none;border:1px solid var(--line);padding:10px;background:var(--bg);font:12px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere"></div>
   </div>
 </div>
 
@@ -1139,11 +1153,103 @@ function renderMembers() {
   $('mNext').disabled = mPage >= pages;
 }
 
+let logController = null, logRetry = null, logCursor = 0, logGeneration = 0;
+let logRows = [], logBytes = 0;
+const logEncoder = new TextEncoder();
+function stopLogs() {
+  clearTimeout(logRetry); logRetry = null;
+  if (logController) logController.abort();
+  logController = null;
+}
+function resetLogView() {
+  logRows = []; logBytes = 0;
+  $('logOutput').replaceChildren();
+}
+function appendLogBatch(batch) {
+  if (batch.reset) resetLogView();
+  logCursor = batch.cursor; logGeneration = batch.generation;
+  const output = $('logOutput'), position = output.scrollTop;
+  const fragment = document.createDocumentFragment();
+  for (const record of batch.records) {
+    const node = document.createElement('div');
+    node.textContent = record.text;
+    const bytes = logEncoder.encode(record.text).length;
+    logRows.push({node, bytes}); logBytes += bytes;
+    fragment.appendChild(node);
+  }
+  output.appendChild(fragment);
+  while (logRows.length > 2048 || logBytes > 2 * 1024 * 1024) {
+    const row = logRows.shift(); logBytes -= row.bytes; row.node.remove();
+  }
+  // Preserve the reader's position, never jump to the newest entry.
+  output.scrollTop = position;
+  $('logStatus').textContent = `${logRows.length} 条 · ${batch.more ? '分批加载中' : '实时接收（不自动滚动）'}`;
+}
+async function startLogs() {
+  stopLogs();
+  if (document.hidden || !$('pLogs').classList.contains('active')) return;
+  const controller = new AbortController(); logController = controller;
+  let reader;
+  try {
+    $('logStatus').textContent = '连接日志流…';
+    const response = await fetch(`/api/logs/stream?cursor=${logCursor}&generation=${logGeneration}`, {
+      signal: controller.signal, cache: 'no-store', credentials: 'same-origin'
+    });
+    if (response.status === 401) { location.href = '/login'; return; }
+    if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
+    reader = response.body.getReader();
+    const decoder = new TextDecoder(); let pending = '';
+    while (!controller.signal.aborted) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, {stream:true});
+      let end;
+      while ((end = pending.indexOf('\n\n')) >= 0) {
+        const event = pending.slice(0, end); pending = pending.slice(end + 2);
+        if (event.startsWith('event: logs\ndata: ')) {
+          if (controller.signal.aborted) return;
+          appendLogBatch(JSON.parse(event.slice('event: logs\ndata: '.length)));
+        }
+      }
+      if (pending.length > 512 * 1024) throw new Error('日志批次过大');
+    }
+    if (!controller.signal.aborted) $('logStatus').textContent = '日志流已断开，正在重连…';
+  } catch (error) {
+    if (!controller.signal.aborted) $('logStatus').textContent = `日志加载失败：${error.message}，稍后重试`;
+  } finally {
+    if (reader) { try { await reader.cancel(); } catch (_) {} reader.releaseLock(); }
+    if (logController === controller) {
+      logController = null;
+      if (!controller.signal.aborted && !document.hidden && $('pLogs').classList.contains('active')) {
+        logRetry = setTimeout(startLogs, 3000);
+      }
+    }
+  }
+}
+function refreshLogs() {
+  stopLogs(); logCursor = 0; logGeneration = 0; resetLogView(); startLogs();
+}
+async function clearConsoleLogs() {
+  stopLogs(); $('clearLogs').disabled = true;
+  try {
+    const response = await fetch('/api/logs/clear', {method:'POST', credentials:'same-origin'});
+    if (response.status === 401) { location.href = '/login'; return; }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    logCursor = 0; logGeneration = 0; resetLogView();
+    $('logStatus').textContent = '控制台缓存已清空，系统日志未删除';
+  } catch (error) { $('logStatus').textContent = `清空失败：${error.message}`; }
+  finally { $('clearLogs').disabled = false; startLogs(); }
+}
+window.addEventListener('pagehide', stopLogs);
+document.addEventListener('visibilitychange', () => { if (document.hidden) stopLogs(); else startLogs(); });
+
 function switchTab(btn) {
+  stopLogs();
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === btn));
   document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === btn.dataset.panel));
   if (btn.dataset.panel === 'pEntry') loadSeedSettings();
   else entryPoll.pause();
+  if (btn.dataset.panel === 'pLogs') startLogs();
 }
 function renderRules() {
   $('ruleList').innerHTML = S.rules.length === 0

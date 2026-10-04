@@ -14,7 +14,7 @@
 //     only come from peers behind a relay）。
 //
 // 于是「没有公网设备 → 找不到好友也打不了洞」并非拓扑必然，而是这段代码
-// 缺失导致的。这里补上常驻预约：入网后周期性向候选预约，成功一次即持有。
+// 缺失导致的。这里补上常驻预约：入网后周期性向候选预约，向全部有界候选预约以增加双方共享中继的机会。
 //
 // ============================ 候选怎么挑 ============================
 //
@@ -26,34 +26,36 @@
 //     另一个中继」，成环且几乎必然失败；
 //   - 不过滤成员新鲜度：已经超期（等同幽灵）的成员仍会被挑中，白等一轮超时。
 //
-// 现在按「已验证种子 → 当前已连上的成员 → 近期活跃成员」的顺序给候选，
+// 现在按「当前已连上的群成员 → 已验证种子 → 近期活跃成员」的顺序给候选，
 // 且统一做地址筛选，行为稳定且不浪费拨号预算。
 package serverless
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"sort"
 	"time"
 
 	"github.com/ayflying/pvn/pkg/p2pkit"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
 const (
 	// relayCandidatesMax 单次交给 autorelay 的候选上限。
 	relayCandidatesMax = 10
-	// relayReserveNumber 期望持有的中继数量（凑够一个保底链路即可，
-	// 多了纯属浪费预约请求）。
-	relayReserveNumber = 2
+	// relayReserveNumber 每轮预约全部有界候选，增加目标与发起方共享中继的机会。
+	relayReserveNumber = relayCandidatesMax
 	// relayReserveInitialDelay 入网后多久开始第一次预约：避开启动期的
 	// DHT 自举与首轮广播，那段时间连候选都还没进成员表。
 	relayReserveInitialDelay = 12 * time.Second
-	// relayReserveInterval 预约补充周期。circuitv2 预约有效期约 1 小时，
-	// 15 分钟补一次余量充足，而一次预约只是一个流请求，开销可忽略。
-	relayReserveInterval = 15 * time.Minute
-	// relayReserveBudget 单轮预约的总预算（内部每个候选各有 10s 子预算）。
+	// relayReserveInterval 每分钟补充新成员/新中继预约，不再等 15 分钟。
+	relayReserveInterval = time.Minute
+	// relayReserveBudget 单轮预约的总预算（内部每个候选最多 3s，按剩余时间平分）。
 	relayReserveBudget = 30 * time.Second
 	// relayReserveLogEvery 连续失败时每多少次打一条日志（降噪：
 	// 纯 NAT 群里没有公网设备时，预约失败是常态，不该刷屏）。
@@ -128,7 +130,7 @@ func (d *Discovery) collectRelayCandidates(ctx context.Context, number int) []pe
 
 	// 第二层：成员表里的同群节点（含好友与被动发现到的同密钥节点）。
 	for _, m := range d.members {
-		if m.PeerID == self.String() || m.LastSeen.Before(cutoff) {
+		if m.PeerID == self.String() || m.LastSeen.Before(cutoff) || !d.trustedNow(m.PeerID) {
 			continue
 		}
 		id, err := peer.Decode(m.PeerID)
@@ -151,7 +153,7 @@ func (d *Discovery) collectRelayCandidates(ctx context.Context, number int) []pe
 
 // orderRelayCandidates 对候选做稳定排序、去重、截断，产出 peer.AddrInfo。
 //
-// 排序键（依次）：种子优先（tier）→ 已连上的优先（现成可达，预约最可能成功）
+// 排序键（依次）：已连接群成员 → 已连接种子 → 其他种子 → 其他成员
 // → 最近见过优先 → 节点 ID（兜底，保证同一输入必得同一输出，避免 autorelay
 // 每轮对着不同候选反复重试）。
 //
@@ -160,11 +162,15 @@ func (d *Discovery) collectRelayCandidates(ctx context.Context, number int) []pe
 func orderRelayCandidates(candidates []relayCandidate, number int) []peer.AddrInfo {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
-		if a.tier != b.tier {
-			return a.tier < b.tier
+		aMember, bMember := a.connected && a.tier == 1, b.connected && b.tier == 1
+		if aMember != bMember {
+			return aMember
 		}
 		if a.connected != b.connected {
 			return a.connected
+		}
+		if a.tier != b.tier {
+			return a.tier < b.tier
 		}
 		if !a.lastSeen.Equal(b.lastSeen) {
 			return a.lastSeen.After(b.lastSeen)
@@ -190,8 +196,7 @@ func orderRelayCandidates(candidates []relayCandidate, number int) []peer.AddrIn
 // startRelayReservation 启动常驻中继预约循环（异步、随 ctx 结束、只启一次）。
 //
 // 无服务器模式下这是唯一会让节点在中继上留下预约的地方（见文件头注释）。
-// 失败不重试得太密：没有公网设备时失败是常态，15 分钟一轮足够，
-// 也避免纯 NAT 群互相刷预约请求。纯本地候选筛选 + 一次流请求，流量可忽略。
+// 每分钟尝试全部有界候选；日志仍降噪。局部预约成功不代表双向可通。
 func (d *Discovery) startRelayReservation(ctx context.Context) {
 	d.relayOnce.Do(func() {
 		go func() {
@@ -200,18 +205,18 @@ func (d *Discovery) startRelayReservation(ctx context.Context) {
 				return
 			case <-time.After(relayReserveInitialDelay):
 			}
-			source := p2pkit.PeerSourceFromCandidates(d.Candidates, relayReserveNumber)
+
 			fails := 0
 			announced := false
 			for {
 				runCtx, cancel := context.WithTimeout(ctx, relayReserveBudget)
-				err := p2pkit.EnsureRelayReservation(runCtx, d.host, source, relayReserveNumber)
+				err := d.reserveRelayCandidates(runCtx)
 				cancel()
 				switch {
 				case err == nil:
 					// 只在「首次成功」或「从中断中恢复」时打日志，避免每轮刷屏。
 					if !announced || fails > 0 {
-						d.logf("中继预约成功（无服务器模式常驻保底链路已建立）")
+						d.logf("中继预约成功（本机可被经对应中继访问；互通仍需目标的共享预约）")
 					}
 					announced = true
 					fails = 0
@@ -231,4 +236,48 @@ func (d *Discovery) startRelayReservation(ctx context.Context) {
 			}
 		}()
 	})
+}
+
+// reserveRelayCandidates reserves on every bounded candidate, not just the first
+// success: two peers with different preference orders need a shared target-side
+// reservation. A successful local reservation alone never proves reachability.
+func (d *Discovery) reserveRelayCandidates(ctx context.Context) error {
+	candidates, err := d.Candidates(ctx, relayReserveNumber)
+	if err != nil {
+		return err
+	}
+	return reserveRelayCandidates(ctx, d.host, candidates)
+}
+
+func reserveRelayCandidates(ctx context.Context, h host.Host, candidates []peer.AddrInfo) error {
+	if len(candidates) > relayCandidatesMax {
+		candidates = candidates[:relayCandidatesMax]
+	}
+	successes := 0
+	for i, candidate := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
+		budget := 3 * time.Second
+		if deadline, ok := ctx.Deadline(); ok {
+			if share := time.Until(deadline) / time.Duration(len(candidates)-i); share < budget {
+				budget = share
+			}
+		}
+		reserveCtx, cancel := context.WithTimeout(ctx, budget)
+		_, err := client.Reserve(reserveCtx, h, candidate)
+		cancel()
+		if err == nil {
+			successes++
+		} else {
+			log.Printf("[lanet-relay] reservation on %s failed: %v", candidate.ID, err)
+		}
+	}
+	if successes > 0 {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return fmt.Errorf("no relay reservation succeeded among %d candidates", len(candidates))
 }

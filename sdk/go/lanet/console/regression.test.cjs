@@ -8,7 +8,7 @@ new vm.Script(script); // Parse the entire embedded script, not just the exercis
 function extract(start, end) { return script.slice(script.indexOf(start), script.indexOf(end, script.indexOf(start))); }
 const elements = {};
 const el = id => elements[id] ||= { value: '', style: {}, textContent: '', innerHTML: '' };
-const ctx = vm.createContext({ $: el, esc: s => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;'), relTime: () => '刚刚', mdLite: s => s, Date });
+const ctx = vm.createContext({ $: el, esc: s => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;'), relTime: () => '刚刚', mdLite: s => s, Date, TextEncoder, window: { addEventListener() {} }, document: { addEventListener() {} } });
 vm.runInContext('let S; let updInfo;\n' + extract('const M_PAGE_SIZE', 'function switchTab') + extract('function fmtCheckedAt', 'async function onUpdateClick'), ctx);
 vm.runInContext(`S = {members: [{peer_id:'peer1', virtual_ip:'10.7.1.2', virtual_ipv6:'fd00:6c61:6e65::1234', online:true}]}; renderMembers();`, ctx);
 assert.match(el('members').innerHTML, /10\.7\.1\.2/);
@@ -41,4 +41,20 @@ for (const separator of ['\n', '\r\n', ' ', '\t', ',']) {
   const submission = script.match(/bootstrap: ([^\n]+),/)[1];
   assert.equal(vm.runInContext(submission, ctx), seeds.join(','));
 }
-console.log('PASS: script syntax, IPv6 rendering/search, seed display-copy-paste-submit');
+const output = el('logOutput');
+output.scrollTop = 137;
+output.children = [];
+output.replaceChildren = () => { output.children = []; };
+output.appendChild = fragment => { output.children.push(...fragment.children); };
+ctx.document.createDocumentFragment = () => ({ children: [], appendChild(node) { this.children.push(node); } });
+ctx.document.createElement = () => ({ textContent: '', remove() { output.children.splice(output.children.indexOf(this), 1); } });
+ctx.batch = { reset: false, cursor: 1, generation: 1, more: true, records: Array.from({length: 2100}, () => ({text: '<script>test</script>'})) };
+vm.runInContext('appendLogBatch(batch)', ctx);
+assert.equal(output.children.length, 2048, 'log DOM must stay bounded');
+assert.equal(output.scrollTop, 137, 'log batches must not auto-scroll');
+assert.equal(output.children[0].textContent, '<script>test</script>', 'logs must render as text');
+ctx.batch = { reset: true, cursor: 2, generation: 2, more: false, records: [{text: 'after clear'}] };
+vm.runInContext('appendLogBatch(batch)', ctx);
+assert.equal(output.children.length, 1, 'generation reset must discard old history');
+assert.equal(output.children[0].textContent, 'after clear');
+console.log('PASS: script syntax, IPv6 rendering/search, seed display-copy-paste-submit, bounded safe logs without auto-scroll');

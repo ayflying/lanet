@@ -1370,7 +1370,8 @@ func (d *Discovery) connectAndIdentifyContext(ctx context.Context, id peer.ID) e
 	}
 	connCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if d.host.Network().Connectedness(id) != network.Connected {
+	connectedness := d.host.Network().Connectedness(id)
+	if connectedness != network.Connected && connectedness != network.Limited {
 		if err := d.host.Connect(connCtx, peer.AddrInfo{ID: id}); err != nil {
 			d.logf("连接成员 %s 失败: %v", id.ShortString(), err)
 			return fmt.Errorf("建连失败: %w", err)
@@ -1713,7 +1714,7 @@ func (d *Discovery) handleInfo(s network.Stream) {
 
 // fetchInfo 主动交换成员信息。
 func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, error) {
-	stream, err := d.host.NewStream(ctx, id, d.protoCandidates(d.protoInfo, d.protoInfoAlt)...)
+	stream, err := d.host.NewStream(network.WithAllowLimitedConn(ctx, "member info over relay"), id, d.protoCandidates(d.protoInfo, d.protoInfoAlt)...)
 	if err != nil {
 		return infoPayload{}, err
 	}

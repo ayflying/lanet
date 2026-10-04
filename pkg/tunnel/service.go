@@ -14,13 +14,12 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	libprotocol "github.com/libp2p/go-libp2p/core/protocol"
-	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
 // 隧道策略：同一群组成员之间建立流式连接。
 // 1. 对端通告了可达地址 → 先直连（P2P，带宽不受中继限制）。
-// 2. 直连失败 → 从 RelaySource 取候选中继，Circuit Relay v2 预约后经 /p2p-circuit 转发保底。
+// 2. 直连失败 → 从 RelaySource 取候选，逐个尝试目标持有预约的 Circuit Relay v2 路径。
 // 3. 建立连接后打开 /pvn/tunnel/1.0.0 流收发数据。
 
 // GroupNetMap 隧道服务所需的 NetMap 能力；由 netmap.Client 实现。
@@ -122,7 +121,7 @@ func (s *Service) OpenStreamToVirtualIPProtocols(ctx context.Context, virtualIP 
 		if err := ctx.Err(); err != nil {
 			return nil, false, err
 		}
-		if s.self.Network().Connectedness(target) != network.Connected {
+		if len(s.self.Network().ConnsToPeer(target)) == 0 {
 			if flight.err != nil {
 				return nil, false, flight.err
 			}
@@ -166,7 +165,7 @@ func (s *Service) OpenStreamToVirtualIPProtocols(ctx context.Context, virtualIP 
 	//    必须最先尝试：对同一 peer 反复 Connect 会触发 libp2p dial
 	//    backoff，且 addrs 里常混有 127.0.0.1/169.254 等不可达地址，
 	//    逐个试会耗尽 dialTimeout——而此时连接明明是健康的。
-	if s.self.Network().Connectedness(target) == network.Connected {
+	if len(s.self.Network().ConnsToPeer(target)) > 0 {
 		stream, streamErr := s.openStream(dialCtx, target, protos...)
 		if streamErr == nil {
 			viaRelay := hasCircuit(stream.Conn().RemoteMultiaddr())
@@ -183,8 +182,9 @@ func (s *Service) OpenStreamToVirtualIPProtocols(ctx context.Context, virtualIP 
 	if directErr == nil {
 		stream, streamErr := s.openStream(dialCtx, target, protos...)
 		if streamErr == nil {
-			s.markRelay(route.PeerID, false)
-			return stream, false, nil
+			viaRelay := hasCircuit(stream.Conn().RemoteMultiaddr())
+			s.markRelay(route.PeerID, viaRelay)
+			return stream, viaRelay, nil
 		}
 		directErr = streamErr
 	}
@@ -195,48 +195,84 @@ func (s *Service) OpenStreamToVirtualIPProtocols(ctx context.Context, virtualIP 
 		return nil, false, fmt.Errorf("direct and relay dial both failed: direct=%s relay=%s",
 			describeDirect(route, directErr), compactError(relayErr))
 	}
-	s.markRelay(route.PeerID, true)
-	return stream, true, nil
+	viaRelay := hasCircuit(stream.Conn().RemoteMultiaddr())
+	s.markRelay(route.PeerID, viaRelay)
+	return stream, viaRelay, nil
 }
 
 func (s *Service) openStream(ctx context.Context, target peer.ID, protos ...libprotocol.ID) (network.Stream, error) {
-	return s.self.NewStream(ctx, target, protos...)
+	// Circuit v2 connections are limited; explicitly allow application streams on
+	// the fallback path without bypassing transport or application trust checks.
+	return s.self.NewStream(network.WithAllowLimitedConn(ctx, "tunnel relay fallback"), target, protos...)
 }
 
 func (s *Service) openViaRelay(ctx context.Context, target peer.ID, protos ...libprotocol.ID) (network.Stream, error) {
-	candidates, err := s.relays.Candidates(ctx, 2)
+	if s.relays == nil {
+		return nil, fmt.Errorf("no relay source available")
+	}
+	const maxRelayCandidates = 10
+	candidates, err := s.relays.Candidates(ctx, maxRelayCandidates)
 	if err != nil {
 		return nil, fmt.Errorf("fetch relay candidates: %w", err)
 	}
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no relay candidates available")
 	}
-	var lastErr error
-	if len(candidates) > 2 {
-		candidates = candidates[:2]
+	if len(candidates) > maxRelayCandidates {
+		candidates = candidates[:maxRelayCandidates]
 	}
-	for _, candidate := range candidates {
-		if candidate.ID == target || len(candidate.Addrs) == 0 {
-			continue // 目标自己不能当中继（直连都失败了，自我中继无意义）
+	var lastErr error
+	seen := make(map[peer.ID]bool)
+	for i, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		reserveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, reserveErr := client.Reserve(reserveCtx, s.self, candidate)
-		cancel()
-		if reserveErr != nil {
-			lastErr = fmt.Errorf("reserve on %s: %w", candidate.ID, reserveErr)
+		if candidate.ID == target || candidate.ID == s.self.ID() || seen[candidate.ID] || len(candidate.Addrs) == 0 {
 			continue
 		}
-		circuitAddr := candidate.Addrs[0].
-			Encapsulate(ma.StringCast("/p2p/" + candidate.ID.String())).
-			Encapsulate(ma.StringCast("/p2p-circuit/p2p/" + target.String()))
-		connectCtx, cancelConnect := context.WithTimeout(ctx, s.dialTimeout)
-		connectErr := s.self.Connect(connectCtx, peer.AddrInfo{ID: target, Addrs: []ma.Multiaddr{circuitAddr}})
-		cancelConnect()
+		seen[candidate.ID] = true
+		// The TARGET must hold a reservation on this relay. Reserving only the
+		// initiator does not help and can reject relays that already serve the target.
+		// Attempt the actual circuit, and switch candidates on NO_RESERVATION etc.
+		var circuitAddrs []ma.Multiaddr
+		for _, addr := range candidate.Addrs {
+			if addr == nil || hasCircuit(addr) {
+				continue
+			}
+			base := addr
+			if _, err := base.ValueForProtocol(ma.P_P2P); err == nil {
+				ai, err := peer.AddrInfoFromP2pAddr(base)
+				if err != nil || ai.ID != candidate.ID || len(ai.Addrs) == 0 {
+					continue
+				}
+				base = ai.Addrs[0]
+			}
+			circuitAddrs = append(circuitAddrs, base.
+				Encapsulate(ma.StringCast("/p2p/"+candidate.ID.String())).
+				Encapsulate(ma.StringCast("/p2p-circuit/p2p/"+target.String())))
+		}
+		if len(circuitAddrs) == 0 {
+			continue
+		}
+		// Share the remaining overall deadline so two black-holed seeds cannot
+		// consume all the time intended for reachable members further down the list.
+		budget := 3 * time.Second
+		if deadline, ok := ctx.Deadline(); ok {
+			share := time.Until(deadline) / time.Duration(len(candidates)-i)
+			if share < budget {
+				budget = share
+			}
+		}
+		connectCtx, cancel := context.WithTimeout(ctx, budget)
+		connectCtx = network.WithAllowLimitedConn(connectCtx, "tunnel relay fallback")
+		connectErr := s.self.Connect(connectCtx, peer.AddrInfo{ID: target, Addrs: circuitAddrs})
 		if connectErr != nil {
-			lastErr = fmt.Errorf("connect via %s: %w", candidate.ID, connectErr)
+			cancel()
+			lastErr = fmt.Errorf("connect via %s (target reservation required): %w", candidate.ID, connectErr)
 			continue
 		}
-		stream, streamErr := s.openStream(ctx, target, protos...)
+		stream, streamErr := s.openStream(connectCtx, target, protos...)
+		cancel()
 		if streamErr != nil {
 			lastErr = fmt.Errorf("open stream via %s: %w", candidate.ID, streamErr)
 			continue
@@ -244,7 +280,6 @@ func (s *Service) openViaRelay(ctx context.Context, target peer.ID, protos ...li
 		return stream, nil
 	}
 	if lastErr == nil {
-		// 候选全被排除（如唯一候选就是目标自身）等情况。
 		lastErr = fmt.Errorf("no usable relay candidate (excluded target %s)", target)
 	}
 	return nil, lastErr

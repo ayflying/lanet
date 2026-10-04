@@ -1,6 +1,11 @@
 package serverless
 
 import (
+	"context"
+	"encoding/json"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peerstore"
+	"io"
 	"testing"
 	"time"
 
@@ -61,7 +66,7 @@ func TestOrderRelayCandidates(t *testing.T) {
 		{id: mustPeerID(t, testPeerC), peerID: testPeerC, lastSeen: now.Add(-9 * time.Minute), addrs: []ma.Multiaddr{addr}, tier: 1},
 		// 成员层：已连上（应排在未连上的成员之前）
 		{id: mustPeerID(t, testPeerB), peerID: testPeerB, lastSeen: now.Add(-9 * time.Minute), addrs: []ma.Multiaddr{addr}, connected: true, tier: 1},
-		// 种子层：即使没连上、很久没见过，也应排在所有成员之前
+		// 未连接种子必须排在已连接群成员之后
 		{id: mustPeerID(t, testPeerA), peerID: testPeerA, lastSeen: time.Time{}, addrs: []ma.Multiaddr{addr}, tier: 0},
 		// 与种子同 ID 的重复项：应被去重
 		{id: mustPeerID(t, testPeerA), peerID: testPeerA, addrs: []ma.Multiaddr{addr}, tier: 0},
@@ -71,7 +76,7 @@ func TestOrderRelayCandidates(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("应得 3 条（去重后共 3 个不同 ID），实际 %d：%v", len(got), got)
 	}
-	wantOrder := []string{testPeerA, testPeerB, testPeerC}
+	wantOrder := []string{testPeerB, testPeerA, testPeerC}
 	for i, want := range wantOrder {
 		if got[i].ID.String() != want {
 			t.Errorf("第 %d 位应为 %s，实际 %s（顺序：%v）", i, want, got[i].ID, got)
@@ -79,8 +84,8 @@ func TestOrderRelayCandidates(t *testing.T) {
 	}
 
 	// 截断生效。
-	if short := orderRelayCandidates(cands, 1); len(short) != 1 || short[0].ID.String() != testPeerA {
-		t.Errorf("截断到 1 条应剩种子，实际 %v", short)
+	if short := orderRelayCandidates(cands, 1); len(short) != 1 || short[0].ID.String() != testPeerB {
+		t.Errorf("截断到 1 条应剩已连接成员，实际 %v", short)
 	}
 	// 空输入不 panic。
 	if out := orderRelayCandidates(nil, 3); len(out) != 0 {
@@ -93,5 +98,77 @@ func TestOrderRelayCandidates(t *testing.T) {
 		if first[i].ID != second[i].ID {
 			t.Fatalf("顺序不稳定：%v vs %v", first, second)
 		}
+	}
+}
+
+// Reserving the first successful hop must not stop before later hops: the
+// remote peer may only be able to reach the latter.
+func TestRelayReservationContinuesAfterSuccess(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	target := testHost(t, false)
+	first, second := testHost(t, true), testHost(t, true)
+	candidates := []peer.AddrInfo{{ID: first.ID(), Addrs: first.Addrs()}, {ID: second.ID(), Addrs: second.Addrs()}}
+	if err := reserveRelayCandidates(ctx, target, candidates); err != nil {
+		t.Fatal(err)
+	}
+	target.SetStreamHandler("/lanet/reservation-test/1", func(st network.Stream) { defer st.Close(); _, _ = io.Copy(st, st) })
+	for _, hop := range candidates {
+		caller := testHost(t, false)
+		// No direct target address is installed in caller's peerstore.
+		addr := hop.Addrs[0].Encapsulate(ma.StringCast("/p2p/" + hop.ID.String() + "/p2p-circuit/p2p/" + target.ID().String()))
+		if err := caller.Connect(network.WithAllowLimitedConn(ctx, "test"), peer.AddrInfo{ID: target.ID(), Addrs: []ma.Multiaddr{addr}}); err != nil {
+			t.Fatalf("reservation missing on %s: %v", hop.ID, err)
+		}
+		st, err := caller.NewStream(network.WithAllowLimitedConn(ctx, "test"), target.ID(), "/lanet/reservation-test/1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Conn().RemoteMultiaddr().ValueForProtocol(ma.P_CIRCUIT); err != nil {
+			t.Fatal("not real circuit")
+		}
+		_ = st.SetDeadline(time.Now().Add(time.Second))
+		_, err = st.Write([]byte("x"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 1)
+		if _, err := io.ReadFull(st, buf); err != nil {
+			t.Fatal(err)
+		}
+		_ = st.Close()
+		const infoProto = "/lanet/relay-info-test/1"
+		target.SetStreamHandler(infoProto, func(s network.Stream) {
+			defer s.Close()
+			var req infoPayload
+			if json.NewDecoder(s).Decode(&req) == nil {
+				_ = json.NewEncoder(s).Encode(infoPayload{Name: "relay-target"})
+			}
+		})
+		d := &Discovery{host: caller, protoInfo: infoProto, groupKey: make([]byte, 32)}
+		info, err := d.fetchInfo(ctx, target.ID())
+		if err != nil || info.Name != "relay-target" {
+			t.Fatalf("member info over limited relay: %v %+v", err, info)
+		}
+	}
+}
+
+func TestRelayCandidatesExcludeRevokedTrust(t *testing.T) {
+	h := testHost(t, false)
+	id := mustPeerID(t, testPeerA)
+	h.Peerstore().AddAddr(id, ma.StringCast("/ip4/192.168.50.20/tcp/4001"), peerstore.TempAddrTTL)
+	d := &Discovery{host: h, memberTTL: time.Hour, members: map[string]*Member{testPeerA: {PeerID: testPeerA, LastSeen: time.Now()}}}
+	d.cfg.IsTrusted = func(string) bool { return false }
+	got, err := d.Candidates(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("revoked member returned: %v", got)
+	}
+	d.cfg.IsTrusted = func(string) bool { return true }
+	got, err = d.Candidates(context.Background(), 10)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("trusted member lost: %v %v", got, err)
 	}
 }

@@ -177,6 +177,7 @@ func runNode(parent context.Context, serviceMode bool) {
 		logMaxSize, logMaxBackups); err == nil {
 		log.SetOutput(tolerantWriter{[]io.Writer{os.Stderr, lf}})
 	}
+	lanet.CaptureConsoleLogs()
 
 	// ---- 单实例：同一配置目录只允许一个节点进程（见 singleton.go）----
 	// 必须放在开库、建 TUN、抢控制台端口之前：双开的两个进程会共用同一份
