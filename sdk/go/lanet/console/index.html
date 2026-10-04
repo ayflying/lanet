@@ -408,7 +408,7 @@
       <button class="ghost" id="clearLogs" onclick="clearConsoleLogs()">清空控制台缓存</button>
       <span class="sub" id="logStatus" role="status">打开页签后分批加载</span>
     </div>
-    <div class="sub" style="margin-bottom:10px">节点与中继运行日志，分批实时加载，不自动滚动。缓存最多 2048 条 / 2 MiB；单条最多 4 KiB。清空只影响控制台内存，不删除系统、Docker 或日志文件。</div>
+    <div class="sub" style="margin-bottom:10px">节点与中继运行日志，分批实时加载，贴底自动滚动：上滚即暂停，回到底部恢复。缓存最多 1000 条 / 1 MiB；单条最多 4 KiB。清空只影响控制台内存，不删除系统、Docker 或日志文件。</div>
     <div id="logOutput" tabindex="0" aria-label="运行日志内容" style="height:55vh;min-height:240px;overflow:auto;overflow-anchor:none;border:1px solid var(--line);padding:10px;background:var(--bg);font:12px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere"></div>
   </div>
 </div>
@@ -1161,8 +1161,19 @@ function renderMembers() {
 }
 
 let logController = null, logRetry = null, logCursor = 0, logGeneration = 0;
-let logRows = [], logBytes = 0;
+let logRows = [], logBytes = 0, logStick = true;
 const logEncoder = new TextEncoder();
+// 贴底跟随：贴底时新日志自动滚到最新；用户上滚即暂停，回到底部自动恢复。
+// 32px 容差吸收亚像素舍入，避免状态抖动。
+$('logOutput').addEventListener('scroll', () => {
+  const el = $('logOutput');
+  const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 32;
+  if (stick !== logStick) {
+    logStick = stick;
+    if (logRows.length) $('logStatus').textContent =
+      `${logRows.length} 条 · ${logStick ? '实时滚动' : '已暂停自动滚动（回到底部继续）'}`;
+  }
+});
 function stopLogs() {
   clearTimeout(logRetry); logRetry = null;
   if (logController) logController.abort();
@@ -1175,7 +1186,8 @@ function resetLogView() {
 function appendLogBatch(batch) {
   if (batch.reset) resetLogView();
   logCursor = batch.cursor; logGeneration = batch.generation;
-  const output = $('logOutput'), position = output.scrollTop;
+  const output = $('logOutput');
+  const prevTop = output.scrollTop, prevHeight = output.scrollHeight;
   const fragment = document.createDocumentFragment();
   for (const record of batch.records) {
     const node = document.createElement('div');
@@ -1185,12 +1197,16 @@ function appendLogBatch(batch) {
     fragment.appendChild(node);
   }
   output.appendChild(fragment);
-  while (logRows.length > 2048 || logBytes > 2 * 1024 * 1024) {
+  // 只保留最近 1000 条 / 1MB：控制台是看日志的，不是存日志的（文件里有全量）。
+  while (logRows.length > 1000 || logBytes > 1024 * 1024) {
     const row = logRows.shift(); logBytes -= row.bytes; row.node.remove();
   }
-  // Preserve the reader's position, never jump to the newest entry.
-  output.scrollTop = position;
-  $('logStatus').textContent = `${logRows.length} 条 · ${batch.more ? '分批加载中' : '实时接收（不自动滚动）'}`;
+  // 贴底（含首次加载）→ 滚到最新；用户上滚 → 锚定原视角：
+  // 按内容高度差补偿 scrollTop，既不被新行推走，也不被顶部裁剪拽动。
+  if (logStick) output.scrollTop = output.scrollHeight;
+  else output.scrollTop = prevTop + (output.scrollHeight - prevHeight);
+  $('logStatus').textContent = `${logRows.length} 条 · ` +
+    (batch.more ? '分批加载中' : (logStick ? '实时滚动' : '已暂停自动滚动（回到底部继续）'));
 }
 async function startLogs() {
   stopLogs();
@@ -1234,7 +1250,7 @@ async function startLogs() {
   }
 }
 function refreshLogs() {
-  stopLogs(); logCursor = 0; logGeneration = 0; resetLogView(); startLogs();
+  stopLogs(); logCursor = 0; logGeneration = 0; logStick = true; resetLogView(); startLogs();
 }
 async function clearConsoleLogs() {
   stopLogs(); $('clearLogs').disabled = true;
@@ -1242,7 +1258,7 @@ async function clearConsoleLogs() {
     const response = await fetch('/api/logs/clear', {method:'POST', credentials:'same-origin'});
     if (response.status === 401) { location.href = '/login'; return; }
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    logCursor = 0; logGeneration = 0; resetLogView();
+    logCursor = 0; logGeneration = 0; logStick = true; resetLogView();
     $('logStatus').textContent = '控制台缓存已清空，系统日志未删除';
   } catch (error) { $('logStatus').textContent = `清空失败：${error.message}`; }
   finally { $('clearLogs').disabled = false; startLogs(); }
