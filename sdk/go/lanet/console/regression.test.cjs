@@ -9,7 +9,7 @@ function extract(start, end) { return script.slice(script.indexOf(start), script
 const elements = {};
 const el = id => elements[id] ||= { value: '', style: {}, textContent: '', innerHTML: '' };
 const ctx = vm.createContext({ $: el, esc: s => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;'), relTime: () => '刚刚', mdLite: s => s, Date, TextEncoder, window: { addEventListener() {} }, document: { addEventListener() {} } });
-vm.runInContext('let S; let updInfo;\n' + extract('const M_PAGE_SIZE', 'function switchTab') + extract('function fmtCheckedAt', 'async function onUpdateClick'), ctx);
+vm.runInContext('let S; let updInfo;\n' + extract('function compareMemberActivity', 'function switchTab') + extract('function fmtCheckedAt', 'async function onUpdateClick'), ctx);
 vm.runInContext(`S = {members: [{peer_id:'peer1', virtual_ip:'10.7.1.2', virtual_ipv6:'fd00:6c61:6e65::1234', online:true}]}; renderMembers();`, ctx);
 assert.match(el('members').innerHTML, /10\.7\.1\.2/);
 let copiedIPv4;
@@ -41,6 +41,10 @@ for (const separator of ['\n', '\r\n', ' ', '\t', ',']) {
   const submission = script.match(/bootstrap: ([^\n]+),/)[1];
   assert.equal(vm.runInContext(submission, ctx), seeds.join(','));
 }
+vm.runInContext(`S.members = [{peer_id:'never',virtual_ip:'10.7.0.1',online:false},{peer_id:'old',virtual_ip:'10.7.0.2',online:false,last_seen:100},{peer_id:'recent',virtual_ip:'10.7.0.3',online:false,last_seen:200},{peer_id:'online',virtual_ip:'10.7.0.4',online:true}];`, ctx);
+assert.equal(vm.runInContext('filteredMembers().map(m => m.peer_id).join(",")', ctx), 'online,recent,old,never');
+vm.runInContext('renderMembers()', ctx);
+assert.match(el('members').innerHTML, /无已验证活跃记录/);
 const output = el('logOutput');
 output.scrollTop = 137;
 output.children = [];

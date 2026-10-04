@@ -1086,7 +1086,14 @@ async function togglePublicDHT() {
   }
 }
 
-// ---- 成员列表：后端已按「在线在前 + 发现时间倒序」稳定排序，这里做筛选/搜索/分页 ----
+// ---- 成员列表：在线在前；离线按真实最后活跃倒序，never 最后 ----
+function compareMemberActivity(a, b) {
+  if (!!a.online !== !!b.online) return a.online ? -1 : 1;
+  if (!a.online && (a.last_seen || 0) !== (b.last_seen || 0)) {
+    return (b.last_seen || 0) - (a.last_seen || 0);
+  }
+  return 0; // 同时间 / 在线保留后端稳定次序
+}
 const M_PAGE_SIZE = 50;
 let mPage = 1;
 
@@ -1099,7 +1106,7 @@ function filteredMembers() {
     if (!q) return true;
     return [m.notes, m.name, m.virtual_ip, m.virtual_ipv6, m.hostname, m.peer_id]
       .some(v => (v || '').toLowerCase().includes(q));
-  });
+  }).sort(compareMemberActivity);
 }
 
 function renderMembers() {
@@ -1135,7 +1142,7 @@ function renderMembers() {
       const ver = m.version
         ? '<span class="tag unknown" title="' + esc(m.platform || '') + '">' + esc(m.version) + '</span>'
         : '<span class="tag unknown" title="旧版本节点，未上报版本号">—</span>';
-      const last = m.last_seen ? relTime(m.last_seen) : '—';
+      const last = m.last_seen ? relTime(m.last_seen) : '无已验证活跃记录';
       const vip = (m.virtual_ip
         ? `<div style="cursor:pointer" title="点击复制" onclick="copyText('${esc(m.virtual_ip)}', this)">${esc(m.virtual_ip)}</div>` : '<div>—</div>') + (m.virtual_ipv6
         ? `<div class="m-ipv6" title="点击复制" onclick="copyText('${esc(m.virtual_ipv6)}', this)">${esc(m.virtual_ipv6)}</div>` : '');

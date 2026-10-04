@@ -313,11 +313,18 @@ func (c *Client) IsPeerTrusted(peerID string) bool { return c.isTrustedPeer(peer
 // isTrustedPeer 供 serverless 审批门查询：该节点是否已被信任。
 // 未启用审批（RequireApproval=false）或地址簿不可用时一律放行。
 func (c *Client) isTrustedPeer(peerID string) bool {
-	if !c.requireApproval() || c.peers == nil {
+	if c.peers == nil {
 		return true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	deleted, err := c.peers.IsUnfriended(ctx, peerID)
+	if err != nil || deleted {
+		return false
+	}
+	if !c.requireApproval() {
+		return true
+	}
 	ok, err := c.peers.IsTrusted(ctx, peerID)
 	if err != nil {
 		return false
@@ -328,11 +335,10 @@ func (c *Client) isTrustedPeer(peerID string) bool {
 // maybeAutoAccept 供 serverless 审批门使用：auto_accept 开启时自动信任，
 // 并把节点写入地址簿（标记为「自动同意」来源，便于审计）。
 func (c *Client) maybeAutoAccept(peerID string, addrs []string, name string) bool {
-	if !c.cfg.AutoAccept {
+	if !c.cfg.AutoAccept || c.isUnfriendedPeer(peerID) {
 		return false
 	}
-	c.rememberPeer(peerID, addrs, name, true)
-	return true
+	return c.rememberPeer(peerID, addrs, name, true)
 }
 
 // onPendingRequest 供 serverless 审批门使用：陌生节点申请连接时落库，
@@ -433,21 +439,23 @@ func (c *Client) onUnfriendReceived(peerID string) {
 }
 
 // rememberPeer 把节点记入地址簿；trusted=true 表示直接标记为已信任。
-func (c *Client) rememberPeer(peerID string, addrs []string, name string, trusted bool) {
+func (c *Client) rememberPeer(peerID string, addrs []string, name string, trusted bool) bool {
 	if c.peers == nil {
-		return
+		return true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := c.peers.UpsertPeer(ctx, peersdb.Peer{PeerID: peerID, Name: name}, addrs); err != nil {
 		c.logf("节点落库失败: %v", err)
-		return
+		return false
 	}
 	if trusted {
 		if err := c.peers.SetTrusted(ctx, peerID, true); err != nil {
 			c.logf("信任标记失败: %v", err)
+			return false
 		}
 	}
+	return true
 }
 
 // ---- 设备名持久化（本地留住「谁是谁」）----
@@ -594,23 +602,17 @@ type ConnResult struct {
 	AlreadyMember bool `json:"already_member,omitempty"`
 }
 
-// clearUnfriendedPeer 供 serverless 协议层使用：墓碑告知送达后消费掉，
-// 避免删除退化成永久拉黑（对方日后的重新申请应能正常进入待审批）。
-func (c *Client) clearUnfriendedPeer(peerID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	c.clearUnfriended(ctx, peerID)
-}
-
-// clearUnfriended 清除某节点的删除墓碑（重新建立好友关系时调用）。
-// 单独封装便于在多条「主动添加/同意」路径复用，失败只记日志不阻断流程。
-func (c *Client) clearUnfriended(ctx context.Context, peerID string) {
-	if c.peers == nil {
-		return
+// restorePeer is only for explicit local add actions, never automatic discovery.
+func (c *Client) restorePeer(ctx context.Context, peerID string, addrs []string) error {
+	if c.peers != nil {
+		if err := c.peers.ClearUnfriended(ctx, peerID); err != nil {
+			return err
+		}
 	}
-	if err := c.peers.ClearUnfriended(ctx, peerID); err != nil {
-		c.logf("清除删除墓碑失败（不影响连接）: %v", err)
+	if !c.rememberPeer(peerID, addrs, "", true) {
+		return fmt.Errorf("记录并信任节点失败")
 	}
+	return nil
 }
 
 // ConnectPeer 按节点 ID 发起连接（控制台统一输入框的后端）。
@@ -699,8 +701,9 @@ func (c *Client) connectPeerInner(ctx context.Context, address string) (*ConnRes
 		if id.String() == c.peerID {
 			return nil, fmt.Errorf("这是本机连接码，无需连接")
 		}
-		c.rememberPeer(id.String(), toStringAddrs(addrs), "", true)
-		c.clearUnfriended(ctx, id.String())
+		if err := c.restorePeer(ctx, id.String(), toStringAddrs(addrs)); err != nil {
+			return nil, err
+		}
 		if len(addrs) == 0 {
 			// 仅身份的连接码：退回按 ID 查找路径。
 			return c.connectByID(ctx, id.String())
@@ -754,8 +757,9 @@ func (c *Client) connectPeerInner(ctx context.Context, address string) (*ConnRes
 		if ai.ID.String() == c.peerID {
 			return nil, fmt.Errorf("这是本机节点 ID，无需连接")
 		}
-		c.rememberPeer(ai.ID.String(), []string{address}, "", true)
-		c.clearUnfriended(ctx, ai.ID.String())
+		if err := c.restorePeer(ctx, ai.ID.String(), []string{address}); err != nil {
+			return nil, err
+		}
 		id, err := c.disc.DialSeed(ctx, []string{address})
 		if err != nil {
 			return pendingOrError(ai.ID.String(), "manual", err)
@@ -813,8 +817,9 @@ func (c *Client) connectByID(ctx context.Context, address string) (*ConnResult, 
 			//   2) 交给周期发现（每轮 FindProviders 群 provider key）自动补连，
 			//      addMember 过审批门时因已信任而直接建连。
 			// 地址簿有记录后 knownPeers 流量门放开，后台查找本来就会执行。
-			c.rememberPeer(id.String(), nil, "", true)
-			c.clearUnfriended(ctx, id.String())
+			if err := c.restorePeer(ctx, id.String(), nil); err != nil {
+				return nil, err
+			}
 			// 立刻触发一轮发现（不等 30s 周期）：对方 provider 记录已在
 			// DHT 里时这一轮就能命中并自动建连。
 			c.disc.TriggerDiscover()
@@ -834,8 +839,9 @@ func (c *Client) connectByID(ctx context.Context, address string) (*ConnResult, 
 	//    语义确认：用户「主动填写对方节点 ID」这件事本身就是我这边的同意，
 	//    所以先在本机把对方记为已信任，再由对方审批本机（加好友是双向的）。
 	//    这样避免「我明明点了连接，却被自己的审批门拦住」的荒谬体验。
-	c.rememberPeer(id.String(), toStringAddrs(ai.Addrs), "", true)
-	c.clearUnfriended(ctx, id.String())
+	if err := c.restorePeer(ctx, id.String(), toStringAddrs(ai.Addrs)); err != nil {
+		return nil, err
+	}
 
 	connectedID, cerr := c.disc.RequestConnect(ctx, ai)
 	if cerr != nil {
@@ -971,6 +977,9 @@ func (c *Client) ApprovePeer(peerID string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if err := c.peers.ClearUnfriended(ctx, peerID); err != nil {
+		return err
+	}
 	if err := c.peers.SetTrusted(ctx, peerID, true); err != nil {
 		return err
 	}
@@ -980,7 +989,15 @@ func (c *Client) ApprovePeer(peerID string) error {
 		go func() {
 			dialCtx, dialCancel := context.WithTimeout(context.Background(), 25*time.Second)
 			defer dialCancel()
-			if _, err := c.ConnectPeer(dialCtx, peerID); err != nil {
+			// 后台重连不是新的用户添加，绝不能清除此后写入的删除墓碑。
+			if !c.isKnownMember(peerID) || c.isUnfriendedPeer(peerID) {
+				return
+			}
+			ai, err := c.disc.FindPeer(dialCtx, peerID)
+			if err == nil {
+				_, err = c.disc.RequestConnect(dialCtx, ai)
+			}
+			if err != nil {
 				c.logf("批准后自动建连未成功（对方可能已离线，等待下轮重连）: %v", err)
 			}
 		}()
@@ -995,11 +1012,11 @@ func (c *Client) RejectPeer(peerID string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := c.peers.SetTrusted(ctx, peerID, false); err != nil {
+	if err := c.peers.RemovePeer(ctx, peerID); err != nil {
 		return err
 	}
-	if err := c.peers.DeletePeer(ctx, peerID); err != nil {
-		return err
+	if c.disc != nil {
+		c.disc.Forget(peerID)
 	}
 	c.logf("已拒绝节点 %s 的连接申请", shortPeer(peerID))
 	return nil
@@ -1033,32 +1050,22 @@ func (c *Client) RemovePeer(peerID string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// 墓碑先行：确保「对方来握手时能拿到明确拒绝」，哪怕本机随后掉线。
-	if err := c.peers.AddUnfriended(ctx, peerID, ""); err != nil {
-		c.logf("删除墓碑写入失败（继续本机移除）: %v", err)
-	}
-	if err := c.peers.SetTrusted(ctx, peerID, false); err != nil {
-		return err
-	}
-	if err := c.peers.DeletePeer(ctx, peerID); err != nil {
+	// 原子记录墓碑并移除信任/待审批；持久化失败时不能声称删除成功。
+	if err := c.peers.RemovePeer(ctx, peerID); err != nil {
 		return err
 	}
 	// 本机成员表立即清除并断开，不等 TTL。
 	if c.disc != nil {
 		c.disc.Forget(peerID)
 	}
-	// 在线即时通知（尽力而为）。送达成功 → 墓碑立即消费（它的使命只是
-	// 补达离线场景的告知，已送达就不该继续拦截对方日后的重新申请）；
-	// 失败 → 保留墓碑，等对方下次握手时自愈送达并被协议层消费。
+	// 在线即时通知（尽力而为）。无论送达与否都保留墓碑：
+	// 删除意图优先于 auto_accept，只有本机用户主动添加/同意才能解除。
 	if c.disc != nil {
 		go func() {
 			nctx, ncancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer ncancel()
 			if err := c.disc.NotifyUnfriend(nctx, peerID); err == nil {
 				c.logf("已通知节点 %s：本机已删除好友，对方将同步移除本机", shortPeer(peerID))
-				dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer dcancel()
-				c.clearUnfriended(dctx, peerID)
 			}
 		}()
 	}

@@ -213,6 +213,11 @@ CREATE TABLE IF NOT EXISTS app_settings (
 	updated_at DATETIME NOT NULL
 );`,
 	},
+	{
+		version: 5,
+		name:    "verified activity only: discard ambiguous legacy last_seen",
+		up:      `UPDATE peers SET last_seen = NULL;`,
+	},
 }
 
 const schemaMigrationsMeta = `

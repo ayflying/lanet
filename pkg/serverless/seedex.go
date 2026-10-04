@@ -561,7 +561,7 @@ func (d *Discovery) seedPeerTargets(scope string, max int) []peer.ID {
 		})
 	}
 	for _, m := range members {
-		if m.LastSeen.Before(cutoff) {
+		if m.freshness().Before(cutoff) {
 			continue
 		}
 		id, err := peer.Decode(m.PeerID)

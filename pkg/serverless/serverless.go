@@ -228,11 +228,8 @@ type Config struct {
 	// 沉默的未审批）——对方据此自动把本机从它的列表同步删除，删除因此
 	// 是双向的。nil = 无墓碑概念（按普通未审批处理）。
 	IsUnfriended func(peerID string) bool
-	// ClearUnfriended 消费某节点的删除墓碑。墓碑的使命是「告知对方同步
-	// 移除本机」——告知送达（回完 unfriended 拒绝 / 在线推送成功）后即应
-	// 清除，让对方的再次申请能正常进入待审批。否则删除过对方的一方会被
-	// 自己的墓碑永久屏蔽对方的重新申请，「附近 → 申请连接」的死恢复。
-	// nil = 无墓碑概念。
+	// ClearUnfriended 保留用于源码兼容；发现服务不再自动消费删除墓碑。
+	// 删除仅由用户显式重新添加/批准解除，防止 auto_accept 复活。
 	ClearUnfriended func(peerID string)
 	// OnSeenUntrusted 被动发现「未被信任」的同群节点时回调（DHT/mDNS
 	// provider 记录），由上层持久化到「附近」列表并在控制台展示。
@@ -283,14 +280,15 @@ type Config struct {
 
 // Member 成员表中的一项。
 type Member struct {
-	PeerID      string    `json:"peer_id"`
-	Name        string    `json:"name"`
-	VirtualIP   string    `json:"virtual_ip"`
-	VirtualIPv6 string    `json:"virtual_ipv6,omitempty"`
-	Addrs       []string  `json:"addrs"`
-	Source      string    `json:"source"`     // dht / dht-private / mdns
-	FirstSeen   time.Time `json:"first_seen"` // 首次发现时间（即上线时间）
-	LastSeen    time.Time `json:"last_seen"`  // 最近一次出现（发现/握手/入向信息）时间
+	PeerID         string    `json:"peer_id"`
+	Name           string    `json:"name"`
+	VirtualIP      string    `json:"virtual_ip"`
+	VirtualIPv6    string    `json:"virtual_ipv6,omitempty"`
+	Addrs          []string  `json:"addrs"`
+	Source         string    `json:"source"`     // dht / dht-private / mdns
+	FirstSeen      time.Time `json:"first_seen"` // 首次发现时间（不代表成功上线）
+	LastSeen       time.Time `json:"last_seen"`  // 最近一次已审批同群 info 握手；零值表示从未成功通信
+	LastDiscovered time.Time `json:"-"`          // 初次发现的 TTL 宽限；陈旧发现记录不续命
 	// Hostname 本成员的虚拟主机名（含 .lanet 后缀，如 yunloli.lanet）。
 	// 由当前成员表确定性推导，重名自动追加后缀。
 	Hostname string `json:"hostname,omitempty"`
@@ -304,6 +302,18 @@ type Member struct {
 	// LocalIPs 成员本机所有非回环网卡 IP（含掩码位数，如 192.168.50.100/24）。
 	// info 协议交换，用于在控制台上识别设备归属网段；旧节点为空。
 	LocalIPs []string `json:"local_ips,omitempty"`
+}
+
+// freshness 用真实通信决定已验证成员的 TTL；从未通信的占位使用初次发现
+// 的宽限，不能由重复 DHT/PEX 记录无限续命。FirstSeen 兼容旧的成员构造。
+func (m Member) freshness() time.Time {
+	if !m.LastSeen.IsZero() {
+		return m.LastSeen
+	}
+	if !m.LastDiscovered.IsZero() {
+		return m.LastDiscovered
+	}
+	return m.FirstSeen
 }
 
 // Discovered 新成员被发现（尚未连通也会触发；连通并确认同群后 Name 有效）。
@@ -799,6 +809,9 @@ func (d *Discovery) DialSeed(ctx context.Context, addrs []string) (string, error
 //   - 陌生 → 先问 AutoAccept（无人值守自动同意），命中则放行；
 //     未命中则上报 OnPending 并拒绝（完全隔离）。
 func (d *Discovery) trustPolicy(peerID string, addrs []string, name string) (trusted, pending bool) {
+	if d.cfg.IsUnfriended != nil && d.cfg.IsUnfriended(peerID) {
+		return false, false
+	}
 	if d.cfg.IsTrusted == nil {
 		return true, false
 	}
@@ -825,6 +838,9 @@ func (d *Discovery) trustPolicy(peerID string, addrs []string, name string) (tru
 // 来源：入向握手（handleInfo）和用户主动添加（RequestConnect），它们走
 // trustPolicy，保留上报。
 func (d *Discovery) trustPolicyPassive(peerID string, addrs []string, name string) bool {
+	if d.cfg.IsUnfriended != nil && d.cfg.IsUnfriended(peerID) {
+		return false
+	}
 	if d.cfg.IsTrusted == nil {
 		return true
 	}
@@ -950,13 +966,13 @@ func (d *Discovery) RequestConnect(ctx context.Context, ai peer.AddrInfo) (strin
 	delete(d.unfriendedAt, ai.ID.String())
 	if _, ok := d.members[ai.ID.String()]; !ok {
 		d.members[ai.ID.String()] = &Member{
-			PeerID:      ai.ID.String(),
-			VirtualIP:   DeriveVirtualIP(d.groupKey, ai.ID.String()),
-			VirtualIPv6: DeriveVirtualIPv6(d.groupKey, ai.ID.String()),
-			Source:      "manual",
-			Addrs:       toStrings(addrs),
-			FirstSeen:   time.Now(),
-			LastSeen:    time.Now(),
+			PeerID:         ai.ID.String(),
+			VirtualIP:      DeriveVirtualIP(d.groupKey, ai.ID.String()),
+			VirtualIPv6:    DeriveVirtualIPv6(d.groupKey, ai.ID.String()),
+			Source:         "manual",
+			Addrs:          toStrings(addrs),
+			FirstSeen:      time.Now(),
+			LastDiscovered: time.Now(),
 		}
 	}
 	d.mu.Unlock()
@@ -1051,7 +1067,7 @@ func (d *Discovery) reapExpired() {
 	d.mu.Lock()
 	var removed []Member
 	for id, m := range d.members {
-		if m.LastSeen.Before(cutoff) {
+		if m.freshness().Before(cutoff) {
 			removed = append(removed, *m)
 			delete(d.members, id)
 		}
@@ -1322,12 +1338,12 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 			return // 刚被删除好友的节点，迟到的发现记录不复活成员、也不上报附近
 		}
 		m = &Member{
-			PeerID:      id.String(),
-			VirtualIP:   DeriveVirtualIP(d.groupKey, id.String()),
-			VirtualIPv6: DeriveVirtualIPv6(d.groupKey, id.String()),
-			Source:      source,
-			FirstSeen:   time.Now(),
-			LastSeen:    time.Now(),
+			PeerID:         id.String(),
+			VirtualIP:      DeriveVirtualIP(d.groupKey, id.String()),
+			VirtualIPv6:    DeriveVirtualIPv6(d.groupKey, id.String()),
+			Source:         source,
+			FirstSeen:      time.Now(),
+			LastDiscovered: time.Now(),
 		}
 		d.members[id.String()] = m
 	} else if m.Source == "inbound" && source != "" && source != "inbound" {
@@ -1603,19 +1619,13 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	remote := s.Conn().RemotePeer()
 	// 墓碑优先：本机主动删除过对方 → 回明确的「unfriended」告知，它收到后
 	// 自动把本机从它的列表同步删除（双向删除的离线自愈路径）。
-	// 同时一次性消费墓碑：告知已送达。若不消费，删除会退化成永久拉黑——
-	// 对方之后的任何重新申请（附近列表点按钮 / 它主动添加本机 ID）都会被
-	// 本墓碑无限挡回，永远进不了待审批。消费后对方再来即正常进入待审批，
-	// 由用户决定是否重新同意，闭环交给「附近 → 申请连接」。
-	if d.cfg.IsUnfriended != nil && !d.trustedNow(remote.String()) && d.cfg.IsUnfriended(remote.String()) {
-		d.logf("拒绝节点 %s 的握手：本机已删除该好友（告知送达，墓碑一次性消费）", remote.ShortString())
+	// 删除决定保持有效；只有用户主动重新添加/批准才解除墓碑。
+	if d.cfg.IsUnfriended != nil && d.cfg.IsUnfriended(remote.String()) {
+		d.logf("拒绝节点 %s 的握手：本机已删除该好友（墓碑保留）", remote.ShortString())
 		_ = json.NewEncoder(s).Encode(infoPayload{
 			Group:    GroupFingerprint(d.groupKey),
 			Rejected: rejectionUnfriended,
 		})
-		if d.cfg.ClearUnfriended != nil {
-			go d.cfg.ClearUnfriended(remote.String())
-		}
 		return
 	}
 	// 审批门：陌生节点一律不响应 info（不回写名称/版本/主机名，避免身份
@@ -1657,13 +1667,13 @@ func (d *Discovery) handleInfo(s network.Stream) {
 			return
 		}
 		m = &Member{
-			PeerID:      remote.String(),
-			VirtualIP:   DeriveVirtualIP(d.groupKey, remote.String()),
-			VirtualIPv6: DeriveVirtualIPv6(d.groupKey, remote.String()),
-			Source:      "inbound",
-			Addrs:       toStrings(addrs),
-			FirstSeen:   time.Now(),
-			LastSeen:    time.Now(),
+			PeerID:         remote.String(),
+			VirtualIP:      DeriveVirtualIP(d.groupKey, remote.String()),
+			VirtualIPv6:    DeriveVirtualIPv6(d.groupKey, remote.String()),
+			Source:         "inbound",
+			Addrs:          toStrings(addrs),
+			FirstSeen:      time.Now(),
+			LastDiscovered: time.Now(),
 		}
 		d.members[remote.String()] = m
 	}
@@ -1683,11 +1693,9 @@ func (d *Discovery) handleInfo(s network.Stream) {
 		m.Addrs = toStrings(addrs)
 	}
 	m.LastSeen = time.Now()
-	snapshot := *m
+	snapshot := cloneMember(*m)
 	d.mu.Unlock()
-	if !ok {
-		d.emit(snapshot)
-	}
+	d.emit(snapshot)
 	// 对端地址入 peerstore：后续建立隧道/直连要用（与成员表同步）。
 	if len(addrs) > 0 {
 		d.host.Peerstore().AddAddrs(remote, addrs, time.Hour)

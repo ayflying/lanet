@@ -130,7 +130,7 @@ func (d *Discovery) collectRelayCandidates(ctx context.Context, number int) []pe
 
 	// 第二层：成员表里的同群节点（含好友与被动发现到的同密钥节点）。
 	for _, m := range d.members {
-		if m.PeerID == self.String() || m.LastSeen.Before(cutoff) || !d.trustedNow(m.PeerID) {
+		if m.PeerID == self.String() || m.freshness().Before(cutoff) || !d.trustedNow(m.PeerID) {
 			continue
 		}
 		id, err := peer.Decode(m.PeerID)

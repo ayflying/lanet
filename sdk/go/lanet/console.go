@@ -270,11 +270,16 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 	// 之后就没了），用本地库兜底，列表才能在对方不在线时照样显示「这是谁」；
 	// 备注（notes）更是只有本机才有。
 	nameIdx := c.PeerNameIndex()
+	lastSeenIdx := make(map[string]time.Time)
+	for _, p := range c.TrustedPeers() {
+		lastSeenIdx[p.PeerID] = p.LastSeen
+	}
 	members := []memberView{}
 	for _, m := range c.NetMap().Members {
 		online := false
 		if pid, err := peer.Decode(m.PeerID); err == nil {
-			online = c.node.Network().Connectedness(pid) == network.Connected
+			state := c.node.Network().Connectedness(pid)
+			online = (c.disc == nil || !m.LastSeen.IsZero()) && (state == network.Connected || state == network.Limited)
 		}
 		name, notes := m.Name, ""
 		if info, ok := nameIdx[m.PeerID]; ok {
@@ -293,22 +298,31 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		if !m.FirstSeen.IsZero() {
 			mv.FirstSeen = m.FirstSeen.Unix()
 		}
-		if !m.LastSeen.IsZero() {
-			mv.LastSeen = m.LastSeen.Unix()
+		lastSeen := m.LastSeen
+		if saved := lastSeenIdx[m.PeerID]; saved.After(lastSeen) {
+			lastSeen = saved
+		}
+		if !lastSeen.IsZero() {
+			mv.LastSeen = lastSeen.Unix()
 		}
 		members = append(members, mv)
 	}
-	// 排序：在线优先（online 的成员永远排在离线之上），同一在线状态内按
-	// 发现时间倒序（最后发现的靠前），FirstSeen 为零（控制面 NetMap 无此
-	// 概念）时按虚拟 IP 兜底——同状态内的相对次序在成员增减之外不跳动。
+	// 在线在前；离线按真实最后活跃倒序（零值 never 最后），在线仍按发现
+	// 时间保持原有排序。相同时间用虚拟 IP / ID 确定性兜底。
 	sort.Slice(members, func(i, j int) bool {
 		if members[i].Online != members[j].Online {
 			return members[i].Online
 		}
-		if members[i].FirstSeen != members[j].FirstSeen && members[i].FirstSeen != 0 && members[j].FirstSeen != 0 {
+		if !members[i].Online && members[i].LastSeen != members[j].LastSeen {
+			return members[i].LastSeen > members[j].LastSeen
+		}
+		if members[i].Online && members[i].FirstSeen != members[j].FirstSeen && members[i].FirstSeen != 0 && members[j].FirstSeen != 0 {
 			return members[i].FirstSeen > members[j].FirstSeen
 		}
-		return members[i].VirtualIP < members[j].VirtualIP
+		if members[i].VirtualIP != members[j].VirtualIP {
+			return members[i].VirtualIP < members[j].VirtualIP
+		}
+		return members[i].PeerID < members[j].PeerID
 	})
 	// 公共 DHT 临时引导状态 + 连接种子（Standalone 专用；常规模式为零值）。
 	pubState, hasPub := c.PublicDHTStatus()

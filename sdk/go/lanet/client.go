@@ -506,11 +506,11 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 			OnPending:            c.onPendingRequest,
 			HasKnownPeers:        c.hasKnownPeers,
 			IsUnfriended:         c.isUnfriendedPeer,
-			ClearUnfriended:      c.clearUnfriendedPeer,
 			OnSeenUntrusted:      c.onSeenUntrusted,
 			OnUnfriendReceived:   c.onUnfriendReceived,
 		})
 		if err == nil {
+			disc.OnDiscovered(c.persistVerifiedMember)
 			err = disc.Start(c.rootCtx)
 		}
 		if err != nil {
@@ -1022,6 +1022,20 @@ func (c *Client) DialProtocols(ctx context.Context, virtualIP string, protoIDs [
 
 // LastPathUsed 返回到对端最近一次链路类型：direct / relay / offline / unknown。
 func (c *Client) LastPathUsed(peerID string) string { return c.tunnelSvc.LastPathUsed(peerID) }
+
+// persistVerifiedMember 不把发现/手动占位当作成功通信；也不修改审批状态。
+func (c *Client) persistVerifiedMember(m serverless.Member) {
+	if c.peers == nil || m.LastSeen.IsZero() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := c.peers.UpsertPeer(ctx, peersdb.Peer{
+		PeerID: m.PeerID, Name: m.Name, LastIP: m.VirtualIP, LastSeen: m.LastSeen,
+	}, m.Addrs); err != nil {
+		c.logf("保存已验证节点活跃时间失败 %s: %v", m.PeerID, err)
+	}
+}
 
 // NetMap 当前群组成员目录快照。Standalone 模式返回本地发现的成员表。
 func (c *Client) NetMap() netmapclient.Snapshot {

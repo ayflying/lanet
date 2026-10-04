@@ -3,11 +3,26 @@ package peersdb
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
 	"time"
 )
+
+// ErrUnfriended means a passive write tried to restore a manually deleted peer.
+var ErrUnfriended = errors.New("peersdb: peer was manually deleted")
+
+func checkUnfriendedTx(ctx context.Context, tx *sql.Tx, peerID string) error {
+	var deleted bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM unfriended WHERE peer_id = ?)`, peerID).Scan(&deleted); err != nil {
+		return err
+	}
+	if deleted {
+		return ErrUnfriended
+	}
+	return nil
+}
 
 // UpsertPeer 记录一次「见到某个节点」：不存在则插入，存在则更新
 // name/last_seen/last_ip，并在提供地址时合并进地址簿。
@@ -19,16 +34,19 @@ func (d *DB) UpsertPeer(ctx context.Context, p Peer, addrs []string) error {
 		return fmt.Errorf("peersdb: begin upsert: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := checkUnfriendedTx(ctx, tx, p.PeerID); err != nil {
+		return err
+	}
 
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO peers (peer_id, name, first_seen, last_seen, last_ip, manual)
 VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(peer_id) DO UPDATE SET
 	name      = CASE WHEN excluded.name != '' THEN excluded.name ELSE peers.name END,
-	last_seen = excluded.last_seen,
+	last_seen = CASE WHEN excluded.last_seen IS NOT NULL AND (peers.last_seen IS NULL OR excluded.last_seen > peers.last_seen) THEN excluded.last_seen ELSE peers.last_seen END,
 	last_ip   = CASE WHEN excluded.last_ip != '' THEN excluded.last_ip ELSE peers.last_ip END,
 	manual    = peers.manual OR excluded.manual`,
-		p.PeerID, p.Name, now, now, p.LastIP, boolInt(p.Manually)); err != nil {
+		p.PeerID, p.Name, now, sql.NullTime{Time: p.LastSeen, Valid: !p.LastSeen.IsZero()}, p.LastIP, boolInt(p.Manually)); err != nil {
 		return fmt.Errorf("peersdb: upsert peer %s: %w", p.PeerID, err)
 	}
 	added := 0
@@ -57,41 +75,58 @@ ON CONFLICT(peer_id) DO UPDATE SET
 //   - 批准后不该再出现在「待审批」列表里；
 //   - 撤销后也不该残留旧的请求。
 func (d *DB) SetTrusted(ctx context.Context, peerID string, trusted bool) error {
-	res, err := d.db.ExecContext(ctx, `
-UPDATE peers SET trusted = ?, approved = ? WHERE peer_id = ?`,
-		boolInt(trusted), boolInt(true), peerID)
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if trusted {
+		if err := checkUnfriendedTx(ctx, tx, peerID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO peers (peer_id, trusted, approved, manual, first_seen, last_seen)
+VALUES (?, ?, 1, 1, ?, ?)
+ON CONFLICT(peer_id) DO UPDATE SET trusted = excluded.trusted, approved = 1`,
+		peerID, boolInt(trusted), time.Now(), nil); err != nil {
 		return fmt.Errorf("peersdb: set trusted %s: %w", peerID, err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		// 库中还没有该节点：先建一条再置信任（手动添加的可信节点）。
-		if _, err := d.db.ExecContext(ctx, `
-INSERT INTO peers (peer_id, trusted, approved, manual, first_seen, last_seen)
-VALUES (?, ?, 1, 1, ?, ?)`, peerID, boolInt(trusted), time.Now(), time.Now()); err != nil {
-			return fmt.Errorf("peersdb: insert trusted %s: %w", peerID, err)
-		}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pending_requests WHERE peer_id = ?`, peerID); err != nil {
+		return err
 	}
-	// 审批动作完成后，该节点不再属于「待审批」。
-	if _, err := d.db.ExecContext(ctx, `DELETE FROM pending_requests WHERE peer_id = ?`, peerID); err != nil {
-		return fmt.Errorf("peersdb: clear pending %s: %w", peerID, err)
-	}
-	// 授予信任后该节点也不再属于「附近」：nearby 的语义是「同网络密钥内
-	// 可发现、但尚未成为好友」。历史缺陷——这里只清了 pending 没清 nearby，
-	// 于是「先被被动发现写进 nearby、紧接着审批通过」的节点会永久滞留在
-	// 附近列表（用户看到一堆其实已经是好友的节点）。
-	// 注意只在 trusted=true 时清：撤销信任/删除好友后，该节点**应该**重新
-	// 出现在附近（下一轮发现会重新写回），这是「申请连接」的恢复入口。
 	if trusted {
-		if _, err := d.db.ExecContext(ctx, `DELETE FROM nearby WHERE peer_id = ?`, peerID); err != nil {
-			return fmt.Errorf("peersdb: clear nearby %s: %w", peerID, err)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM nearby WHERE peer_id = ?`, peerID); err != nil {
+			return err
 		}
-		for scope := range seedTables {
-			if err := d.DeleteSeed(ctx, scope, peerID); err != nil {
+		for _, table := range seedTables {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE peer_id = ?`, peerID); err != nil {
 				return err
 			}
 		}
 	}
-	return nil
+	return tx.Commit()
+}
+
+// RemovePeer atomically records a persistent deletion and removes friendship/pending state.
+// Nearby observations and seed transport records are not friendship authorization.
+func (d *DB) RemovePeer(ctx context.Context, peerID string) error {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO unfriended (peer_id, name, at)
+VALUES (?, COALESCE((SELECT name FROM peers WHERE peer_id = ?), ''), ?)
+ON CONFLICT(peer_id) DO UPDATE SET at = excluded.at`, peerID, peerID, time.Now()); err != nil {
+		return err
+	}
+	for _, table := range []string{"pending_requests", "peers"} {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE peer_id = ?`, peerID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // IsTrusted 查询某节点是否已审批信任。
@@ -489,13 +524,13 @@ func (d *DB) AddPending(ctx context.Context, r PendingRequest) error {
 	}
 	_, err := d.db.ExecContext(ctx, `
 INSERT INTO pending_requests (peer_id, name, addrs, requested_at, reason)
-VALUES (?, ?, ?, ?, ?)
+SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM unfriended WHERE peer_id = ?)
 ON CONFLICT(peer_id) DO UPDATE SET
 	name         = CASE WHEN excluded.name != '' THEN excluded.name ELSE pending_requests.name END,
 	addrs        = excluded.addrs,
 	requested_at = excluded.requested_at,
 	reason       = excluded.reason`,
-		r.PeerID, r.Name, strings.Join(NormalizeAddrs(r.Addrs), ","), at, r.Reason)
+		r.PeerID, r.Name, strings.Join(NormalizeAddrs(r.Addrs), ","), at, r.Reason, r.PeerID)
 	if err != nil {
 		return fmt.Errorf("peersdb: add pending %s: %w", r.PeerID, err)
 	}
@@ -814,9 +849,10 @@ func (d *DB) SetName(ctx context.Context, peerID, name string) error {
 	}
 	now := time.Now()
 	if _, err := d.db.ExecContext(ctx, `
-INSERT INTO peers (peer_id, name, first_seen, last_seen) VALUES (?, ?, ?, ?)
+INSERT INTO peers (peer_id, name, first_seen, last_seen)
+SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM unfriended WHERE peer_id = ?)
 ON CONFLICT(peer_id) DO UPDATE SET name = excluded.name`,
-		peerID, name, now, now); err != nil {
+		peerID, name, now, nil, peerID); err != nil {
 		return fmt.Errorf("peersdb: set name %s: %w", peerID, err)
 	}
 	return nil
@@ -839,7 +875,7 @@ func (d *DB) SetNotes(ctx context.Context, peerID, notes string) error {
 	if _, err := d.db.ExecContext(ctx, `
 INSERT INTO peers (peer_id, notes, first_seen, last_seen) VALUES (?, ?, ?, ?)
 ON CONFLICT(peer_id) DO UPDATE SET notes = excluded.notes`,
-		peerID, strings.TrimSpace(notes), now, now); err != nil {
+		peerID, strings.TrimSpace(notes), now, nil); err != nil {
 		return fmt.Errorf("peersdb: set notes %s: %w", peerID, err)
 	}
 	return nil
