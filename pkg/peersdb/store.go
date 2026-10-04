@@ -116,9 +116,9 @@ func (d *DB) RemovePeer(ctx context.Context, peerID string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO unfriended (peer_id, name, at)
-VALUES (?, COALESCE((SELECT name FROM peers WHERE peer_id = ?), ''), ?)
-ON CONFLICT(peer_id) DO UPDATE SET at = excluded.at`, peerID, peerID, time.Now()); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO unfriended (peer_id, name, at, notified)
+VALUES (?, COALESCE((SELECT name FROM peers WHERE peer_id = ?), ''), ?, 0)
+ON CONFLICT(peer_id) DO UPDATE SET at = excluded.at, notified = 0`, peerID, peerID, time.Now()); err != nil {
 		return err
 	}
 	for _, table := range []string{"pending_requests", "peers"} {
@@ -464,6 +464,10 @@ func (d *DB) PruneSelf(ctx context.Context, selfPeerID string) (int64, error) {
 // AddUnfriended 记录「本机已主动删除该节点」的墓碑。附近列表记录**保留**：
 // 被删除的好友仍应出现在「附近」里，用户点「申请连接」即可重新加回
 // （那会清除墓碑）——如果顺手删了，删除过的节点就再也刷不出来了。
+//
+// 删除不是拉黑：墓碑只是「删除意图」+「一次性告知对方」，告知送达后
+// 对方仍可重新申请（进入待审批，由用户显式决定是否恢复）。重复删除
+// 会重置告知状态，让新一次删除重新走一遍告知。
 func (d *DB) AddUnfriended(ctx context.Context, peerID, name string) error {
 	if peerID == "" {
 		return nil
@@ -475,10 +479,11 @@ func (d *DB) AddUnfriended(ctx context.Context, peerID, name string) error {
 		}
 	}
 	if _, err := d.db.ExecContext(ctx, `
-INSERT INTO unfriended (peer_id, name, at) VALUES (?, ?, ?)
+INSERT INTO unfriended (peer_id, name, at, notified) VALUES (?, ?, ?, 0)
 ON CONFLICT(peer_id) DO UPDATE SET
-	name = CASE WHEN excluded.name != '' THEN excluded.name ELSE unfriended.name END,
-	at   = excluded.at`, peerID, name, time.Now()); err != nil {
+	name     = CASE WHEN excluded.name != '' THEN excluded.name ELSE unfriended.name END,
+	at       = excluded.at,
+	notified = 0`, peerID, name, time.Now()); err != nil {
 		return fmt.Errorf("peersdb: add unfriended %s: %w", peerID, err)
 	}
 	return nil
@@ -493,6 +498,29 @@ func (d *DB) IsUnfriended(ctx context.Context, peerID string) (bool, error) {
 		return false, fmt.Errorf("peersdb: is unfriended %s: %w", peerID, err)
 	}
 	return n > 0, nil
+}
+
+// IsUnfriendedNotified 查询「已被删除」的告知是否已送达过该节点。
+// 每次删除只告知一次：首次握手回明确的 unfriended 拒绝标记并置位；
+// 之后对方重新申请时按普通未审批申请处理（删除不是永久拉黑）。
+func (d *DB) IsUnfriendedNotified(ctx context.Context, peerID string) (bool, error) {
+	var notified int
+	err := d.db.QueryRowContext(ctx,
+		`SELECT notified FROM unfriended WHERE peer_id = ?`, peerID).Scan(&notified)
+	if err != nil {
+		return false, fmt.Errorf("peersdb: is unfriended notified %s: %w", peerID, err)
+	}
+	return notified != 0, nil
+}
+
+// MarkUnfriendedNotified 标记「已被删除」的告知已送达（对方收到过一次
+// unfriended 拒绝标记，或对方删除时的 unfriend 推送已确认送达）。
+func (d *DB) MarkUnfriendedNotified(ctx context.Context, peerID string) error {
+	if _, err := d.db.ExecContext(ctx,
+		`UPDATE unfriended SET notified = 1 WHERE peer_id = ?`, peerID); err != nil {
+		return fmt.Errorf("peersdb: mark unfriended notified %s: %w", peerID, err)
+	}
+	return nil
 }
 
 // ClearUnfriended 清除墓碑（重新加好友 / 收到对方的 unfriend 通知时）。
@@ -517,6 +545,11 @@ type PendingRequest struct {
 }
 
 // AddPending 记录一条待审批请求（重复请求刷新时间与地址）。
+//
+// 被删除过的节点（墓碑存在）同样允许记录待审批：删除不是拉黑，
+// 告知送达后对方可以重新申请，是否恢复好友由本机用户显式决定。
+// 自动同意仍由审批门（trustPolicy 的墓碑分支）与 SetTrusted 的墓碑
+// 门共同挡住，待审批记录本身不赋予任何信任。
 func (d *DB) AddPending(ctx context.Context, r PendingRequest) error {
 	at := r.RequestedAt
 	if at.IsZero() {
@@ -524,13 +557,13 @@ func (d *DB) AddPending(ctx context.Context, r PendingRequest) error {
 	}
 	_, err := d.db.ExecContext(ctx, `
 INSERT INTO pending_requests (peer_id, name, addrs, requested_at, reason)
-SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM unfriended WHERE peer_id = ?)
+VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(peer_id) DO UPDATE SET
 	name         = CASE WHEN excluded.name != '' THEN excluded.name ELSE pending_requests.name END,
 	addrs        = excluded.addrs,
 	requested_at = excluded.requested_at,
 	reason       = excluded.reason`,
-		r.PeerID, r.Name, strings.Join(NormalizeAddrs(r.Addrs), ","), at, r.Reason, r.PeerID)
+		r.PeerID, r.Name, strings.Join(NormalizeAddrs(r.Addrs), ","), at, r.Reason)
 	if err != nil {
 		return fmt.Errorf("peersdb: add pending %s: %w", r.PeerID, err)
 	}

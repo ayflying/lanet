@@ -218,6 +218,11 @@ CREATE TABLE IF NOT EXISTS app_settings (
 		name:    "verified activity only: discard ambiguous legacy last_seen",
 		up:      `UPDATE peers SET last_seen = NULL;`,
 	},
+	{
+		version: 6,
+		name:    "unfriended.notified: 删除告知已送达（一次性告知，之后可重新申请）",
+		up:      `ALTER TABLE unfriended ADD COLUMN notified INTEGER NOT NULL DEFAULT 0;`,
+	},
 }
 
 const schemaMigrationsMeta = `

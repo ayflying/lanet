@@ -9,7 +9,11 @@ import (
 func TestActivityMigrationDropsAmbiguousLegacyTime(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
-	if _, err := d.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = 5`); err != nil {
+	if _, err := d.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version IN (5, 6)`); err != nil {
+		t.Fatal(err)
+	}
+	// 回到 v4 表结构（v6 的 notified 列先卸掉），迁移 5 与 6 才能重放。
+	if _, err := d.db.ExecContext(ctx, `ALTER TABLE unfriended DROP COLUMN notified`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := d.db.ExecContext(ctx, `INSERT INTO peers (peer_id,name,trusted,notes,last_seen) VALUES ('legacy','name',1,'note',CURRENT_TIMESTAMP)`); err != nil {

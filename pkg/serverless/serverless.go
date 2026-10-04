@@ -224,10 +224,18 @@ type Config struct {
 	// nil = 不启用该优化（按历史行为每轮查找）。
 	HasKnownPeers func() bool
 	// IsUnfriended 查询本机是否主动删除过该节点（删除好友墓碑）。
-	// 已删除的节点再次来握手时，回明确的「unfriended」拒绝标记（而不是
-	// 沉默的未审批）——对方据此自动把本机从它的列表同步删除，删除因此
-	// 是双向的。nil = 无墓碑概念（按普通未审批处理）。
+	// 墓碑存在时回「unfriended」拒绝标记（首次，一次性告知）或按未审批
+	// 申请处理（告知已送达后）——删除不是拉黑，恢复仍由用户显式批准。
+	// nil = 无墓碑概念（按普通未审批处理）。
 	IsUnfriended func(peerID string) bool
+	// IsUnfriendedNotified 查询「已被删除」的告知是否已送达过该节点。
+	// 每次删除只告知一次：未告知 → 首次握手回 unfriended 并标记已送达；
+	// 已告知 → 对方重新申请按普通未审批申请处理（进待审批，可恢复）。
+	// nil = 视为未告知（保守：墓碑节点保持完全拒绝，历史行为）。
+	IsUnfriendedNotified func(peerID string) bool
+	// MarkUnfriendedNotified 标记「已被删除」的告知已送达（首次握手回
+	// unfriended 后调用；上层也可在删除推送确认送达时提前置位）。
+	MarkUnfriendedNotified func(peerID string)
 	// ClearUnfriended 保留用于源码兼容；发现服务不再自动消费删除墓碑。
 	// 删除仅由用户显式重新添加/批准解除，防止 auto_accept 复活。
 	ClearUnfriended func(peerID string)
@@ -811,6 +819,15 @@ func (d *Discovery) DialSeed(ctx context.Context, addrs []string) (string, error
 //     未命中则上报 OnPending 并拒绝（完全隔离）。
 func (d *Discovery) trustPolicy(peerID string, addrs []string, name string) (trusted, pending bool) {
 	if d.cfg.IsUnfriended != nil && d.cfg.IsUnfriended(peerID) {
+		// 删除墓碑不是永久拉黑：告知已送达后，被删节点可以重新申请——
+		// 直接上报待审批（跳过 auto_accept：删除意图仍优先于无人值守
+		// 自动同意，只有本机用户显式批准才恢复好友）。
+		// 未告知（nil 视为未告知）→ 保持完全拒绝，让对方先收到一次
+		// 「已被删除」的明确告知（一次性），之后才进入可申请状态。
+		if d.cfg.IsUnfriendedNotified != nil && d.cfg.IsUnfriendedNotified(peerID) && d.cfg.OnPending != nil {
+			d.cfg.OnPending(peerID, addrs, name)
+			return false, true
+		}
 		return false, false
 	}
 	if d.cfg.IsTrusted == nil {
@@ -1627,16 +1644,26 @@ func (d *Discovery) handleInfo(s network.Stream) {
 		return
 	}
 	remote := s.Conn().RemotePeer()
-	// 墓碑优先：本机主动删除过对方 → 回明确的「unfriended」告知，它收到后
-	// 自动把本机从它的列表同步删除（双向删除的离线自愈路径）。
-	// 删除决定保持有效；只有用户主动重新添加/批准才解除墓碑。
+	// 墓碑优先（两阶段）：本机主动删除过对方时——
+	//   首次握手：回明确的「unfriended」告知并标记已送达，它收到后自动把
+	//   本机从它的列表同步删除（双向删除的离线自愈路径）；
+	//   之后的握手：删除不是拉黑，落入下方审批门按未审批申请处理——对方
+	//   会进入本机待审批列表，用户显式批准（ApprovePeer 清墓碑）即恢复。
+	// 只有用户主动重新添加/批准才解除墓碑；auto_accept 永不复活被删节点。
 	if d.cfg.IsUnfriended != nil && d.cfg.IsUnfriended(remote.String()) {
-		d.logf("拒绝节点 %s 的握手：本机已删除该好友（墓碑保留）", remote.ShortString())
-		_ = json.NewEncoder(s).Encode(infoPayload{
-			Group:    GroupFingerprint(d.groupKey),
-			Rejected: rejectionUnfriended,
-		})
-		return
+		notified := d.cfg.IsUnfriendedNotified != nil && d.cfg.IsUnfriendedNotified(remote.String())
+		if !notified {
+			if d.cfg.MarkUnfriendedNotified != nil {
+				d.cfg.MarkUnfriendedNotified(remote.String())
+			}
+			d.logf("拒绝节点 %s 的握手：告知其本机已删除该好友（一次性告知）", remote.ShortString())
+			_ = json.NewEncoder(s).Encode(infoPayload{
+				Group:    GroupFingerprint(d.groupKey),
+				Rejected: rejectionUnfriended,
+			})
+			return
+		}
+		d.logf("节点 %s 再次握手：删除已告知，按未审批申请处理（进入待审批）", remote.ShortString())
 	}
 	// 审批门：陌生节点一律不响应 info（不回写名称/版本/主机名，避免身份
 	// 信息与网络拓扑泄漏），不进成员表、不进私有 DHT 路由表。

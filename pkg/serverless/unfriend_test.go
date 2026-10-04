@@ -180,6 +180,100 @@ func TestUnfriendOfflineSelfHeal(t *testing.T) {
 	}
 }
 
+// TestUnfriendTwoPhaseReapply 删除不是拉黑（两阶段墓碑）：A 删了 B，
+// B 首次握手收到一次 unfriended 告知（并标记已送达）；B 再次握手不再
+// 被拒为 unfriended，而是按未审批申请处理——A 侧触发 OnPending（进入
+// 待审批），B 收到 not_approved（申请已送达，等待对方同意）。
+func TestUnfriendTwoPhaseReapply(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	ha := testHost(t, false)
+	hb := testHost(t, false)
+
+	notified := map[string]bool{}
+	var mu sync.Mutex
+	pendingCalls := 0
+	autoAcceptCalls := 0
+	da, err := New(ctx, ha, Config{
+		NetworkKey:   "grp-uf-two",
+		Name:         "node-a",
+		IsTrusted:    func(string) bool { return false },
+		IsUnfriended: func(string) bool { return true }, // A 删过 B
+		IsUnfriendedNotified: func(peerID string) bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return notified[peerID]
+		},
+		MarkUnfriendedNotified: func(peerID string) {
+			mu.Lock()
+			notified[peerID] = true
+			mu.Unlock()
+		},
+		AutoAccept: func(string, []string, string) bool {
+			mu.Lock()
+			autoAcceptCalls++
+			mu.Unlock()
+			return true // auto_accept 开着也绝不能自动复活被删节点
+		},
+		OnPending: func(string, []string, string) {
+			mu.Lock()
+			pendingCalls++
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("new A: %v", err)
+	}
+	if err = da.Start(ctx); err != nil {
+		t.Fatalf("start A: %v", err)
+	}
+	hbD, err := New(ctx, hb, Config{NetworkKey: "grp-uf-two", Name: "node-b"})
+	if err != nil {
+		t.Fatalf("new B: %v", err)
+	}
+	if err = hbD.Start(ctx); err != nil {
+		t.Fatalf("start B: %v", err)
+	}
+	if err = ha.Connect(ctx, peer.AddrInfo{ID: hb.ID(), Addrs: hb.Addrs()}); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	// 第一次握手：一次性删除告知。
+	resp, err := hbD.fetchInfo(ctx, ha.ID())
+	if err != nil {
+		t.Fatalf("首次握手应收到响应: %v", err)
+	}
+	if resp.Rejected != rejectionUnfriended {
+		t.Fatalf("首次握手应回 unfriended 告知，实际 %q", resp.Rejected)
+	}
+	// 告知标记应落在握手发起方 B 的 ID 上（A 收到的是 B 的握手）。
+	mu.Lock()
+	marked := notified[hb.ID().String()]
+	mu.Unlock()
+	if !marked {
+		t.Fatal("首次握手应标记删除告知已送达")
+	}
+
+	// 第二次握手：不再回 unfriended，而是未审批（申请进入 A 的待审批）。
+	resp, err = hbD.fetchInfo(ctx, ha.ID())
+	if err != nil {
+		t.Fatalf("再次握手应收到响应: %v", err)
+	}
+	if resp.Rejected != rejectionNotApproved {
+		t.Fatalf("告知送达后再次握手应按未审批处理，实际 %q", resp.Rejected)
+	}
+	mu.Lock()
+	calls, auto := pendingCalls, autoAcceptCalls
+	mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("再次握手应恰好上报一次待审批，实际 %d", calls)
+	}
+	if auto != 0 {
+		t.Fatalf("auto_accept 不得对被删节点生效，实际调用 %d 次", auto)
+	}
+}
+
 // TestNearbyReportOnPassiveDiscover 被动发现未信任节点时应触发
 // OnSeenUntrusted 上报（附近列表的来源），且不进成员表。
 // 同时断言**不得**产生待审批：被动发现 ≠ 对方申请连接。

@@ -349,7 +349,9 @@ func (c *Client) onPendingRequest(peerID string, addrs []string, name string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := c.peers.UpsertPeer(ctx, peersdb.Peer{PeerID: peerID, Name: name}, addrs); err != nil {
+	// 被删除过的节点（墓碑存在）重新申请：peers 行不写回（防自动复活），
+	// 但待审批记录照常落库——删除不是拉黑，是否恢复由用户显式批准。
+	if err := c.peers.UpsertPeer(ctx, peersdb.Peer{PeerID: peerID, Name: name}, addrs); err != nil && !errors.Is(err, peersdb.ErrUnfriended) {
 		c.logf("待审批节点落库失败: %v", err)
 		return
 	}
@@ -377,8 +379,9 @@ func (c *Client) hasKnownPeers() bool {
 }
 
 // isUnfriendedPeer 供 serverless 审批门使用：本机是否主动删除过该节点
-// （墓碑）。已删除节点再来握手时，协议层会回明确的 unfriended 拒绝标记，
-// 让对方自动把本机从它的列表同步删除（双向删除的离线自愈路径）。
+// （墓碑）。已删除节点首次再来握手时，协议层回明确的 unfriended 拒绝
+// 标记（一次性告知），之后按未审批申请处理——删除不是拉黑，恢复由
+// 用户显式批准。
 func (c *Client) isUnfriendedPeer(peerID string) bool {
 	if c.peers == nil {
 		return false
@@ -390,6 +393,34 @@ func (c *Client) isUnfriendedPeer(peerID string) bool {
 		return false
 	}
 	return ok
+}
+
+// isUnfriendedNotifiedPeer 供 serverless 审批门使用：删除告知是否已送达。
+// 未告知 → 首次握手回 unfriended；已告知 → 重新申请进入待审批。
+func (c *Client) isUnfriendedNotifiedPeer(peerID string) bool {
+	if c.peers == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ok, err := c.peers.IsUnfriendedNotified(ctx, peerID)
+	if err != nil {
+		return false
+	}
+	return ok
+}
+
+// markUnfriendedNotifiedPeer 供 serverless 审批门使用：首次握手回
+// unfriended 后标记「删除告知已送达」（每次删除只告知一次）。
+func (c *Client) markUnfriendedNotifiedPeer(peerID string) {
+	if c.peers == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := c.peers.MarkUnfriendedNotified(ctx, peerID); err != nil {
+		c.logf("标记删除告知已送达失败 %s: %v", shortPeer(peerID), err)
+	}
 }
 
 // onSeenUntrusted 供 serverless 被动发现使用：发现同群但未信任的节点时
@@ -867,14 +898,15 @@ func isTerminalConnectError(err error) bool {
 }
 
 func pendingOrError(peerID, via string, err error) (*ConnResult, error) {
-	// 对方已把本机删除好友：本机的同步移除已由协议层回调完成，
-	// 这里给出明确下一步指引（需对方主动添加本机）。
+	// 对方已把本机删除好友：本机的同步移除已由协议层回调完成。
+	// 删除不是拉黑——首次申请送达了「删除告知」，再次申请会进入对方的
+	// 待审批列表；对方同意后即恢复好友。
 	if errors.Is(err, serverless.ErrUnfriended) {
 		return &ConnResult{
 			PeerID:  peerID,
 			Pending: true,
 			Via:     via,
-			Message: "对方已把本机删除好友——请把本机连接码或节点 ID 发给对方，让对方在「附近」列表中找到本机并申请连接（或直接添加本机节点 ID）。",
+			Message: "对方已把本机删除好友——删除不是拉黑：可在「附近」列表中找到对方（或直接输入对方节点 ID）重新申请连接，对方同意后即恢复好友。若刚发送过申请，该次只是送达了删除告知，请再发送一次。",
 		}, nil
 	}
 	// 对方尚未同意本机：这不算失败，是「申请已送达」的正常中间态。
@@ -910,7 +942,7 @@ func friendlyDialErr(err error) error {
 		return errors.New(FriendlyGroupMismatchHint)
 	}
 	if errors.Is(err, serverless.ErrUnfriended) {
-		return errors.New("对方已把本机删除好友——请把本机连接码发给对方，让对方在「附近」列表中找到本机并申请连接。")
+		return errors.New("对方已把本机删除好友——删除不是拉黑：请重新向对方发送连接申请（「附近」列表或对方节点 ID），对方同意后即恢复好友；若刚发送过申请，请再发送一次。")
 	}
 	return err
 }
@@ -1060,11 +1092,18 @@ func (c *Client) RemovePeer(peerID string) error {
 	}
 	// 在线即时通知（尽力而为）。无论送达与否都保留墓碑：
 	// 删除意图优先于 auto_accept，只有本机用户主动添加/同意才能解除。
+	// 通知确认送达后标记「删除告知已送达」——之后对方重新申请会直接进入
+	// 本机待审批列表（删除不是拉黑，每个删除周期只告知一次）。
 	if c.disc != nil {
 		go func() {
 			nctx, ncancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer ncancel()
 			if err := c.disc.NotifyUnfriend(nctx, peerID); err == nil {
+				mctx, mcancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer mcancel()
+				if merr := c.peers.MarkUnfriendedNotified(mctx, peerID); merr != nil {
+					c.logf("标记删除告知已送达失败 %s: %v", shortPeer(peerID), merr)
+				}
 				c.logf("已通知节点 %s：本机已删除好友，对方将同步移除本机", shortPeer(peerID))
 			}
 		}()
@@ -1387,8 +1426,9 @@ func dropSelfNearby(list []peersdb.Nearby, selfPeerID string) []peersdb.Nearby {
 // 结果语义（复用 ConnectPeer 主链路）：
 //   - 已连通 → Connected；
 //   - 对方未审批 → Pending（它的待审批列表会出现本机）；
-//   - 对方墓碑生效（它删过本机）→ Pending + 明确提示「需对方主动添加你」
-//     （本机侧的同步移除已由协议层 OnUnfriendReceived 完成）。
+//   - 对方墓碑生效（它删过本机）→ 首次申请送达「删除告知」后回 Pending +
+//     明确提示；再次申请即进入对方待审批列表，对方同意即恢复（删除不是
+//     拉黑；本机侧的同步移除已由协议层 OnUnfriendReceived 完成）。
 func (c *Client) ReconnectPeer(ctx context.Context, peerID string) (*ConnResult, error) {
 	peerID = strings.TrimSpace(peerID)
 	addr := peerID

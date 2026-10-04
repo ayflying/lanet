@@ -34,7 +34,9 @@ func TestDeletedPeerOverridesAutoAccept(t *testing.T) {
 			if p, err := db.GetPeer(ctx, id); err != nil || p != nil {
 				t.Fatalf("deleted row resurrected: %+v %v", p, err)
 			}
-			if pending := c.PendingList(); len(pending) != 0 {
+			// 删除不是拉黑：重新申请会进入待审批（是否恢复由用户显式批准），
+			// 但申请记录不赋予任何信任——上面 maybeAutoAccept/trust 仍是 false。
+			if pending := c.PendingList(); len(pending) != 1 || pending[0].PeerID != id {
 				t.Fatalf("deleted peer pending: %v", pending)
 			}
 			if err := db.Close(); err != nil {
