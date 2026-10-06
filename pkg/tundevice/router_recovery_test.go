@@ -14,6 +14,7 @@ import (
 	"github.com/ayflying/pvn/pkg/protocol"
 	"github.com/libp2p/go-libp2p/core/network"
 	libprotocol "github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // ----------------------------------------------------------------------------
@@ -223,12 +224,14 @@ func (m *mockBlockingStream) Scope() network.StreamScope       { return nil }
 // 返回错误 → runOutbound 在途预算归还。验证「取消解除 stream.Write 阻塞」与
 // 「回收预算」二者同时成立。
 func TestForwardPacketCancelUnblocksWriteAndReclaimsBudget(t *testing.T) {
+	targetID := peer.ID("mock-peer")
 	router := &Router{
 		outbound:       make(map[string]*outboundWorker),
 		outboundLimit:  8,
 		outboundIdle:   time.Minute,
 		writeBudgetMax: 16 * 1024 * 1024,
-		streams:        make(map[string]*streamState),
+		flows:          make(map[peer.ID]*peerFlow),
+		flowByAddr:     map[string]peer.ID{"10.7.0.3": targetID},
 	}
 	// 走真实 forwardPacket（含 AfterFunc→Reset 解除阻塞写）。
 	router.forwardImpl = func(ctx context.Context, p []byte) error {
@@ -236,7 +239,8 @@ func TestForwardPacketCancelUnblocksWriteAndReclaimsBudget(t *testing.T) {
 	}
 
 	ms := newMockBlockingStream()
-	router.streams["10.7.0.3"] = &streamState{stream: ms}
+	flow := newPeerFlow(ms, targetID, targetID, []string{"10.7.0.3"})
+	router.flows[targetID] = flow
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

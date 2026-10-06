@@ -73,6 +73,40 @@ func New(self host.Host, netmapCli GroupNetMap, relays RelaySource) *Service {
 	}
 }
 
+// PeerRoute 把虚拟地址（IPv4 或 IPv6）解析为对端身份：PeerID + 该 peer 的
+// 全部虚拟地址别名。
+//
+// 这是隧道流「按对端归一」的基础：一个 peer 在 NetMap 里同时拥有 IPv4 与
+// IPv6 两个虚拟地址，两者是同一条隧道流的两个门面。调用方（Router）据此
+// 把两个地址映射到同一条流，避免同一 peer 被当成两个目的各建一条流、
+// 再互相 Reset（表现为隧道秒级重建 + stream reset by remote error code 0）。
+func (s *Service) PeerRoute(virtualIP string) (peer.ID, []string, bool) {
+	route, ok := s.netmapCli.Resolve(virtualIP)
+	if !ok {
+		return "", nil, false
+	}
+	target, err := peer.Decode(route.PeerID)
+	if err != nil || target == "" {
+		return "", nil, false
+	}
+	aliases := make([]string, 0, 2)
+	for _, addr := range []string{route.VirtualIP, route.VirtualIPv6} {
+		if addr != "" {
+			aliases = append(aliases, addr)
+		}
+	}
+	return target, aliases, true
+}
+
+// LocalPeerID 返回本机 PeerID。Router 用它作为出向流的发起方标识，与对端
+// 做对称仲裁时双方算出的赢家必然一致（见 tundevice.Router.installFlow）。
+func (s *Service) LocalPeerID() peer.ID {
+	if s == nil || s.self == nil {
+		return ""
+	}
+	return s.self.ID()
+}
+
 // OpenStreamToVirtualIP 按虚拟 IP 连接对端并打开隧道流。
 // 返回流与是否经中继（用于状态展示与带宽诊断）。
 func (s *Service) OpenStreamToVirtualIP(ctx context.Context, virtualIP string) (network.Stream, bool, error) {

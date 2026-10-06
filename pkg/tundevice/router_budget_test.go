@@ -16,24 +16,24 @@ import (
 
 func TestReaperHonorsBothDirectionsAndInFlightWrite(t *testing.T) {
 	r := New(nil, nil)
-	st := &streamState{}
+	flow := &peerFlow{peer: peer.ID("busy")}
 	past := time.Now().Add(-time.Minute)
-	st.lastActivity.Store(past.UnixNano())
-	st.writing.Add(1)
-	r.streams["busy"] = st
+	flow.lastActive.Store(past.UnixNano())
+	flow.writes.Add(1)
+	r.flows[flow.peer] = flow
 	r.reapIdle(time.Now(), 5*time.Second)
-	if r.streams["busy"] != st {
+	if r.flows[flow.peer] != flow {
 		t.Fatal("在途写期间误回收")
 	}
-	st.lastActivity.Store(time.Now().UnixNano()) // 单向出站写也应刷新活动
-	st.writing.Add(-1)
+	flow.lastActive.Store(time.Now().UnixNano()) // 单向出站写也应刷新活动
+	flow.writes.Add(-1)
 	r.reapIdle(time.Now(), 5*time.Second)
-	if r.streams["busy"] != st {
+	if r.flows[flow.peer] != flow {
 		t.Fatal("单向写活动后误回收")
 	}
-	st.lastActivity.Store(time.Now().UnixNano()) // 单向入站Read同样刷新该字段
+	flow.lastActive.Store(time.Now().UnixNano()) // 单向入站Read同样刷新该字段
 	r.reapIdle(time.Now(), 5*time.Second)
-	if r.streams["busy"] != st {
+	if r.flows[flow.peer] != flow {
 		t.Fatal("单向读活动后误回收")
 	}
 }
@@ -58,7 +58,10 @@ func TestFailedDialPreservesConcurrentInboundStream(t *testing.T) {
 	r := New(nil, tunnel.New(a, routes, relay))
 	defer r.Close()
 	failed := make(chan error, 1)
-	go func() { _, err := r.dialStream(ctx, "10.7.0.2"); failed <- err }()
+	go func() {
+		_, err := r.dialStream(ctx, offlineID, "10.7.0.2")
+		failed <- err
+	}()
 	select {
 	case <-relay.entered:
 	case <-ctx.Done():
@@ -72,17 +75,18 @@ func TestFailedDialPreservesConcurrentInboundStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	r.mu.Lock()
 	// 使用真实入向流作为竞争注册结果，避免阻塞的入向读取干扰断言。
-	healthy := &streamState{stream: st}
-	r.streams["10.7.0.2"] = healthy
-	r.mu.Unlock()
+	healthy := newPeerFlow(st, offlineID, offlineID, []string{"10.7.0.2"})
+	_, installed := r.installFlow(healthy)
+	if !installed {
+		t.Fatal("入向流注册失败")
+	}
 	close(relay.release)
 	if err := <-failed; err == nil {
 		t.Fatal("出向拨号本应失败")
 	}
 	r.mu.Lock()
-	kept := r.streams["10.7.0.2"] == healthy
+	kept := r.flows[offlineID] == healthy
 	r.mu.Unlock()
 	if !kept {
 		t.Fatal("失败出向拨号误删并发健康入向流")

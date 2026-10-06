@@ -18,7 +18,7 @@
 | TUN 配 IPv6 + 成员 /128 路由 | `pkg/tundevice/config.go` | `ConfigureTUNIPv6` / `EnsureRouteIPv6`（Windows 走原生 API，Linux/macOS 走 /48 接口路由） |
 | 成员视图带 IPv6 | `pkg/serverless/vaddr.go` `MemberRef`、`pkg/netmapclient/client.go` `Member`/`Route` | 字段 `virtual_ipv6,omitempty` |
 | 虚拟地址解析含 IPv6 | `pkg/serverless/vaddr.go` `ResolveTarget`、`pkg/netmapclient` `Resolve` | 同时匹配 `VirtualIP` 与 `VirtualIPv6` |
-| 入向流别名 | `sdk/go/lanet/client.go` | `virtualIPAliasesByPeer` → `ServeInboundStreamAliases(v4, v6, stream)` |
+| 入向流别名 | `sdk/go/lanet/client.go` | `virtualIPAliasesByPeer` → `ServeInboundStreamAliases(v4, v6, stream)`；**出向侧曾长期缺这层归一，导致同一 peer 出现两条隧道流互拆**，已由 `docs/tunnel-single-stream-per-peer.md` 修复（流表改按 PeerID 索引） |
 | Standalone 自派生地址 | `pkg/serverless` | `DeriveVirtualIPv6(groupKey, peerID)`，`validVirtualIPv6` 只认自派生值 |
 
 ### 1.2 控制面的缺口（本方案要补的）

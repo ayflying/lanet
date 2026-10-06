@@ -17,6 +17,7 @@ import (
 	"github.com/ayflying/pvn/pkg/firewall"
 	tunnel "github.com/ayflying/pvn/pkg/tunnel"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // virtioNetHdrLen Linux 端 wireguard/tun 以 IFF_VNET_HDR 打开 TUN 时的
@@ -45,6 +46,11 @@ const (
 	// maxConsecutiveReadErrors 连续「非瞬时」读错误上限：达到即判定设备
 	// 已失效并退出读循环。单包级瞬时错误（IsRecoverableReadError）不计入。
 	maxConsecutiveReadErrors = 100
+	// streamRetireGrace 被仲裁淘汰的流：先 Close 让对端读到 EOF 干净退出，
+	// 宽限后再 Reset 释放本地读侧。避免对方收到 STREAM_RESET 打出
+	// "stream reset by remote, error code 0"（代码 0 = NO_ERROR，来自 Reset()
+	// 而非协议拒绝），从而切断秒级重建循环的反馈信号。
+	streamRetireGrace = 2 * time.Second
 )
 
 // packetWriteOffset 返回向 TUN 写包时数据在缓冲区中的起始偏移。
@@ -69,8 +75,17 @@ type Router struct {
 	// onIP 返回本机虚拟 IP（ARP 应答需要；nil = 不应答 ARP）。
 	onIP func() netip.Addr
 
-	mu      sync.Mutex
-	streams map[string]*streamState // virtualIP -> 当前到对端的活跃双工流
+	mu   sync.Mutex
+	// flows 按「对端 PeerID」索引：任一时刻对每个对端有且仅有一条活跃双工流。
+	// 不能按虚拟 IP 索引——同一 peer 同时拥有 IPv4/IPv6 两个虚拟地址，
+	// 按 IP 建表会让同一 peer 出现两条独立流，进而互相 Reset 成死循环。
+	flows map[peer.ID]*peerFlow
+	// flowByAddr 是虚拟地址（IPv4/IPv6）到对端 PeerID 的别名索引：
+	// 同一 peer 的两个地址都指向同一条流。目的是让稳态下的出向查表是 O(1)，
+	// 避免每个包都去扫一遍 NetMap 成员表。
+	flowByAddr map[string]peer.ID
+	// selfID 本机 PeerID，是出向流的发起方标识，参与对称仲裁。
+	selfID peer.ID
 	// outbound 按目标 IP 隔离拨号和发送。离线成员的慢拨号不能阻塞唯一的
 	// TUN 读取循环，否则其他成员的回程包也会滞留在网卡里并表现为随机丢包。
 	outbound map[string]*outboundWorker
@@ -91,18 +106,22 @@ type Router struct {
 	// Wintun 的 NativeTun.Read/Write 要求每个方向由单一调用方串行访问。
 	// 多条入向隧道流可能同时写 TUN，不加锁会在环形缓冲上产生间歇性丢包。
 	writeMu sync.Mutex
-	// dialing single-flight：同一虚拟 IP 只允许一个 goroutine 拨号，
-	// 其余调用等待复用结果。没有它，TUN 读循环里每个丢包的 ping 都会
-	// 各自触发一次拨号，几十个并发拨号会打爆 libp2p 资源限制
-	// （观测到 resource limit exceeded / NO_RESERVATION），拖垮重连。
-	dialing    map[string]*dialCall
+	// dialing single-flight：同一对端只允许一个 goroutine 拨号，其余调用等待
+	// 复用结果。没有它，TUN 读循环里每个丢包的 ping 都会各自触发一次拨号，
+	// 几十个并发拨号会打爆 libp2p 资源限制（观测到 resource limit exceeded /
+	// NO_RESERVATION），拖垮重连。按 PeerID 而非 IP 归并，确保同一 peer 的
+	// IPv4 与 IPv6 包共用一次拨号。
+	dialing    map[peer.ID]*dialCall
 	closed     bool
 	cancel     context.CancelFunc
 	workers    sync.WaitGroup
 	pumps      sync.WaitGroup
 	streamIdle time.Duration
-	closeDone  chan struct{}
-	runDone    chan struct{}
+	// retireGrace 淘汰一条竞争失败流后到强制 Reset 之间的宽限期：Close 先让
+	// 对端读到 EOF 干净退出，宽限期结束仍未退出的再 Reset 释放读侧资源。
+	retireGrace time.Duration
+	closeDone   chan struct{}
+	runDone     chan struct{}
 }
 
 // dialCall 一次拨号的结果广播。done 关闭后 err 可安全读取。
@@ -117,26 +136,48 @@ type outboundWorker struct {
 	dropped uint64
 }
 
-// streamState 串行化同一字节流上的包写入。network.Stream 是字节流，若多个
-// goroutine 并发 Write，IP 包字节可能交错，接收端将无法按 IPv4 total_length 分帧。
-type streamState struct {
-	stream       network.Stream
-	writeMu      sync.Mutex
-	lastActivity atomic.Int64
-	writing      atomic.Int32
+// peerFlow 是一个对端的一条隧道双工流。
+//
+// network.Stream 是字节流，若多个 goroutine 并发 Write，IP 包字节可能交错，
+// 接收端将无法按 IPv4 total_length 分帧 —— 同一字节流上的包写入必须串行。
+type peerFlow struct {
+	stream network.Stream
+	// peer 是流的对端 PeerID，也是流表的键。
+	peer peer.ID
+	// initiator 是这条流的发起方：出向流是本机，入向流是对端。
+	// 双方都拿得到对方的 PeerID，因此两端各自算出的仲裁赢家必然一致。
+	initiator peer.ID
+	// addrs 是该 peer 的全部虚拟地址别名（IPv4 + IPv6），用于建立别名索引。
+	addrs []string
+	// retired 表示这条流已被淘汰：不再向 TUN 投递数据，也不再作为查表结果。
+	// 置位后 read 循环会自行退出并对流做最终清理。
+	retired atomic.Bool
+	// writeMu 串行化同一字节流上的包写入：IPv4 与 IPv6 的出向 worker 是两条
+	// 独立队列，但最终汇聚到同一条流，不加锁会让字节交错、接收端无法分帧。
+	writeMu sync.Mutex
+	// writes 统计尚未完成的并发写，用于 reapIdle 避开在途写。
+	writes     atomic.Int32
+	lastActive atomic.Int64
 }
+
+func (f *peerFlow) touch() { f.lastActive.Store(time.Now().UnixNano()) }
 
 func New(device Device, tunnelSvc *tunnel.Service) *Router {
 	r := &Router{
 		device:         device,
 		tunnel:         tunnelSvc,
-		streams:        make(map[string]*streamState),
+		flows:          make(map[peer.ID]*peerFlow),
+		flowByAddr:     make(map[string]peer.ID),
 		outbound:       make(map[string]*outboundWorker),
 		outboundLimit:  maxOutboundWorkers,
 		outboundIdle:   outboundWorkerIdle,
-		dialing:        make(map[string]*dialCall),
+		dialing:        make(map[peer.ID]*dialCall),
 		writeBudgetMax: outboundQueueBudget,
 		streamIdle:     streamIdleTimeout,
+		retireGrace:    streamRetireGrace,
+	}
+	if tunnelSvc != nil {
+		r.selfID = tunnelSvc.LocalPeerID()
 	}
 	r.forwardImpl = func(ctx context.Context, p []byte) error { return r.forwardPacket(ctx, p) }
 	return r
@@ -382,8 +423,10 @@ func (r *Router) Close() {
 	r.closed = true
 	r.closeDone = make(chan struct{})
 	cancel := r.cancel
-	streams := r.streams
-	r.streams = make(map[string]*streamState)
+	// 流表按对端归一后每个对端只有一条流，直接整表取走即可；别名索引同步清空。
+	flows := r.flows
+	r.flows = make(map[peer.ID]*peerFlow)
+	r.flowByAddr = make(map[string]peer.ID)
 	workers := make([]*outboundWorker, 0, len(r.outbound))
 	for _, worker := range r.outbound {
 		workers = append(workers, worker)
@@ -404,8 +447,10 @@ func (r *Router) Close() {
 	if r.runDone != nil {
 		<-r.runDone
 	}
-	for _, st := range streams {
-		_ = st.stream.Reset()
+	// 主动关闭一律 Reset：不再需要对方的读循环配合，立即释放底层资源。
+	for _, flow := range flows {
+		flow.retired.Store(true)
+		_ = flow.stream.Reset()
 	}
 	r.workers.Wait()
 	r.pumps.Wait()
@@ -429,22 +474,18 @@ func (r *Router) reapStreams(ctx context.Context) {
 	}
 }
 
+// reapIdle 回收空闲流。流表按对端归一，删掉一条流同时清掉它的全部地址别名。
 func (r *Router) reapIdle(now time.Time, idle time.Duration) {
-	stale := make(map[*streamState]struct{})
+	var stale []*peerFlow
 	r.mu.Lock()
-	for _, st := range r.streams {
-		if st.writing.Load() == 0 && now.Sub(time.Unix(0, st.lastActivity.Load())) >= idle {
-			stale[st] = struct{}{}
-		}
-	}
-	for ip, st := range r.streams {
-		if _, ok := stale[st]; ok {
-			delete(r.streams, ip)
+	for _, flow := range r.flows {
+		if flow.writes.Load() == 0 && now.Sub(time.Unix(0, flow.lastActive.Load())) >= idle {
+			stale = append(stale, flow)
 		}
 	}
 	r.mu.Unlock()
-	for st := range stale {
-		_ = st.stream.Reset()
+	for _, flow := range stale {
+		r.retireFlow(flow, "idle")
 	}
 }
 
@@ -585,24 +626,65 @@ func packetDestination(packet []byte) (string, error) {
 	}
 }
 
-// forwardPacket 解析目的 IP，找到对端路由并经隧道发送。
+// lookupPeer 把虚拟地址解析为对端 PeerID。
+// 先查别名索引（稳态 O(1)，同一 peer 的 IPv4/IPv6 都已指向同一 PeerID）；
+// 未命中再查一次 NetMap 并把该 peer 的全部别名回填，避免每个包都扫成员表。
+func (r *Router) lookupPeer(destination string) (peer.ID, error) {
+	r.mu.Lock()
+	target, ok := r.flowByAddr[destination]
+	r.mu.Unlock()
+	if ok && target != "" {
+		return target, nil
+	}
+	if r.tunnel == nil {
+		return "", fmt.Errorf("tunnel service unavailable")
+	}
+	resolved, aliases, found := r.tunnel.PeerRoute(destination)
+	if !found {
+		return "", fmt.Errorf("virtual IP %s not in group netmap", destination)
+	}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return "", context.Canceled
+	}
+	// 回填前先核对：期间可能已有别的路径把这个地址绑到了同一 peer 上。
+	if current, bound := r.flowByAddr[destination]; bound && current != "" {
+		resolved = current
+	} else {
+		for _, addr := range aliases {
+			if owner, bound := r.flowByAddr[addr]; !bound || owner == "" || owner == resolved {
+				r.flowByAddr[addr] = resolved
+			}
+		}
+	}
+	r.mu.Unlock()
+	return resolved, nil
+}
+
+// forwardPacket 解析目的 IP，找到对端流并经隧道发送。
 func (r *Router) forwardPacket(ctx context.Context, packet []byte) error {
 	destination, err := packetDestination(packet)
 	if err != nil || destination == "" {
 		return err
 	}
+	target, err := r.lookupPeer(destination)
+	if err != nil {
+		return err
+	}
 
-	var state *streamState
+	var flow *peerFlow
 	for {
 		var err error
-		state, err = r.streamTo(ctx, destination)
+		flow, err = r.flowTo(ctx, target, destination)
 		if err != nil {
 			return err
 		}
 		r.mu.Lock()
-		if r.streams[destination] == state && !r.closed {
-			state.writing.Add(1)
-			state.lastActivity.Store(time.Now().UnixNano())
+		// 必须复核流仍然在位：拿流到加锁之间它可能已被对端的新流顶替。
+		if r.flows[target] == flow && !flow.retired.Load() && !r.closed {
+			flow.writes.Add(1)
+			flow.touch()
 			r.mu.Unlock()
 			break
 		}
@@ -611,41 +693,42 @@ func (r *Router) forwardPacket(ctx context.Context, packet []byte) error {
 			return ctx.Err()
 		}
 	}
-	defer state.writing.Add(-1)
+	defer flow.writes.Add(-1)
 
 	// 关闭/取消时 Reset 打断阻塞写；正常返回立刻撤销回调。
-	resetFn := context.AfterFunc(ctx, func() { _ = state.stream.Reset() })
+	resetFn := context.AfterFunc(ctx, func() { _ = flow.stream.Reset() })
 	defer resetFn()
 
-	state.writeMu.Lock()
-	state.stream.SetWriteDeadline(time.Now().Add(outboundWriteDeadline))
-	_, err = state.stream.Write(packet)
+	flow.writeMu.Lock()
+	flow.stream.SetWriteDeadline(time.Now().Add(outboundWriteDeadline))
+	_, err = flow.stream.Write(packet)
 	if err == nil {
-		state.lastActivity.Store(time.Now().UnixNano())
+		flow.touch()
 	}
-	state.writeMu.Unlock()
+	flow.writeMu.Unlock()
 	if err != nil {
-		r.dropStream(destination, state)
-		return fmt.Errorf("write to %s: %w", destination, err)
+		r.retireFlow(flow, "write failed")
+		return fmt.Errorf("write to %s (peer %s): %w", destination, target.ShortString(), err)
 	}
 	return nil
 }
 
-// streamTo 返回到目的虚拟 IP 的活跃流，没有则建立。
-// 拨号按虚拟 IP single-flight 合并：并发调用只发起一次真实拨号，
-// 其余等待结果并复用同一条流，避免拨号风暴。
-func (r *Router) streamTo(ctx context.Context, virtualIP string) (*streamState, error) {
+// flowTo 返回到对端 target 的活跃流，没有则建立。
+//
+// 拨号按 PeerID single-flight 合并：同一 peer 的 IPv4 与 IPv6 包共用一次拨号，
+// 并发调用只发起一次真实拨号，其余等待结果并复用同一条流，避免拨号风暴。
+func (r *Router) flowTo(ctx context.Context, target peer.ID, destination string) (*peerFlow, error) {
 	for {
 		r.mu.Lock()
 		if r.closed {
 			r.mu.Unlock()
 			return nil, context.Canceled
 		}
-		if state, ok := r.streams[virtualIP]; ok {
+		if flow, ok := r.flows[target]; ok && !flow.retired.Load() {
 			r.mu.Unlock()
-			return state, nil
+			return flow, nil
 		}
-		if call, ok := r.dialing[virtualIP]; ok {
+		if call, ok := r.dialing[target]; ok {
 			// 已有拨号进行中：等待其结果后重查缓存。
 			r.mu.Unlock()
 			select {
@@ -657,56 +740,50 @@ func (r *Router) streamTo(ctx context.Context, virtualIP string) (*streamState, 
 		}
 		// 由当前调用者发起拨号。
 		call := &dialCall{done: make(chan struct{})}
-		r.dialing[virtualIP] = call
+		r.dialing[target] = call
 		r.mu.Unlock()
 
-		state, err := r.dialStream(ctx, virtualIP)
+		flow, err := r.dialStream(ctx, target, destination)
 		r.mu.Lock()
-		delete(r.dialing, virtualIP)
+		delete(r.dialing, target)
 		r.mu.Unlock()
 		call.err = err
 		close(call.done)
-		return state, err
+		return flow, err
 	}
 }
 
-// dialStream 真实拨号并注册到流缓存。
-func (r *Router) dialStream(ctx context.Context, virtualIP string) (*streamState, error) {
-	stream, _, err := r.tunnel.OpenStreamToVirtualIP(ctx, virtualIP)
+// dialStream 真实拨号，并用对称仲裁把流装进流表。
+func (r *Router) dialStream(ctx context.Context, target peer.ID, destination string) (*peerFlow, error) {
+	stream, viaRelay, err := r.tunnel.OpenStreamToVirtualIP(ctx, destination)
 	if err != nil {
 		// 本次拨号尚未注册流；并发入向流可能已被注册，不能误删。
 		return nil, err
 	}
-	state := &streamState{stream: stream}
-	state.lastActivity.Store(time.Now().UnixNano())
-
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		_ = stream.Reset()
-		return nil, context.Canceled
+	// 以流实际连上的对端为准（NetMap 过期时也能归一到正确对端）。
+	if remote := stream.Conn().RemotePeer(); remote != "" {
+		target = remote
 	}
-	// 拨号期间对端可能已经建立了反向流。保留先注册的健康流，关闭重复流。
-	if existing, ok := r.streams[virtualIP]; ok {
-		r.mu.Unlock()
-		_ = stream.Close()
-		return existing, nil
+	_, aliases, _ := r.tunnel.PeerRoute(destination)
+	candidate := newPeerFlow(stream, target, r.selfID, aliases)
+	kept, installed := r.installFlow(candidate)
+	if !installed {
+		return nil, fmt.Errorf("router flow rejected for peer %s", target.ShortString())
 	}
-	if len(r.streams) >= maxOutboundWorkers {
-		r.mu.Unlock()
-		_ = stream.Reset()
-		return nil, fmt.Errorf("router stream limit reached")
+	if kept != candidate {
+		// 仲裁判给了在位的老流：复用它，新拨的流已被优雅关闭。
+		return kept, nil
 	}
-	r.streams[virtualIP] = state
-	r.pumps.Add(1)
-	r.mu.Unlock()
+	log.Printf("[router] tunnel established to %s peer=%s initiator=self via=%s remote=%s",
+		destination, target.ShortString(), viaRelayLabel(viaRelay), stream.Conn().RemoteMultiaddr())
+	return candidate, nil
+}
 
-	log.Printf("[router] tunnel established to %s via peer=%s remote=%s",
-		virtualIP, stream.Conn().RemotePeer().ShortString(), stream.Conn().RemoteMultiaddr())
-
-	// 入向：把对端发来的包写回 TUN。
-	go func() { defer r.pumps.Done(); r.pumpFromStream(virtualIP, state) }()
-	return state, nil
+func viaRelayLabel(viaRelay bool) string {
+	if viaRelay {
+		return "relay"
+	}
+	return "direct"
 }
 
 // ServeInboundStream 处理仅有 IPv4 地址的旧节点入向流。
@@ -714,7 +791,11 @@ func (r *Router) ServeInboundStream(virtualIP string, stream network.Stream) {
 	r.ServeInboundStreamAliases(virtualIP, "", stream)
 }
 
-// ServeInboundStreamAliases 注册一个对端流，使 IPv4/IPv6 地址都复用同一双工流。
+// ServeInboundStreamAliases 注册一个对端流：v4/v6 两个虚拟地址共用这一条流。
+//
+// 关键：入向与出向走同一套仲裁（installFlow）。两端各自独立算出的赢家必然
+// 相同（比较的是发起方 PeerID，双方都知道双方是谁），因此不会再出现
+// 「A 留下自己拨的流、B 留下自己拨的流、互相对拆」的秒级重建死循环。
 func (r *Router) ServeInboundStreamAliases(v4, v6 string, stream network.Stream) {
 	aliases := make([]string, 0, 2)
 	if v4 != "" {
@@ -723,50 +804,27 @@ func (r *Router) ServeInboundStreamAliases(v4, v6 string, stream network.Stream)
 	if v6 != "" && v6 != v4 {
 		aliases = append(aliases, v6)
 	}
-	if len(aliases) == 0 {
-		log.Printf("[router] inbound tunnel stream ignored: unknown peer=%s", stream.Conn().RemotePeer().ShortString())
-		_ = stream.Reset()
+	remote := stream.Conn().RemotePeer()
+	if len(aliases) == 0 || remote == "" {
+		// 认不出来的流：Close 而非 Reset，避免对端打出误导性的
+		// "stream reset by remote, error code 0" 并误判自己被踢。
+		log.Printf("[router] inbound tunnel stream ignored: unknown peer=%s", remote.ShortString())
+		_ = stream.Close()
 		return
 	}
-	state := &streamState{stream: stream}
-	state.lastActivity.Store(time.Now().UnixNano())
-	r.mu.Lock()
-	oldStates := make(map[*streamState]struct{})
-	for _, ip := range aliases {
-		if old := r.streams[ip]; old != nil && old != state {
-			oldStates[old] = struct{}{}
-		}
-	}
-	newCount := 0
-	for _, ip := range aliases {
-		if r.streams[ip] == nil {
-			newCount++
-		}
-	}
-	if r.closed || len(r.streams)+newCount > maxOutboundWorkers {
-		r.mu.Unlock()
-		_ = stream.Reset()
+	candidate := newPeerFlow(stream, remote, remote, aliases)
+	kept, installed := r.installFlow(candidate)
+	if !installed {
 		return
 	}
-	for old := range oldStates {
-		for ip, mapped := range r.streams {
-			if mapped == old {
-				delete(r.streams, ip)
-			}
-		}
+	if kept != candidate {
+		return // 仲裁判给了在位的老流，本流已被优雅关闭，无需 pump。
 	}
-	for _, ip := range aliases {
-		r.streams[ip] = state
-	}
+	log.Printf("[router] inbound tunnel established from %s peer=%s initiator=remote remote=%s",
+		aliases[0], remote.ShortString(), stream.Conn().RemoteMultiaddr())
 	r.pumps.Add(1)
-	r.mu.Unlock()
 	defer r.pumps.Done()
-	for old := range oldStates {
-		_ = old.stream.Reset()
-	}
-	log.Printf("[router] inbound tunnel established from %s peer=%s",
-		aliases[0], stream.Conn().RemotePeer().ShortString())
-	r.pumpFromStream(aliases[0], state)
+	r.pumpFromStream(candidate)
 }
 
 // writeInbound 把一个完整的 IP 包过防火墙后写回 TUN。
@@ -801,23 +859,28 @@ func (r *Router) writeDevice(bufs [][]byte, offset int) error {
 	return err
 }
 
-func (r *Router) pumpFromStream(virtualIP string, state *streamState) {
-	defer r.dropStream(virtualIP, state)
+func (r *Router) pumpFromStream(flow *peerFlow) {
+	defer r.retireFlow(flow, "closed by peer")
 	writeOffset := packetWriteOffset()
 	bufs := make([][]byte, 1)
 	sizes := make([]int, 1)
 	readBuf := make([]byte, maxPacketSize)
 	framer := &ipFramer{}
 	for {
-		n, err := state.stream.Read(readBuf)
+		n, err := flow.stream.Read(readBuf)
 		if err != nil {
+			return
+		}
+		// 被仲裁淘汰后立即停止往 TUN 投递：老流与新流同时活着会让对端的包
+		// 重复进入本机协议栈（一次会话出现两份相同的 TCP 包）。
+		if flow.retired.Load() {
 			return
 		}
 		if n == 0 {
 			time.Sleep(time.Millisecond)
 			continue
 		}
-		state.lastActivity.Store(time.Now().UnixNano())
+		flow.touch()
 		// 隧道是字节流，必须按 IP 包边界切分后再逐个写 TUN。
 		for _, pkt := range framer.feed(readBuf[:n]) {
 			r.writeInbound(bufs, sizes, pkt, writeOffset)
@@ -837,24 +900,172 @@ func protoName(n byte) string {
 	}
 }
 
-func (r *Router) dropStream(virtualIP string, state *streamState) {
+func newPeerFlow(stream network.Stream, target, initiator peer.ID, addrs []string) *peerFlow {
+	flow := &peerFlow{stream: stream, peer: target, initiator: initiator}
+	flow.lastActive.Store(time.Now().UnixNano())
+	for _, addr := range addrs {
+		if addr != "" {
+			flow.addrs = append(flow.addrs, addr)
+		}
+	}
+	return flow
+}
+
+// installFlow 按对称仲裁把 candidate 装进流表，返回留存的那条流。
+//
+// 仲裁规则：比较两条流的发起方 PeerID，字典序小的一方获胜。
+// 出向流的发起方是本机，入向流的发起方是对端 —— 两端都同时知道这两个
+// PeerID，因此各自独立算出的赢家必然相同。这是消除「互相对拆」死循环的
+// 根本保证：任何一端都不可能留下一条被对端 Reset 掉的流。
+//
+// 发起方相同（对端重拨）时保留在位的老流。发起方自己不会并发拨两条流
+// （flowTo 按 PeerID single-flight 合并），且它在重拨前已经 Reset 掉旧流，
+// 对端读侧随即报 EOF 摘除旧流，通常不会走到这个平局分支；即便走到也是
+// 收敛的（失败的一方 Close，重拨代价由 runOutbound 的退避兜住）。
+//
+// installed=false 表示 Router 已关闭或流数超限，调用方不要再使用该流。
+func (r *Router) installFlow(candidate *peerFlow) (kept *peerFlow, installed bool) {
 	r.mu.Lock()
-	var removed *streamState
-	if state == nil {
-		removed = r.streams[virtualIP]
-		delete(r.streams, virtualIP)
-	} else {
-		for ip, current := range r.streams {
-			if current == state {
-				delete(r.streams, ip)
-				removed = current
+	if r.closed || r.flows == nil {
+		r.mu.Unlock()
+		_ = candidate.stream.Close()
+		return nil, false
+	}
+	existing := r.flows[candidate.peer]
+	if existing == candidate {
+		r.mergeAddrsLocked(existing, candidate.addrs)
+		r.mu.Unlock()
+		return candidate, true
+	}
+	if existing != nil && !candidateWins(existing, candidate) {
+		// 败者也可能是别名更全的那一条（例如本机直连拨号时 NetMap 还没给出
+		// 对端的 IPv6，稍后到达的入向流才补齐），先把它知道的别名并入存活流再退场。
+		r.mergeAddrsLocked(existing, candidate.addrs)
+		r.mu.Unlock()
+		// 败者优雅退场：Close 让对端读到 EOF 干净退出，而不是收到
+		// STREAM_RESET(code 0) 后重拨回来再次参与竞争。
+		_ = candidate.stream.Close()
+		r.scheduleForceReset(candidate)
+		return existing, true
+	}
+	if existing == nil && len(r.flows) >= maxOutboundWorkers {
+		r.mu.Unlock()
+		_ = candidate.stream.Close()
+		log.Printf("[router] 流数上限 %d 已满，拒绝 peer %s 的入向流",
+			maxOutboundWorkers, candidate.peer.ShortString())
+		return nil, false
+	}
+	r.flows[candidate.peer] = candidate
+	// 先清掉该 peer 的全部旧别名，再挂上新流的别名，保证别名索引与流表一致。
+	for addr, owner := range r.flowByAddr {
+		if owner == candidate.peer {
+			delete(r.flowByAddr, addr)
+		}
+	}
+	// 别名取并集：新流知道的 ∪ 旧流知道的。入向流由 client.go 按 PeerID 查表拿到
+	// v4+v6，通常更全；但先到的直连流可能只有 v4（拨号瞬间 NetMap 尚未下发 IPv6）。
+	// 只保留新流自己的别名会让存活流丢掉 IPv6，指向该地址的下一个包又会再次拨号 ——
+	// 那正是本次「同一 peer 两条流」故障的形态。
+	r.mergeAddrsLocked(candidate, candidate.addrs)
+	if existing != nil {
+		r.mergeAddrsLocked(candidate, existing.addrs)
+	}
+	r.mu.Unlock()
+
+	if existing != nil {
+		existing.retired.Store(true)
+		r.mu.Lock()
+		if r.flows[candidate.peer] == existing {
+			delete(r.flows, candidate.peer)
+			for addr, owner := range r.flowByAddr {
+				if owner == candidate.peer {
+					delete(r.flowByAddr, addr)
+				}
+			}
+		}
+		r.mu.Unlock()
+		log.Printf("[router] tunnel replaced for peer %s: 保留发起方 %s，淘汰发起方 %s",
+			candidate.peer.ShortString(), initiatorLabel(candidate.initiator), initiatorLabel(existing.initiator))
+		_ = existing.stream.Close()
+		r.scheduleForceReset(existing)
+	}
+	return candidate, true
+}
+
+// mergeAddrsLocked 把 addrs 并入 flow 的别名集合（幂等），调用方必须持有 r.mu。
+func (r *Router) mergeAddrsLocked(flow *peerFlow, addrs []string) {
+	for _, addr := range addrs {
+		if addr == "" {
+			continue
+		}
+		// 已被占用就不抢占：别名只归一个 peer，避免索引指向错误的流。
+		if _, taken := r.flowByAddr[addr]; taken {
+			continue
+		}
+		r.flowByAddr[addr] = flow.peer
+		flow.addrs = append(flow.addrs, addr)
+	}
+}
+
+// candidateWins 报告 candidate 是否有权顶替 existing（两端算法一致）。
+func candidateWins(existing, candidate *peerFlow) bool {
+	if existing == nil {
+		return true
+	}
+	if existing.peer != candidate.peer {
+		return false // 不同对端从不竞争。
+	}
+	return candidate.initiator < existing.initiator
+}
+
+func initiatorLabel(id peer.ID) string {
+	if id == "" {
+		return "unknown"
+	}
+	return id.ShortString()
+}
+
+// scheduleForceReset 在宽限期后强制 Reset 一条已优雅关闭的流。
+// Close 通常已经让读循环返回并释放资源；这里只是兜底，防止某些传输
+// 实现上 Close 后仍占着底层缓冲。
+func (r *Router) scheduleForceReset(flow *peerFlow) {
+	grace := r.retireGrace
+	if grace <= 0 {
+		_ = flow.stream.Reset()
+		return
+	}
+	timer := time.NewTimer(grace)
+	go func() {
+		defer timer.Stop()
+		<-timer.C
+		_ = flow.stream.Reset()
+	}()
+}
+
+// retireFlow 把流移出流表并关闭它。idempotent：重复调用只有第一次生效，
+// 避免并发路径下同一条流被反复 Reset 而把对端日志刷成一片。
+func (r *Router) retireFlow(flow *peerFlow, reason string) {
+	if flow == nil || !flow.retired.CompareAndSwap(false, true) {
+		return
+	}
+	r.mu.Lock()
+	if r.flows[flow.peer] == flow {
+		delete(r.flows, flow.peer)
+		for addr, owner := range r.flowByAddr {
+			if owner == flow.peer {
+				delete(r.flowByAddr, addr)
 			}
 		}
 	}
 	r.mu.Unlock()
-	if removed != nil {
-		_ = removed.stream.Reset()
+
+	if r.closed {
+		_ = flow.stream.Reset()
+		return
 	}
+	log.Printf("[router] tunnel closed for peer %s (%s)", flow.peer.ShortString(), reason)
+	_ = flow.stream.Close()
+	r.scheduleForceReset(flow)
 }
 
 // 有用的小工具：把 IPv4 头中的协议字段取出来（TCP=6 UDP=17），调试用。
