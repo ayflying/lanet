@@ -122,6 +122,8 @@
 | `TestArbitrationLoserIsClosedNotReset` | 败者被 `Close`、**未**被立刻 `Reset`；胜者不动；别名索引更新 |
 | `TestRetiredFlowStopsDeliveringToTUN` | 淘汰后不再往 TUN 投递 |
 | `TestLookupPeerResolvesBothAliasesToSamePeer` | v4/v6 解析到同一 PeerID，并互相回填别名索引（NetMap 失效后仍命中缓存） |
+| `TestDialedStreamPumpsInboundPacketsToTUN` | **0.5.96 数据面回归用例（见 §6）**：对端写回本机拨出流的回包必须到达本机 TUN；去掉修复后该用例失败（录制 0 个入向包），红绿验证通过 |
+| `TestDialedStreamPumpIsNotDuplicatedOnKeptFlow` | `ensurePump` 的 CAS 防双读：同一条流重复调用只启动一个读循环 |
 
 原有 `router_budget_test.go` / `router_recovery_test.go` 用例已迁移到新结构并保持通过。
 
@@ -140,6 +142,54 @@
 2. `stream reset by remote, error code 0` **0 条**；
 3. `anyang-job-pc` 的 `[probe] OK … via=relay` 连续 5 轮无 FAIL。
 
-## 6. 相关文档
+## 6. 0.5.96 回归：拨出流读循环丢失（2026-10-07 线上故障）
+
+> 状态：**已修复并通过红绿验证的单元测试**（随 0.5.97 发布）。
+> 触发事件：`anyang-job-pc` 升级 0.5.96 后「控制台在线 + 直连，但 ping/TCP 全部超时」。
+
+### 6.1 现象
+
+- 控制台/probe 一切正常：所有在线成员 `[probe] OK … via=direct rtt=1~28ms`，
+  隧道长连数小时不断；`[router] tunnel established … initiator=self via=direct`
+  也正常出现。
+- 但数据面纯单通：`ping`/TCP 100% 超时；TUN 网卡
+  `Get-NetAdapterStatistics` 的 **ReceivedBytes 全天冻结在 7618**，
+  发包持续增长、收包恒为 0（SendDelta 正常、RecvDelta=0）。
+- 对端 TCP 进本机同样失败 —— 对端若是 0.5.96，它拨出的流同样没人读。
+
+### 6.2 根因
+
+§4 的重构删掉了旧 `dialStream` 里的读循环：
+
+```go
+// 旧实现（< 0.5.96）：入向：把对端发来的包写回 TUN。
+go func() { defer r.pumps.Done(); r.pumpFromStream(virtualIP, state) }()
+```
+
+重构后 `pumpFromStream` 只剩 `ServeInboundStreamAliases` 一个调用点
+（入向流同步 pump），**所有本机拨出的流只写不读**。libp2p 流是双工的：
+远端把响应写回同一条流，本机却没有任何 goroutine 在读 —— 回包永远滞留在
+流缓冲里。控制面（probe/控制台走独立应用流）完全不受影响，
+于是呈现「在线 + 直连但 ping/TCP 全断」的割裂现象。
+
+### 6.3 修复
+
+| 项 | 改动 |
+|---|---|
+| `peerFlow` | 新增 `pumped atomic.Bool`：标记读循环是否已启动 |
+| `ensurePump` | 新增：`pumped` CAS 防双读 → `pumps.Add(1)` + `go pumpFromStream(flow)`，幂等 |
+| `dialStream` | `installFlow` 成功后对返回流调用 `ensurePump`：candidate 与仲裁复用的 kept 都要保证有读循环（kept 可能同样来自本机更早的拨号）；且在首次出向写入**之前**启动 |
+| `ServeInboundStreamAliases` | 同步 pump 改为 `ensurePump`，与拨出路径共用同一套 CAS 守卫 |
+
+不变量升级为：**任一时刻，每个对端 PeerID 恰好一条活跃双工流，且该流有且只有一个读循环。**
+
+### 6.4 受影响版本与部署
+
+- 仅 **0.5.96** 受影响（读循环随 56ec972 重构丢失）；≤ 0.5.95 旧实现两条路径都有读循环，行为正常。
+- 修复随 **0.5.97** 发布；至少升级两台 Windows 0.5.96 节点（`anyang-job-pc`、`tianzong-pc`）。
+- 升级前后的判别方法：`ping 对端虚拟 IP` 期间看本机 TUN 网卡的 ReceivedBytes 是否增长；
+  或查节点日志有没有 `tunnel established … initiator=self` 之后仍然 ping 不通。
+
+## 7. 相关文档
 
 - `docs/control-plane-ipv6-dual-stack.md` —— 虚拟 IPv6 双栈的来源（`ServeInboundStreamAliases` 的入向别名能力出自其 §1.1）。

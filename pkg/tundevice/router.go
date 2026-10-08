@@ -152,6 +152,10 @@ type peerFlow struct {
 	// retired 表示这条流已被淘汰：不再向 TUN 投递数据，也不再作为查表结果。
 	// 置位后 read 循环会自行退出并对流做最终清理。
 	retired atomic.Bool
+	// pumped 表示这条流已启动读循环（pumpFromStream）。拨出流与入向流的启动
+	// 点不同，仲裁留下的 kept 流也可能早已在读 —— 用 CAS 保证同一条流只有一个
+	// 读循环，否则两个 goroutine 并发 Read 同一条字节流会把包拆坏。
+	pumped atomic.Bool
 	// writeMu 串行化同一字节流上的包写入：IPv4 与 IPv6 的出向 worker 是两条
 	// 独立队列，但最终汇聚到同一条流，不加锁会让字节交错、接收端无法分帧。
 	writeMu sync.Mutex
@@ -771,9 +775,17 @@ func (r *Router) dialStream(ctx context.Context, target peer.ID, destination str
 		return nil, fmt.Errorf("router flow rejected for peer %s", target.ShortString())
 	}
 	if kept != candidate {
-		// 仲裁判给了在位的老流：复用它，新拨的流已被优雅关闭。
+		// 仲裁判给了在位的老流：复用它，新拨的流已被优雅关闭。老流同样可能
+		// 来自本机更早的拨号 —— 出表返回的流必须有读循环，这里兜底补上。
+		r.ensurePump(kept)
 		return kept, nil
 	}
+	// 读循环必须在首次出向写入前启动：对端的响应可能紧随其后写回这条流。
+	// （0.5.96 回归：重构仲裁时丢掉了旧 dialStream 里的
+	//   go func(){ ...; r.pumpFromStream(virtualIP, state) }()
+	//  拨出流从此只写不读，对端回包永远滞留在流里 —— ping/TCP 全部超时、
+	//  TUN 网卡收包数冻结为 0，而 probe 等应用层流完全正常。）
+	r.ensurePump(candidate)
 	log.Printf("[router] tunnel established to %s peer=%s initiator=self via=%s remote=%s",
 		destination, target.ShortString(), viaRelayLabel(viaRelay), stream.Conn().RemoteMultiaddr())
 	return candidate, nil
@@ -822,9 +834,9 @@ func (r *Router) ServeInboundStreamAliases(v4, v6 string, stream network.Stream)
 	}
 	log.Printf("[router] inbound tunnel established from %s peer=%s initiator=remote remote=%s",
 		aliases[0], remote.ShortString(), stream.Conn().RemoteMultiaddr())
-	r.pumps.Add(1)
-	defer r.pumps.Done()
-	r.pumpFromStream(candidate)
+	// 入向流同样经 ensurePump 启动读循环：与拨出流共用同一套 CAS 防双读，
+	// 处理 goroutine 不再被读循环占住（读循环生命周期由 r.pumps 跟踪）。
+	r.ensurePump(candidate)
 }
 
 // writeInbound 把一个完整的 IP 包过防火墙后写回 TUN。
@@ -857,6 +869,24 @@ func (r *Router) writeDevice(bufs [][]byte, offset int) error {
 	defer r.writeMu.Unlock()
 	_, err := r.device.Write(bufs, offset)
 	return err
+}
+
+// ensurePump 为还没有读循环的流启动 pumpFromStream（幂等）。
+//
+// 每条进入流表的流都必须有且只有一个读循环：它把对端写回流上的包按 IP 包
+// 边界切分后送进本机 TUN。出向流由 dialStream 启动（旧实现是
+// `go r.pumpFromStream(virtualIP, state)`，0.5.96 重构时曾整体丢失，导致
+// 本机拨出的流只写不读）；入向流由 ServeInboundStreamAliases 启动。两条路径
+// 共用这里的 CAS：仲裁留下的 kept 流不会被二次启动读循环。
+func (r *Router) ensurePump(flow *peerFlow) {
+	if !flow.pumped.CompareAndSwap(false, true) {
+		return
+	}
+	r.pumps.Add(1)
+	go func() {
+		defer r.pumps.Done()
+		r.pumpFromStream(flow)
+	}()
 }
 
 func (r *Router) pumpFromStream(flow *peerFlow) {

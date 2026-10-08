@@ -1,6 +1,7 @@
 package tundevice
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/netip"
@@ -389,34 +390,179 @@ func mustAddr(s string) netip.Addr {
 }
 
 // fakeFlowStream 是只记录动作、不产生 I/O 的 network.Stream，用于断言
-// 「淘汰走 Close 而不是 Reset」。
+// 「淘汰走 Close 而不是 Reset」。Read 阻塞到流被 Close/Reset（与真实流一致），
+// 保证 ensurePump 启动的读循环在测试收尾时能立即退出。
 type fakeFlowStream struct {
-	tag    string
-	closed atomic.Bool
-	reset  atomic.Bool
+	tag      string
+	closed   atomic.Bool
+	reset    atomic.Bool
+	deadOnce sync.Once
+	dead     chan struct{}
 }
 
-func newFakeFlowStream() *fakeFlowStream { return &fakeFlowStream{} }
+func newFakeFlowStream() *fakeFlowStream { return &fakeFlowStream{dead: make(chan struct{})} }
 
 func (f *fakeFlowStream) Read([]byte) (int, error) {
-	time.Sleep(time.Hour)
-	return 0, io.EOF
+	select {
+	case <-f.dead:
+		return 0, io.EOF
+	case <-time.After(time.Hour):
+		return 0, io.EOF
+	}
 }
 func (f *fakeFlowStream) Write(p []byte) (int, error) { return len(p), nil }
-func (f *fakeFlowStream) Close() error                 { f.closed.Store(true); return nil }
-func (f *fakeFlowStream) CloseWrite() error            { return nil }
-func (f *fakeFlowStream) CloseRead() error             { return nil }
+func (f *fakeFlowStream) Close() error                { f.closed.Store(true); f.markDead(); return nil }
+func (f *fakeFlowStream) CloseWrite() error           { return nil }
+func (f *fakeFlowStream) CloseRead() error            { return nil }
 func (f *fakeFlowStream) Reset() error {
 	f.reset.Store(true)
+	f.markDead()
 	return nil
 }
+func (f *fakeFlowStream) markDead()                                    { f.deadOnce.Do(func() { close(f.dead) }) }
 func (f *fakeFlowStream) ResetWithError(network.StreamErrorCode) error { return f.Reset() }
-func (f *fakeFlowStream) SetDeadline(time.Time) error                 { return nil }
-func (f *fakeFlowStream) SetReadDeadline(time.Time) error             { return nil }
-func (f *fakeFlowStream) SetWriteDeadline(time.Time) error            { return nil }
-func (f *fakeFlowStream) ID() string                                  { return f.tag }
-func (f *fakeFlowStream) Protocol() libprotocol.ID                    { return protocol.Tunnel }
-func (f *fakeFlowStream) SetProtocol(libprotocol.ID) error            { return nil }
-func (f *fakeFlowStream) Stat() network.Stats                         { return network.Stats{} }
-func (f *fakeFlowStream) Conn() network.Conn                          { return nil }
-func (f *fakeFlowStream) Scope() network.StreamScope                  { return nil }
+func (f *fakeFlowStream) SetDeadline(time.Time) error                  { return nil }
+func (f *fakeFlowStream) SetReadDeadline(time.Time) error              { return nil }
+func (f *fakeFlowStream) SetWriteDeadline(time.Time) error             { return nil }
+func (f *fakeFlowStream) ID() string                                   { return f.tag }
+func (f *fakeFlowStream) Protocol() libprotocol.ID                     { return protocol.Tunnel }
+func (f *fakeFlowStream) SetProtocol(libprotocol.ID) error             { return nil }
+func (f *fakeFlowStream) Stat() network.Stats                          { return network.Stats{} }
+func (f *fakeFlowStream) Conn() network.Conn                           { return nil }
+func (f *fakeFlowStream) Scope() network.StreamScope                   { return nil }
+
+// recordingDevice 包装内存 TUN：Read 走内存回环（供 Run 消费 inject 的出向包），
+// Write 只录制不转发 —— Write 是 router 的入向投递路径（真实设备=交给本机
+// 协议栈），在此可观测，同时避免内存回环把回包又送回出向转发。
+type recordingDevice struct {
+	Device
+	mu      sync.Mutex
+	written [][]byte
+}
+
+func (d *recordingDevice) Write(bufs [][]byte, offset int) (int, error) {
+	packet := append([]byte(nil), bufs[0][offset:]...)
+	d.mu.Lock()
+	d.written = append(d.written, packet)
+	d.mu.Unlock()
+	return 1, nil
+}
+
+func (d *recordingDevice) snapshot() [][]byte {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([][]byte(nil), d.written...)
+}
+
+// TestDialedStreamPumpsInboundPacketsToTUN 是 2026-10-07 线上故障的核心回归用例：
+// 本机拨出的隧道流必须有读循环 —— 对端写回同一条流的响应包必须被送进本机 TUN。
+//
+// 背景：0.5.96 重构流仲裁时丢掉了旧 dialStream 里的
+// `go r.pumpFromStream(virtualIP, state)`，所有本机拨出的流变成只写不读：
+// ping/TCP 100% 超时、TUN 网卡收包数全天冻结，而 probe（应用层长流）完全正常，
+// 控制台依旧显示「在线 + 直连」。
+func TestDialedStreamPumpsInboundPacketsToTUN(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	hostA, hostB := newPair(t)
+	if err := hostA.Connect(ctx, peer.AddrInfo{ID: hostB.ID(), Addrs: hostB.Addrs()}); err != nil {
+		t.Fatalf("connect a->b: %v", err)
+	}
+
+	ipA := [4]byte{10, 7, 0, 2}
+	ipB := [4]byte{10, 7, 0, 3}
+
+	// 对端模拟协议栈：读到本机拨出流上的请求后，把回包写回同一条流。
+	hostB.SetStreamHandler(protocol.Tunnel, func(stream network.Stream) {
+		buf := make([]byte, 65535)
+		n, err := stream.Read(buf)
+		if err != nil || n == 0 {
+			return
+		}
+		_, _ = stream.Write(buildIPv4(ipB, ipA, []byte("echo-reply")))
+	})
+
+	memDevice, inject, err := NewMemory(1400)
+	if err != nil {
+		t.Fatalf("mem tun: %v", err)
+	}
+	defer memDevice.Close()
+	device := &recordingDevice{Device: memDevice}
+
+	routes := &stubNetmap{routes: map[string]peer.ID{"10.7.0.3": hostB.ID()}}
+	router := New(device, tunnel.New(hostA, routes, stubRelay{}))
+	defer router.Close()
+	go router.Run(ctx)
+
+	if err = inject(buildIPv4(ipA, ipB, []byte("ping-request"))); err != nil {
+		t.Fatalf("inject request: %v", err)
+	}
+
+	reply := buildIPv4(ipB, ipA, []byte("echo-reply"))
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		for _, pkt := range device.snapshot() {
+			if bytes.Equal(pkt, reply) {
+				return // 回包经本机拨出的流到达 TUN —— 拨出流的读循环在位。
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("对端写回拨出流的回包未到达本机 TUN（读循环缺失），共录制 %d 个入向包",
+				len(device.snapshot()))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestDialedStreamPumpIsNotDuplicatedOnKeptFlow 验证 ensurePump 的 CAS 防双读：
+// 对同一条流（如仲裁复用的 kept 流）重复调用只能启动一个读循环 —— 两个
+// goroutine 并发 Read 同一条字节流会把包按错误边界切开。
+func TestDialedStreamPumpIsNotDuplicatedOnKeptFlow(t *testing.T) {
+	stream := &countingFlowStream{fakeFlowStream: newFakeFlowStream()}
+	flow := newPeerFlow(stream, peer.ID("remote"), peer.ID("self"), []string{testPeerV4})
+
+	router := New(nil, nil)
+	router.ensurePump(flow)
+	router.ensurePump(flow) // 第二次必须被 pumped CAS 拦下
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		// 读循环读到 EOF 后经 defer retireFlow 收尾：retired 置位即已退出。
+		if flow.retired.Load() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !flow.retired.Load() {
+		t.Fatal("读循环未在超时内退出")
+	}
+	if got := stream.maxConcurrent.Load(); got != 1 {
+		t.Fatalf("同一条流上观测到 %d 个并发读者, want 1（CAS 防双读失效）", got)
+	}
+}
+
+// countingFlowStream 记录 Read 的并发峰值，并让每次 Read 在 30ms 后返回 EOF，
+// 使 ensurePump 的读循环自然走完一个生命周期。
+type countingFlowStream struct {
+	*fakeFlowStream
+	concurrent    atomic.Int32
+	maxConcurrent atomic.Int32
+}
+
+func (f *countingFlowStream) Read(p []byte) (int, error) {
+	cur := f.concurrent.Add(1)
+	defer f.concurrent.Add(-1)
+	for {
+		max := f.maxConcurrent.Load()
+		if cur <= max || f.maxConcurrent.CompareAndSwap(max, cur) {
+			break
+		}
+	}
+	select {
+	case <-f.dead:
+		return 0, io.EOF
+	case <-time.After(30 * time.Millisecond):
+		return 0, io.EOF
+	}
+}
