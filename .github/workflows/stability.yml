@@ -37,7 +37,21 @@ jobs:
       - name: Linux 并发竞争检测
         if: runner.os == 'Linux'
         shell: bash
-        run: go test -race -count=1 -timeout=240s ./pkg/... ./sdk/go/lanet/... ./app/gateway/...
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=240s ./pkg/... ./sdk/go/lanet/... ./app/gateway/... 2>&1 | tee race-test.log
+      - name: 并发竞争检测失败日志写入 Job Summary
+        if: runner.os == 'Linux' && failure()
+        shell: bash
+        run: |
+          if [ -f race-test.log ]; then
+            {
+              echo "### Linux 并发竞争检测日志"
+              echo '```'
+              tail -c 50000 race-test.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: stability-coverage-${{ matrix.os }}
