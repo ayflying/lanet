@@ -297,6 +297,9 @@ func (u *updateState) finish(res updateResult, errMsg string) {
 	u.latest, u.notes = res.latest, res.notes
 	u.assetURL, u.assetName = res.assetURL, res.assetName
 	u.assetAPI, u.sumsAPI = res.assetAPIURL, res.sumsAPIURL
+	if errMsg == "" {
+		errMsg = res.errMsg
+	}
 	u.errMsg = errMsg
 }
 

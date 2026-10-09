@@ -627,9 +627,22 @@ func (c *Coordinator) selfManifestPaths() []string {
 		return nil
 	}
 	out := []string{primary}
-	alt := filepath.Join(filepath.Dir(primary), DistManifestName)
-	if alt != primary {
-		out = append(out, alt)
+	dirs := []string{filepath.Dir(primary)}
+	if c.cfg.ExePath != "" {
+		dirs = append(dirs, filepath.Dir(c.cfg.ExePath))
+	}
+	for _, dir := range dirs {
+		alt := filepath.Join(dir, DistManifestName)
+		duplicate := false
+		for _, existing := range out {
+			if existing == alt {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			out = append(out, alt)
+		}
 	}
 	return out
 }
