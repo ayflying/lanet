@@ -59,3 +59,5 @@ sdk/android-plugin/__pycache__/
 # 构建方式见 sdk/h5/README.md（与 Android 的 lanet.aar 同理，现场构建）
 sdk/h5/dist/
 sdk/h5/node_modules/
+# 临时调试/发布产物目录：内含 Portainer/数据库口令、会话日志、安装包等（严禁入库）
+tmp/
