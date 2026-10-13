@@ -1087,9 +1087,12 @@ func (r *Router) retireFlow(flow *peerFlow, reason string) {
 			}
 		}
 	}
+	// closed 与 Close() 的写入共享 r.mu：这里必须在解锁前读取，
+	// 否则与 Close() 里的 r.closed = true 构成数据竞争（race 检测失败）。
+	closed := r.closed
 	r.mu.Unlock()
 
-	if r.closed {
+	if closed {
 		_ = flow.stream.Reset()
 		return
 	}
