@@ -1,0 +1,8 @@
+{
+  "exclude": [
+    ".git", ".hg", ".svn", ".cg", "node_modules", "venv", ".venv",
+    "__pycache__", "dist", "build", "target", ".tox", ".pytest_cache",
+    "coverage", "*.min.js", "*.min.css", "*.lock",
+    "tmp", "outputs", ".workbuddy", ".tmp-mock", ".testbin", ".tmp-watch"
+  ]
+}
