@@ -215,6 +215,8 @@ type Config struct {
 	// 返回 true 表示本端已自动信任该节点，本次握手按已信任处理。
 	// 仅当 IsTrusted 返回 false 时才会被调用；nil = 不自动审批。
 	AutoAccept func(peerID string, addrs []string, name string) bool
+	// AutoReaccept 仅显式重新申请可调用，允许自动审批时清除删除记录。
+	AutoReaccept func(peerID string, addrs []string, name string) bool
 	// OnPending 陌生节点申请连接（未信任且未自动放行）时上报，
 	// 由上层持久化到待审批列表并在控制台展示。可能被并发调用。
 	OnPending func(peerID string, addrs []string, name string)
@@ -781,7 +783,7 @@ func (d *Discovery) DialSeed(ctx context.Context, addrs []string) (string, error
 			continue
 		}
 		// 建连后立刻走 info 协议确认同群（拿到名称、校验渠道与密钥）。
-		if err := d.identifyExplicit(ctx, ai.ID); err != nil {
+		if err := d.identifyExplicit(context.WithValue(ctx, connectRequestKey{}, true), ai.ID); err != nil {
 			// 对方明确拒绝（未审批 / 已删除本机 / 不在同一网络）：这些是
 			// 对端给出的终局结论，不是链路抖动，换下一个地址重试也不会变，
 			// 直接原样上抛、保留可识别语义——跨群拒绝尤其不能套「拨号
@@ -847,14 +849,13 @@ func (d *Discovery) trustPolicy(peerID string, addrs []string, name string) (tru
 	return false, false
 }
 
-// trustPolicyPassive 判定「被动发现」到的节点能否放行，语义与 trustPolicy
-// 的放行分支完全一致（信任 / auto_accept），但**不产生 OnPending 副作用**。
+// trustPolicyPassive 只检查现有信任，绝不触发自动审批或待审批回调。
+// 自动同意只适用于收到的申请，不能把发现陌生节点变成主动申请。
 //
 // 为什么需要单独一个：被动发现（DHT provider 记录、mDNS）只说明「同群里有
 // 这么个节点」，不代表对方申请连接——把它记进待审批会让控制台出现没人申请
-// 过的条目，而且发现是周期性的，同一节点会被反复上报。真正的申请只有两条
-// 来源：入向握手（handleInfo）和用户主动添加（RequestConnect），它们走
-// trustPolicy，保留上报。
+// 过的条目，而且发现是周期性的，同一节点会被反复上报。
+// 只有入向握手（handleInfo）可以调用带审批副作用的 trustPolicy。
 func (d *Discovery) trustPolicyPassive(peerID string, addrs []string, name string) bool {
 	if d.cfg.IsUnfriended != nil && d.cfg.IsUnfriended(peerID) {
 		return false
@@ -863,10 +864,6 @@ func (d *Discovery) trustPolicyPassive(peerID string, addrs []string, name strin
 		return true
 	}
 	if d.cfg.IsTrusted(peerID) {
-		return true
-	}
-	if d.cfg.AutoAccept != nil && d.cfg.AutoAccept(peerID, addrs, name) {
-		d.logf("已自动同意陌生节点 %s 的连接申请（auto_accept 开启）", shortID(peerID))
 		return true
 	}
 	return false
@@ -958,8 +955,32 @@ func (d *Discovery) findPeer(ctx context.Context, peerID string, forceDHT bool) 
 	return pi, nil
 }
 
-// RequestConnect 按节点 ID 发起连接申请：先做信任判定，已信任/已自动放行
-// 则直接建连并交换信息；陌生节点记入待审批列表由用户确认。
+// Reconnect 仅恢复已有好友的连接，不携带用户重新申请标记。
+func (d *Discovery) Reconnect(ctx context.Context, ai peer.AddrInfo) (string, error) {
+	if ai.ID == d.host.ID() || !d.trustPolicyPassive(ai.ID.String(), nil, "") {
+		return ai.ID.String(), fmt.Errorf("对方节点未被信任，无法重连")
+	}
+	addrs := p2pkit.CleanUnderlayAddrs(ai.Addrs)
+	if len(addrs) > 0 {
+		d.host.Peerstore().AddAddrs(ai.ID, addrs, peerstore.PermanentAddrTTL)
+	}
+	d.mu.Lock()
+	if d.unfriendGuardBlocked(ai.ID.String()) {
+		d.mu.Unlock()
+		return ai.ID.String(), ErrUnfriended
+	}
+	if _, ok := d.members[ai.ID.String()]; !ok {
+		d.members[ai.ID.String()] = &Member{
+			PeerID: ai.ID.String(), VirtualIP: DeriveVirtualIP(d.groupKey, ai.ID.String()),
+			VirtualIPv6: DeriveVirtualIPv6(d.groupKey, ai.ID.String()), Source: "warmup",
+			Addrs: toStrings(addrs), FirstSeen: time.Now(), LastDiscovered: time.Now(),
+		}
+	}
+	d.mu.Unlock()
+	return ai.ID.String(), d.identifyExplicit(ctx, ai.ID)
+}
+
+// RequestConnect 按节点 ID 显式申请连接；调用方须已根据用户动作授予本地信任。
 // 返回 (对端节点ID, error)。error 可能表示「已提交申请，等待对方同意」。
 func (d *Discovery) RequestConnect(ctx context.Context, ai peer.AddrInfo) (string, error) {
 	if ai.ID == d.host.ID() {
@@ -969,11 +990,7 @@ func (d *Discovery) RequestConnect(ctx context.Context, ai peer.AddrInfo) (strin
 	if len(addrs) > 0 {
 		d.host.Peerstore().AddAddrs(ai.ID, addrs, peerstore.PermanentAddrTTL)
 	}
-	trusted, pending := d.trustPolicy(ai.ID.String(), toStrings(addrs), "")
-	if !trusted {
-		if pending {
-			return ai.ID.String(), fmt.Errorf("已向 %s 提交连接申请，等待对方同意后即可连通", shortID(ai.ID.String()))
-		}
+	if !d.trustPolicyPassive(ai.ID.String(), toStrings(addrs), "") {
 		return ai.ID.String(), fmt.Errorf("对方节点未被信任，无法连接")
 	}
 	// 已信任：按普通成员流程建连 + info 交换（失败即返回真实原因）。
@@ -994,7 +1011,7 @@ func (d *Discovery) RequestConnect(ctx context.Context, ai peer.AddrInfo) (strin
 		}
 	}
 	d.mu.Unlock()
-	if err := d.identifyExplicit(ctx, ai.ID); err != nil {
+	if err := d.identifyExplicit(context.WithValue(ctx, connectRequestKey{}, true), ai.ID); err != nil {
 		return ai.ID.String(), err
 	}
 	return ai.ID.String(), nil
@@ -1403,13 +1420,12 @@ func (d *Discovery) connectAndIdentify(id peer.ID) error {
 }
 
 func (d *Discovery) connectAndIdentifyContext(ctx context.Context, id peer.ID) error {
-	// 审批门（出向）：未信任的陌生节点不建连。地址簿里的历史地址可以带过去
-	// 一起上报待审批，方便用户在控制台看到「谁在申请连我」。
-	if trusted, _ := d.trustPolicy(id.String(), toStrings(p2pkit.FilterUnderlayAddrs(d.host.Peerstore().Addrs(id))), ""); !trusted {
+	// 出向只检查现有信任，不自动审批，也不伪造收到申请的记录。
+	if !d.trustPolicyPassive(id.String(), nil, "") {
 		d.mu.Lock()
 		delete(d.members, id.String())
 		d.mu.Unlock()
-		return fmt.Errorf("对端尚未通过连接审批（已记入待审批列表）")
+		return fmt.Errorf("对端尚未通过本地连接审批，无法主动建连")
 	}
 	connCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -1596,14 +1612,15 @@ func (d *Discovery) applyMemberHints(hints []memberHint) {
 // Rejected 非空表示本端拒绝了这次握手（未通过连接审批）——此时其余字段
 // 一律留空，不向对方泄漏任何身份信息，只告知「你还没被同意」。
 type infoPayload struct {
-	Name       string   `json:"name"`
-	Group      string   `json:"group"`
-	OS         string   `json:"os"`
-	Version    string   `json:"version,omitempty"`     // 程序版本（P2P 自更新用）
-	Platform   string   `json:"platform,omitempty"`    // GOOS/GOARCH
-	OSHostname string   `json:"os_hostname,omitempty"` // 操作系统主机名（0.5.15 起）
-	LocalIPs   []string `json:"local_ips,omitempty"`   // 本机非回环网卡 IP（0.5.15 起）
-	Rejected   string   `json:"rejected,omitempty"`    // 非空 = 拒绝原因（连接审批）
+	ConnectRequest bool     `json:"connect_request,omitempty"` // 仅用户显式添加/重新申请时置位，后台重连不携带。
+	Name           string   `json:"name"`
+	Group          string   `json:"group"`
+	OS             string   `json:"os"`
+	Version        string   `json:"version,omitempty"`     // 程序版本（P2P 自更新用）
+	Platform       string   `json:"platform,omitempty"`    // GOOS/GOARCH
+	OSHostname     string   `json:"os_hostname,omitempty"` // 操作系统主机名（0.5.15 起）
+	LocalIPs       []string `json:"local_ips,omitempty"`   // 本机非回环网卡 IP（0.5.15 起）
+	Rejected       string   `json:"rejected,omitempty"`    // 非空 = 拒绝原因（连接审批）
 	// Members 成员表摘要（0.5.58 起，成员地址同步 / PEX）：把本机已知
 	// 同群成员的节点 ID 与地址分享给对端，解决「唯一种子一挂全网失联」
 	// ——种子恢复前，先恢复的成员把其他成员的地址带给还没恢复的。
@@ -1644,13 +1661,23 @@ func (d *Discovery) handleInfo(s network.Stream) {
 		return
 	}
 	remote := s.Conn().RemotePeer()
+	// 显式重新申请可在自动审批开启时恢复；普通后台握手不能越过删除保护。
+	autoRestored := false
+	if req.ConnectRequest && d.cfg.IsUnfriended != nil && d.cfg.IsUnfriended(remote.String()) && d.cfg.AutoReaccept != nil {
+		autoRestored = d.cfg.AutoReaccept(remote.String(), nil, req.Name)
+		if autoRestored {
+			d.mu.Lock()
+			delete(d.unfriendedAt, remote.String())
+			d.mu.Unlock()
+		}
+	}
 	// 墓碑优先（两阶段）：本机主动删除过对方时——
 	//   首次握手：回明确的「unfriended」告知并标记已送达，它收到后自动把
 	//   本机从它的列表同步删除（双向删除的离线自愈路径）；
 	//   之后的握手：删除不是拉黑，落入下方审批门按未审批申请处理——对方
 	//   会进入本机待审批列表，用户显式批准（ApprovePeer 清墓碑）即恢复。
-	// 只有用户主动重新添加/批准才解除墓碑；auto_accept 永不复活被删节点。
-	if d.cfg.IsUnfriended != nil && d.cfg.IsUnfriended(remote.String()) {
+	// 普通后台握手保留墓碑；显式申请可由上方自动审批恢复。
+	if !autoRestored && d.cfg.IsUnfriended != nil && d.cfg.IsUnfriended(remote.String()) {
 		notified := d.cfg.IsUnfriendedNotified != nil && d.cfg.IsUnfriendedNotified(remote.String())
 		if !notified {
 			if d.cfg.MarkUnfriendedNotified != nil {
@@ -1669,7 +1696,11 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	// 信息与网络拓扑泄漏），不进成员表、不进私有 DHT 路由表。
 	// 但会明确回一个「未同意」标记——对端据此提示「等待对方同意」，
 	// 而不是让用户面对一个沉默的 EOF 无从判断。
-	if trusted, _ := d.trustPolicy(remote.String(), nil, req.Name); !trusted {
+	trusted := autoRestored
+	if !trusted {
+		trusted, _ = d.trustPolicy(remote.String(), nil, req.Name)
+	}
+	if !trusted {
 		d.logf("拒绝陌生节点 %s 的握手（未审批，已记入待审批列表）", remote.ShortString())
 		_ = json.NewEncoder(s).Encode(infoPayload{
 			Group:    GroupFingerprint(d.groupKey),
@@ -1757,6 +1788,9 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	_ = json.NewEncoder(s).Encode(resp)
 }
 
+// connectRequestKey 仅沿显式连接调用传递，不存入后台调度器，避免重试误带申请标记。
+type connectRequestKey struct{}
+
 // fetchInfo 主动交换成员信息。
 func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, error) {
 	stream, err := d.host.NewStream(network.WithAllowLimitedConn(ctx, "member info over relay"), id, d.protoCandidates(d.protoInfo, d.protoInfoAlt)...)
@@ -1787,15 +1821,17 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 	}()
 	// 真实流截止时间：携带更短 ctx 截止时取 ctx，否则用默认握手超时。
 	_ = stream.SetDeadline(infoStreamDeadline(ctx))
+	connectRequest, _ := ctx.Value(connectRequestKey{}).(bool)
 	req := infoPayload{
-		Name:        d.cfg.Name,
-		Group:       GroupFingerprint(d.groupKey),
-		VirtualIPv6: d.selfIPv6,
-		Version:     d.cfg.Version,
-		Platform:    d.cfg.Platform,
-		OSHostname:  d.cfg.OSHostname,
-		LocalIPs:    d.cfg.LocalIPs,
-		Members:     d.pexSnapshot(),
+		ConnectRequest: connectRequest,
+		Name:           d.cfg.Name,
+		Group:          GroupFingerprint(d.groupKey),
+		VirtualIPv6:    d.selfIPv6,
+		Version:        d.cfg.Version,
+		Platform:       d.cfg.Platform,
+		OSHostname:     d.cfg.OSHostname,
+		LocalIPs:       d.cfg.LocalIPs,
+		Members:        d.pexSnapshot(),
 	}
 	if err = json.NewEncoder(stream).Encode(req); err != nil {
 		return infoPayload{}, err

@@ -58,6 +58,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 	libprotocol "github.com/libp2p/go-libp2p/core/protocol"
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -503,6 +504,7 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 			Quiet:                  cfg.Quiet,
 			IsTrusted:              c.isTrustedPeer,
 			AutoAccept:             c.maybeAutoAccept,
+			AutoReaccept:           c.maybeAutoReaccept,
 			OnPending:              c.onPendingRequest,
 			HasKnownPeers:          c.hasKnownPeers,
 			IsUnfriended:           c.isUnfriendedPeer,
@@ -857,6 +859,33 @@ func (c *Client) ConnectSeed(seed string) (string, error) {
 	ctx := c.rootCtx
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// 先完整校验输入，避免后续地址非法或指向本机时，已为前面的目标授予信任。
+	infos := make([]peer.AddrInfo, 0, len(addrs))
+	for _, addr := range addrs {
+		maddr, err := ma.NewMultiaddr(addr)
+		if err != nil {
+			return "", fmt.Errorf("连接种子非法: %w", err)
+		}
+		ai, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil || len(ai.Addrs) == 0 {
+			return "", fmt.Errorf("连接种子非法：需要带 /p2p/<ID> 的完整节点地址: %s", addr)
+		}
+		if ai.ID.String() == c.peerID {
+			return "", fmt.Errorf("连接种子指向本机，无需连接")
+		}
+		infos = append(infos, *ai)
+	}
+	// 连接种子是用户主动添加：本地先授权，对方是否接受仍由其审批策略决定。
+	// 不借用 auto_accept，否则出向握手会绕过真实申请的边界。
+	for _, ai := range infos {
+		peerAddrs := make([]string, 0, len(ai.Addrs))
+		for _, addr := range ai.Addrs {
+			peerAddrs = append(peerAddrs, addr.String())
+		}
+		if err := c.restorePeer(ctx, ai.ID.String(), peerAddrs); err != nil {
+			return "", fmt.Errorf("记录并信任连接种子失败: %w", err)
+		}
 	}
 	// 终局语义错误（跨群/未审批/已删好友）翻译成可读文案，
 	// 不再让「信息交换失败: EOF」这类裸错误直达用户。

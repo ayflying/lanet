@@ -17,9 +17,10 @@ const discoveryQueueSize = 128
 const discoveryStateLimit = 4096
 
 type discoveryCall struct {
-	id   peer.ID
-	done chan struct{}
-	err  error
+	id             peer.ID
+	done           chan struct{}
+	err            error
+	connectRequest bool
 }
 type discoveryRetry struct {
 	failures int
@@ -50,6 +51,10 @@ func newDiscoveryScheduler(parent context.Context, cooldown time.Duration, run f
 
 // 入队前去重；队满直接拒绝，不为等待容量派生协程。
 func (s *discoveryScheduler) submit(id peer.ID, explicit bool) (*discoveryCall, error) {
+	return s.submitMode(id, explicit, false)
+}
+
+func (s *discoveryScheduler) submitMode(id peer.ID, explicit, connectRequest bool) (*discoveryCall, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.ctx.Err(); err != nil {
@@ -61,7 +66,7 @@ func (s *discoveryScheduler) submit(id peer.ID, explicit bool) (*discoveryCall, 
 	if !explicit && s.now().Before(s.retry[id].next) {
 		return nil, nil
 	}
-	call := &discoveryCall{id: id, done: make(chan struct{})}
+	call := &discoveryCall{id: id, done: make(chan struct{}), connectRequest: connectRequest}
 	select {
 	case s.queue <- call:
 		s.calls[id] = call
@@ -99,7 +104,11 @@ func (s *discoveryScheduler) worker() {
 		case call := <-s.queue:
 			err := s.ctx.Err()
 			if err == nil {
-				err = s.run(s.ctx, call.id)
+				runCtx := s.ctx
+				if call.connectRequest {
+					runCtx = context.WithValue(runCtx, connectRequestKey{}, true)
+				}
+				err = s.run(runCtx, call.id)
 			}
 			s.mu.Lock()
 			call.err = err
@@ -139,17 +148,25 @@ func (s *discoveryScheduler) request(ctx context.Context, id peer.ID) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	call, err := s.submit(id, true)
-	if err != nil {
-		return err
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.ctx.Done():
-		return s.ctx.Err()
-	case <-call.done:
-		return call.err
+	connectRequest, _ := ctx.Value(connectRequestKey{}).(bool)
+	for {
+		call, err := s.submitMode(id, true, connectRequest)
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		case <-call.done:
+			// 若先加入的是后台任务，等其结束后再提交真正申请，不能
+			// 修改正在运行的任务，也不能把申请标记丢在后台单飞里。
+			if connectRequest && !call.connectRequest {
+				continue
+			}
+			return call.err
+		}
 	}
 }
 func (d *Discovery) scheduleIdentify(id peer.ID) {

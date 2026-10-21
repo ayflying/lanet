@@ -228,7 +228,7 @@ func (c *Client) startWarmup(ctx context.Context, db *peersdb.DB) {
 				}
 				dCtx, dCancel := context.WithTimeout(ctx, warmupDialTimeout)
 				defer dCancel()
-				_, cerr := c.disc.RequestConnect(dCtx, peer.AddrInfo{ID: pid, Addrs: parsed})
+				_, cerr := c.disc.Reconnect(dCtx, peer.AddrInfo{ID: pid, Addrs: parsed})
 				mu.Lock()
 				if cerr == nil {
 					good++
@@ -332,11 +332,35 @@ func (c *Client) isTrustedPeer(peerID string) bool {
 	return ok
 }
 
-// maybeAutoAccept 供 serverless 审批门使用：auto_accept 开启时自动信任，
-// 并把节点写入地址簿（标记为「自动同意」来源，便于审计）。
+// maybeAutoAccept 仅自动接受普通入向握手，不清墓碑。
+// 即使调用前检查后发生并发删除，rememberPeer 的数据库墓碑门仍会拒绝恢复。
 func (c *Client) maybeAutoAccept(peerID string, addrs []string, name string) bool {
-	if !c.cfg.AutoAccept || c.isUnfriendedPeer(peerID) {
+	if !c.cfg.AutoAccept {
 		return false
+	}
+	return c.rememberPeer(peerID, addrs, name, true)
+}
+
+// maybeAutoReaccept 只供协议层收到显式连接申请时调用：auto_accept 开启
+// 允许清除墓碑并恢复好友；普通握手、被动发现与出向连接不得调用。
+func (c *Client) maybeAutoReaccept(peerID string, addrs []string, name string) bool {
+	if !c.cfg.AutoAccept {
+		return false
+	}
+	if c.peers != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		deleted, err := c.peers.IsUnfriended(ctx, peerID)
+		if err != nil {
+			c.logf("自动同意查询删除记录失败 %s: %v", shortPeer(peerID), err)
+			return false
+		}
+		if deleted {
+			if err := c.peers.ClearUnfriended(ctx, peerID); err != nil {
+				c.logf("自动同意清除删除记录失败 %s: %v", shortPeer(peerID), err)
+				return false
+			}
+		}
 	}
 	return c.rememberPeer(peerID, addrs, name, true)
 }
@@ -350,7 +374,7 @@ func (c *Client) onPendingRequest(peerID string, addrs []string, name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// 被删除过的节点（墓碑存在）重新申请：peers 行不写回（防自动复活），
-	// 但待审批记录照常落库——删除不是拉黑，是否恢复由用户显式批准。
+	// 但待审批记录照常落库——删除不是拉黑，可由显式批准或真实申请的自动同意恢复。
 	if err := c.peers.UpsertPeer(ctx, peersdb.Peer{PeerID: peerID, Name: name}, addrs); err != nil && !errors.Is(err, peersdb.ErrUnfriended) {
 		c.logf("待审批节点落库失败: %v", err)
 		return
@@ -380,8 +404,8 @@ func (c *Client) hasKnownPeers() bool {
 
 // isUnfriendedPeer 供 serverless 审批门使用：本机是否主动删除过该节点
 // （墓碑）。已删除节点首次再来握手时，协议层回明确的 unfriended 拒绝
-// 标记（一次性告知），之后按未审批申请处理——删除不是拉黑，恢复由
-// 用户显式批准。
+// 标记（一次性告知），之后按未审批申请处理——删除不是拉黑，真实
+// 重新申请可由用户显式批准或 auto_accept 恢复。
 func (c *Client) isUnfriendedPeer(peerID string) bool {
 	if c.peers == nil {
 		return false
@@ -453,8 +477,7 @@ func (c *Client) onSeenUntrusted(peerID string, addrs []string, source string) {
 // 本机同步移除该节点，完成双向删除。
 //
 // 移除后不记本机墓碑——是对方删的，本机可以重新申请；对方仍持有它的墓碑，
-// 若本机申请连接，对方握手会再次回 unfriended，界面提示「对方已删除你，
-// 需对方主动添加你」。
+// 本机再次显式申请连接时，对方可以手动批准，或按 auto_accept 配置恢复。
 func (c *Client) onUnfriendReceived(peerID string) {
 	if c.peers == nil {
 		return
@@ -1027,7 +1050,7 @@ func (c *Client) ApprovePeer(peerID string) error {
 			}
 			ai, err := c.disc.FindPeer(dialCtx, peerID)
 			if err == nil {
-				_, err = c.disc.RequestConnect(dialCtx, ai)
+				_, err = c.disc.Reconnect(dialCtx, ai)
 			}
 			if err != nil {
 				c.logf("批准后自动建连未成功（对方可能已离线，等待下轮重连）: %v", err)

@@ -270,8 +270,7 @@ func TestEmptyAddressBookSkipsFindProviders(t *testing.T) {
 	}
 }
 
-// TestRequestConnectPendingUntrusted 通过 RequestConnect 申请连接陌生节点：
-// 应提交待审批并给出明确提示，而不是静默失败。
+// TestRequestConnectPendingUntrusted 本地未授权时不能伪造收到的待审批申请。
 func TestRequestConnectPendingUntrusted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -291,13 +290,10 @@ func TestRequestConnectPendingUntrusted(t *testing.T) {
 		t.Fatalf("start A: %v", err)
 	}
 	_, err = da.RequestConnect(ctx, peer.AddrInfo{ID: hb.ID(), Addrs: hb.Addrs()})
-	if err == nil {
-		t.Fatalf("申请连接陌生节点应返回「等待对方同意」提示")
+	if err == nil || !strings.Contains(err.Error(), "未被信任") {
+		t.Fatalf("本地未授权应明确拒绝，实际: %v", err)
 	}
-	if !strings.Contains(err.Error(), "等待对方同意") {
-		t.Fatalf("错误信息应说明已提交申请，实际: %v", err)
-	}
-	if pendingCount == 0 {
-		t.Fatalf("申请连接陌生节点应记入待审批")
+	if pendingCount != 0 {
+		t.Fatalf("出向操作不得伪造本地收到的申请")
 	}
 }
