@@ -75,7 +75,7 @@ type Router struct {
 	// onIP 返回本机虚拟 IP（ARP 应答需要；nil = 不应答 ARP）。
 	onIP func() netip.Addr
 
-	mu   sync.Mutex
+	mu sync.Mutex
 	// flows 按「对端 PeerID」索引：任一时刻对每个对端有且仅有一条活跃双工流。
 	// 不能按虚拟 IP 索引——同一 peer 同时拥有 IPv4/IPv6 两个虚拟地址，
 	// 按 IP 建表会让同一 peer 出现两条独立流，进而互相 Reset 成死循环。
@@ -890,7 +890,8 @@ func (r *Router) ensurePump(flow *peerFlow) {
 }
 
 func (r *Router) pumpFromStream(flow *peerFlow) {
-	defer r.retireFlow(flow, "closed by peer")
+	reason := "retired"
+	defer func() { r.retireFlow(flow, reason) }()
 	writeOffset := packetWriteOffset()
 	bufs := make([][]byte, 1)
 	sizes := make([]int, 1)
@@ -899,6 +900,8 @@ func (r *Router) pumpFromStream(flow *peerFlow) {
 	for {
 		n, err := flow.stream.Read(readBuf)
 		if err != nil {
+			// EOF 才是对端正常关闭；Reset、超时和传输错误必须保留原始原因。
+			reason = streamReadExitReason(flow.stream, err)
 			return
 		}
 		// 被仲裁淘汰后立即停止往 TUN 投递：老流与新流同时活着会让对端的包
@@ -948,10 +951,10 @@ func newPeerFlow(stream network.Stream, target, initiator peer.ID, addrs []strin
 // PeerID，因此各自独立算出的赢家必然相同。这是消除「互相对拆」死循环的
 // 根本保证：任何一端都不可能留下一条被对端 Reset 掉的流。
 //
-// 发起方相同（对端重拨）时保留在位的老流。发起方自己不会并发拨两条流
-// （flowTo 按 PeerID single-flight 合并），且它在重拨前已经 Reset 掉旧流，
-// 对端读侧随即报 EOF 摘除旧流，通常不会走到这个平局分支；即便走到也是
-// 收敛的（失败的一方 Close，重拨代价由 runOutbound 的退避兜住）。
+// 同发起方跨代由发起端决定：本机拨出仍复用在位流；对端重拨的入向流可替换
+// 旧入向流。flowTo 的 PeerID single-flight 保证发起端先淘汰旧流再重拨，接收端
+// 不能依赖旧读循环已收到 EOF。不同发起方仍按 PeerID 仲裁，绝不无条件以新换旧。
+// 注意：network.Stream.ID() 是本地编号，两端并不一致，不能作为跨端仲裁依据。
 //
 // installed=false 表示 Router 已关闭或流数超限，调用方不要再使用该流。
 func (r *Router) installFlow(candidate *peerFlow) (kept *peerFlow, installed bool) {
@@ -967,7 +970,7 @@ func (r *Router) installFlow(candidate *peerFlow) (kept *peerFlow, installed boo
 		r.mu.Unlock()
 		return candidate, true
 	}
-	if existing != nil && !candidateWins(existing, candidate) {
+	if existing != nil && !r.candidateWins(existing, candidate) {
 		// 败者也可能是别名更全的那一条（例如本机直连拨号时 NetMap 还没给出
 		// 对端的 IPv6，稍后到达的入向流才补齐），先把它知道的别名并入存活流再退场。
 		r.mergeAddrsLocked(existing, candidate.addrs)
@@ -984,6 +987,10 @@ func (r *Router) installFlow(candidate *peerFlow) (kept *peerFlow, installed boo
 		log.Printf("[router] 流数上限 %d 已满，拒绝 peer %s 的入向流",
 			maxOutboundWorkers, candidate.peer.ShortString())
 		return nil, false
+	}
+	if existing != nil {
+		// 旧流退役与新流发布在同一临界区完成，避免并发安装观察到半完成的替换。
+		existing.retired.Store(true)
 	}
 	r.flows[candidate.peer] = candidate
 	// 先清掉该 peer 的全部旧别名，再挂上新流的别名，保证别名索引与流表一致。
@@ -1003,17 +1010,6 @@ func (r *Router) installFlow(candidate *peerFlow) (kept *peerFlow, installed boo
 	r.mu.Unlock()
 
 	if existing != nil {
-		existing.retired.Store(true)
-		r.mu.Lock()
-		if r.flows[candidate.peer] == existing {
-			delete(r.flows, candidate.peer)
-			for addr, owner := range r.flowByAddr {
-				if owner == candidate.peer {
-					delete(r.flowByAddr, addr)
-				}
-			}
-		}
-		r.mu.Unlock()
 		log.Printf("[router] tunnel replaced for peer %s: 保留发起方 %s，淘汰发起方 %s",
 			candidate.peer.ShortString(), initiatorLabel(candidate.initiator), initiatorLabel(existing.initiator))
 		_ = existing.stream.Close()
@@ -1035,17 +1031,6 @@ func (r *Router) mergeAddrsLocked(flow *peerFlow, addrs []string) {
 		r.flowByAddr[addr] = flow.peer
 		flow.addrs = append(flow.addrs, addr)
 	}
-}
-
-// candidateWins 报告 candidate 是否有权顶替 existing（两端算法一致）。
-func candidateWins(existing, candidate *peerFlow) bool {
-	if existing == nil {
-		return true
-	}
-	if existing.peer != candidate.peer {
-		return false // 不同对端从不竞争。
-	}
-	return candidate.initiator < existing.initiator
 }
 
 func initiatorLabel(id peer.ID) string {

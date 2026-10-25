@@ -41,6 +41,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	libprotocol "github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -98,13 +99,27 @@ type relayCandidate struct {
 	lastSeen  time.Time
 	addrs     []ma.Multiaddr
 	connected bool
-	tier      int // 0 = 种子，1 = 成员
+	hop       bool // 已知支持中继服务；未知能力仍可作为兜底探测
+	tier      int  // 0 = 种子，1 = 成员
+}
+
+// relayDirectConnection 只认可真实非受限直连，不能用 Connectedness 推断。
+func relayDirectConnection(netw network.Network, id peer.ID) bool {
+	for _, c := range netw.ConnsToPeer(id) {
+		if _, err := c.RemoteMultiaddr().ValueForProtocol(ma.P_CIRCUIT); err != nil && !c.Stat().Limited {
+			return true
+		}
+	}
+	return false
 }
 
 // collectRelayCandidates 收集并排序中继候选（调用方需已持 d.mu 读锁或无并发写）。
 func (d *Discovery) collectRelayCandidates(ctx context.Context, number int) []peer.AddrInfo {
 	self := d.host.ID()
-	netw := d.host.Network()
+	hop := func(id peer.ID) bool {
+		ps, _ := d.host.Peerstore().SupportsProtocols(id, libprotocol.ID("/libp2p/circuit/relay/0.2.0/hop"))
+		return len(ps) > 0
+	}
 	store := d.host.Peerstore()
 	// 幽灵成员过滤：与 reapExpired 同一时限。超期未通讯的成员即使还在表里
 	// （回收周期没到），也不该拿去预约。
@@ -124,13 +139,13 @@ func (d *Discovery) collectRelayCandidates(ctx context.Context, number int) []pe
 		}
 		candidates = append(candidates, relayCandidate{
 			id: ai.ID, peerID: ai.ID.String(), addrs: addrs,
-			connected: netw.Connectedness(ai.ID) == network.Connected, tier: 0,
+			connected: relayDirectConnection(d.host.Network(), ai.ID), hop: hop(ai.ID), tier: 0,
 		})
 	}
 
 	// 第二层：成员表里的同群节点（含好友与被动发现到的同密钥节点）。
 	for _, m := range d.members {
-		if m.PeerID == self.String() || m.freshness().Before(cutoff) || !d.trustedNow(m.PeerID) {
+		if m.PeerID == self.String() || m.LastSeen.IsZero() || m.LastSeen.Before(cutoff) || !d.trustedNow(m.PeerID) {
 			continue
 		}
 		id, err := peer.Decode(m.PeerID)
@@ -143,7 +158,7 @@ func (d *Discovery) collectRelayCandidates(ctx context.Context, number int) []pe
 		}
 		candidates = append(candidates, relayCandidate{
 			id: id, peerID: m.PeerID, lastSeen: m.LastSeen, addrs: addrs,
-			connected: netw.Connectedness(id) == network.Connected, tier: 1,
+			connected: relayDirectConnection(d.host.Network(), id), hop: hop(id), tier: 1,
 		})
 	}
 
@@ -153,15 +168,18 @@ func (d *Discovery) collectRelayCandidates(ctx context.Context, number int) []pe
 
 // orderRelayCandidates 对候选做稳定排序、去重、截断，产出 peer.AddrInfo。
 //
-// 排序键（依次）：已连接群成员 → 已连接种子 → 其他种子 → 其他成员
-// → 最近见过优先 → 节点 ID（兜底，保证同一输入必得同一输出，避免 autorelay
-// 每轮对着不同候选反复重试）。
+// 排序键（依次）：已知 HOP 能力 → 真实直连群成员 → 真实直连种子
+// → 其他已验证种子 → 其他成员 → 节点 ID。新鲜度只作准入门，不按每轮握手
+// 时间重排，避免同样可靠的候选因时间戳变化反复抖动。
 //
 // 抽成独立纯函数的原因：真实 collectRelayCandidates 需要 libp2p host 才能跑，
 // 而排序/去重/截断才是最容易出错、也最值得回归保护的部分。
 func orderRelayCandidates(candidates []relayCandidate, number int) []peer.AddrInfo {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
+		if a.hop != b.hop {
+			return a.hop
+		}
 		aMember, bMember := a.connected && a.tier == 1, b.connected && b.tier == 1
 		if aMember != bMember {
 			return aMember
@@ -171,9 +189,6 @@ func orderRelayCandidates(candidates []relayCandidate, number int) []peer.AddrIn
 		}
 		if a.tier != b.tier {
 			return a.tier < b.tier
-		}
-		if !a.lastSeen.Equal(b.lastSeen) {
-			return a.lastSeen.After(b.lastSeen)
 		}
 		return a.peerID < b.peerID
 	})

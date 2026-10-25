@@ -22,6 +22,10 @@ jobs:
       - name: 核心模块覆盖测试
         shell: bash
         run: go test -count=1 -timeout=180s -coverprofile=coverage.out ./pkg/... ./sdk/go/lanet/... ./app/gateway/...
+      - name: 普通中继跨两分钟持续传输回归
+        if: runner.os == 'Linux'
+        shell: bash
+        run: LANET_LONG_RELAY_TEST=1 go test -count=1 -timeout=170s -run TestNodeRelayBeyondDefaultDuration -v ./pkg/p2pkit
       - name: 日志轮转回归
         shell: bash
         run: go test -count=1 app/agent/cmd/pvn-node/logrotate.go app/agent/cmd/pvn-node/logrotate_test.go

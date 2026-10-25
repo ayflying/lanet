@@ -127,6 +127,9 @@ func TestRelayReservationContinuesAfterSuccess(t *testing.T) {
 		if _, err := st.Conn().RemoteMultiaddr().ValueForProtocol(ma.P_CIRCUIT); err != nil {
 			t.Fatal("not real circuit")
 		}
+		if relayDirectConnection(caller.Network(), target.ID()) {
+			t.Fatal("仅经中继的连接被误判为直连")
+		}
 		_ = st.SetDeadline(time.Now().Add(time.Second))
 		_, err = st.Write([]byte("x"))
 		if err != nil {

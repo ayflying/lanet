@@ -374,8 +374,9 @@ type Discovery struct {
 
 	memberTTL time.Duration // 成员不活跃回收时限（Config.MemberTTL 归一化后）
 
-	mu      sync.RWMutex
-	members map[string]*Member // peerID -> member
+	mu             sync.RWMutex
+	members        map[string]*Member // peerID -> member
+	expiredMembers memberQuarantine   // 回收成员须真实握手后才能重新发布
 
 	// unfriendedAt 复活防护表：近期收到删除好友通知（unfriend / Forget）
 	// 的节点 -> 通知处理时间。与 members 同受 mu 保护，读写必须在同一
@@ -1096,7 +1097,7 @@ func (d *Discovery) TriggerDiscover() {
 }
 
 // reapExpired 清理超过 memberTTL 无真实通讯的成员。
-// 被移除的成员若仍实际在线，下一轮发现会重新入表（FirstSeen 重置）。
+// 被移除的成员进入有界隔离；后续发现只触发重验证，成功握手才重新入表。
 func (d *Discovery) reapExpired() {
 	cutoff := time.Now().Add(-d.memberTTL)
 	d.mu.Lock()
@@ -1104,6 +1105,7 @@ func (d *Discovery) reapExpired() {
 	for id, m := range d.members {
 		if m.freshness().Before(cutoff) {
 			removed = append(removed, *m)
+			d.expiredMembers.remember(id)
 			delete(d.members, id)
 		}
 	}
@@ -1332,7 +1334,7 @@ func (d *Discovery) retirePublicDHT(reason string) {
 // 才刷新 LastSeen。DHT 的 provider 记录带 TTL（本端 Provide 后仍能在
 // 查询结果里出现数分钟），已下线成员会以「陈旧记录」形式反复出现——
 // 这里不把发现本身当作活跃证据，否则死成员永远不过期。
-func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
+func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) (inserted bool) {
 	if id == d.host.ID() {
 		return
 	}
@@ -1381,6 +1383,16 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 			d.mu.Unlock()
 			return // 刚被删除好友的节点，迟到的发现记录不复活成员、也不上报附近
 		}
+		if d.expiredMembers.requiresHandshake(id.String()) {
+			d.mu.Unlock()
+			// 隔离不是拉黑：保留最新地址并继续退避重试，真实重启可主动恢复。
+			if len(addrs) > 0 {
+				d.host.Peerstore().AddAddrs(id, addrs, time.Hour)
+			}
+			d.scheduleIdentify(id)
+			return
+		}
+		inserted = true
 		m = &Member{
 			PeerID:         id.String(),
 			VirtualIP:      DeriveVirtualIP(d.groupKey, id.String()),
@@ -1411,6 +1423,7 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) {
 		return
 	}
 	d.scheduleIdentify(id)
+	return
 }
 
 // connectAndIdentify 建连并交换成员信息；失败静默（下轮发现会重试）。
@@ -1484,7 +1497,8 @@ func (d *Discovery) connectAndIdentifyContext(ctx context.Context, id peer.ID) e
 	// 确认同群即检查公共 DHT 退出（公共网络模式无私有 DHT，同样适用）。
 	d.maybeRetirePublicDHT()
 	d.mu.Lock()
-	if m, ok := d.members[id.String()]; ok {
+	if m := d.verifiedMemberLocked(id.String(), "revalidated"); m != nil {
+		m.Addrs = toStrings(p2pkit.CleanUnderlayAddrs(d.host.Peerstore().Addrs(id)))
 		m.Name = info.Name
 		if d.validVirtualIPv6(id.String(), info.VirtualIPv6) {
 			m.VirtualIPv6 = info.VirtualIPv6
@@ -1533,7 +1547,7 @@ func (d *Discovery) pexSnapshot() []memberHint {
 	defer d.mu.RUnlock()
 	out := make([]memberHint, 0, len(d.members))
 	for _, m := range d.members {
-		if m.PeerID == "" || len(m.Addrs) == 0 {
+		if m.PeerID == "" || len(m.Addrs) == 0 || m.LastSeen.IsZero() || time.Since(m.LastSeen) > d.memberTTL {
 			continue
 		}
 		addrs := m.Addrs
@@ -1595,11 +1609,7 @@ func (d *Discovery) applyMemberHints(hints []memberHint) {
 				addrs = append(addrs, a)
 			}
 		}
-		d.mu.RLock()
-		_, existed := d.members[id.String()]
-		d.mu.RUnlock()
-		d.addMember(id, addrs, "pex")
-		if !existed {
+		if d.addMember(id, addrs, "pex") {
 			applied++
 		}
 	}
@@ -1761,6 +1771,7 @@ func (d *Discovery) handleInfo(s network.Stream) {
 		m.Addrs = toStrings(addrs)
 	}
 	m.LastSeen = time.Now()
+	d.expiredMembers.verified(remote.String())
 	snapshot := cloneMember(*m)
 	d.mu.Unlock()
 	d.emit(snapshot)

@@ -829,8 +829,13 @@ func TestMemberReclaim(t *testing.T) {
 	}
 	_ = firstSeen
 
-	// 阶段三：被回收的成员下一轮发现重新入表（虚拟 IP 重新派生，值不变）。
-	da.addMember(hb.ID(), hb.Addrs(), "dht")
+	// 阶段三：陈旧发现不能直接入表；真实握手后恢复（虚拟 IP 派生不变）。
+	if da.addMember(hb.ID(), hb.Addrs(), "dht") {
+		t.Fatal("回收后未经验证即重新入表")
+	}
+	if err := da.connectAndIdentify(hb.ID()); err != nil {
+		t.Fatalf("真实握手恢复失败: %v", err)
+	}
 	da.mu.RLock()
 	m2, ok2 := da.members[hb.ID().String()]
 	var vip string

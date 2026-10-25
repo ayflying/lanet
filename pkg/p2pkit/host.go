@@ -100,8 +100,9 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 				libp2p.EnableRelayService(relayv2.WithInfiniteLimits()),
 			)
 		} else {
-			// 节点即服务端：默认配额，可达性交给 AutoNAT 真实探测。
-			options = append(options, libp2p.EnableRelayService())
+			// 长期组网连接不能受打洞临时通道的两分钟/128KiB限制；
+			// 只取消单条连接限额，预约数、并发数及资源管理器仍然有界。
+			options = append(options, libp2p.EnableRelayService(nodeRelayOptions()...))
 		}
 	}
 	if spec.RelaySource != nil {
@@ -119,8 +120,8 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 		return nil, fmt.Errorf("create libp2p host: %w", err)
 	}
 	if spec.RelayServiceAlways {
-		// 底层 hop 服务：默认资源配额，不受 reachability 事件约束。
-		if _, err = relayv2.New(h); err != nil {
+		// 底层 hop 服务与 AutoNAT 模式共用长期连接策略，避免两套入口漏改。
+		if _, err = relayv2.New(h, nodeRelayOptions()...); err != nil {
 			_ = h.Close()
 			return nil, fmt.Errorf("start relay service: %w", err)
 		}
