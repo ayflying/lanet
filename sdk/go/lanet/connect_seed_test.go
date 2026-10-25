@@ -3,10 +3,11 @@ package lanet
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/ayflying/pvn/pkg/serverless"
+	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -58,10 +59,45 @@ func TestConnectSeedTrustDatabaseError(t *testing.T) {
 	}
 }
 
+// newManualSeedClient 保留真实 host、地址簿、审批回调、调度器及 info
+// 协议，但不创建 mDNS、不启公共兜底、无引导节点且不运行发现循环。
+// 因此对端只能由测试的显式 ConnectSeed 拨号，不会在墓碑准备期间
+// 自动反向握手并触发双向删除；仅靠 loopback 监听并不能隔离 mDNS。
+func newManualSeedClient(t *testing.T, name string) *Client {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	c, _ := newSeedTestClient(t, h.ID().String())
+	c.node, c.rootCtx, c.cancel = h, ctx, cancel
+	c.cfg.Name = name
+	d, err := serverless.New(ctx, h, serverless.Config{
+		NetworkKey: "seed-local-trust", Name: name,
+		EnableMDNS: false, EnablePublicFallback: false,
+		IsTrusted: c.isTrustedPeer, IsUnfriended: c.isUnfriendedPeer,
+		IsUnfriendedNotified:   c.isUnfriendedNotifiedPeer,
+		MarkUnfriendedNotified: c.markUnfriendedNotifiedPeer,
+		AutoAccept:             c.maybeAutoAccept, AutoReaccept: c.maybeAutoReaccept,
+		OnPending: c.onPendingRequest, OnUnfriendReceived: c.onUnfriendReceived,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.disc = d
+	t.Cleanup(func() { _ = c.Close() })
+	if err := d.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
 func TestConnectSeedGrantsLocalTrust(t *testing.T) {
-	dir := t.TempDir()
-	a := newStandaloneClient(t, "seed-a", "seed-local-trust", filepath.Join(dir, "a.db"))
-	b := newStandaloneClient(t, "seed-b", "seed-local-trust", filepath.Join(dir, "b.db"))
+	a := newManualSeedClient(t, "seed-a")
+	b := newManualSeedClient(t, "seed-b")
 	// 手动连接种子不依赖本机 auto_accept。
 	a.cfg.AutoAccept = false
 	// 只构造本机持久化删除状态：本测试验证种子恢复本地信任，
