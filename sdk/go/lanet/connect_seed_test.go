@@ -62,11 +62,8 @@ func TestConnectSeedGrantsLocalTrust(t *testing.T) {
 	dir := t.TempDir()
 	a := newStandaloneClient(t, "seed-a", "seed-local-trust", filepath.Join(dir, "a.db"))
 	b := newStandaloneClient(t, "seed-b", "seed-local-trust", filepath.Join(dir, "b.db"))
-	// 手动连接种子不依赖本机 auto_accept；对方预先同意，避免异步审批干扰。
+	// 手动连接种子不依赖本机 auto_accept。
 	a.cfg.AutoAccept = false
-	if err := b.ApprovePeer(a.peerID); err != nil {
-		t.Fatal(err)
-	}
 	// 只构造本机持久化删除状态：本测试验证种子恢复本地信任，
 	// 不启动 RemovePeer 的异步双向删除通知，否则迟到通知可能关闭
 	// 下方 ConnectSeed 刚建立的连接，或撤销 b 的预审批。
@@ -75,6 +72,14 @@ func TestConnectSeedGrantsLocalTrust(t *testing.T) {
 	}
 	if !a.isUnfriendedPeer(b.peerID) || a.isTrustedPeer(b.peerID) {
 		t.Fatal("local deletion fixture did not revoke trust and create tombstone")
+	}
+	// 最后同步设置对方审批状态。不能调用 ApprovePeer：它会启动后台
+	// 重连，在 a 仍持墓碑时握手会触发 unfriended 并反过来撤销 b 的信任。
+	if err := b.peers.SetTrusted(context.Background(), a.peerID, true); err != nil {
+		t.Fatal(err)
+	}
+	if !b.isTrustedPeer(a.peerID) {
+		t.Fatal("remote approval fixture did not grant trust")
 	}
 	seed := fmt.Sprintf("%s/p2p/%s", b.Host().Addrs()[0], b.peerID)
 	id, err := a.ConnectSeed(seed)
