@@ -336,7 +336,10 @@ type Client struct {
 
 	dns *serverless.DNSServer // .lanet DNS 应答器（启动成功时非 nil）
 
-	peers *peersdb.DB // 地址簿 + 审批记录（Standalone 且 DBPath != "-" 时非 nil）
+	// 地址簿指针在构造后不可变：异步协议回调可与 Close 并发读取。
+	// Close 只关闭底层并发安全的 sql.DB；保留句柄让迟到访问返回关闭错误，
+	// 不能置 nil，否则既产生数据竞争，也会误走「未启用地址簿」的放行路径。
+	peers *peersdb.DB // Standalone 且 DBPath != "-" 时非 nil
 
 	nearbyMu   sync.Mutex
 	nearbyLive map[string]nearbyProbeState
@@ -1330,7 +1333,6 @@ func (c *Client) Close() error {
 			if err := c.peers.Close(); err != nil {
 				c.logf("地址簿关闭失败（忽略）: %v", err)
 			}
-			c.peers = nil
 		}
 		// 7. 本地发现服务（Standalone）：释放 DHT/mDNS 长生命周期资源。
 		if c.disc != nil {

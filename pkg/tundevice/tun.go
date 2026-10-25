@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -58,9 +59,10 @@ func NewMemory(mtu int) (Device, func([]byte) error, error) {
 }
 
 type memoryDevice struct {
-	mtu     int
-	packets chan []byte
-	closed  chan struct{}
+	mtu       int
+	packets   chan []byte
+	closed    chan struct{}
+	closeOnce sync.Once // Router取消回调和调用方清理可能同时关闭设备。
 }
 
 // inject 注入一个包，后续会被 Read 返回。
@@ -98,11 +100,7 @@ func (m *memoryDevice) Write(bufs [][]byte, offset int) (int, error) {
 func (m *memoryDevice) MTU() (int, error)     { return m.mtu, nil }
 func (m *memoryDevice) Name() (string, error) { return "pvn-mem0", nil }
 func (m *memoryDevice) Close() error {
-	select {
-	case <-m.closed:
-	default:
-		close(m.closed)
-	}
+	m.closeOnce.Do(func() { close(m.closed) })
 	return nil
 }
 

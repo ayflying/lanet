@@ -67,8 +67,14 @@ func TestConnectSeedGrantsLocalTrust(t *testing.T) {
 	if err := b.ApprovePeer(a.peerID); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.RemovePeer(b.peerID); err != nil {
+	// 只构造本机持久化删除状态：本测试验证种子恢复本地信任，
+	// 不启动 RemovePeer 的异步双向删除通知，否则迟到通知可能关闭
+	// 下方 ConnectSeed 刚建立的连接，或撤销 b 的预审批。
+	if err := a.peers.RemovePeer(context.Background(), b.peerID); err != nil {
 		t.Fatal(err)
+	}
+	if !a.isUnfriendedPeer(b.peerID) || a.isTrustedPeer(b.peerID) {
+		t.Fatal("local deletion fixture did not revoke trust and create tombstone")
 	}
 	seed := fmt.Sprintf("%s/p2p/%s", b.Host().Addrs()[0], b.peerID)
 	id, err := a.ConnectSeed(seed)
