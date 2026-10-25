@@ -276,16 +276,83 @@ func tokenUserString(tok windows.Token) string {
 	return dom + `\` + name
 }
 
+// queryTrayTaskXML 读取已注册任务的原始定义（schtasks 输出的字节先归一化成 UTF-8）；
+// 任务不存在或查询失败返回空串。
+func queryTrayTaskXML() string {
+	out, err := runSchtasks("/Query", "/TN", trayTaskName, "/XML")
+	if err != nil {
+		return ""
+	}
+	return decodeTrayTaskXMLBytes([]byte(out))
+}
+
+// installedTrayTaskStaleReason 已注册定义相对当前版本是否过期（空串=一致）。
+//
+// 解析失败按「不需要重建」处理：手里没有可信定义时贸然 /F 覆盖，可能把别人
+// 精心配置过的任务改掉，代价比多试一次拉起更大。
+func installedTrayTaskStaleReason(wantUser string) string {
+	t, err := parseTrayInstalledTask(queryTrayTaskXML())
+	if err != nil {
+		return ""
+	}
+	return trayTaskStaleReason(t, selfExe(), serviceConfigPath(), wantUser)
+}
+
+// adoptTrayTaskForUser 按当前版本为指定登录用户注册任务并立即拉起一次。
+//
+// 收敛在一处：服务兜底补注册、过期重建都走它，避免两条路径各自拼命令与日志。
+func adoptTrayTaskForUser(userID, why string) bool {
+	doc, err := trayTaskXMLFor(userID)
+	if err != nil {
+		log.Printf("[tray] %s：生成任务定义失败: %v", why, err)
+		return false
+	}
+	if err := registerTrayTask(doc); err != nil {
+		// SYSTEM 创建任务失败通常是策略限制；交还用户走控制台开关。
+		log.Printf("[tray] %s：注册托盘任务失败（请从控制台重开一次「开机自启」）: %v", why, err)
+		return false
+	}
+	log.Printf("[tray] %s：已按当前版本注册托盘任务（登录用户 %s）", why, userID)
+	startTrayTaskNow()
+	return true
+}
+
 // ensureTrayAutostartFromService 服务（Session 0）启动后的托盘兜底。
 //
 // 为什么需要它：托盘任务只在控制台开「开机自启」时注册；若用户经 services.msc
 // 手动装/启动服务、或任务被清理过，登录后永远不会有图标，且没有任何报错。
 // 这里在服务启动后周期探测登录用户（开机场景服务先于用户登录是常态，explorer
 // 出现即视为已登录），一旦取到交互用户就补注册任务并立即拉起托盘，最多等待
-// 2 小时后放弃；任务已注册则只立即拉起一次（托盘侧有单实例锁，重复拉起安全）。
+// 2 小时后放弃；任务已注册则先校验定义是否过期再拉起（托盘侧有单实例锁，重复拉起安全）。
+//
+// 为什么要校验「过期」而不只是「存在」（2026-10-26 真机故障）：任务若由未提升的
+// 进程注册，Windows 会静默丢弃 RunLevel=HighestAvailable，落成最低权限任务；而
+// lanet.exe 要求管理员，登录启动必然失败 0x800702E4，图标一直不出现也不报错。
+// 服务本身是 SYSTEM，能用 /F 重建出带最高权限声明的正确任务。
 func ensureTrayAutostartFromService(ctx context.Context) {
+	users := consoleSessionUsers()
 	if isTrayAutostartInstalled() {
-		startTrayTaskNow()
+		userID := ""
+		if len(users) > 0 {
+			userID = users[0]
+		}
+		switch reason := installedTrayTaskStaleReason(userID); {
+		case reason == "":
+			startTrayTaskNow()
+			return
+		case userID == "":
+			// 定义过期，但还没有交互用户可写（开机早于登录）：留给下面的轮询。
+			log.Printf("[tray] 已注册托盘任务定义过期（%s），等待用户登录后重建", reason)
+		case adoptTrayTaskForUser(userID, "托盘任务定义过期（"+reason+"）"):
+			return
+		default:
+			// 重建失败时仍尝试拉起：旧任务若恰好能跑，图标至少能出来。
+			startTrayTaskNow()
+			return
+		}
+	}
+	if len(users) > 0 {
+		adoptTrayTaskForUser(users[0], "服务兜底")
 		return
 	}
 	// 开机自启的服务普遍先于用户登录：登录后 explorer 出现，下一轮探测即可注册。
@@ -294,20 +361,8 @@ func ensureTrayAutostartFromService(ctx context.Context) {
 	tick := time.NewTicker(detectEvery)
 	defer tick.Stop()
 	for {
-		users := consoleSessionUsers()
-		if len(users) > 0 {
-			doc, err := trayTaskXMLFor(users[0])
-			if err != nil {
-				log.Printf("[tray] 服务兜底生成任务定义失败: %v", err)
-				return
-			}
-			if err := registerTrayTask(doc); err != nil {
-				// SYSTEM 创建任务失败通常是策略限制；交还用户走控制台开关。
-				log.Printf("[tray] 服务兜底补注册托盘任务失败（请从控制台重开一次「开机自启」）: %v", err)
-				return
-			}
-			log.Printf("[tray] 服务兜底：已补注册托盘任务（登录用户 %s）", users[0])
-			startTrayTaskNow()
+		if users := consoleSessionUsers(); len(users) > 0 {
+			adoptTrayTaskForUser(users[0], "服务兜底")
 			return
 		}
 		select {
