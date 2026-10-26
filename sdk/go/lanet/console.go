@@ -793,6 +793,20 @@ func (c *Client) apiLocalInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// findNetMapMember 在同一份成员快照里按 PeerID 精确查找。
+// 必须传入调用方已持有的同一切片：NetMap() 每次调用都从发现层重新构建
+// （内部遍历 map，顺序随机），若在循环里反复调用，比较用的快照与取值用的
+// 快照可能顺序不同，会出现「查 A 返回 B」甚至误报 404（0.5.101 及之前
+// /api/member-info 的串号 bug 即由此而来）。
+func findNetMapMember(members []netmapclient.Member, peerID string) *netmapclient.Member {
+	for i := range members {
+		if members[i].PeerID == peerID {
+			return &members[i]
+		}
+	}
+	return nil
+}
+
 // apiMemberInfo 指定成员的设备信息：主机名、系统/平台、版本、虚拟身份、
 // 本机网卡 IP（经 info 协议从对端交换所得）。0.5.15 起；旧版本对端
 // 未上报这些字段时返回空值，前端回退显示已知信息。
@@ -802,13 +816,7 @@ func (c *Client) apiMemberInfo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少 peer_id"})
 		return
 	}
-	var found *netmapclient.Member
-	for i := range c.NetMap().Members {
-		if c.NetMap().Members[i].PeerID == peerID {
-			found = &c.NetMap().Members[i]
-			break
-		}
-	}
+	found := findNetMapMember(c.NetMap().Members, peerID)
 	if found == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "成员不存在或已下线"})
 		return
