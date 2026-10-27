@@ -26,7 +26,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-//go:embed console/index.html console/logo.png
+//go:embed console/index.html console/logo.png console/network-rules.js
 var consoleFS embed.FS
 
 // 防火墙类型别名：SDK 用户无需直接 import pkg/firewall。
@@ -113,6 +113,13 @@ func (c *Client) startConsole() error {
 	// 种子表接口（实现在 console_seeds.go，避免与内嵌 UI 的改动面重叠）。
 	c.registerSeedRoutes(mux)
 	c.registerLogRoutes(mux)
+	// 独立的规则编辑脚本随二进制内嵌，认证策略与控制台相同。
+	mux.HandleFunc("GET /network-rules.js", func(w http.ResponseWriter, r *http.Request) {
+		script, _ := consoleFS.ReadFile("console/network-rules.js")
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store, must-revalidate")
+		_, _ = w.Write(script)
+	})
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		if logo, err := consoleFS.ReadFile("console/logo.png"); err == nil {

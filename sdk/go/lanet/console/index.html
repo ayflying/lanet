@@ -313,7 +313,7 @@
   <div class="card">
     <h2>入向防火墙</h2>
     <div class="row">
-      <select id="fwMode">
+      <select id="fwMode" onchange="saveFirewall()">
         <option value="deny-all">默认全拒绝（deny-all）</option>
         <option value="allow-list">按规则放行（allow-list）</option>
         <option value="allow-all">端口全开（allow-all）</option>
@@ -332,8 +332,12 @@
       <input type="text" id="rPort" placeholder="端口：3389 / 5000-5010 / *" style="flex:.6">
       <button onclick="addRule()">添加</button>
     </div>
-    <button onclick="saveFirewall()">保存防火墙</button>
-    <button class="ghost" onclick="loadState()">刷新</button>
+    <details style="margin-top:12px">
+      <summary>批量添加规则</summary>
+      <div class="sub" style="margin:8px 0">每行一条：来源、协议、端口，用空格或逗号分隔。整批校验通过后一次添加，添加、删除及切换模式均立即生效。</div>
+      <textarea id="fwBatch" rows="4" style="width:100%;box-sizing:border-box" placeholder="* tcp 3389&#10;10.7.0.0/16 udp 5000-5010"></textarea>
+      <button onclick="addRulesBatch()">批量添加</button>
+    </details>
     <div class="msg" id="fwMsg"></div>
   </div>
 </div>
@@ -349,8 +353,13 @@
       <input type="number" id="fTargetPort" placeholder="目标端口" style="flex:.5">
       <button onclick="addForward()">添加</button>
     </div>
-    <button onclick="saveForwards()">保存转发映射</button>
-    <button class="ghost" onclick="loadState()">刷新</button>
+    <details style="margin-top:12px">
+      <summary>批量添加转发</summary>
+      <div class="sub" style="margin:8px 0">每行一条：本地端口、目标 IP、目标端口，用空格或逗号分隔。本地端口不能重复，整批校验通过后一次添加。</div>
+      <textarea id="fwdBatch" rows="4" style="width:100%;box-sizing:border-box" placeholder="8080 192.168.1.100 80&#10;8443 192.168.1.100 443"></textarea>
+      <button onclick="addForwardsBatch()">批量添加</button>
+    </details>
+    <div class="sub" style="margin-top:8px">添加、删除立即应用，无需再次保存。转发仍受防火墙规则约束；配置提交成功不代表目标服务可达，监听失败请查看日志。删除映射会断开该端口的活动连接。</div>
     <div class="msg" id="fwdMsg"></div>
   </div>
 </div>
@@ -469,6 +478,7 @@
   </div>
 
 </div>
+<script src="/network-rules.js"></script>
 <script>
 let S = null;
 const $ = id => document.getElementById(id);
@@ -531,8 +541,17 @@ function createPoll(run, enabled) {
 const statePoll = createPoll(fetchState, () => !document.hidden);
 function loadState() { return statePoll.refresh(); }
 async function fetchState(signal) {
+  const rulesRevision = networkRulesRevision;
   const r = await fetch('/api/state', { signal });
-  S = await r.json();
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const next = await r.json();
+  // PUT 是整表替换：请求期间或提交前发出的旧轮询不能覆盖刚确认的配置。
+  // 输入框草稿不参与重绘，失败时用户仍可修改并重新添加。
+  const keepRules = S && (networkRulesBusy || rulesRevision !== networkRulesRevision);
+  if (keepRules) {
+    next.mode = S.mode; next.rules = S.rules; next.forwards = S.forwards;
+  }
+  S = next;
   const i = S.info;
   const nodeName = i.name || (i.peer_id ? i.peer_id.slice(0, 16) + '…' : '节点');
   $('nodeTitle').textContent = nodeName;
@@ -549,13 +568,13 @@ async function fetchState(signal) {
   $('members').innerHTML = '';
   renderMembers();
   $('fwMode').value = S.mode;
-  $('bRules').textContent = S.rules.length;
   // 防御旧版后端/异常响应返回 null：任何列表字段缺失都兜底为空数组，
   // 保证 loadState 不中断（一处抛错会让后面的 renderConnect 全部失效）。
   S.rules = S.rules || []; S.forwards = S.forwards || [];
   S.members = S.members || []; S.pending = S.pending || []; S.nearby = S.nearby || [];
+  $('bRules').textContent = S.rules.length;
   $('bForwards').textContent = S.forwards.length;
-  renderRules(); renderForwards();
+  if (!networkRulesBusy) { renderRules(); renderForwards(); }
   renderConnect(); renderSeed(); renderPublicDHT(); renderNearby();
 }
 
@@ -1284,64 +1303,6 @@ function switchTab(btn) {
   else entryPoll.pause();
   if (btn.dataset.panel === 'pLogs') startLogs();
   else releaseLogs();   // 切离日志页：停流并释放缓存，内存不白占
-}
-function renderRules() {
-  $('ruleList').innerHTML = S.rules.length === 0
-    ? '<div class="empty" style="margin:8px 0">暂无放行规则</div>'
-    : '<table><tr><th>来源</th><th>端口</th><th></th></tr>' +
-      S.rules.map((r, idx) =>
-        `<tr><td>${esc(r.source)}</td><td>${esc(r.port)}</td>` +
-        `<td><button class="del" onclick="S.rules.splice(${idx},1);renderRules()">删除</button></td></tr>`).join('') +
-      '</table>';
-}
-function renderForwards() {
-  $('fwdList').innerHTML = S.forwards.length === 0
-    ? '<div class="empty" style="margin:8px 0">暂无转发映射</div>'
-    : '<table><tr><th>本地端口</th><th>目标 IP</th><th>目标端口</th><th></th></tr>' +
-      S.forwards.map((f, idx) => {
-        // target 存储为 "IP:端口"；lastIndexOf 兼容 IPv6 的 [::1]:80 形态。
-        const i = (f.target || '').lastIndexOf(':');
-        const th = i > 0 ? f.target.slice(0, i) : f.target;
-        const tp = i > 0 ? f.target.slice(i + 1) : '';
-        return `<tr><td>${f.listen}</td><td>${esc(th)}</td><td>${esc(tp)}</td>` +
-          `<td><button class="del" onclick="S.forwards.splice(${idx},1);renderForwards()">删除</button></td></tr>`;
-      }).join('') +
-      '</table>';
-}
-function addRule() {
-  const src = $('rSrc').value.trim(), proto = $('rProto').value, port = $('rPort').value.trim();
-  if (!src) { flash('fwMsg', '请填写来源', false); return; }
-  const isStream = proto.startsWith('/') || proto === '*';
-  if (!isStream && !port) { flash('fwMsg', '请填写端口', false); return; }
-  const rule = { source: src, proto, port: isStream ? '*' : port };
-  S.rules.push(rule);
-  $('rSrc').value = ''; $('rPort').value = '';
-  renderRules();
-}
-function addForward() {
-  const listen = parseInt($('fListen').value, 10);
-  const host = $('fTargetHost').value.trim(), tport = parseInt($('fTargetPort').value, 10);
-  if (!listen || listen < 1 || listen > 65535) { flash('fwdMsg', '请填写有效的本地端口（1-65535）', false); return; }
-  if (!host) { flash('fwdMsg', '请填写目标 IP', false); return; }
-  if (!tport || tport < 1 || tport > 65535) { flash('fwdMsg', '请填写有效的目标端口（1-65535）', false); return; }
-  // 后端 LANForward.Target 仍是 "IP:端口" 合一存储，这里拼回去，旧数据不受影响。
-  S.forwards.push({ listen, target: host + ':' + tport });
-  $('fListen').value = ''; $('fTargetHost').value = ''; $('fTargetPort').value = '';
-  renderForwards();
-}
-async function saveFirewall() {
-  const r = await fetch('/api/firewall', { method:'PUT',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ mode: $('fwMode').value, rules: S.rules }) });
-  flash('fwMsg', r.ok ? '防火墙已保存并生效' : '保存失败', r.ok);
-  loadState();
-}
-async function saveForwards() {
-  const r = await fetch('/api/forwards', { method:'PUT',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ forwards: S.forwards }) });
-  flash('fwdMsg', r.ok ? '转发映射已保存并生效' : '保存失败', r.ok);
-  loadState();
 }
 function flash(id, text, ok) { const el = $(id); if (!el) return; el.textContent = text; el.className = 'msg ' + (ok ? 'ok' : 'bad'); el.style.display = ''; }
 
