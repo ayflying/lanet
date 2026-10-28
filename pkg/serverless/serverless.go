@@ -364,6 +364,8 @@ type Discovery struct {
 	protoInfo     libprotocol.ID
 	protoUnfriend libprotocol.ID
 	protoNearby   libprotocol.ID
+	protoControl  libprotocol.ID
+	control       controlState
 	nearbyGate    nearbyRateLimiter
 	// protoInfoAlt / protoUnfriendAlt 历史固定协议 ID（派生模式下非空）：
 	// 同群新老版本混跑过渡用——出向建流时作为候选兜底（对端只认固定 ID
@@ -517,6 +519,7 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		d.protoSeedsGroup = lproto.GroupProtoID(lproto.BaseSeeds, d.groupKey)
 	}
 	d.protoNearby = lproto.GroupProtoID("nearby-name", d.groupKey)
+	d.protoControl = lproto.GroupProtoID("control", d.groupKey)
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
 	d.selfIPv6 = DeriveVirtualIPv6(d.groupKey, h.ID().String())
 
@@ -653,6 +656,7 @@ func (d *Discovery) Start(ctx context.Context) error {
 		return d.serviceCtx.Err()
 	}
 	d.host.SetStreamHandler(d.protoNearby, d.handleNearby)
+	d.host.SetStreamHandler(d.protoControl, d.handleControl)
 	d.host.SetStreamHandler(d.protoInfo, d.gateControl("info", d.handleInfo))
 	d.host.SetStreamHandler(d.protoUnfriend, d.gateControl("unfriend", d.handleUnfriend))
 	if d.protoInfoAlt != "" {
@@ -1150,11 +1154,8 @@ func (d *Discovery) advertiseAndDiscover(ctx context.Context) {
 // dhtRound 单张 DHT 的一轮：把自身发布为群的 provider（TTL 由 DHT 管理，
 // 周期刷新），再查找同群 provider 列表并逐个建连确认。
 //
-// 流量控制：若上层声明地址簿为空（首次启动、未添加过任何节点），则只做
-// Provide 广播、不做 FindProviders 查找。理由——没有任何已知目标的查找
-// 只会拿到一堆陌生 provider 记录，既浪费查询流量又必然被审批门拒掉；
-// 此时保持「可被发现」即可（别人按 ID 找到我，我来应答）。一旦地址簿有
-// 了内容（用户添加过节点），恢复每轮查找。
+// 地址簿为空也查找同组协作节点；查找有总超时和结果上限，后续控制证明
+// 另有并发、冷却和缓存限额。能提供连接线索不等于获准成为业务成员。
 func (d *Discovery) dhtRound(ctx context.Context, dht *kaddht.IpfsDHT, source string, advTimeout, findTimeout time.Duration) {
 	key := d.providerKey()
 
@@ -1164,10 +1165,8 @@ func (d *Discovery) dhtRound(ctx context.Context, dht *kaddht.IpfsDHT, source st
 	}
 	cancel()
 
-	if !d.knownPeers() {
-		return // 地址簿为空：只广播不查找，省查询流量
-	}
-
+	// 空地址簿也需要发现协作节点；addMember 会将未授权目标送往
+	// 独立、有界的组证明协议，而不是制造申请或授予业务权限。
 	findCtx, cancel := context.WithTimeout(ctx, findTimeout)
 	defer cancel()
 	for pi := range dht.FindProvidersAsync(findCtx, key, 64) {
@@ -1212,48 +1211,49 @@ func (d *Discovery) logAdvFailure(source string, err error) {
 // 1 = 只要有一个同群种子就退（同群成员互为种子，后续发现可持续）。
 const publicRetireThreshold = 1
 
-// maybeRetirePublicDHT 每确认一个同群成员就检查一次：攒够足够多的
-// 「自己人」后，主动退出公共 DHT（停止广告、清空路由表、关闭流处理），
-// 不再承担公共 DHT server 的应答流量（实测上行 ~4MB/分钟）。
-// 判据按模式区分：
-//   - 有私有 DHT（当前所有路径，含密钥留空默认归一化后）：私有 DHT
-//     路由表中的同群节点数；
-//   - 无私有 DHT（防御分支，为后续单机多网络重构保留）：成员表中
-//     仍活跃（memberTTL 内有真实通讯）的同群成员数。
+// maybeRetirePublicDHT 仅在已有足够多真实已连接的同群节点时退出公共 DHT。
+// 同群证据来自 memberTTL 内有真实通讯的业务成员，或 ControlPeers 返回的
+// 新鲜双向组证明；两者按 peer ID 去重。默认私有 DHT 路由表跨群共享，
+// 不能把路由表人数或未经验证的发现缓存当作同群证据。
 //
-// 退出后不自动回归公共——mDNS 与成员表里的地址仍可重连；彻底失联时
+// 成员与控制缓存分别取快照，绝不同时持有 d.mu 和 control.mu，避免锁反序。
+// 退出后不自动回归公共——mDNS、控制协作与成员表地址仍可重连；彻底失联时
 // 重启节点即可重新冷启动。
 func (d *Discovery) maybeRetirePublicDHT() {
-	d.mu.Lock()
+	d.mu.RLock()
 	if d.dhtPublic.Load() == nil || d.publicRetired {
-		d.mu.Unlock()
+		d.mu.RUnlock()
 		return
 	}
+	cutoff := time.Now().Add(-d.memberTTL)
+	members := make([]string, 0, len(d.members))
+	for id, m := range d.members {
+		if m.LastSeen.After(cutoff) {
+			members = append(members, id)
+		}
+	}
+	d.mu.RUnlock()
+
+	verified := make(map[peer.ID]struct{}, len(members))
+	for _, id := range members {
+		if pid, err := peer.Decode(id); err == nil {
+			verified[pid] = struct{}{}
+		}
+	}
+	for _, ai := range d.ControlPeers() {
+		verified[ai.ID] = struct{}{}
+	}
 	var n int
-	if priv := d.dhtPrivate.Load(); priv != nil {
-		n = len(priv.RoutingTable().ListPeers())
-	} else {
-		cutoff := time.Now().Add(-d.memberTTL)
-		for _, m := range d.members {
-			if m.LastSeen.After(cutoff) {
-				n++
-			}
+	for id := range verified {
+		if id != "" && id != d.host.ID() && d.host.Network().Connectedness(id) == network.Connected {
+			n++
 		}
 	}
 	if n < publicRetireThreshold {
-		d.mu.Unlock()
 		return
 	}
-	reason := fmt.Sprintf("已连接 %d 个同群成员", n)
-	if d.dhtPrivate.Load() != nil {
-		reason = fmt.Sprintf("私有 DHT 就绪（路由表 %d 个同群节点）", n)
-	}
-	d.mu.Unlock()
-	if d.dhtPrivate.Load() != nil {
-		d.logf("%s，退出公共 DHT 省流量", reason)
-	} else {
-		d.logf("%s，退出公共 DHT 省流量", reason)
-	}
+	reason := fmt.Sprintf("已连接 %d 个已验证同群节点（业务成员或控制协作）", n)
+	d.logf("%s，退出公共 DHT 省流量", reason)
 	go d.retirePublicDHT(reason)
 }
 
@@ -1284,12 +1284,12 @@ func (d *Discovery) PublicDHTState() PublicDHTState {
 }
 
 // retirePublicDHT 退出公共 DHT（幂等，可被「找到即退」与「超时退出」并发触发）：
-//  1. Close 停掉 kad 协议流处理与周期刷新（不再应答公网随机查询）；
-//  2. 断开全部公网 DHT 连接（识别哪些连接来自公共 DHT 不可行，直接
-//     按「非同群成员」过滤——同群成员有成员表背书）；
-//  3. 置 nil，后续 advertiseAndDiscover 不再跑公共轮。
+// 锁内移交公共实例并置 nil，后续不再跑公共轮；Close 停掉公共 kad 协议
+// 流处理与周期刷新，不再应答公网随机查询。
 //
-// 私有 DHT / mDNS / 成员表直连不受影响。
+// 不 ClosePeer 或关闭底层 Conns：无法确知公共 DHT 对连接的独占所有权。
+// 即使非业务成员，也可能承载共享私有 RT、种子交换、控制协作或其他业务流，
+// 不能冒险断开共享 underlay；连接回收交给 connmgr。
 func (d *Discovery) retirePublicDHT(reason string) {
 	d.mu.Lock()
 	if d.dhtPublic.Load() == nil || d.publicRetired {
@@ -1303,27 +1303,6 @@ func (d *Discovery) retirePublicDHT(reason string) {
 	d.mu.Unlock()
 	if err := pub.Close(); err != nil {
 		d.logf("公共 DHT 关闭失败（忽略）: %v", err)
-	}
-	d.mu.Lock()
-	// 旧实例关闭期间若已重新启用，不能清空新实例或拆掉它的连接。
-	if d.dhtPublic.Load() != nil {
-		d.mu.Unlock()
-		return
-	}
-	// 同群成员快照（保留这些连接）。
-	keep := make(map[string]struct{}, len(d.members))
-	for id := range d.members {
-		keep[id] = struct{}{}
-	}
-	d.mu.Unlock()
-
-	self := d.host.ID()
-	for _, c := range d.host.Network().Conns() {
-		remote := c.RemotePeer()
-		if _, ok := keep[remote.String()]; ok || remote == self {
-			continue
-		}
-		_ = c.Close()
 	}
 	d.logf("已退出公共 DHT（%s；同群发现继续：mDNS + 成员表 + 私有 DHT，彻底失联时重启可重新冷启动）", reason)
 }
@@ -1371,6 +1350,8 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) (
 		// 同群可见但未信任 → 上报「附近」列表（上层持久化后在控制台展示，
 		// 用户可一键申请连接）。被动发现不建连、不泄漏身份，语义不变。
 		d.reportNearby(id, addrs, source)
+		// 同组控制协作不等于成员授权：只在独立证明协议中交换连接线索。
+		d.queueControl(peer.AddrInfo{ID: id, Addrs: addrs})
 		return
 	}
 
@@ -2148,7 +2129,7 @@ func (d *Discovery) Close() error {
 		d.protocolMu.Lock()
 		if d.host != nil {
 			if d.protocolsStarted {
-				for _, p := range []libprotocol.ID{d.protoNearby, d.protoInfo, d.protoInfoAlt, d.protoUnfriend, d.protoUnfriendAlt} {
+				for _, p := range []libprotocol.ID{d.protoControl, d.protoNearby, d.protoInfo, d.protoInfoAlt, d.protoUnfriend, d.protoUnfriendAlt} {
 					if p != "" {
 						d.host.RemoveStreamHandler(p)
 					}
