@@ -51,7 +51,7 @@ func TestApprovalRejectsUntrusted(t *testing.T) {
 	if err = ha.Connect(ctx, peer.AddrInfo{ID: hb.ID(), Addrs: hb.Addrs()}); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	rej, err := db.fetchInfo(ctx, ha.ID())
+	rej, err := db.fetchInfo(context.WithValue(ctx, connectRequestKey{}, true), ha.ID())
 	if err != nil {
 		// 拒答也算合格（老语义）；只要拿不到身份信息即可。
 		t.Logf("对端直接断开（可接受）: %v", err)
@@ -188,7 +188,7 @@ func TestAutoAcceptUnattended(t *testing.T) {
 	if err = ha.Connect(ctx, peer.AddrInfo{ID: hb.ID(), Addrs: hb.Addrs()}); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	info, err := db.fetchInfo(ctx, ha.ID())
+	info, err := db.fetchInfo(context.WithValue(ctx, connectRequestKey{}, true), ha.ID())
 	if err != nil {
 		t.Fatalf("auto_accept 开启时陌生节点应能直接握手: %v", err)
 	}

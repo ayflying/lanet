@@ -1706,12 +1706,24 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	// 信息与网络拓扑泄漏），不进成员表、不进私有 DHT 路由表。
 	// 但会明确回一个「未同意」标记——对端据此提示「等待对方同意」，
 	// 而不是让用户面对一个沉默的 EOF 无从判断。
+	// info 也用于后台重连、身份交换，并不等同于用户申请。
+	// 只有显式申请标记才允许自动审批/写入待审批；缺失标记的旧节点
+	// 同样按普通握手处理，宁可要求升级，也不能凭在线探测伪造申请。
 	trusted := autoRestored
+	pending := false
 	if !trusted {
-		trusted, _ = d.trustPolicy(remote.String(), nil, req.Name)
+		if req.ConnectRequest {
+			trusted, pending = d.trustPolicy(remote.String(), nil, req.Name)
+		} else {
+			trusted = d.trustPolicyPassive(remote.String(), nil, req.Name)
+		}
 	}
 	if !trusted {
-		d.logf("拒绝陌生节点 %s 的握手（未审批，已记入待审批列表）", remote.ShortString())
+		if pending {
+			d.logf("收到节点 %s 的显式连接申请（未审批，已记入待审批列表）", remote.ShortString())
+		} else {
+			d.logf("拒绝节点 %s 的普通握手（未信任，不产生连接申请）", remote.ShortString())
+		}
 		_ = json.NewEncoder(s).Encode(infoPayload{
 			Group:    GroupFingerprint(d.groupKey),
 			Rejected: rejectionNotApproved,

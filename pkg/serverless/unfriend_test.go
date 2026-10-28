@@ -181,9 +181,9 @@ func TestUnfriendOfflineSelfHeal(t *testing.T) {
 }
 
 // TestUnfriendTwoPhaseReapply 删除不是拉黑（两阶段墓碑）：A 删了 B，
-// B 首次握手收到一次 unfriended 告知（并标记已送达）；B 再次握手不再
-// 被拒为 unfriended，而是按未审批申请处理——A 侧触发 OnPending（进入
-// 待审批），B 收到 not_approved（申请已送达，等待对方同意）。
+// B 首次普通握手收到一次 unfriended 告知（并标记已送达）；之后普通
+// 握手只回 not_approved，不产生申请。B 显式重新申请才触发 A 侧
+// OnPending（进入待审批），B 收到 not_approved（等待对方同意）。
 func TestUnfriendTwoPhaseReapply(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -255,8 +255,26 @@ func TestUnfriendTwoPhaseReapply(t *testing.T) {
 		t.Fatal("首次握手应标记删除告知已送达")
 	}
 
-	// 第二次握手：不再回 unfriended，而是未审批（申请进入 A 的待审批）。
+	// 告知送达后的普通后台握手不能伪造重新申请，也不能自动复活好友。
 	resp, err = hbD.fetchInfo(ctx, ha.ID())
+	if err != nil {
+		t.Fatalf("普通后台握手应收到响应: %v", err)
+	}
+	if resp.Rejected != rejectionNotApproved {
+		t.Fatalf("删除告知只发送一次，之后普通握手应回 not_approved，实际 %q", resp.Rejected)
+	}
+	mu.Lock()
+	passivePending, passiveAuto := pendingCalls, autoAcceptCalls
+	mu.Unlock()
+	if passivePending != 0 || passiveAuto != 0 {
+		t.Fatalf("已告知删除的普通握手不得申请或自动恢复，pending=%d auto=%d", passivePending, passiveAuto)
+	}
+	if _, ok := memberOf(da, hb.ID().String()); ok {
+		t.Fatal("已删除节点普通握手不得进入成员表")
+	}
+
+	// 用户显式重新申请：不再回 unfriended，而是未审批（申请进入 A 的待审批）。
+	resp, err = hbD.fetchInfo(context.WithValue(ctx, connectRequestKey{}, true), ha.ID())
 	if err != nil {
 		t.Fatalf("再次握手应收到响应: %v", err)
 	}
