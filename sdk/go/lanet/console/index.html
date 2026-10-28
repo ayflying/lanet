@@ -330,7 +330,8 @@
         <option value="*">全部协议</option>
       </select>
       <input type="text" id="rPort" placeholder="端口：3389 / 5000-5010 / *" style="flex:.6">
-      <button onclick="addRule()">添加</button>
+      <button id="ruleSubmit" onclick="addRule()">添加</button>
+      <button id="ruleCancel" class="ghost" style="display:none" onclick="cancelRuleEdit()">取消编辑</button>
     </div>
     <details style="margin-top:12px">
       <summary>批量添加规则</summary>
@@ -351,7 +352,8 @@
       <input type="number" id="fListen" placeholder="本地端口" style="flex:.5">
       <input type="text" id="fTargetHost" placeholder="目标 IP（如 192.168.1.100）">
       <input type="number" id="fTargetPort" placeholder="目标端口" style="flex:.5">
-      <button onclick="addForward()">添加</button>
+      <button id="forwardSubmit" onclick="addForward()">添加</button>
+      <button id="forwardCancel" class="ghost" style="display:none" onclick="cancelForwardEdit()">取消编辑</button>
     </div>
     <details style="margin-top:12px">
       <summary>批量添加转发</summary>

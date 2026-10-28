@@ -48,8 +48,8 @@ test('rules are deduplicated against batch and stored rules, protocol labels sta
 function harness(fetchImpl) {
   const elements = new Map();
   const makeElement = () => ({ value: '', textContent: '', innerHTML: '', disabled: false, style: {}, children: {}, setAttribute() {}, focus() {}, querySelector(selector) { return this.children[selector] ||= makeElement(); } });
-  for (const id of ['rSrc', 'rProto', 'rPort', 'fwMode', 'fwBatch', 'fListen', 'fTargetHost', 'fTargetPort', 'fwdBatch', 'ruleList', 'fwdList', 'bRules', 'bForwards', 'button']) elements.set(id, makeElement());
-  const controls = ['rSrc', 'rProto', 'rPort', 'fwMode', 'fwBatch', 'fListen', 'fTargetHost', 'fTargetPort', 'fwdBatch', 'button'].map(id => elements.get(id));
+  for (const id of ['rSrc', 'rProto', 'rPort', 'fwMode', 'fwBatch', 'fListen', 'fTargetHost', 'fTargetPort', 'fwdBatch', 'ruleList', 'fwdList', 'bRules', 'bForwards', 'ruleSubmit', 'ruleCancel', 'forwardSubmit', 'forwardCancel', 'button']) elements.set(id, makeElement());
+  const controls = ['rSrc', 'rProto', 'rPort', 'fwMode', 'fwBatch', 'fListen', 'fTargetHost', 'fTargetPort', 'fwdBatch', 'ruleSubmit', 'ruleCancel', 'forwardSubmit', 'forwardCancel', 'button'].map(id => elements.get(id));
   const requests = [];
   const context = vm.createContext({ URL, console,
     S: { mode: 'allow-list', rules: [], forwards: [], info: { name: 'unchanged' } },
@@ -236,9 +236,13 @@ test('actual network panels have immediate mode/batch bindings and no save or re
     assert.ok(match, `${id} panel exists`);
     panels[id] = match[1];
     const buttons = [...match[1].matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g)].map(m => m[0]);
-    assert.equal(buttons.length, 2, `${id} has only single and batch add buttons`);
+    assert.equal(buttons.length, 3, `${id} has single submit, edit cancel and batch add buttons`);
     for (const button of buttons) assert.doesNotMatch(button, /保存|刷新|saveFirewall|saveForwards|loadState|fetchState/i);
   }
+  assert.match(panels.pFirewall, /<button\b[^>]*id="ruleSubmit"[^>]*onclick="addRule\(\)"/);
+  assert.match(panels.pFirewall, /<button\b[^>]*id="ruleCancel"[^>]*onclick="cancelRuleEdit\(\)"/);
+  assert.match(panels.pForwards, /<button\b[^>]*id="forwardSubmit"[^>]*onclick="addForward\(\)"/);
+  assert.match(panels.pForwards, /<button\b[^>]*id="forwardCancel"[^>]*onclick="cancelForwardEdit\(\)"/);
   assert.match(panels.pFirewall, /<select\b[^>]*id="fwMode"[^>]*onchange="saveFirewall\(\)"/);
   assert.match(panels.pFirewall, /<textarea\b[^>]*id="fwBatch"/);
   assert.match(panels.pFirewall, /<button\b[^>]*onclick="addRulesBatch\(\)"[^>]*>批量添加<\/button>/);
@@ -284,3 +288,155 @@ test('single additions reject duplicate listeners and preserve drafts on malform
   assert.equal(malformed.elements.get('fwBatch').value, '* tcp 80');
   assert.equal(malformed.context.networkRulesRevision, 0);
 });
+
+for (const kind of ['rules', 'forwards']) {
+  const rule = kind === 'rules';
+  const edit = rule ? 'editRule' : 'editForward';
+  const submit = rule ? 'addRule' : 'addForward';
+  const cancel = rule ? 'cancelRuleEdit' : 'cancelForwardEdit';
+  const state = rule ? 'networkRuleEdit' : 'networkForwardEdit';
+  const field = rule ? 'rPort' : 'fListen';
+  const submitID = rule ? 'ruleSubmit' : 'forwardSubmit';
+  const cancelID = rule ? 'ruleCancel' : 'forwardCancel';
+  const first = () => rule ? { source: '2001:db8::/64', proto: 'udp', port: '80', note: { retained: true } } : { listen: 8080, target: '[2001:db8::1]:80', note: { retained: true } };
+  const second = () => rule ? { source: '*', proto: 'tcp', port: '90' } : { listen: 9090, target: '127.0.0.1:90' };
+  const error = h => h.elements.get('networkRulesError').querySelector('.modal-body').textContent;
+
+  test(`${kind} edit fills form, preserves original until one PUT, handles IPv6 and exits on success`, async () => {
+    const put = deferred();
+    const h = harness(() => put.promise);
+    h.context.S[kind] = [first(), second()];
+    const original = JSON.stringify(h.context.S[kind]);
+    h.context[rule ? 'renderRules' : 'renderForwards']();
+    assert.match(h.elements.get(rule ? 'ruleList' : 'fwdList').innerHTML, new RegExp(`onclick="${edit}\\(0\\)"`));
+    assert.equal(h.context[edit](0), true);
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.elements.get(submitID).textContent, '应用修改');
+    assert.equal(h.elements.get(cancelID).style.display, '');
+    if (rule) {
+      assert.equal(h.elements.get('rSrc').value, '2001:db8::/64');
+      assert.equal(h.elements.get('rProto').value, 'udp');
+    } else {
+      assert.equal(h.elements.get('fTargetHost').value, '2001:db8::1');
+      assert.equal(h.elements.get('fTargetPort').value, '80');
+      h.elements.get('fTargetHost').value = '[2001:db8::2]';
+    }
+    h.elements.get(field).value = '8081';
+    const write = h.context[submit]();
+    assert.equal(JSON.stringify(h.context.S[kind]), original);
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.requests[0].options.method, 'PUT');
+    assert.equal(h.requests[0].body[kind].length, 2);
+    assert.equal(h.requests[0].body[kind][0][rule ? 'port' : 'listen'], rule ? '8081' : 8081);
+    assert.deepEqual(h.requests[0].body[kind][0].note, { retained: true });
+    if (!rule) assert.equal(h.requests[0].body.forwards[0].target, '[2001:db8::2]:80');
+    assert.equal(h.context[edit](1), false);
+    assert.equal(h.context[cancel](), false);
+    assert.equal(await h.context[submit](), false);
+    assert.equal(h.elements.get(field).value, '8081');
+    assert.equal(h.requests.length, 1);
+    put.resolve({ ok: true, json: async () => h.requests[0].body });
+    assert.equal(await write, true);
+    assert.equal(h.context[state], null);
+    assert.equal(h.elements.get(submitID).textContent, '添加');
+    assert.equal(h.elements.get(cancelID).style.display, 'none');
+    assert.equal(h.elements.get(field).value, '');
+    assert.ok(h.controls.every(el => !el.disabled));
+  });
+
+  test(`${kind} failed edit keeps snapshot and draft; cancel makes no request`, async () => {
+    const h = harness(() => ({ ok: false, status: 409, json: async () => ({ error: 'refused' }) }));
+    h.context.S[kind] = [first()];
+    h.context[edit](0);
+    const snapshot = h.context[state];
+    h.elements.get(field).value = '81';
+    assert.equal(await h.context[submit](), false);
+    assert.equal(h.context[state], snapshot);
+    assert.equal(h.elements.get(field).value, '81');
+    assert.equal(h.elements.get(submitID).textContent, '应用修改');
+    assert.equal(JSON.stringify(h.context.S[kind][0]), JSON.stringify(first()));
+    assert.equal(h.context[cancel](), true);
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.context[state], null);
+    assert.equal(h.elements.get(field).value, '');
+  });
+
+  test(`${kind} snapshot tracks moved rows, refuses missing, ambiguous or changed full fields`, async () => {
+    for (const change of ['move', 'missing', 'ambiguous', 'extra-field', 'nested-field']) {
+      const h = harness();
+      h.context.S[kind] = [first(), second()];
+      h.context[edit](0);
+      h.elements.get(field).value = '81';
+      if (change === 'move') h.context.S[kind].reverse();
+      if (change === 'missing') h.context.S[kind].shift();
+      if (change === 'ambiguous') h.context.S[kind].push(first());
+      if (change === 'extra-field') h.context.S[kind][0].extra = true;
+      if (change === 'nested-field') h.context.S[kind][0].note.retained = false;
+      assert.equal(await h.context[submit](), change === 'move');
+      if (change === 'move') {
+        assert.equal(h.requests[0].body[kind][0][rule ? 'port' : 'listen'], rule ? '90' : 9090);
+        assert.equal(h.requests[0].body[kind][1][rule ? 'port' : 'listen'], rule ? '81' : 81);
+      } else {
+        assert.equal(h.requests.length, 0);
+        assert.match(error(h), /重新编辑/);
+        assert.equal(h.elements.get(field).value, '81');
+        assert.notEqual(h.context[state], null);
+      }
+    }
+  });
+
+  test(`${kind} duplicate validation excludes self but rejects another row`, async () => {
+    const h = harness();
+    h.context.S[kind] = [first(), second()];
+    h.context[edit](0);
+    assert.equal(await h.context[submit](), true, 'unchanged self is allowed');
+    h.context[edit](0);
+    if (rule) {
+      h.elements.get('rSrc').value = '*';
+      h.elements.get('rProto').value = 'tcp';
+      h.elements.get('rPort').value = '90';
+    } else h.elements.get('fListen').value = '9090';
+    assert.equal(await h.context[submit](), false);
+    assert.equal(h.requests.length, 1);
+    assert.match(error(h), /重复/);
+    assert.notEqual(h.context[state], null);
+  });
+
+  test(`${kind} deletion of other row and batches preserve draft; deleting edited row cancels only on success`, async () => {
+    const h = harness();
+    h.context.S[kind] = [second(), first()];
+    h.context[edit](1);
+    h.elements.get(field).value = '81';
+    const remove = rule ? 'deleteRule' : 'deleteForward';
+    assert.equal(await h.context[remove](0), true);
+    assert.notEqual(h.context[state], null);
+    assert.equal(h.elements.get(field).value, '81');
+    h.elements.get(rule ? 'fwBatch' : 'fwdBatch').value = rule ? '* tcp 123' : '123 ::1 456';
+    assert.equal(await h.context[rule ? 'addRulesBatch' : 'addForwardsBatch'](), true);
+    assert.notEqual(h.context[state], null);
+    assert.equal(h.elements.get(field).value, '81');
+    assert.equal(await h.context[remove](0), true);
+    assert.equal(h.context[state], null);
+    assert.equal(h.elements.get(field).value, '');
+    const failed = harness(() => { throw new Error('offline'); });
+    failed.context.S[kind] = [first()];
+    failed.context[edit](0);
+    assert.equal(await failed.context[remove](0), false);
+    assert.notEqual(failed.context[state], null);
+  });
+
+  test(`${kind} actual polling continues during editing without replacing draft`, async () => {
+    const h = pollingHarness(() => ({ ok: true, json: async () => ({ ...pollState(), [kind]: [second(), first()] }) }));
+    h.context.S[kind] = [first()];
+    h.context[edit](0);
+    const snapshot = h.context[state];
+    h.elements.get(field).value = '81';
+    await h.context.fetchState();
+    assert.equal(h.context.S[kind].length, 2);
+    assert.equal(h.context.S.info.name, 'new info');
+    assert.equal(h.context[state], snapshot);
+    assert.equal(h.elements.get(field).value, '81');
+    assert.equal(h.elements.get(submitID).textContent, '应用修改');
+    assert.equal(h.requests.length, 1);
+  });
+}
