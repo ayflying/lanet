@@ -31,6 +31,8 @@ func nodeStartEnv(applied bool) []string {
 	return append(env, updateHelperDoneEnv+"=1")
 }
 
+// containerized 判断当前是否跑在容器里（实现在 p2pupdate.go 的 runningInContainer）。
+
 func runUpdateHelper() bool {
 	exe := selfExe()
 	if len(os.Args) >= 2 && os.Args[1] == updateHelperArg {
@@ -46,6 +48,18 @@ func runUpdateHelper() bool {
 		if strings.HasPrefix(lower, "-service") || strings.HasPrefix(lower, "--service") {
 			return false
 		}
+	}
+	// 容器环境绝不在这里派生 helper 后自杀：本进程就是容器的 PID 1，退出即
+	// 意味着容器被运行时杀掉，全部子进程（包括刚派生的 helper）一起消失——
+	// 标记永远消费不掉，于是「每次启动活一下就退出」，容器陷入无限重启。
+	// 容器里的正确处理是丢弃残留标记（镜像里的二进制本来就换不掉），
+	// 继续以当前版本运行。容器更新走编排层（compose pull + up -d）。
+	if containerized() {
+		if _, err := os.Stat(pendingUpdateMarkerPath(exe)); err == nil {
+			log.Printf("[update-helper] 容器环境：丢弃残留的待更新标记（容器更新走编排层，重启容器即回到镜像版本）")
+			dropPendingUpdate(exe)
+		}
+		return false
 	}
 	if updateHelperSuppressed() {
 		return false
@@ -140,9 +154,17 @@ func updateHelperConfigPath(exe string, args []string) string {
 }
 
 func spawnUpdateHelper() error {
+	// spawnUpdateHelperFunc 仅供测试注入（默认走真实派生）：启动入口的
+	// 「见标记就转交 helper」分支必须可测，不能真起进程。
+	if spawnUpdateHelperFunc != nil {
+		return spawnUpdateHelperFunc()
+	}
 	args := append([]string{updateHelperArg}, os.Args[1:]...)
 	cmd := exec.Command(selfExe(), args...)
 	cmd.Dir = exeDir()
 	cmd.SysProcAttr = spawnSysProcAttr
 	return cmd.Start()
 }
+
+// spawnUpdateHelperFunc 测试注入点（见 spawnUpdateHelper）。
+var spawnUpdateHelperFunc func() error

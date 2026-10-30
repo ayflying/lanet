@@ -125,7 +125,7 @@ func StartP2PUpdate(ctx context.Context, c *lanet.Client, version string, exeDir
 	if version == "" || version == "dev" {
 		return "dev 构建（版本号不可比）"
 	}
-	if runningInContainer() {
+	if containerized() {
 		return "容器环境（更新走编排层）"
 	}
 	exePath, err := os.Executable()

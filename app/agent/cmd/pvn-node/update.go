@@ -124,6 +124,20 @@ func readConfigToken(path string) string {
 	return nc.GitHubToken
 }
 
+// errUpdateInContainer 容器内拒绝「下载并替换自身」。
+//
+// 容器里点「立即更新并重启」从来不可能成功，而且会把容器拖进重启循环：
+// 新程序暂存在 /usr/local/bin（镜像层，容器一重建就没了），随后进程退出让
+// 运行时重启容器——容器重启=回到镜像里的旧程序。更糟的是 0.5.98 的启动
+// 入口见到待更新标记就派生 helper 并立刻 os.Exit(0)，而容器在 PID 1 退出的
+// 瞬间杀掉全部子进程，helper 根本没机会消费标记，于是每次启动都「活 50ms
+// 就退出」→ 无限重启。容器更新必须交给编排层（docker compose pull && up -d）。
+var errUpdateInContainer = errors.New(
+	"容器环境不支持在程序内更新（新程序会随容器重建丢失）：请用 docker compose pull && up -d 更新镜像")
+
+// containerized 判断当前是否跑在容器里，供测试替换（默认按标记文件探测）。
+var containerized = runningInContainer
+
 // updateRoutes 控制台扩展路由：更新检查 / 应用更新 / 重启 / 退出。
 func updateRoutes(cancel context.CancelFunc) map[string]http.HandlerFunc {
 	return map[string]http.HandlerFunc{
@@ -160,6 +174,10 @@ func updateRoutes(cancel context.CancelFunc) map[string]http.HandlerFunc {
 				"checked_at":  at.Format(time.RFC3339),
 				"cache_ttl_s": int(updateCacheTTL.Seconds()),
 				"timed_out":   timedOut,
+				// container 让控制台隐藏「立即更新并重启」按钮，改为提示走编排层：
+				// 容器内替换二进制只会随容器重建丢失，探不到这一点就会让用户
+				// 反复点更新、反复看到版本没变。
+				"container": containerized(),
 			})
 		},
 		"POST /api/update/apply": func(w http.ResponseWriter, r *http.Request) {
@@ -169,6 +187,10 @@ func updateRoutes(cancel context.CancelFunc) map[string]http.HandlerFunc {
 				if errors.Is(err, errUpdateInFlight) {
 					// 已有更新在途（另一条路径/上一轮还没重启）：这是并发拒绝，
 					// 不是服务故障，回 409 让前端提示「更新进行中」而不是报错。
+					status = http.StatusConflict
+				}
+				if errors.Is(err, errUpdateInContainer) {
+					// 容器环境：这不是故障，是「换条路走」，同样用 409 区别于 500。
 					status = http.StatusConflict
 				}
 				writeJSONLocal(w, status, map[string]string{"error": err.Error()})
@@ -362,7 +384,14 @@ func (u *updateState) snapshot() (checked, hasUpdate, needToken bool, latest, no
 // 与 P2P 自动更新共用 updateGate（见 p2pupdate.go）：两条路径不会同时替换
 // 同一个 exe；已有一轮更新在途时直接拒绝——避免「升级窗口里又点一次」造成
 // 重复下载、重复替换、反复重启。
+//
+// 容器环境直接拒绝（见 errUpdateInContainer）：容器内替换的二进制落在镜像层，
+// 容器一重建就丢；而 0.5.98 的启动入口会「见标记就派生 helper 后立刻退出」，
+// 容器在 PID 1 退出时杀掉 helper，导致永远应用不上、陷入重启循环。
 func applyUpdate() (err error) {
+	if containerized() {
+		return errUpdateInContainer
+	}
 	if !acquireUpdate() {
 		return errUpdateInFlight
 	}
@@ -850,6 +879,12 @@ func applyPendingUpdate(exePath string) (bool, error) {
 }
 
 func selfExe() string {
+	// selfExeOverride 仅供测试注入（nil = 走真实实现）：启动路径上的函数
+	// （runUpdateHelper / restartSelf）按 selfExe 定位标记文件，测试要能在
+	// 临时目录里跑完整流程而不触碰真实程序。
+	if selfExeOverride != nil {
+		return selfExeOverride()
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return os.Args[0]
@@ -859,6 +894,9 @@ func selfExe() string {
 	}
 	return exe
 }
+
+// selfExeOverride 测试注入点（见 selfExe）。
+var selfExeOverride func() string
 
 func extOf() string {
 	if runtime.GOOS == "windows" {
@@ -890,6 +928,13 @@ func restartSelf(delay time.Duration) {
 		}
 		exe := selfExe()
 		log.Printf("[node] 重启程序: %s %v", exe, os.Args[1:])
+		// 容器环境没有「换掉自己再重启」这回事：本进程是容器的 PID 1，
+		// 派生子进程后自杀只会让容器被重建，子进程一并消失。这里直接干净退出，
+		// 交给容器运行时的 restart 策略重新拉起（镜像版本保持不变）。
+		if containerized() {
+			activeSingleton.release()
+			os.Exit(0)
+		}
 		if _, err := os.Stat(pendingUpdateMarkerPath(exe)); err == nil {
 			if err := spawnUpdateHelper(); err != nil {
 				log.Printf("[node] 更新辅助进程启动失败: %v", err)

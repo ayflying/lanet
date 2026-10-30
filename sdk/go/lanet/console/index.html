@@ -1604,7 +1604,16 @@ function renderUpdateModal() {
   $('updNotes').innerHTML = has
     ? (mdLite(updInfo.notes) || '（无发行说明）')
     : '当前已是最新版本，无需更新。';
-  $('updApply').style.display = has ? '' : 'none';
+  // 容器内不能就地替换二进制（换了也会随容器重建丢失），隐藏「立即更新并重启」，
+  // 改成在说明区给出编排层命令——否则用户会反复点更新、反复看到版本没变。
+  $('updApply').style.display = (has && !updInfo.container) ? '' : 'none';
+  if (has && updInfo.container) {
+    $('updNotes').innerHTML +=
+      '<div style="margin-top:10px;padding:10px;border:1px solid var(--warn,#b8860b);border-radius:6px">' +
+      '<b>容器环境请用编排层更新</b><br>' +
+      '在宿主机执行：<code>docker compose pull &amp;&amp; docker compose up -d</code><br>' +
+      '在程序内更新会把新程序写进容器层，容器一重建就回到旧版本。</div>';
+  }
   const at = fmtCheckedAt(updInfo.checked_at);
   const note = updInfo.timed_out ? '本次检查超时（展示上次结果）' : '';
   const err = updInfo.error ? '检查出错：' + updInfo.error : '';
