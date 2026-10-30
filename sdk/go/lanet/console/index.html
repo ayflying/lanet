@@ -1754,11 +1754,20 @@ async function applyUpdate() {
     $('updApply').disabled = false;
   }
 }
-function onRestartClick() {
+async function onRestartClick() {
   if (!confirm('确定要重启节点程序吗？重启期间本节点会短暂离线。')) return;
-  fetch('/api/restart', { method: 'POST' });
-  $('addrLine').textContent = '程序重启中，页面将自动重连…';
-  pollAndReload();
+  try {
+    const r = await fetch('/api/restart', { method: 'POST' });
+    const res = await r.json().catch(() => ({}));
+    if (!r.ok || !res.restarting) {
+      alert(res.error || '重启请求未被接受，节点保持运行。');
+      return;
+    }
+    $('addrLine').textContent = '程序重启中，页面将自动重连…';
+    pollAndReload();
+  } catch (e) {
+    alert('无法确认重启请求结果，请检查节点状态：' + e);
+  }
 }
 function onQuitClick() {
   if (!confirm('确定要关闭节点程序吗？\n关闭后本节点离线，其他成员将无法连接，直到再次手动启动。')) return;

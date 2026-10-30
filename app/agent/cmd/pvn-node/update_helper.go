@@ -31,11 +31,15 @@ func nodeStartEnv(applied bool) []string {
 	return append(env, updateHelperDoneEnv+"=1")
 }
 
-// containerized 判断当前是否跑在容器里（实现在 p2pupdate.go 的 runningInContainer）。
-
 func runUpdateHelper() bool {
 	exe := selfExe()
 	if len(os.Args) >= 2 && os.Args[1] == updateHelperArg {
+		// 内部命令也必须遵守容器禁用策略，且不能继续流入普通 flag 解析。
+		if containerized() {
+			dropPendingUpdate(exe)
+			log.Printf("[update-helper] 容器内拒绝更新辅助命令，请由编排层更新镜像")
+			return true
+		}
 		args := append([]string(nil), os.Args[2:]...)
 		return runUpdateHelperProcess(exe, args)
 	}
@@ -52,11 +56,11 @@ func runUpdateHelper() bool {
 	// 容器环境绝不在这里派生 helper 后自杀：本进程就是容器的 PID 1，退出即
 	// 意味着容器被运行时杀掉，全部子进程（包括刚派生的 helper）一起消失——
 	// 标记永远消费不掉，于是「每次启动活一下就退出」，容器陷入无限重启。
-	// 容器里的正确处理是丢弃残留标记（镜像里的二进制本来就换不掉），
+	// 容器里的处理是丢弃不受支持的暂存更新，避免残留标记触发退出循环，
 	// 继续以当前版本运行。容器更新走编排层（compose pull + up -d）。
 	if containerized() {
 		if _, err := os.Stat(pendingUpdateMarkerPath(exe)); err == nil {
-			log.Printf("[update-helper] 容器环境：丢弃残留的待更新标记（容器更新走编排层，重启容器即回到镜像版本）")
+			log.Printf("[update-helper] 容器环境：丢弃残留的待更新标记，继续运行当前版本；请由编排层更新镜像")
 			dropPendingUpdate(exe)
 		}
 		return false

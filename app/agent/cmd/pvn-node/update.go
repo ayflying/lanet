@@ -126,14 +126,12 @@ func readConfigToken(path string) string {
 
 // errUpdateInContainer 容器内拒绝「下载并替换自身」。
 //
-// 容器里点「立即更新并重启」从来不可能成功，而且会把容器拖进重启循环：
-// 新程序暂存在 /usr/local/bin（镜像层，容器一重建就没了），随后进程退出让
-// 运行时重启容器——容器重启=回到镜像里的旧程序。更糟的是 0.5.98 的启动
-// 入口见到待更新标记就派生 helper 并立刻 os.Exit(0)，而容器在 PID 1 退出的
-// 瞬间杀掉全部子进程，helper 根本没机会消费标记，于是每次启动都「活 50ms
-// 就退出」→ 无限重启。容器更新必须交给编排层（docker compose pull && up -d）。
+// 自替换写入容器可写层：普通 restart 保留它，recreate 才会丢失它。
+// 更关键的是，本程序作为 PID 1 时，「派生 helper 后退出」会结束整个容器，
+// helper 随之被终止，残留标记可触发反复启动退出。因此按部署策略禁止
+// 容器内自替换，镜像升级统一交给编排层。
 var errUpdateInContainer = errors.New(
-	"容器环境不支持在程序内更新（新程序会随容器重建丢失）：请用 docker compose pull && up -d 更新镜像")
+	"容器环境不支持在程序内更新（新程序会随容器重建丢失）：请在宿主机的 Compose 项目目录执行 docker compose pull && docker compose up -d 更新镜像")
 
 // containerized 判断当前是否跑在容器里，供测试替换（默认按标记文件探测）。
 var containerized = runningInContainer
@@ -200,6 +198,12 @@ func updateRoutes(cancel context.CancelFunc) map[string]http.HandlerFunc {
 			restartSelf(1500 * time.Millisecond) // 留出响应送达时间；启动入口消费暂存更新
 		},
 		"POST /api/restart": func(w http.ResponseWriter, r *http.Request) {
+			// 进程无法可靠获知 Docker 的 restart policy；退出可能是永久停服。
+			// 不返回虚假的重启成功，统一交由宿主机编排层执行。
+			if containerized() {
+				writeJSONLocal(w, http.StatusConflict, map[string]string{"error": "容器内不执行进程自重启：请在宿主机执行 docker compose restart"})
+				return
+			}
 			writeJSONLocal(w, http.StatusOK, map[string]any{"restarting": true})
 			restartSelf(800 * time.Millisecond)
 		},
@@ -385,7 +389,7 @@ func (u *updateState) snapshot() (checked, hasUpdate, needToken bool, latest, no
 // 同一个 exe；已有一轮更新在途时直接拒绝——避免「升级窗口里又点一次」造成
 // 重复下载、重复替换、反复重启。
 //
-// 容器环境直接拒绝（见 errUpdateInContainer）：容器内替换的二进制落在镜像层，
+// 容器环境直接拒绝（见 errUpdateInContainer）：替换写入的是容器可写层，
 // 容器一重建就丢；而 0.5.98 的启动入口会「见标记就派生 helper 后立刻退出」，
 // 容器在 PID 1 退出时杀掉 helper，导致永远应用不上、陷入重启循环。
 func applyUpdate() (err error) {
@@ -928,12 +932,10 @@ func restartSelf(delay time.Duration) {
 		}
 		exe := selfExe()
 		log.Printf("[node] 重启程序: %s %v", exe, os.Args[1:])
-		// 容器环境没有「换掉自己再重启」这回事：本进程是容器的 PID 1，
-		// 派生子进程后自杀只会让容器被重建，子进程一并消失。这里直接干净退出，
-		// 交给容器运行时的 restart 策略重新拉起（镜像版本保持不变）。
+		// 防御内部调用：容器未必配置自动重启，保持当前进程存活最安全。
 		if containerized() {
-			activeSingleton.release()
-			os.Exit(0)
+			log.Printf("[node] 容器内跳过进程自重启，请由宿主机编排层重启")
+			return
 		}
 		if _, err := os.Stat(pendingUpdateMarkerPath(exe)); err == nil {
 			if err := spawnUpdateHelper(); err != nil {
