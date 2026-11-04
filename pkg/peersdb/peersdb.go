@@ -57,11 +57,10 @@ func Open(ctx context.Context, path string) (*DB, error) {
 		_ = sqldb.Close()
 		return nil, err
 	}
-	// 启动自愈：旧版本授予信任时不清理 nearby，导致「先被被动发现写进附近、
-	// 紧接着审批通过」的节点永久滞留在附近列表（且 nearby 不区分网络密钥，
-	// 换 network_key 后陈旧行照旧显示）。这里每次打开库做一次幂等清理，
-	// 无需追加迁移即可修好存量脏数据。尽力而为——清理失败不阻塞启动。
-	_, _ = d.PruneTrustedNearby(ctx)
+	// 启动自愈：「附近在线节点」功能已删除，旧版本 lanet.db 里可能残留 nearby
+	// 观察行。每次打开库做一次幂等清理（只清数据、不删表，迁移 3 已发布不可改），
+	// 老库因此能平滑升级而不需要任何额外迁移。尽力而为——清理失败不阻塞启动。
+	_, _ = d.dropNearbyObservations(ctx)
 	return d, nil
 }
 
@@ -133,9 +132,10 @@ CREATE INDEX IF NOT EXISTS idx_pending_requested ON pending_requests(requested_a
 		version: 3,
 		name:    "nearby + unfriended: 附近节点观察表与删除好友墓碑",
 		up: `
--- 附近节点：发现到（DHT/mDNS）但尚未成为好友的同网络密钥节点。
--- 只存公开可发现的信息（节点 ID + 地址），名称等身份细节因审批隔离拿不到。
--- 被删除过的好友同样会回到这里（可重新申请连接）。
+-- ⚠️ 历史迁移（已发布，禁止修改）：其中 nearby 表对应已删除的「附近在线节点」
+-- 功能，本版本不再读写它，只在打开库时做一次幂等清理（见 store.go 的
+-- dropNearbyObservations）。保留建表语句是为了让既有 lanet.db 的迁移版本链
+-- 与结构保持完全一致，避免旧库/新库出现两套结构。
 CREATE TABLE IF NOT EXISTS nearby (
 	peer_id   TEXT PRIMARY KEY,
 	name      TEXT NOT NULL DEFAULT '',
@@ -162,10 +162,9 @@ CREATE TABLE IF NOT EXISTS unfriended (
 		up: `
 -- 种子表：记录「不需要加好友、直接可用」的公网可达节点。
 --
--- 为什么单独建表而不复用 nearby：nearby 是「被动发现到的同密钥节点」，
--- 语义是「可选好友候选」，且不区分网络密钥、没有可达性验证字段；种子表要的是
--- 「实测能直拨的中转/发现入口」，必须有 ok_count / last_ok 作验证门、必须有
--- 容量上限与淘汰顺序，两者语义与生命周期都不同，混用会互相污染。
+-- 为什么单独建表而不复用 peers：种子要的是「实测能直拨的中转/发现入口」，
+-- 必须有 ok_count / last_ok 作验证门、必须有容量上限与淘汰顺序；而 peers 是
+-- 「已审批的好友/成员」，两者语义与生命周期都不同，混用会互相污染。
 --
 -- 两张表**物理隔离**而非用 scope 列：请求方是不同开关下的两套逻辑
 -- （群内种子默认可用；全域种子只在「全域开关」打开时才参与），

@@ -18,9 +18,9 @@ import (
 //     本机可以拨它、可以让它指路，但它不等于虚拟网成员（服务级放行 ≠ 成员）；
 //   - peers 无容量上限、无淘汰；种子有上限与淘汰（长期不上线的先剔）。
 //
-// 与 nearby 的区别：nearby 是「被动发现到的同密钥节点」= 潜在好友候选，
-// 不区分网络密钥、没有可达性验证字段。把两者混在一张表里会让
-// 「谁是我能直接用的入口」与「谁可能成为我好友」互相污染，故分表。
+// 为什么不复用 peers：peers 存的是「好友与待审批关系」，两者语义与生命周期
+// 都不同（好友有互信与审批状态；种子不需要互信、却必须有可达性验证字段），
+// 混在一张表里会互相污染。
 
 // SeedScope 种子范围。**两张表物理隔离**：群内种子默认可用，全域种子只在
 // 「全域开关」打开时参与，任何一处逻辑都不该看到另一个范围的数据。
@@ -375,7 +375,7 @@ DELETE FROM %s WHERE peer_id IN (
 
 // PruneTrustedSeeds 清理两张种子表里「其实已经是好友」的行，返回删除条数。
 //
-// 与 PruneTrustedNearby 同理：UpsertSeed 会拦新写入，但**存量**行不会自动消失
+// 与 PruneTrustedSeeds 同理：UpsertSeed 会拦新写入，但**存量**行不会自动消失
 // （比如先当种子、后被审批成好友）。每次打开库做一次幂等清理。
 func (d *DB) PruneTrustedSeeds(ctx context.Context) (int64, error) {
 	var total int64
@@ -508,7 +508,7 @@ func (d *DB) DeleteSetting(ctx context.Context, key string) error {
 
 // ---- 内部助手 ----
 
-// joinAddrs / splitAddrs：地址列表用逗号存成单列（与 peers/nearby 的历史做法一致）。
+// joinAddrs / splitAddrs：地址列表用逗号存成单列（与 peers 的历史做法一致）。
 // multiaddr 本身不含逗号，故无需转义。
 func joinAddrs(addrs []string) string {
 	out := ""

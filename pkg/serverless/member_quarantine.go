@@ -45,10 +45,14 @@ func (d *Discovery) verifiedMemberLocked(id, source string) *Member {
 		if d.unfriendGuardBlocked(id) {
 			return nil
 		}
-		m = &Member{PeerID: id, VirtualIP: DeriveVirtualIP(d.groupKey, id),
+		m = &Member{PeerID: id, VirtualIP: d.alignedVirtualIP(id),
 			VirtualIPv6: DeriveVirtualIPv6(d.groupKey, id), Source: source,
 			FirstSeen: time.Now(), LastDiscovered: time.Now()}
 		d.members[id] = m
+		// 新成员入表后立即同步虚拟 IP 占用表：本函数是独立写入口，不能靠
+		// 调用方记得补同步。唯一调用方 connectAndIdentifyContext 随后还会
+		// 同步一次（幂等，no-op），那是为了覆盖「成员集合未变」的路径。
+		d.claimVirtualIPsLocked()
 	}
 	d.expiredMembers.verified(id)
 	return m

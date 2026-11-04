@@ -4,11 +4,12 @@
 # 触发：push 到 main（代码/VERSION/打包脚本变更）、v* tag、手动 workflow_dispatch。
 # 版本号：根目录 VERSION 文件（三段式，如 0.2.1）。改代码先改 VERSION 再提交。
 #
-# 产物（全部压缩，不直接上传 exe）：
+# 产物（桌面端全部压缩，不直接上传 exe）：
 #   lanet-{版本}-windows-amd64.zip    含 lanet.exe（单程序，客户端=服务端）+ wintun.dll + README
 #   lanet-{版本}-linux-amd64.tar.gz   含 lanet
 #   lanet-{版本}-linux-arm64.tar.gz   同上（arm64）
-#   sha256sums.txt                    全部压缩包校验和
+#   lanet-{版本}-android.apk          安卓安装包（由 android.yml 构建，本文件只负责挂载）
+#   sha256sums.txt                    以上全部产物的校验和（APK 也在内）
 #
 # 发行说明 = 改 VERSION 那次提交的 commit message（直接写改动内容，不留 compare 链接）。
 # ⚠️ wintun.dll 不打入 exe（运行时从 exe 同目录或 System32 加载），
@@ -41,6 +42,7 @@ env:
 jobs:
   stability:
     uses: ./.github/workflows/stability.yml
+
   build:
     needs: stability
     name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
@@ -142,10 +144,36 @@ jobs:
             dist/manifest-*.json
           retention-days: 30
 
+  # -------------------------------------------------------------------------------
+  # 安卓 APK：复用 android.yml（workflow_call），而不是在这里再写一遍
+  # 「Java + Android SDK + NDK + gomobile」的环境准备。好处是 APK 与「单独跑
+  # android.yml」走同一份构建逻辑，不存在两套工具链漂移。
+  #
+  # 需要这个 job 的理由只有一条：release job 要等它，才能把 APK 和三个平台的
+  # 压缩包一次性挂到同一个 Release、并合并出完整的 sha256sums.txt。
+  #
+  # ⚠️ 这个 job 写在 build job 之后（源码顺序，不是执行顺序）只是为了让阅读时
+  # 不把两个 "build" 看混：android.yml 内部也有一个叫 build 的 job，本文件也有。
+  # 两者不会真的冲突（跨 workflow 的 job 名不共享命名空间），但人肉读日志时
+  # 容易误解，所以把 android 这块集中放在 build 的步骤清单之后。
+  # 万一以后改名字，先跑 actionlint —— 它会报出悬空的 needs 引用。
+  # -------------------------------------------------------------------------------
+  android:
+    uses: ./.github/workflows/android.yml
+    # 刻意不加 needs: stability —— 理由见 android.yml 里 build job 的注释：
+    # Android 构建与业务正确性无关，让它挡在发行前面只会放大与代码无关的偶发
+    # 失败面（SDK 下载抖动、NDK 许可变更）。正确性由上方的 build（已 needs:
+    # stability）把关。若将来要求「稳定性不通过就不出 APK」，在这里加一行即可。
+
   release:
     name: Attach to GitHub Release
     runs-on: ubuntu-latest
-    needs: build
+    # 必须同时等 build 与 android：APK 要和三个平台的压缩包出现在**同一个**
+    # Release 里，而 sha256sums.txt 是 release job 现场合并出来的。
+    # 只有都到齐，sha256sums.txt 才是一次性写全的（软链到 Release 后用户可以
+    # 拿它校验任何一个附件）。Android 构建失败则整个发行失败——这是有意的：
+    # 一个缺 APK 的发行比一次红灯更难排查，用户会以为「这版没出安卓包」。
+    needs: [build, android]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -172,6 +200,10 @@ jobs:
             echo "---"
             echo "解压即用（Windows 双击运行，UAC 弹窗点「是」即可；wintun.dll 保持与 lanet.exe 同目录）。"
             echo "完整性校验：\`sha256sum -c sha256sums.txt\`"
+            echo
+            echo "**安卓**：\`lanet-${VERSION}-android.apk\` 可直接安装（传手机 / \`adb install\`）。"
+            echo "证书类型见 Actions 里 android 构建的 Job Summary——未配置 release 签名 Secret 时是 debug 证书，"
+            echo "只适合验证与内测（任何持有同款 debug.keystore 的人都能覆盖安装）。详见 docs/android-release.md。"
           } > release-notes.md
           echo "---- release-notes.md ----"
           cat release-notes.md
@@ -180,15 +212,56 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          # lanet-* 只匹配 build 矩阵的三个 artifact（名字是 lanet-{goos}-{goarch}）。
+          # ⚠️ 这里必须保持 pattern 筛选，不要为了省事把 APK 也让它抓：APK 走下面的
+          # 精确名字下载（lanet-apk / lanet-apk-sha256），两边如果都覆盖同一个 artifact，
+          # 就会出现「同一份文件下载两次」，而 merge-multiple 下同名文件是覆盖合并，
+          # 先后顺序不确定——sha256sums.txt 里会出现重复条目。
           pattern: lanet-*
           merge-multiple: true
+
+      # APK 走单独的 artifact，按名字精确下载到 dist（与三个平台压缩包同目录）。
+      # 用精确名字而不是 pattern 匹配的原因见上一条注释：pattern 同时匹配到时会重复下载。
+      - name: Download Android APK
+        uses: actions/download-artifact@v4
+        with:
+          name: lanet-apk
+          path: dist
+
+      # APK 的 .sha256 走另一个 artifact（lanet-apk-sha256）：它被单独下载到 dist/，
+      # 与三个平台的 .sha256 一起拼进 sha256sums.txt。
+      - name: Download Android APK checksum
+        uses: actions/download-artifact@v4
+        with:
+          name: lanet-apk-sha256
+          path: dist
 
       - name: Merge checksums
         shell: bash
         run: |
           cd dist
+          # APK 的 .sha256 由上面的 lanet-apk-sha256 artifact 单独下载，
+          # 这里把它和三个平台的 .sha256 一起拼成 sha256sums.txt。
+          # 注意顺序无关紧要：sha256sum -c 只要能找到文件即可。
+          #
+          # ⚠️ 拼之前先确认 APK 本体和它的 .sha256 都在，缺一个就当场失败。
+          # 缺 APK 却不报错的话，会发布一个「sha256sums.txt 里有一行找不到文件」的
+          # 发行包，用户校验时看到 "No such file or directory" 会以为下载损坏。
+          if ! ls lanet-*-android.apk >/dev/null 2>&1; then
+            echo "::error::dist/ 里没有 lanet-*-android.apk（Android 构建的 artifact 没下载到？）"
+            exit 1
+          fi
+          if ! ls lanet-*-android.apk.sha256 >/dev/null 2>&1; then
+            echo "::error::dist/ 里没有 APK 的 .sha256 文件"
+            exit 1
+          fi
           cat *.sha256 > sha256sums.txt
           rm -f *.sha256
+          echo "---- sha256sums.txt ----"
+          cat sha256sums.txt
+          # 自检：逐条校验。若这里失败，说明某个包在上传/下载过程中被改过
+          # （artifact 传输损坏或命名不一致），必须在挂 Release 前拦住。
+          sha256sum -c sha256sums.txt
 
       # 合并各平台签名分片为全网统一清单（P2P 自更新信任锚）。
       # 无分片（未配置签名密钥）时脚本内自动跳过；不用 if: secrets（上下文不可用）。
@@ -220,6 +293,7 @@ jobs:
           files: |
             dist/lanet-*.zip
             dist/lanet-*.tar.gz
+            dist/lanet-*.apk
             dist/sha256sums.txt
             dist/manifest.json
           body_path: release-notes.md

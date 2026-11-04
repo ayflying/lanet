@@ -96,9 +96,9 @@ ON CONFLICT(peer_id) DO UPDATE SET trusted = excluded.trusted, approved = 1`,
 		return err
 	}
 	if trusted {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM nearby WHERE peer_id = ?`, peerID); err != nil {
-			return err
-		}
+		// 历史遗留：旧版本 nearby 观察表里可能有该节点的行。附近功能已删除，
+		// 这里只做一次兜底清理（表不存在时忽略错误）。
+		_, _ = tx.ExecContext(ctx, `DELETE FROM nearby WHERE peer_id = ?`, peerID)
 		for _, table := range seedTables {
 			if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE peer_id = ?`, peerID); err != nil {
 				return err
@@ -109,7 +109,7 @@ ON CONFLICT(peer_id) DO UPDATE SET trusted = excluded.trusted, approved = 1`,
 }
 
 // RemovePeer atomically records a persistent deletion and removes friendship/pending state.
-// Nearby observations and seed transport records are not friendship authorization.
+// Seed transport records are not friendship authorization.
 func (d *DB) RemovePeer(ctx context.Context, peerID string) error {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -292,128 +292,29 @@ func (d *DB) DeletePeer(ctx context.Context, peerID string) error {
 }
 
 // =================================================================================
-// 附近节点（发现到但尚未成为好友的同网络节点）
+// 已删除的「附近节点」观察表（为了旧库平滑升级而保留最小清理入口）
 // =================================================================================
-
-// Nearby 一条「附近」观察：同网络密钥内可见、但本机未信任的节点。
-type Nearby struct {
-	PeerID string
-	Name   string
-	Addrs  []string
-	Source string
-	// Notes 本机手写的备注（来自 peers 表，**不是** nearby 表的列）。
-	// 仅用于展示：用户给「曾经是好友、后来删掉」的节点写过备注时，它在附近
-	// 列表里仍应显示出来，否则用户认不出这是谁而不敢重新申请。
-	Notes     string
-	FirstSeen time.Time
-	LastSeen  time.Time
-}
-
-// UpsertNearby 记录一次「发现某个非好友节点」：不存在则插入，存在则刷新
-// 地址/来源/最近时间。已信任节点直接忽略（好友不进附近）。被删除过的好友
-// 同样会回到附近（墓碑只改握手拒绝语义，不屏蔽可见性）——用户正是靠这条
-// 记录点「申请连接」重新加回对方。
-// 表容量封顶 200 条（按最近发现时间保留），防止公共大网下无限膨胀。
-func (d *DB) UpsertNearby(ctx context.Context, n Nearby) error {
-	if n.PeerID == "" {
-		return nil
-	}
-	trusted, err := d.IsTrusted(ctx, n.PeerID)
-	if err != nil {
-		return err
-	}
-	if trusted {
-		// 已信任节点不该出现在附近：顺手清掉可能残留的历史观察。这同时
-		// 覆盖「发现时读到未信任 → 审批并发完成 → 本次 INSERT 才落地」的
-		// 竞态窗口（若只 return 而不删，这条记录会永久滞留）。
-		_, _ = d.db.ExecContext(ctx, `DELETE FROM nearby WHERE peer_id = ?`, n.PeerID)
-		return nil
-	}
-	now := time.Now()
-	if n.Name == "" {
-		// 被动发现拿不到对端身份（审批隔离），但本机可能早就认识它——曾经是
-		// 好友、或手动添加过。把本地已知名字一起写进观察表，展示时不必每次
-		// 回查；对端改名后，下一次「对方主动申请」会以新名字覆盖。
-		var known sql.NullString
-		if err := d.db.QueryRowContext(ctx,
-			`SELECT name FROM peers WHERE peer_id = ?`, n.PeerID).Scan(&known); err == nil && known.Valid {
-			n.Name = known.String
-		}
-	}
-	res, err := d.db.ExecContext(ctx, `
-INSERT INTO nearby (peer_id, name, addrs, source, first_seen, last_seen)
-SELECT ?, ?, ?, ?, ?, ?
-WHERE NOT EXISTS (SELECT 1 FROM peers WHERE peer_id = ? AND trusted = 1)
-ON CONFLICT(peer_id) DO UPDATE SET
-	name      = CASE WHEN excluded.name != '' THEN excluded.name ELSE nearby.name END,
-	addrs     = CASE WHEN excluded.addrs != '' THEN excluded.addrs ELSE nearby.addrs END,
-	source    = CASE WHEN excluded.source != '' THEN excluded.source ELSE nearby.source END,
-	last_seen = excluded.last_seen
-WHERE (excluded.name != '' AND excluded.name != nearby.name)
-   OR (excluded.addrs != '' AND excluded.addrs != nearby.addrs)
-   OR (excluded.source != '' AND excluded.source != nearby.source)
-   OR nearby.last_seen <= ?`,
-		n.PeerID, n.Name, strings.Join(FilterDialableAddrs(NormalizeAddrs(n.Addrs)), ","), n.Source, now, now, n.PeerID, now.Add(-2*time.Minute))
-	if err != nil {
-		return fmt.Errorf("peersdb: upsert nearby %s: %w", n.PeerID, err)
-	}
-	if count, _ := res.RowsAffected(); count == 0 {
-		return nil
-	}
-	// 封顶修剪：只保留最近出现的 200 条。
-	if _, err = d.db.ExecContext(ctx, `
-DELETE FROM nearby WHERE peer_id NOT IN (
-	SELECT peer_id FROM nearby ORDER BY last_seen DESC LIMIT 200)`); err != nil {
-		return fmt.Errorf("peersdb: prune nearby: %w", err)
-	}
-	return nil
-}
-
-// ListNearby 列出附近节点（按最近发现时间倒序）。
-func (d *DB) ListNearby(ctx context.Context) ([]Nearby, error) {
-	rows, err := d.db.QueryContext(ctx, `
-SELECT peer_id, name, addrs, source, first_seen, last_seen
-FROM nearby ORDER BY last_seen DESC`)
-	if err != nil {
-		return nil, fmt.Errorf("peersdb: list nearby: %w", err)
-	}
-	defer rows.Close()
-	var out []Nearby
-	for rows.Next() {
-		var n Nearby
-		var addrs string
-		var firstSeen, lastSeen sql.NullTime
-		if err := rows.Scan(&n.PeerID, &n.Name, &addrs, &n.Source, &firstSeen, &lastSeen); err != nil {
-			return nil, err
-		}
-		n.Addrs = NormalizeAddrs(strings.Split(addrs, ","))
-		n.FirstSeen, n.LastSeen = firstSeen.Time, lastSeen.Time
-		out = append(out, n)
-	}
-	return out, rows.Err()
-}
-
-// RemoveNearby 从附近列表移除一条观察（成为好友后清理）。
-func (d *DB) RemoveNearby(ctx context.Context, peerID string) error {
-	if _, err := d.db.ExecContext(ctx, `DELETE FROM nearby WHERE peer_id = ?`, peerID); err != nil {
-		return fmt.Errorf("peersdb: remove nearby %s: %w", peerID, err)
-	}
-	return nil
-}
-
-// PruneTrustedNearby 清理 nearby 表里「其实已经是好友」的残留行，返回删除条数。
 //
-// 用于修复存量脏数据：旧版本 SetTrusted 只清 pending_requests、不清 nearby，
-// 于是「被动发现先写进附近 → 同一秒审批通过」的节点会永久留在附近列表；
-// 又因为 nearby 表不含网络密钥字段（ListNearby 全表返回），用户切换
-// network_key 之后这些陈旧行依然会显示，看起来像「换了密钥还能看到对方」。
-// 幂等，可在每次打开库时调用。
-func (d *DB) PruneTrustedNearby(ctx context.Context) (int64, error) {
-	res, err := d.db.ExecContext(ctx, `
-DELETE FROM nearby WHERE peer_id IN (
-	SELECT peer_id FROM peers WHERE trusted = 1)`)
+// 「附近在线节点」功能已整体删除：不再有 Nearby 类型、UpsertNearby / ListNearby /
+// RemoveNearby，也不再写任何 nearby 行。这里只保留**幂等清理**，理由：
+//   - 旧版本 lanet.db 里残留的 nearby 行不含任何有用信息（纯展示用），必须清掉，
+//     否则文件只增不减；
+//   - 但迁移禁止修改已发布的历史迁移，所以不能在 migration 3 里删表；
+//   - 改用「每次打开库执行一次」的幂等清理（见 Open），无需追加迁移即可让老库
+//     平滑升级——不删表本身，避免任何依赖旧表结构的外部只读工具直接报错。
+
+// dropNearbyObservations 清空历史遗留的 nearby 观察表，返回删除条数。
+//
+// 幂等：删两次结果一致；表不存在时返回 0 且不报错（老库、新库都能安全调用）。
+// 只清数据不删表，保留表结构是为兼容「旧库 + 旧版只读工具」的过渡期。
+func (d *DB) dropNearbyObservations(ctx context.Context) (int64, error) {
+	res, err := d.db.ExecContext(ctx, `DELETE FROM nearby`)
 	if err != nil {
-		return 0, fmt.Errorf("peersdb: prune trusted nearby: %w", err)
+		// 表可能根本不存在（库是全新创建的）：这不算错误。
+		if strings.Contains(err.Error(), "no such table") {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("peersdb: clear legacy nearby: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
@@ -421,7 +322,7 @@ DELETE FROM nearby WHERE peer_id IN (
 
 // PruneSelf 清理地址簿里「指向本机自己」的残留行，返回删除条数。
 //
-// 为什么会出现指向自己的行：nearby / pending_requests 是**持久化观察表**，
+// 为什么会出现指向自己的行：pending_requests 是**持久化观察表**，
 // 与「当前身份」没有任何绑定关系。当 node.key 发生变化时（历史版本在
 // Windows 服务模式下把身份文件路径解析到了 CWD，于是 SCM 在 System32 里
 // 建了一个全新身份，PeerID 与虚拟 IP 双双漂移），身份 A 运行期间会把身份 B
@@ -429,7 +330,7 @@ DELETE FROM nearby WHERE peer_id IN (
 // 陌生节点展示，用户点「申请连接」又会被自我保护拦下，报一句看不懂的
 // 「这就是本机节点 ID，无需连接」。
 //
-// 与 PruneTrustedNearby 同理：每次打开库做一次幂等清理，无需追加迁移即可
+// 与 PruneSelf 同理：每次打开库做一次幂等清理，无需追加迁移即可
 // 修好存量脏数据。peer_addrs 由 peers 的外键 ON DELETE CASCADE 级联清理；
 // unfriended（墓碑）指向自己同样有害——本机会拒绝自己的握手。
 func (d *DB) PruneSelf(ctx context.Context, selfPeerID string) (int64, error) {
@@ -438,6 +339,7 @@ func (d *DB) PruneSelf(ctx context.Context, selfPeerID string) (int64, error) {
 	}
 	var total int64
 	for _, q := range []string{
+		// 历史遗留的 nearby 行（附近功能已删除，仅做清理）。
 		`DELETE FROM nearby WHERE peer_id = ?`,
 		`DELETE FROM pending_requests WHERE peer_id = ?`,
 		`DELETE FROM unfriended WHERE peer_id = ?`,
@@ -461,9 +363,9 @@ func (d *DB) PruneSelf(ctx context.Context, selfPeerID string) (int64, error) {
 // 删除好友墓碑（unfriended）
 // =================================================================================
 
-// AddUnfriended 记录「本机已主动删除该节点」的墓碑。附近列表记录**保留**：
-// 被删除的好友仍应出现在「附近」里，用户点「申请连接」即可重新加回
-// （那会清除墓碑）——如果顺手删了，删除过的节点就再也刷不出来了。
+// AddUnfriended 记录「本机已主动删除该节点」的墓碑。墓碑不阻塞重新申请：
+// 对方再次申请（或本机重新添加）会清除墓碑并重新进入待审批，由用户显式
+// 决定是否恢复。
 //
 // 删除不是拉黑：墓碑只是「删除意图」+「一次性告知对方」，告知送达后
 // 对方仍可重新申请（进入待审批，由用户显式决定是否恢复）。重复删除
@@ -897,7 +799,7 @@ ON CONFLICT(peer_id) DO UPDATE SET name = excluded.name`,
 // 是本机写的，**永不被对端数据覆盖**。两者并存，展示时备注优先、真名次之，
 // 这样「对方把名字改成一串乱码」也不会让列表失去可读性。
 //
-// 目标可能还没有 peers 行（附近节点、待审批节点都可能有备注），不存在时建一行；
+// 目标可能还没有 peers 行（待审批节点也可能有备注），不存在时建一行；
 // 不改变 trusted / approved 状态——备注只是标注，不是授权。
 func (d *DB) SetNotes(ctx context.Context, peerID, notes string) error {
 	peerID = strings.TrimSpace(peerID)
@@ -921,13 +823,13 @@ type NameInfo struct {
 }
 
 // NameIndex 一次性返回「节点 ID → 名称/备注」全量索引，供控制台在渲染成员 /
-// 附近 / 待审批列表时做展示兜底。
+// 待审批列表时做展示兜底。
 //
 // 为什么需要兜底：
 //   - 成员表（运行时）只有在线/近期节点才带名字，重启或对端长期离线后名字
 //     就没了，列表退化成「12D3KooW…」——用户下次根本认不出谁是谁；
-//   - 附近节点是**被动发现**的，本就拿不到身份信息（审批隔离），唯一真实的
-//     名字来源是「对方主动申请连接」时带来的那个名字（存在 pending_requests）。
+//   - 待审批节点是**对方的显式申请**带来的，对方自报的名字只存在
+//     pending_requests 里，尚未进入 peers 表。
 //
 // 故合并两个来源：peers 表为主，pending_requests 里非空的名字作次级补充
 // （仅当 peers 表无该行时采用）。表都很小（几十到几百行），一次全量读比在

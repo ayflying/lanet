@@ -447,31 +447,6 @@ func (c *Client) markUnfriendedNotifiedPeer(peerID string) {
 	}
 }
 
-// onSeenUntrusted 供 serverless 被动发现使用：发现同群但未信任的节点时
-// 落库到「附近」表，供控制台展示与一键申请连接。
-func (c *Client) onSeenUntrusted(peerID string, addrs []string, source string) {
-	if c.peers == nil || (c.rootCtx != nil && c.rootCtx.Err() != nil) {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := c.peers.UpsertNearby(ctx, peersdb.Nearby{PeerID: peerID, Addrs: addrs, Source: source}); err != nil {
-		c.logf("附近节点落库失败: %v", err)
-		return
-	}
-	if len(addrs) > 0 {
-		c.nearbyMu.Lock()
-		state := c.nearbyLive[peerID]
-		if c.nearbyLive != nil && state.noAddress {
-			state.noAddress = false
-			state.nextAttempt = time.Time{}
-			c.nearbyLive[peerID] = state
-		}
-		c.nearbyMu.Unlock()
-	}
-	c.wakeNearbyProbes()
-}
-
 // onUnfriendReceived 供 serverless 使用：确认「对端已把本机删除好友」
 // （在线收到 unfriend 推送，或出向握手收到 unfriended 拒绝标记）时，
 // 本机同步移除该节点，完成双向删除。
@@ -557,9 +532,8 @@ func (c *Client) startNameSync(ctx context.Context, db *peersdb.DB) {
 
 // syncMemberNames 把成员表里的名字写进本地库（名字为空则跳过），返回写入条数。
 //
-// 只处理成员表（同群 + 已互信/已发现），不碰「附近」列表：附近节点的名字本来
-// 就来自「对端主动申请」或历史记录，写回去会形成自我强化，把一个可能已经
-// 失效的名字永久钉在那儿。
+// 只处理成员表（同群 + 已互信/已发现）。成员名来自 info 协议与本地备注，
+// 不写入任何「非成员」的名字，避免把一个可能已失效的名字永久钉在库里。
 func (c *Client) syncMemberNames(ctx context.Context, db *peersdb.DB) int {
 	members := c.NetMap().Members
 	if len(members) == 0 {
@@ -929,7 +903,7 @@ func pendingOrError(peerID, via string, err error) (*ConnResult, error) {
 			PeerID:  peerID,
 			Pending: true,
 			Via:     via,
-			Message: "对方已把本机删除好友——删除不是拉黑：可在「附近」列表中找到对方（或直接输入对方节点 ID）重新申请连接，对方同意后即恢复好友。若刚发送过申请，该次只是送达了删除告知，请再发送一次。",
+			Message: "对方已把本机删除好友——删除不是拉黑：重新粘贴对方的连接码或节点 ID 即可再次申请，对方同意后即恢复好友。若刚发送过申请，该次只是送达了删除告知，请再发送一次。",
 		}, nil
 	}
 	// 对方尚未同意本机：这不算失败，是「申请已送达」的正常中间态。
@@ -965,7 +939,7 @@ func friendlyDialErr(err error) error {
 		return errors.New(FriendlyGroupMismatchHint)
 	}
 	if errors.Is(err, serverless.ErrUnfriended) {
-		return errors.New("对方已把本机删除好友——删除不是拉黑：请重新向对方发送连接申请（「附近」列表或对方节点 ID），对方同意后即恢复好友；若刚发送过申请，请再发送一次。")
+		return errors.New("对方已把本机删除好友——删除不是拉黑：请重新粘贴对方的连接码或节点 ID 发送连接申请，对方同意后即恢复好友；若刚发送过申请，请再发送一次。")
 	}
 	return err
 }
@@ -1013,7 +987,7 @@ func (c *Client) PendingList() []peersdb.PendingRequest {
 		c.logf("读取待审批列表失败: %v", err)
 		return nil
 	}
-	// 同 NearbyList：待审批同样是持久化观察表，身份漂移会留下指向自己的行。
+	// 待审批同样是持久化观察表，身份漂移会留下指向自己的行。
 	// 展示给自己看既无意义，点「同意」还会把自己写进信任名单。
 	out := list[:0]
 	for _, p := range list {
@@ -1098,7 +1072,8 @@ func (c *Client) TrustedPeers() []peersdb.Peer {
 //  3. 对方离线：它下次来握手时收到 rejection=unfriended，自动同步删除
 //     （自愈式，无需双方同时在线）。
 //
-// 被删节点若仍可被发现，会回到双方「附近」列表，可重新申请连接。
+// 删除不是拉黑：被删节点若再次主动申请（或本机重新粘贴它的连接码），
+// 仍会进入待审批，由用户显式决定是否恢复。
 func (c *Client) RemovePeer(peerID string) error {
 	if c.peers == nil {
 		return fmt.Errorf("地址簿未启用")
@@ -1148,337 +1123,6 @@ func (c *Client) DHTRoutingPeers() []string {
 		return nil
 	}
 	return c.disc.DHTRoutingPeers()
-}
-
-const (
-	nearbyProbeInterval = 15 * time.Second
-	nearbyProbeTTL      = 90 * time.Second
-	nearbyProbeSuccess  = 60 * time.Second
-	nearbyProbeFailure  = 2 * time.Minute
-	nearbyProbeMaxDelay = 15 * time.Minute
-	nearbyProbeLegacy   = time.Hour
-	nearbyProbeTimeout  = 10 * time.Second
-	nearbyProbeWorkers  = 2
-	nearbyProbeQueue    = 8
-)
-
-type nearbyProbeState struct {
-	name        string
-	expires     time.Time
-	nextAttempt time.Time
-	failures    uint8
-	pending     bool
-	noAddress   bool
-}
-
-// 失败采用有上限的指数退避；协议不支持的旧版设备降低到每小时尝试。
-func nearbyNextAttempt(now time.Time, state nearbyProbeState, err error) nearbyProbeState {
-	if err == nil {
-		state.failures = 0
-		state.nextAttempt = now.Add(nearbyProbeSuccess)
-		return state
-	}
-	if errors.Is(err, serverless.ErrNearbyUnsupported) {
-		state.nextAttempt = now.Add(nearbyProbeLegacy)
-		return state
-	}
-	if errors.Is(err, serverless.ErrNearbyCooldown) {
-		state.nextAttempt = now.Add(nearbyProbeFailure)
-		return state
-	}
-	if state.failures < 4 {
-		state.failures++
-	}
-	delay := nearbyProbeFailure << (state.failures - 1)
-	if delay > nearbyProbeMaxDelay {
-		delay = nearbyProbeMaxDelay
-	}
-	state.nextAttempt = now.Add(delay)
-	return state
-}
-
-// startNearbyProbes 只从后台巡检持久化候选；HTTP 列表请求不发起网络拨号。
-func (c *Client) startNearbyProbes() {
-	c.nearbyMu.Lock()
-	c.nearbyLive = make(map[string]nearbyProbeState)
-	c.nearbyWake = make(chan struct{}, 1)
-	wake := c.nearbyWake
-	c.nearbyMu.Unlock()
-	jobs := make(chan peersdb.Nearby, nearbyProbeQueue)
-	c.nearbyWG.Add(nearbyProbeWorkers + 1)
-	for range nearbyProbeWorkers {
-		go func() {
-			defer c.nearbyWG.Done()
-			for {
-				select {
-				case <-c.rootCtx.Done():
-					return
-				case n := <-jobs:
-					if c.rootCtx.Err() != nil {
-						return
-					}
-					c.probeNearby(n)
-				}
-			}
-		}()
-	}
-	go func() {
-		defer c.nearbyWG.Done()
-		ticker := time.NewTicker(nearbyProbeInterval)
-		defer ticker.Stop()
-		c.scanNearbyProbes(jobs)
-		for {
-			select {
-			case <-c.rootCtx.Done():
-				return
-			case <-wake:
-			case <-ticker.C:
-			}
-			c.scanNearbyProbes(jobs)
-		}
-	}()
-}
-
-func (c *Client) wakeNearbyProbes() {
-	c.nearbyMu.Lock()
-	wake := c.nearbyWake
-	c.nearbyMu.Unlock()
-	if wake != nil {
-		select {
-		case wake <- struct{}{}:
-		default:
-		}
-	}
-}
-
-func (c *Client) scanNearbyProbes(jobs chan<- peersdb.Nearby) {
-	if c.rootCtx.Err() != nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(c.rootCtx, 3*time.Second)
-	defer cancel()
-	list, err := c.peers.ListNearby(ctx)
-	if err != nil {
-		return
-	}
-	trusted, err := c.peers.TrustedIDs(ctx)
-	if err != nil {
-		return
-	}
-	now := time.Now()
-	c.nearbyMu.Lock()
-	defer c.nearbyMu.Unlock()
-	present := make(map[string]bool, len(list))
-	// 在线重验优先于新候选，新候选优先于失败旧记录；避免持续新增把在线设备挤到 TTL 过期。
-	for priority := 0; priority < 3; priority++ {
-		for _, n := range list {
-			if n.PeerID == c.peerID || trusted[n.PeerID] {
-				continue
-			}
-			present[n.PeerID] = true
-			state := c.nearbyLive[n.PeerID]
-			if state.pending || now.Before(state.nextAttempt) {
-				continue
-			}
-			_, observed := c.nearbyLive[n.PeerID]
-			class := 2 // 已失败或过期的旧候选最后重试。
-			if observed && now.Before(state.expires) {
-				class = 0
-			} else if !observed {
-				class = 1
-			}
-			if priority != class {
-				continue
-			}
-			if len(n.Addrs) == 0 {
-				pid, err := peer.Decode(n.PeerID)
-				if err != nil || (len(c.node.Peerstore().Addrs(pid)) == 0 && len(c.node.Network().ConnsToPeer(pid)) == 0) {
-					state.noAddress = true
-					c.nearbyLive[n.PeerID] = state
-					continue
-				}
-			}
-			state.noAddress = false
-			select {
-			case jobs <- n:
-				state.pending = true
-				c.nearbyLive[n.PeerID] = state
-			default:
-				// 队列满时下一轮再评估，不推迟未入队节点的下一次机会。
-				c.nearbyLive[n.PeerID] = state
-			}
-		}
-	}
-	for id := range c.nearbyLive {
-		if !present[id] {
-			delete(c.nearbyLive, id)
-		}
-	}
-}
-
-func (c *Client) probeNearby(n peersdb.Nearby) {
-	ctx, cancel := context.WithTimeout(c.rootCtx, nearbyProbeTimeout)
-	defer cancel()
-	trusted, trustErr := c.peers.IsTrusted(ctx, n.PeerID)
-	name, err := "", trustErr
-	if err == nil && !trusted && n.PeerID != c.peerID {
-		pid, decodeErr := peer.Decode(n.PeerID)
-		if decodeErr != nil {
-			err = decodeErr
-		} else {
-			ai := peer.AddrInfo{ID: pid, Addrs: parseAddrs(n.Addrs)}
-			if len(ai.Addrs) == 0 && len(c.node.Peerstore().Addrs(pid)) == 0 && len(c.node.Network().ConnsToPeer(pid)) == 0 {
-				err = errors.New("附近设备无已观察地址")
-			} else {
-				result, probeErr := c.disc.ProbeNearby(ctx, ai)
-				name, err = result.Name, probeErr
-				if err == nil && !result.Alive {
-					err = errors.New("附近设备未确认在线")
-				}
-			}
-		}
-	}
-	if err == nil {
-		trusted, err = c.peers.IsTrusted(ctx, n.PeerID)
-	}
-	if err == nil {
-		// 候选可能在拨号期间被移出持久化观察表，不能复活已过期结果。
-		list, listErr := c.peers.ListNearby(ctx)
-		err = listErr
-		found := false
-		for _, item := range list {
-			if item.PeerID == n.PeerID {
-				found = true
-				break
-			}
-		}
-		if !found && err == nil {
-			err = errors.New("附近候选已移除")
-		}
-	}
-	c.nearbyMu.Lock()
-	defer c.nearbyMu.Unlock()
-	if c.rootCtx.Err() != nil {
-		return
-	}
-	state, exists := c.nearbyLive[n.PeerID]
-	if !exists {
-		return // 扫描已删掉该候选，不能由进行中的探测把它重新写回。
-	}
-	state.pending = false
-	now := time.Now()
-	if trusted || n.PeerID == c.peerID {
-		state.expires = time.Time{}
-		state.name = ""
-		state.nextAttempt = now.Add(nearbyProbeLegacy)
-	} else if errors.Is(err, serverless.ErrNearbyCooldown) {
-		state = nearbyNextAttempt(now, state, err)
-	} else if err != nil {
-		state.expires = time.Time{}
-		state.name = ""
-		state = nearbyNextAttempt(now, state, err)
-	} else {
-		state.expires = now.Add(nearbyProbeTTL)
-		state.name = strings.TrimSpace(name)
-		state = nearbyNextAttempt(now, state, nil)
-	}
-	c.nearbyLive[n.PeerID] = state
-}
-
-// NearbyList 只返回近期通过在线探测的未信任附近设备（含被删除的好友）。
-// 持久化观察行本身不代表在线；旧版本无新协议、失败或 TTL 到期均隐藏，
-// 但不删除地址簿中的候选，供后台下一轮重试。已信任及本机自身始终过滤。
-func (c *Client) NearbyList() []peersdb.Nearby {
-	if c.peers == nil || (c.rootCtx != nil && c.rootCtx.Err() != nil) {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	list, err := c.peers.ListNearby(ctx)
-	if err != nil {
-		c.logf("读取附近列表失败: %v", err)
-		return nil
-	}
-	trusted, err := c.peers.TrustedIDs(ctx)
-	if err != nil {
-		c.logf("读取信任列表失败（附近列表暂不展示）: %v", err)
-		return nil
-	}
-	idx, ierr := c.peers.NameIndex(ctx)
-	if ierr != nil {
-		c.logf("读取本地名称索引失败（附近列表将只显示设备自报名）: %v", ierr)
-	}
-	c.nearbyMu.Lock()
-	defer c.nearbyMu.Unlock()
-	out := make([]peersdb.Nearby, 0, len(list))
-	for _, n := range list {
-		if n.PeerID == c.peerID || trusted[n.PeerID] {
-			continue
-		}
-		state, ok := c.nearbyLive[n.PeerID]
-		if !ok || !time.Now().Before(state.expires) {
-			continue
-		}
-		// 名称只来自本轮成功探测；历史数据库名称不能伪装成设备自报。
-		n.Name = state.name
-		n.Notes = idx[n.PeerID].Notes
-		out = append(out, n)
-	}
-	return out
-}
-
-// dropSelfNearby 剔除附近列表里指向本机自己的条目（保留原顺序）。
-func dropSelfNearby(list []peersdb.Nearby, selfPeerID string) []peersdb.Nearby {
-	if selfPeerID == "" {
-		return list
-	}
-	out := list[:0]
-	for _, n := range list {
-		if n.PeerID == selfPeerID {
-			continue
-		}
-		out = append(out, n)
-	}
-	return out
-}
-
-// ReconnectPeer 向「附近」列表中的节点重新申请连接（好友被删除后的恢复
-// 入口）。优先用附近记录里缓存的地址直接拨号（免查 DHT、秒发申请），
-// 没有地址则退回纯 ID 查找路径。
-//
-// 结果语义（复用 ConnectPeer 主链路）：
-//   - 已连通 → Connected；
-//   - 对方未审批 → Pending（它的待审批列表会出现本机）；
-//   - 对方墓碑生效（它删过本机）→ 首次申请送达「删除告知」后回 Pending +
-//     明确提示；再次申请即进入对方待审批列表，对方同意即恢复（删除不是
-//     拉黑；本机侧的同步移除已由协议层 OnUnfriendReceived 完成）。
-func (c *Client) ReconnectPeer(ctx context.Context, peerID string) (*ConnResult, error) {
-	peerID = strings.TrimSpace(peerID)
-	addr := peerID
-	if c.peers != nil && !strings.Contains(peerID, "/p2p/") {
-		dbCtx, dbCancel := context.WithTimeout(ctx, 3*time.Second)
-		list, _ := c.peers.ListNearby(dbCtx)
-		dbCancel()
-		for _, n := range list {
-			if n.PeerID != peerID {
-				continue
-			}
-			for _, a := range n.Addrs {
-				full := a
-				if !strings.Contains(full, "/p2p/") {
-					full = strings.TrimSuffix(full, "/") + "/p2p/" + peerID
-				}
-				if m, err := ma.NewMultiaddr(full); err == nil {
-					if _, err := peer.AddrInfoFromP2pAddr(m); err == nil {
-						addr = full
-						break
-					}
-				}
-			}
-			break
-		}
-	}
-	return c.ConnectPeer(ctx, addr)
 }
 
 // ---- 辅助 ----

@@ -268,7 +268,10 @@ namespace Lanet.Sdk
         /// <summary>重新拉取待审批列表。</summary>
         public LanetPendingInfo[] Pending() => LanetAndroidNode.Pending();
 
-        /// <summary>重新拉取附近节点列表。</summary>
+        /// <summary>
+        /// 已废弃：「附近在线节点」功能自 0.5.109 起整体删除，恒返回空数组。
+        /// </summary>
+        [System.Obsolete("附近节点功能已删除，请改用 ConnectPeer / Pending")]
         public LanetNearbyInfo[] Nearby() => LanetAndroidNode.Nearby();
 
         private LanetNodeOptions BuildNodeOptions() => new LanetNodeOptions

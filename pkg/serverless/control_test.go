@@ -22,7 +22,6 @@ func controlTestDiscovery(t *testing.T, h host.Host, key string, cfg Config) *Di
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Discovery{host: h, cfg: cfg, groupKey: GroupKey("", key), serviceCtx: ctx, serviceCancel: cancel, members: make(map[string]*Member), unfriendedAt: make(map[string]time.Time)}
 	d.pexLast = make(map[string]time.Time)
-	d.nearbySeen = make(map[string]time.Time)
 	d.protoControl = lproto.GroupProtoID("control", d.groupKey)
 	d.protoInfo = lproto.GroupProtoID(lproto.BaseInfo, d.groupKey)
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())

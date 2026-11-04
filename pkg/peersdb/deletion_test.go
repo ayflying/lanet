@@ -55,10 +55,6 @@ func TestPersistentDeletionBlocksPassiveWrites(t *testing.T) {
 	} else if pending[0].PeerID != id {
 		t.Fatalf("pending peer: %s", pending[0].PeerID)
 	}
-	// Nearby visibility is only a manual re-add affordance, not authorization.
-	if err := db.UpsertNearby(ctx, Nearby{PeerID: id}); err != nil {
-		t.Fatal(err)
-	}
 	if err := db.ClearUnfriended(ctx, id); err != nil {
 		t.Fatal(err)
 	}

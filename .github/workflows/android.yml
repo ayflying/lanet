@@ -1,0 +1,426 @@
+# =================================================================================
+# Lanet 安卓发行包 CI：现场用 gomobile 编出 Go 核心 AAR，再打成可直接安装的 APK。
+#
+# 触发：push 到 main（只关心会影响 APK 的路径）+ v* tag + 手动 workflow_dispatch。
+# 版本号：根目录 VERSION（唯一真相源，如 0.5.108）→ versionName=0.5.108、
+#        versionCode=50108（映射规则见 sdk/android/app/build.gradle.kts 顶部注释）。
+# 产物：lanet-{版本}-android.apk（+ .sha256），上传 artifact 交给 release.yml 挂到
+#       同一个 GitHub Release（tag v{版本}），并并入 sha256sums.txt。
+#
+# 为什么是独立 workflow 而不是 release.yml 里的一个矩阵行：
+#   1. 运行环境完全不同（Java 17 + Android SDK + NDK），塞进 3 行的 Go 交叉编译矩阵
+#      会让每个 runner 都白装一套 Android 工具链；GitHub 按 job 计费，独立 job 更省。
+#   2. 失败定位：矩阵里某一行挂了，日志被 matrix 名字包起来；独立 workflow 的
+#      job/step 命名能一眼看出死在 gomobile / NDK / gradle 哪一段。
+#   3. 可复用性：用 workflow_call 暴露给 release.yml，两边共用一份构建逻辑，
+#      避免「发行包里的 APK 和单独跑出来的 APK 不一致」这类漂移。
+#   ⚠️ 不把 Android 构建直接写进 release.yml 的 needs 链，理由见 android-build job 注释。
+# =================================================================================
+
+name: android
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # 只有这些路径的变更才可能影响 APK。刻意不用 "**.go"（全仓库 Go 变更都触发），
+      # 否则每次改 pkg/ 都要跑 20 分钟的 Android 构建；而 sdk/go/mobile 与 sdk/go/lanet
+      # 是 APK 里真正被编进去的代码，单独列出。
+      - "sdk/go/mobile/**"
+      - "sdk/go/lanet/**"
+      - "sdk/android/**"
+      - "pkg/**"
+      - "go.mod"
+      - "go.sum"
+      - "VERSION"
+      - ".github/workflows/android.yml"
+    tags: ["v*"]
+  workflow_dispatch:
+  # 供 release.yml 复用：release 的发布 job 直接 needs 这个 workflow，共享同一份构建。
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  # ---------- 工具链版本：全部钉死，避免「上游 latest 一升级，CI 突然红」 ----------
+  # NDK 用 r27（27.x LTS）。gomobile bind 只要求 NDK r23+，但 r27 是 AGP 8.6 官方
+  # 支持矩阵里的长期版本，且它是第一批默认 16KB page size 对齐的 NDK——Play 从 2025
+  # 开始要求 .so 支持 16KB 页，提前对齐能省掉一次全量返工。
+  # 注意：这里必须与 Gradle 里 AGP 8.6.1 认的 NDK 版本保持一致，否则 AGP 会尝试
+  # 自己下载另一个版本（CI 里会多花几分钟，且可能因许可未接受而失败）。
+  ANDROID_NDK_VERSION: "27.2.12479018"
+  # platform 35 / build-tools 35.0.0 与 sdk/android/app/build.gradle.kts 的
+  # compileSdk=35、targetSdk=35 对齐；build-tools 顺带提供 apksigner / zipalign。
+  ANDROID_PLATFORM: "android-35"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  # gomobile 版本钉死：gomobile bind 的输出（Java 包名、AAR 布局）随版本有差异，
+  # 本地实测的是 v0.0.0-20260908204917-8b95e45f8d3e 这一版（与 sdk/go/mobile/go.mod
+  # 里声明的 golang.org/x/mobile 同源）。装 @latest 会在上游改动时静默换掉编译器。
+  GOMOBILE_VERSION: "v0.0.0-20260908204917-8b95e45f8d3e"
+
+jobs:
+  # ===============================================================================
+  # 构建任务：把「Go 核心 → AAR → APK」整条链路跑通，产出 APK + sha256。
+  #
+  # ⚠️ 为什么这里不写 needs: stability（release.yml 里别的 job 都等它）：
+  #   1. stability 会跑 ubuntu+windows 两个 runner 的完整测试（含 -race 与两分钟的
+  #      中继传输回归），把 Android 构建挂到它后面等于每次改一行 Go 都先等 10 分钟；
+  #   2. APK 是「附属产物」，构建本身不验证正确性——正确性由 release.yml 的
+  #      stability 关卡把关，APK 能编出来就说明工具链没坏，这个信号独立且便宜；
+  #   3. 反过来，让 Android 构建成为 release 的前置会放大偶发失败面（Android SDK
+  #      下载/证书问题与业务代码无关，却会卡住整个发行）。
+  #   结论：本 workflow 独立跑，release.yml 只在发布时用 needs 等它，不额外加稳定性前置。
+  # ===============================================================================
+  build:
+    name: 构建 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Go 版本必须读 sdk/go/mobile/go.mod（独立模块，声明 go 1.26.0），
+      # 不是仓库根的 go.mod（go 1.25.7）。gomobile bind 在 sdk/go/mobile 目录里跑，
+      # 用根 go.mod 会装出偏低的 Go，遇到 go 1.26 的语法直接失败。
+      - name: Set up Go（读 sdk/go/mobile/go.mod 的版本）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sdk/go/mobile/go.mod
+          cache-dependency-path: sdk/go/mobile/go.sum
+
+      - name: 打印版本号（VERSION → versionName/versionCode）
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          # VERSION 文件可能带 CRLF（Windows 上编辑过），tr 一并清掉空白与回车。
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if ! [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::VERSION 内容不是三段式数字（实际：'$VERSION'），APK 的 versionCode 无法派生"
+            exit 1
+          fi
+          MAJOR="${BASH_REMATCH[1]}"
+          MINOR="${BASH_REMATCH[2]}"
+          PATCH="${BASH_REMATCH[3]}"
+          # 与 sdk/android/app/build.gradle.kts 的 versionCodeOf() 必须逐字一致：
+          #   versionCode = major*1000000 + minor*10000 + patch
+          # 两处都算一遍是刻意的防漂移：下面的「校验」步骤会比对 Gradle 实际产出的
+          # 版本号与这里推导的一致，任何一边改规则都会当场红。
+          VERSION_CODE=$(( MAJOR * 1000000 + MINOR * 10000 + PATCH ))
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION（versionCode=$VERSION_CODE）" >> "$GITHUB_STEP_SUMMARY"
+          echo "VERSION=$VERSION versionCode=$VERSION_CODE"
+
+      - name: Set up JDK 17（AGP 8.6 要求 JDK 17，gomobile 最后一步也要 javac）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # 官方 setup-android：负责装 cmdline-tools、写入 ANDROID_HOME 并接受许可。
+      # 不用「手动 curl sdkmanager」是因为许可交互在 CI 里最容易卡死（y 交互式提问）。
+      - name: Set up Android SDK（cmdline-tools）
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 platform 35 / build-tools / NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --sdk_root 显式给，避免 setup-android 与 AGP 对 SDK 根目录理解不一致。
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --install \
+            "$ANDROID_PLATFORM" \
+            "platform-tools" \
+            "build-tools;$ANDROID_BUILD_TOOLS" \
+            "ndk;$ANDROID_NDK_VERSION"
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses > /dev/null
+          # gomobile 读 ANDROID_NDK_HOME（老变量名），AGP 读 ndk.dir/本地 SDK 布局。
+          # 两者都导到 GITHUB_ENV，后续所有步骤共用。
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+
+      # 缓存 gomobile 编译的 C 中间产物。
+      # gomobile bind 每次都会把 Go 运行时 + 依赖（libp2p/wireguard/sqlite）重新编一遍，
+      # 即使有 Go build cache 也要几分钟；把 GOMODCACHE + GOCACHE 一起缓存能省掉
+      # 大部分「下载 + 首次编译」。key 里带 Go 版本和 gomobile 版本：
+      # 任一升级都必须重新编，否则会拿到不匹配的 .a 文件（表现为链接期符号错误）。
+      - name: 缓存 Go / gomobile 构建产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: gomobile-${{ runner.os }}-${{ env.GOMOBILE_VERSION }}-${{ hashFiles('sdk/go/mobile/go.sum', '**/*.go') }}
+          restore-keys: |
+            gomobile-${{ runner.os }}-${{ env.GOMOBILE_VERSION }}-
+            gomobile-${{ runner.os }}-
+
+      # Gradle 缓存由官方 setup-gradle 负责（它同时处理 ~/.gradle/caches、
+      # configuration-cache 与 dependency verification 元数据）。用它的原因是
+      # 手写 actions/cache 很容易漏掉 ~/.gradle/wrapper 与 caches/jars-9 这类
+      # 版本敏感目录，缓存命中率反而更低。
+      - name: Set up Gradle（8.11.1，与 build.gradle.kts 对齐）
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # 显式指定版本：仓库里没有 gradle wrapper（见下方「生成 wrapper」步骤，
+          # 现状是刻意不加），所以 setup-gradle 只提供 gradle 可执行文件。
+          gradle-version: "8.11.1"
+          # 缓存 key 带上版本号，避免 Gradle 小版本升级后读到不兼容的缓存目录。
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: 安装 gomobile 并初始化
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install golang.org/x/mobile/cmd/gomobile@"$GOMOBILE_VERSION"
+          go install golang.org/x/mobile/cmd/gobind@"$GOMOBILE_VERSION"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          # gomobile init 会编译 Android 目标所需的 runtime 包并写入 $GOPATH/pkg，
+          # 必须显式调用一次，否则 bind 时会报 "gomobile: cannot find ..."。
+          # 它在没有 ANDROID_NDK_HOME 的机器上也能跑（只编 Go 部分），但先导出更稳。
+          "$(go env GOPATH)/bin/gomobile" init
+
+      - name: gomobile bind（Go 核心 → lanet.aar）
+        shell: bash
+        # 工作目录必须是 sdk/go/mobile：它是独立 go module（module
+        # github.com/ayflying/pvn/sdk/go/mobile，replace 回仓库根），在仓库根跑 bind
+        # 会把整个 pvn 主模块当成绑定目标，直接报错。
+        working-directory: sdk/go/mobile
+        run: |
+          set -euo pipefail
+          # 参数逐字抄 sdk/go/mobile/node.go 包注释里实测过的那一行，四个坑：
+          #   1. -androidapi 21：gomobile 默认 16，现代 NDK 的 meta/platforms.json
+          #      下限是 21，不显式给会报 "unsupported API version 16"；
+          #      21 同时与 app/build.gradle.kts 的 minSdk=21 对齐。
+          #   2. -javapkg=com.lanet：它是「前缀 + Go 包名」，得到 com.lanet.mobile
+          #      （Kotlin 侧 import com.lanet.mobile.Node）；写成 com.lanet.mobile
+          #      会得到 com.lanet.mobile.mobile，Kotlin 立刻编译不过。
+          #   3. -ldflags 里的 -checklinkname=0：Go 1.23+ 的 linkname 校验会拦下
+          #      libp2p 依赖的 github.com/wlynxg/anet（invalid reference to net.zoneCache）。
+          #   4. -s -w 瘦身：单架构 22MB→13MB，双架构 26MB；APK 体积直接受益。
+          # android/amd64 不能省：MuMu/AVD 模拟器是 x86_64，只出 arm64 装不上。
+          gomobile bind \
+            -target=android/arm64,android/amd64 \
+            -androidapi 21 \
+            -javapkg=com.lanet \
+            -ldflags="-checklinkname=0 -s -w" \
+            -o lanet.aar .
+          ls -lh lanet.aar
+          # 产物拷到宿主工程的 libs/（该文件在 .gitignore 里忽略，构建前必须现编）。
+          mkdir -p ../android/app/libs
+          cp lanet.aar ../android/app/libs/lanet.aar
+          ls -lh ../android/app/libs/lanet.aar
+
+      # 签名判断只能靠 env 中转：GitHub Actions 的 if: 条件里**不允许** secrets 上下文，
+      # 写成 `if: secrets.ANDROID_KEYSTORE_BASE64 != ''` 会让整个 workflow 校验失败、
+      # 0 job 启动即红（release.yml 的「Sign binary」步骤注释里已经踩过这个坑）。
+      # 所以统一：env 把 Secret 注入成环境变量 → 步骤内用 shell 判断 → 输出到
+      # $GITHUB_OUTPUT → 后续步骤用 steps.signing.outputs.* 走正常的 if。
+      - name: 判断是否有 release 签名配置
+        id: signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # 四项必须齐全才走 release 签名：半套配置（比如只配了 base64 忘了密码）
+          # 会让 apksigner 在最后一步失败，浪费 20 分钟构建，不如提前降级到 debug。
+          missing=()
+          [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]   || missing+=("ANDROID_KEYSTORE_BASE64")
+          [ -n "${ANDROID_KEYSTORE_PASSWORD:-}" ] || missing+=("ANDROID_KEYSTORE_PASSWORD")
+          [ -n "${ANDROID_KEY_ALIAS:-}" ]         || missing+=("ANDROID_KEY_ALIAS")
+          [ -n "${ANDROID_KEY_PASSWORD:-}" ]      || missing+=("ANDROID_KEY_PASSWORD")
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 检测到完整 release 签名配置，将产出 **release 签名** APK。" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "signed=false" >> "$GITHUB_OUTPUT"
+          echo "未配置的签名 Secret：${missing[*]}" >> "$GITHUB_STEP_SUMMARY"
+          echo "⚠️ 未检测到完整 release 签名配置（缺：${missing[*]}），本次产出 **debug 签名** APK。" >> "$GITHUB_STEP_SUMMARY"
+          # 注意：这里**不能** exit 1。缺 Secret 是完全合法的降级路径，只是产物
+          # 证书不同；用户要的是「CI 能自动出 APK」，配签名是可选增强。
+          {
+            echo "### ⚠️ 本次 APK 为 debug 签名"
+            echo ""
+            echo "缺少 Secret：${missing[*]}。"
+            echo "debug 签名包可以直接安装，但证书是公开的 debug 证书（任何持有同款"
+            echo "debug.keystore 的人都能对同名包覆盖安装），只适合验证与内测。"
+            echo "配置签名的方式见 docs/android-release.md。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 还原 release keystore（仅签名配置齐全时）
+        if: steps.signing.outputs.signed == 'true'
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          # 落地到 runner 临时目录而非工作区：工作区会被 upload-artifact 扫到，
+          # 万一后续 steps 的 path 写宽了，密钥文件就有泄露风险。
+          KEYSTORE_PATH="$RUNNER_TEMP/lanet-release.keystore"
+          # base64 解码用 -d（GNU coreutils，ubuntu-latest 上可用）；
+          # 参数化 Secret 里常见换行，-d 默认会跳过换行，无需额外处理。
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_PATH"
+          chmod 600 "$KEYSTORE_PATH"
+          # 用 keytool 先验一遍（别名/密码错在这里就红，比等 apksigner 快得多）。
+          ANDROID_KEY_ALIAS="${{ secrets.ANDROID_KEY_ALIAS }}" \
+          ANDROID_KEYSTORE_PASSWORD="${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
+          keytool -list -keystore "$KEYSTORE_PATH" \
+            -alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
+            -storepass "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" > /dev/null
+          echo "ANDROID_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+          echo "keystore 校验通过（alias=${{ secrets.ANDROID_KEY_ALIAS }}）"
+
+      # 生成 gradle wrapper。
+      # 现状：sdk/android 没有 gradle wrapper（仓库作者刻意没提交 wrapper jar，
+      # 2MB 二进制 + 与 AGP 版本的隐性耦合）。CI 里用 gradle/actions/setup-gradle
+      # 提供 gradle 8.11.1 后，`gradle wrapper` 会按当前版本生成一套 wrapper 文件；
+      # 这么做的收益是后续所有步骤都能用 ./gradlew（与本地文档一致），
+      # 代价是每次 CI 多一条命令（几秒）。备选方案是全程直接用 `gradle` 命令，
+      # 但那样本地与 CI 命令不一致，文档要多写一套，容易踩「本地 gradlew 与 CI gradle
+      # 版本不同」的坑——所以选择生成 wrapper。
+      - name: 生成 gradle wrapper（仓库未提交 wrapper）
+        working-directory: sdk/android
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --gradle-version 显式对齐 build.gradle.kts 注释里的 8.11.1；
+          # --no-daemon 避免在 CI 里残留守护进程。
+          gradle wrapper --gradle-version 8.11.1 --distribution-type bin --no-daemon
+          ls -la gradlew gradle/wrapper/
+          chmod +x gradlew
+
+      - name: 编译 APK
+        id: assemble
+        working-directory: sdk/android
+        shell: bash
+        env:
+          # Gradle 里通过 System.getenv 读这四个变量决定签名方式（见 app/build.gradle.kts）。
+          # 未配置时为空，Gradle 自动回退到 debug 签名。
+          ANDROID_KEYSTORE_PATH: ${{ env.ANDROID_KEYSTORE_PATH }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          TASK="assembleDebug"
+          OUT_DIR="app/build/outputs/apk/debug"
+          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+            TASK="assembleRelease"
+            OUT_DIR="app/build/outputs/apk/release"
+          fi
+          # --no-daemon：CI 单次构建，守护进程只会拖慢收尾；
+          # --stacktrace：失败时给出 Gradle 内部调用栈，便于区分「AGP 配置错」与「编译错」。
+          ./gradlew --no-daemon --stacktrace clean "$TASK"
+          # clean 是必须的：增量打包复用旧条目布局时 zip 里会出现空洞
+          # （ZipFlinger 残影，APK 体积虚高），见 sdk/android/README.md 第二节。
+          echo "out_dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
+          ls -lh "$OUT_DIR"
+
+      # 校验 Gradle 实际打出来的 versionName/versionCode 与 VERSION 推导值一致。
+      # 这一步防的是「VERSION 改了但 APK 还在用旧版本号」这类静默漂移：
+      # 用 aapt2 dump badging 读 APK 里的真值，而不是相信 build.gradle.kts 的意图。
+      - name: 校验 APK 的 versionName / versionCode
+        shell: bash
+        env:
+          OUT_DIR: ${{ steps.assemble.outputs.out_dir }}
+        run: |
+          set -euo pipefail
+          APK="$(find "sdk/android/$OUT_DIR" -maxdepth 1 -name '*.apk' | head -1)"
+          if [ -z "$APK" ]; then
+            echo "::error::在 sdk/android/$OUT_DIR 下没找到 APK"
+            exit 1
+          fi
+          AAPT2="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/aapt2"
+          BADGING="$("$AAPT2" dump badging "$APK" | head -1)"
+          echo "$BADGING"
+          GOT_NAME="$(sed -n "s/.*versionName='\([^']*\)'.*/\1/p" <<< "$BADGING")"
+          GOT_CODE="$(sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" <<< "$BADGING")"
+          if [ "$GOT_NAME" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::error::APK versionName=$GOT_NAME 与 VERSION=${{ steps.ver.outputs.version }} 不一致"
+            exit 1
+          fi
+          if [ "$GOT_CODE" != "${{ steps.ver.outputs.version_code }}" ]; then
+            echo "::error::APK versionCode=$GOT_CODE 与推导值 ${{ steps.ver.outputs.version_code }} 不一致（两处映射规则可能不同步）"
+            exit 1
+          fi
+          echo "✅ APK 版本号校验通过：versionName=$GOT_NAME versionCode=$GOT_CODE"
+
+      # 用 apksigner 独立验证签名，并把证书指纹写进 Summary。
+      # 这一步的价值：debug 签名与 release 签名在构建日志里长得一样，
+      # 只有证书指纹能说明「这份包到底是哪一种」，用户下载前就能看到。
+      - name: 验证签名并记录证书指纹
+        shell: bash
+        env:
+          OUT_DIR: ${{ steps.assemble.outputs.out_dir }}
+        run: |
+          set -euo pipefail
+          APK="$(find "sdk/android/$OUT_DIR" -maxdepth 1 -name '*.apk' | head -1)"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
+          "$APKSIGNER" verify --print-certs "$APK" | tee apk-certs.txt
+          {
+            echo "### APK 签名信息"
+            echo ""
+            echo '```'
+            cat apk-certs.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 产物统一命名成发行包的样子：lanet-{版本}-android.apk。
+      # 命名必须与 docs/ 里写的、release.yml 的 glob（dist/lanet-*.apk）一致，
+      # 否则 APK 会「构建成功但没挂上 Release」，这是最容易漏的一环。
+      - name: 重命名为发行包名并生成 sha256
+        shell: bash
+        env:
+          OUT_DIR: ${{ steps.assemble.outputs.out_dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          APK="$(find "sdk/android/$OUT_DIR" -maxdepth 1 -name '*.apk' | head -1)"
+          OUT="dist/lanet-${{ steps.ver.outputs.version }}-android.apk"
+          cp "$APK" "$OUT"
+          # sha256 的格式与 release.yml 里别的平台完全一致（"<hash>  <文件名>"），
+          # release job 用 cat *.sha256 > sha256sums.txt 直接拼，无需特判。
+          ( cd dist && sha256sum "lanet-${{ steps.ver.outputs.version }}-android.apk" > "lanet-${{ steps.ver.outputs.version }}-android.apk.sha256" )
+          ls -lh dist/
+          cat dist/*.sha256
+
+      # artifact 名字用 lanet-apk / lanet-apk-sha256（带 lanet- 前缀）。
+      # ⚠️ 前缀与 release.yml 的下载步骤必须**成对维护**：
+      #   release.yml 的「Download all archives」用 pattern: lanet-* 只抓三个平台的
+      #   压缩包 matrix artifact；APK 的两个 artifact 也用 lanet- 开头，但 release.yml
+      #   是**按名字精确下载**（name: lanet-apk），因此不会漏、也不会重复。
+      #   **限制**：如果以后有人图省事把 release.yml 的写死名字改回 pattern: lanet-*，
+      #   APK 就会被下载两遍（一份来自精确下载、一份来自 pattern），sha256sums.txt
+      #   里出现重复行。改动这两处时请一起看。
+      - name: 上传 APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanet-apk
+          path: dist/lanet-*-android.apk
+          retention-days: 30
+
+      # sha256 单独一个 artifact：只为了「只需要校验和」的场景不必连带拉 30MB 的
+      # APK 本体（例如把 sha256 同步到别处的镜像仓库）。release.yml 里它会被
+      # 精确下载一次并与三个平台的 .sha256 合并。
+      - name: 上传 sha256 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanet-apk-sha256
+          path: dist/*.sha256
+          retention-days: 30
+
+      - name: 清理 keystore（无论成败）
+        if: always()
+        shell: bash
+        run: |
+          # runner 是一次性的，但仍显式删除：万一将来换成 self-hosted runner，
+          # $RUNNER_TEMP 不会自动清空，密钥留在磁盘上就是长期隐患。
+          rm -f "$RUNNER_TEMP/lanet-release.keystore" || true

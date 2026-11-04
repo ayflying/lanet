@@ -150,7 +150,7 @@ function pollingHarness(fetchImpl) {
     h.elements.set(id, { textContent: '', innerHTML: '', style: {} });
   }
   // Only unrelated panels are stubbed; network renderers and PUTs remain real.
-  for (const name of ['renderMembers', 'renderConnect', 'renderSeed', 'renderPublicDHT', 'renderNearby']) h.context[name] = () => {};
+  for (const name of ['renderMembers', 'renderConnect', 'renderSeed', 'renderPublicDHT']) h.context[name] = () => {};
   const start = html.indexOf('async function fetchState(');
   const end = html.indexOf('// ----', start);
   assert.ok(start >= 0 && end > start, 'extract actual fetchState through the next section marker');

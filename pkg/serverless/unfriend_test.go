@@ -292,9 +292,9 @@ func TestUnfriendTwoPhaseReapply(t *testing.T) {
 	}
 }
 
-// TestNearbyReportOnPassiveDiscover 被动发现未信任节点时应触发
-// OnSeenUntrusted 上报（附近列表的来源），且不进成员表。
-// 同时断言**不得**产生待审批：被动发现 ≠ 对方申请连接。
+// TestNearbyReportOnPassiveDiscover 被动发现未信任节点时既不进成员表、也不
+// 产生待审批（被动发现 ≠ 对方申请连接），且不再上报任何「附近」数据——附近
+// 功能已删除，未信任节点对界面完全不可见。
 func TestNearbyReportOnPassiveDiscover(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -303,7 +303,6 @@ func TestNearbyReportOnPassiveDiscover(t *testing.T) {
 	hb := testHost(t, false)
 
 	var mu sync.Mutex
-	var seen []string
 	var pending []string
 	da, err := New(ctx, ha, Config{
 		NetworkKey: "grp-nearby",
@@ -312,11 +311,6 @@ func TestNearbyReportOnPassiveDiscover(t *testing.T) {
 		OnPending: func(peerID string, _ []string, _ string) {
 			mu.Lock()
 			pending = append(pending, peerID)
-			mu.Unlock()
-		},
-		OnSeenUntrusted: func(peerID string, _ []string, _ string) {
-			mu.Lock()
-			seen = append(seen, peerID)
 			mu.Unlock()
 		},
 	})
@@ -329,21 +323,9 @@ func TestNearbyReportOnPassiveDiscover(t *testing.T) {
 	// 直接走发现路径：A 收到 B 的 provider 记录（addMember 未信任分支）。
 	da.addMember(hb.ID(), hb.Addrs(), "dht-private")
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		mu.Lock()
-		n := len(seen)
-		mu.Unlock()
-		if n > 0 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	time.Sleep(500 * time.Millisecond)
 	mu.Lock()
 	defer mu.Unlock()
-	if len(seen) == 0 || seen[0] != hb.ID().String() {
-		t.Fatalf("被动发现未信任节点应上报附近，实际 %v", seen)
-	}
 	if len(pending) != 0 {
 		t.Fatalf("被动发现不得上报待审批（发现≠申请），实际 %v", pending)
 	}
@@ -353,9 +335,9 @@ func TestNearbyReportOnPassiveDiscover(t *testing.T) {
 }
 
 // TestPassiveDiscoverRepeatedStaysQuiet 被动发现是周期性的：同一节点被反复
-// 发现（DHT 每轮 provider 查询）时，既不该重复堆「附近」，更不该每次刷一条
-// 假的「连接申请」——这正是 0.5.40 及以前控制台待审批被刷屏、日志每轮
-// 一条「收到陌生节点…的连接申请」的成因。
+// 发现（DHT 每轮 provider 查询）时，不得每次刷一条假的「连接申请」——这正是
+// 0.5.40 及以前控制台待审批被刷屏、日志每轮一条「收到陌生节点…的连接申请」
+// 的成因。附近上报删除后，重复发现同样必须保持完全静默。
 func TestPassiveDiscoverRepeatedStaysQuiet(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -364,18 +346,13 @@ func TestPassiveDiscoverRepeatedStaysQuiet(t *testing.T) {
 	hb := testHost(t, false)
 
 	var mu sync.Mutex
-	var pendingCount, nearbyCount int
+	var pendingCount int
 	da, err := New(ctx, ha, Config{
 		NetworkKey: "grp-nearby-rep",
 		IsTrusted:  func(string) bool { return false },
 		OnPending: func(string, []string, string) {
 			mu.Lock()
 			pendingCount++
-			mu.Unlock()
-		},
-		OnSeenUntrusted: func(string, []string, string) {
-			mu.Lock()
-			nearbyCount++
 			mu.Unlock()
 		},
 	})
@@ -394,9 +371,6 @@ func TestPassiveDiscoverRepeatedStaysQuiet(t *testing.T) {
 	defer mu.Unlock()
 	if pendingCount != 0 {
 		t.Fatalf("重复被动发现不得产生任何待审批，实际 %d 条", pendingCount)
-	}
-	if nearbyCount == 0 {
-		t.Fatalf("重复被动发现仍应上报附近（至少一次）")
 	}
 }
 

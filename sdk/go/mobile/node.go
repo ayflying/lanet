@@ -298,26 +298,15 @@ func (n *Node) Peers() string {
 	return toJSON(out)
 }
 
-// Nearby 附近节点（发现到但未经互信的节点，JSON 数组）。可用于 UI 的
-// "发现新设备"列表——用户从这里发起添加。
+// Nearby 已废弃：「附近在线节点」功能已整体删除，本方法恒返回空 JSON 数组 "[]"。
+//
+// 保留方法只为不改动已发布的 AAR / JNI 绑定签名（Delphi/Android 侧调用不会
+// 因为缺方法而崩溃）；调用方应改为 connect(地址/连接码) 主动添加，或在
+// pending() 里处理对方的连接申请。
+//
+// Deprecated: 附近节点功能已删除，请改用 Connect / Pending。
 func (n *Node) Nearby() string {
-	c := n.current()
-	if c == nil {
-		return "[]"
-	}
-	list := c.NearbyList()
-	out := make([]map[string]any, 0, len(list))
-	for _, p := range list {
-		out = append(out, map[string]any{
-			"peer_id":    p.PeerID,
-			"name":       p.Name,
-			"addrs":      p.Addrs,
-			"source":     p.Source,
-			"first_seen": p.FirstSeen.Format("2006-01-02 15:04:05"),
-			"last_seen":  p.LastSeen.Format("2006-01-02 15:04:05"),
-		})
-	}
-	return toJSON(out)
+	return "[]"
 }
 
 // Approve 同意（approve=true）或拒绝某节点的连接申请。

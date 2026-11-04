@@ -2,6 +2,7 @@ package peersdb
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -71,32 +72,16 @@ func TestSeedExplicitVersionWatermark(t *testing.T) {
 	}
 }
 
-func TestHasPeersAndNearbyObservation(t *testing.T) {
+// TestHasPeersReflectsApproval 地址簿是否「非空」只看 peers 表；审批状态
+// 变化必须即时反映（附近观察表已随功能删除，不再参与判定）。
+func TestHasPeersReflectsApproval(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
 	if yes, err := d.HasPeers(ctx, false); err != nil || yes {
 		t.Fatalf("空库: %v %v", yes, err)
 	}
-	n := Nearby{PeerID: "nearby", Name: "设备", Addrs: []string{"/ip4/1.1.1.1/tcp/4001"}}
-	if err := d.UpsertNearby(ctx, n); err != nil {
-		t.Fatal(err)
-	}
-	var before, after int
-	if err := d.db.QueryRow(`SELECT total_changes()`).Scan(&before); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 100; i++ {
-		if err := d.UpsertNearby(ctx, n); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := d.db.QueryRow(`SELECT total_changes()`).Scan(&after); err != nil {
-		t.Fatal(err)
-	}
-	if after != before {
-		t.Fatalf("附近重复观察产生 %d 次写入", after-before)
-	}
-	if err := d.UpsertPeer(ctx, Peer{PeerID: n.PeerID}, nil); err != nil {
+	const id = "peer-1"
+	if err := d.UpsertPeer(ctx, Peer{PeerID: id}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if yes, err := d.HasPeers(ctx, false); err != nil || !yes {
@@ -105,19 +90,58 @@ func TestHasPeersAndNearbyObservation(t *testing.T) {
 	if yes, err := d.HasPeers(ctx, true); err != nil || yes {
 		t.Fatalf("未审批: %v %v", yes, err)
 	}
-	if err := d.SetTrusted(ctx, n.PeerID, true); err != nil {
+	if err := d.SetTrusted(ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
 	if yes, err := d.HasPeers(ctx, true); err != nil || !yes {
 		t.Fatalf("审批必须即时: %v %v", yes, err)
 	}
-	if err := d.UpsertNearby(ctx, n); err != nil {
+}
+
+// TestLegacyNearbyTableIsClearedOnOpen 旧库升级平滑性：历史版本留下的
+// nearby 观察行在打开库时被幂等清空，且清理不影响其他表；重复打开不报错。
+func TestLegacyNearbyTableIsClearedOnOpen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	d, err := Open(ctx, path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	list, err := d.ListNearby(ctx)
-	if err != nil || len(list) != 0 {
-		t.Fatalf("好友不能再入附近: %+v %v", list, err)
+	// 直接写历史表，模拟旧版本留下的存量行（新版本已无 Nearby 写入入口）。
+	if _, err := d.db.ExecContext(ctx,
+		`INSERT INTO nearby (peer_id, name, addrs, source) VALUES ('old-peer', '旧设备', '', 'dht-private')`); err != nil {
+		t.Fatalf("写入历史 nearby 行失败（表结构必须仍然存在）: %v", err)
 	}
+	if err := d.UpsertPeer(ctx, Peer{PeerID: "friend-1"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d2, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("老库必须仍然能打开: %v", err)
+	}
+	defer d2.Close()
+	var n int
+	if err := d2.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM nearby`).Scan(&n); err != nil {
+		t.Fatalf("nearby 表结构应保留: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("打开库应清空历史 nearby 行，实际残留 %d 条", n)
+	}
+	if p, err := d2.GetPeer(ctx, "friend-1"); err != nil || p == nil {
+		t.Fatalf("清理不得影响地址簿: %+v %v", p, err)
+	}
+	// 幂等：再次打开依然正常。
+	if err := d2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d3, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("重复打开失败: %v", err)
+	}
+	_ = d3.Close()
 }
 
 // TestSeedScopeIsolation 两个范围的种子必须物理隔离：写一边，另一边看不到。

@@ -30,9 +30,8 @@ func TestDeletedPeerExplicitRequestAutoAccept(t *testing.T) {
 				if err := c.RemovePeer(id); err != nil {
 					t.Fatal(err)
 				}
-				c.onSeenUntrusted(id, nil, "dht-private")
 				c.onPendingRequest(id, nil, "")
-				// 被动发现、待审批记录与普通地址簿写入都不能恢复墓碑。
+				// 待审批记录与普通地址簿写入都不能恢复墓碑。
 				for _, trusted := range []bool{false, true} {
 					if c.rememberPeer(id, nil, "passive", trusted) {
 						t.Fatal("passive remember restored deleted peer")

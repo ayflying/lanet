@@ -2,10 +2,17 @@ package main
 
 // p2pupdate.go P2P 自更新接线：
 //   - 容器环境自动禁用（容器内替换二进制会被镜像回滚，更新走编排层）；
-//   - 候选来源 = 成员表 ∪ 私有 DHT 路由表 ∪「附近」观察表，覆盖**整个 lanet
-//     私有 DHT 网络**——不同网络密钥、没加过好友、甚至只是被 DHT 路由过的
-//     节点都算，发现更高版本即征询；
+//   - 候选来源 = 成员表 ∪ 私有 DHT 路由表，覆盖**整个 lanet 私有 DHT 网络**
+//     ——不同网络密钥、没加过好友、甚至只是被 DHT 路由过的节点都算，发现更高
+//     版本即征询；
 //   - 验签通过后 P2P 下载，由本文件完成自替换与随机抖动重启。
+//
+// 关于「附近」：0.5.109 起「附近在线节点」功能整体删除（协议、观察表、控制台
+// 卡片、SDK 探测状态机全部移除），候选来源因此从三类收敛为两类。新语义是：
+// 同一网络密钥下的节点在 **P2P 层自动连接**用于控制同步（互相通知组件成员与
+// 地址线索、PEX 种子交换、更新分发），但**不参与用户路由**——不可 ping、
+// 不可访问端口、不进成员列表。也就是说「自动连上」与「能不能用」被彻底分开了：
+// 连接不再等价于成员授权，所以不再需要一个「附近列表」把未审批节点暴露给用户。
 //
 // 信任链：CI 私钥签名（GitHub Secrets）→ 节点内置公钥验签 → sha256 下载
 // 校验。验签通过即可信（1 票制），GitHub 仅是发版与首种子来源。
@@ -85,15 +92,21 @@ func updateInFlight() bool {
 
 // netmapPeers 把「本机能看到的 lanet 节点」适配为 selfupdate.PeerSource。
 //
-// 三个来源合并（按 PeerID 去重）：
-//  1. 成员表：已建连的同群节点，带版本与平台 —— 巡检可纯本地比较，零开销；
+// 两个来源合并（按 PeerID 去重）：
+//  1. 成员表：已审批的同群节点，带版本与平台 —— 巡检可纯本地比较，零开销；
 //  2. 私有 DHT 路由表：整个 lanet DHT 网络的节点（含不同网络密钥、未加好友
-//     的），只有 ID，版本靠征询清单获取；
-//  3. 「附近」观察表：被动发现到的同群节点（不建连、不进成员表），也只有 ID。
+//     的），只有 ID，版本靠征询清单获取。
 //
 // 2 是主力来源：用户要的是「P2P 更新不一定需要在自己的网络密钥下面，是整个
-// DHT 网络，发现新版本就更新」。被动发现不建连（trustPolicyPassive），所以
-// 只盯成员表永远覆盖不到未加好友的节点。
+// DHT 网络，发现新版本就更新」。只盯成员表永远覆盖不到未加好友的节点。
+//
+// 为什么删掉「附近」观察表这一来源不会漏掉「同群但未审批」的节点：
+// 私有 DHT 前缀是按群组密钥派生的（GroupProtoID），同群节点共用同一张私有
+// DHT 路由网，路由表只由 DHT 协议本身维护（本文件不做信任过滤），所以只要
+// 双方在同一网络密钥下并参与私有 DHT，未审批节点同样会出现在
+// DHTRoutingPeers() 里 —— 它们不需要成为成员就能被当成更新候选。
+// 这也是「P2P 自动连接 ≠ 成员授权」在新语义下的直接体现：能互相发现、
+// 能互相征询更新，但拿不到虚拟 IP、不能 ping、进不了成员表。
 type netmapPeers struct{ c *lanet.Client }
 
 func (n netmapPeers) Peers() []selfupdate.PeerInfo {
@@ -111,9 +124,6 @@ func (n netmapPeers) Peers() []selfupdate.PeerInfo {
 	}
 	for _, id := range n.c.DHTRoutingPeers() {
 		add(selfupdate.PeerInfo{ID: id})
-	}
-	for _, nb := range n.c.NearbyList() {
-		add(selfupdate.PeerInfo{ID: nb.PeerID})
 	}
 	return out
 }
@@ -143,7 +153,7 @@ func StartP2PUpdate(ctx context.Context, c *lanet.Client, version string, exeDir
 		ExePath:        exePath,
 		ManifestPath:   filepath.Join(exeDir, "update-manifest.json"),
 		// 巡检节奏：「发现新版本立即升级」——启动 30 秒后先比一轮版本，
-		// 之后每 5 分钟一轮。候选来自内存视图（成员表/路由表/附近表），
+		// 之后每 5 分钟一轮。候选来自内存视图（成员表/路由表），
 		// 真正的网络开销只在向「版本未知」的候选征询时发生（一轮最多 3 个）。
 		InitialDelay:  30 * time.Second,
 		CheckInterval: 5 * time.Minute,

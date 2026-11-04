@@ -163,7 +163,7 @@ type Config struct {
 	// LegacyProtocols 迁移兼容开关（仅 Standalone 模式生效，0.5.34 起）：
 	// 0.5.34 起控制面协议（成员信息交换、删除好友通知、P2P 更新分发、
 	// 私有 DHT、探测回显）的协议 ID 按群组密钥派生——不知道网络密钥的
-	// 节点连协议都协商不上，跨群噪音（陌生握手、附近列表污染、公网扫描器
+	// 节点连协议都协商不上，跨群噪音（陌生握手、伪装待审批、公网扫描器
 	// 拉取二进制）在传输层归零。置 true 退回历史固定协议 ID，用于与
 	// 「未升级的老版本对端」重新互通（出向已自带固定 ID 兜底，一般无需开启）。
 	LegacyProtocols bool
@@ -340,11 +340,6 @@ type Client struct {
 	// Close 只关闭底层并发安全的 sql.DB；保留句柄让迟到访问返回关闭错误，
 	// 不能置 nil，否则既产生数据竞争，也会误走「未启用地址簿」的放行路径。
 	peers *peersdb.DB // Standalone 且 DBPath != "-" 时非 nil
-
-	nearbyMu   sync.Mutex
-	nearbyLive map[string]nearbyProbeState
-	nearbyWake chan struct{}
-	nearbyWG   sync.WaitGroup
 }
 
 // Info 节点入网后的身份信息。
@@ -513,7 +508,6 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 			IsUnfriended:           c.isUnfriendedPeer,
 			IsUnfriendedNotified:   c.isUnfriendedNotifiedPeer,
 			MarkUnfriendedNotified: c.markUnfriendedNotifiedPeer,
-			OnSeenUntrusted:        c.onSeenUntrusted,
 			OnUnfriendReceived:     c.onUnfriendReceived,
 		})
 		if err == nil {
@@ -595,9 +589,6 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 	// 5. 内置 Web 控制台。
 	if err = c.startConsole(); err != nil {
 		return nil, err
-	}
-	if c.peers != nil && c.disc != nil {
-		c.startNearbyProbes()
 	}
 	close(c.ready)
 	return c, nil
@@ -1302,10 +1293,6 @@ func (c *Client) Close() error {
 		if c.cancel != nil {
 			c.cancel()
 		}
-		c.nearbyWG.Wait()
-		c.nearbyMu.Lock()
-		c.nearbyLive = nil
-		c.nearbyMu.Unlock()
 		// 2. TUN 虚拟网卡。
 		c.tunMu.Lock()
 		if c.tunDevice != nil {

@@ -150,6 +150,18 @@ func (c *controlState) snapshot(now time.Time) []peer.AddrInfo {
 // ControlPeers returns only fresh, directly challenge-verified peers, not hints.
 func (d *Discovery) ControlPeers() []peer.AddrInfo { return d.control.snapshot(time.Now()) }
 
+// queueControl 为「同群但未审批」的节点排队一次控制协作握手（无需用户点任何按钮）。
+//
+// 边界（重要，改这里之前先读完）：
+//   - P2P 连接 ≠ 业务成员。未审批节点照样会被拨号、握手、交换控制线索（成员摘要、
+//     中继/地址线索、PEX、种子交换、更新分发都走这条链路），这正是「同一网络密钥
+//     下的主机自动互相认识、网络自我完善」的实现；
+//   - 但它**不是**可访问主机：连接审批（pending/approve）管的是「能不能被当成成员
+//     访问」——虚拟 IP 路由、隧道、端口转发、成员表可见性、ping，全部由审批门
+//     之后才解锁。未审批节点既不进 members 表，也拿不到虚拟地址；
+//   - 证明只证明「持有群密钥」，绝不等于好友、待审批、中继授权或可发起业务握手的授权。
+//     因此这里刻意不共享 members 的锁，也不调用任何 OnPending 回调。
+//
 // queueControl reserves capacity before spawning: no goroutine queue, no approval
 // callbacks. Hint-driven followups cannot recursively fan out into more probes.
 func (d *Discovery) queueControl(ai peer.AddrInfo) { d.queueControlMode(ai, true) }

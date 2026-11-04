@@ -20,6 +20,10 @@ sdk/android/
 └── dist/                           构建产物输出，已忽略
 ```
 
+> **CI 出包 / 签名 / 版本号规则**：见 [`docs/android-release.md`](../../docs/android-release.md)。
+> 本文件讲的是「本地怎么编、怎么装、怎么验证」；那份文档讲的是「CI 怎么自动出 APK、
+> 怎么从 debug 签名切到 release 签名」。
+
 ## 一、先编译 AAR
 
 ```bash
@@ -36,6 +40,10 @@ cp lanet.aar ../android/app/libs/lanet.aar
 
 **x86_64 目标不能省**：MuMu / AVD 等模拟器是 x86_64，只出 arm64 的 AAR 在模拟器上装不上。
 
+> CI 里这条命令由 `.github/workflows/android.yml` 自动执行（`working-directory: sdk/go/mobile`，
+> 参数逐字相同）。**发行用的 Android 安装包不需要你本地构建**——push 到 `main` 就会在
+> GitHub Release 上出现 `lanet-{版本}-android.apk`。细节见 [`docs/android-release.md`](../../docs/android-release.md)。
+
 ## 二、编译 APK
 
 ```bash
@@ -43,6 +51,22 @@ cd sdk/android
 gradle clean assembleDebug          # 或直接用 Android Studio 打开本目录
 # 产物：app/build/outputs/apk/debug/app-debug.apk（双架构约 29MB）
 ```
+
+版本号（`versionName`/`versionCode`）从**仓库根 `VERSION`** 派生，不再是硬编码的 `0.1.0`：
+`VERSION` 为 `0.5.108` 时得到 `versionName=0.5.108`、`versionCode=50108`
+（映射规则 `major*1000000 + minor*10000 + patch`，详见
+[`docs/android-release.md`](../../docs/android-release.md) 第二节）。要显式指定：
+
+```bash
+gradle clean assembleDebug -PversionName=0.5.108 -PversionCode=50108
+```
+
+签名：**默认走 debug 签名**（AGP 用公开的 `debug.keystore`，能直接安装，但任何持有同款
+debug 证书的人都可覆盖安装——只适合验证与内测）。配齐 `ANDROID_KEYSTORE_PATH` /
+`ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD` 四个环境变量后，
+`app/build.gradle.kts` 会自动创建 release 签名配置，`assembleRelease` 即出正式签名包；
+CI 里对应 4 个同名 Secret，配齐就自动改走 `assembleRelease`。完整步骤见
+[`docs/android-release.md`](../../docs/android-release.md) 第三节。
 
 无 cmd.exe 的环境（如受限沙箱）里 `gradle.bat` 跑不起来，可直接调 Gradle 主类：
 
@@ -90,7 +114,8 @@ adb shell am start -n com.lanet.demo/.MainActivity \
 ## 四、验证清单
 
 UI 里「刷新状态 / 成员」按钮下方会打出状态区（虚拟 IP、网络组、**入向防火墙**、虚拟网卡
-是否已接管、成员/待审批/已信任/附近列表）。整页可滚动，状态区在下方，别以为没显示。
+是否已接管、成员/待审批/已信任列表）。整页可滚动，状态区在下方，别以为没显示。
+（「附近列表」已在 0.5.109 随功能删除；`nearby()` 接口保留但恒返回 `[]`。）
 
 ```bash
 # 手机 → 群内成员（应 0% 丢包）
@@ -109,6 +134,12 @@ ping -n 4 10.7.144.45
 ```
 
 ## 五、已知限制（实测踩过的坑）
+
+0. **发行包默认是 debug 签名**。CI（`.github/workflows/android.yml`）在没有配置签名 Secret 时
+   产出 debug 签名 APK：装得上、能跑通，但证书是公开的 `debug.keystore`，**任何持有同款
+   debug 证书的人都能做出覆盖安装你这份包的 APK**，不适合正式分发。切到 release 签名的
+   4 个 Secret 与操作步骤见 [`docs/android-release.md`](../../docs/android-release.md)。
+   另外：debug 包与 release 包**不能互相覆盖安装**，切换前要 `adb uninstall com.lanet.demo`。
 
 1. **Android 把 uid 2000（adb shell）排除在 VPN 之外**（日志里 `Uids: {1-1999, 2001-99999}`）。
    用 `adb shell` 起的监听进程**无法被群内访问**——它的回包不走 tun0。要验证「手机当服务端」，

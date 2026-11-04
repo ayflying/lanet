@@ -161,7 +161,14 @@ object LanetNode {
     @JvmStatic
     fun peers(): String = LanetCore.peers().toString()
 
-    /** 附近节点（JSON 数组）：发现到但未互信，可用于「发现新设备」列表。 */
+    /**
+     * 已废弃（JSON 数组）：0.5.109 起「附近在线节点」功能整体删除，恒返回 "[]"。
+     *
+     * 保留方法只为不破坏既有 ABI / JNI 绑定（Delphi、Unity、uniapp 侧调用不会因缺方法
+     * 而崩溃）。要添加设备请用 [connect]（连接码 / 节点 ID），本机是被申请方时
+     * 在 [pending] 里审批。
+     */
+    @Deprecated("附近节点功能已删除，请改用 connect() / pending()")
     @JvmStatic
     fun nearby(): String = LanetCore.nearby().toString()
 

@@ -106,7 +106,7 @@ public class Net : MonoBehaviour
 | `StartNode(options = null)` / `StopNode()` | 链路 2 启动/停止（参数为 null 时用 Inspector 取值） |
 | `ConnectPeer(address)` | 主动连接：裸 PeerID / 连接码 `lanet://…` / multiaddr |
 | `ApprovePeer(peerId, approve)` / `RemovePeer(peerId)` | 审批 / 移除成员 |
-| `Members()` / `Pending()` / `Nearby()` | 拉成员表 / 待审批 / 附近节点 |
+| `Members()` / `Pending()` | 拉成员表 / 待审批 |
 | `IsGatewayConnected` / `IsNodeRunning` / `NodeStatus` / `InviteCode` | 状态读取 |
 | 事件 `OnGatewayConnected` / `OnGatewayClosed` / `OnGatewayError` / `OnInboundStream` / `OnNodeStateChanged` / `OnNodeMessage` | **全部在主线程触发**，可直接碰 Unity API |
 
@@ -117,8 +117,12 @@ public class Net : MonoBehaviour
 ### `LanetAndroidNode`（静态门面，Android 专用）
 
 `Start(opt)` / `Stop()` / `IsRunning()` / `Status()` / `Members()` / `Pending()` /
-`Peers()` / `Nearby()` / `SeedAddrs()` / `InviteCode()` / `LastError()` / `Version()` /
+`Peers()` / `SeedAddrs()` / `InviteCode()` / `LastError()` / `Version()` /
 `Connect(addr)` / `Approve(id, bool)` / `Remove(id)`。
+
+> `Nearby()` 自 0.5.109 起已废弃（「附近在线节点」功能整体删除），签名保留只为
+> 不破坏既有 JNI 绑定，恒返回 `"[]"`。要添加设备请用 `Connect(连接码/节点 ID)`，
+> 本机是被申请方时在 `Pending()` 里审批。
 
 非 Android 平台或 AAR 缺失时：`IsSupported` / `IsAvailable` 为 false，所有调用返回
 安全默认值并把原因写进 `LastError()`，**不会抛异常**——所以可以放心在跨平台代码里调用。
@@ -164,7 +168,7 @@ public class Net : MonoBehaviour
 | `原生层未初始化：LanetInitProvider 未生效` | AAR 的 manifest 没被合并（多半是 AAR 放错位置，或用了 `.jar` 而不是 `.aar`） |
 | 启动返回 `awaiting_permission` 但一直不 running | 用户在系统弹窗点了拒绝；或应用没有可用的前台服务权限。查 `LastError()` |
 | 网关连上但 `RequestAsync` 超时 | 目标端口在对方节点没监听（链路是通的，服务不在）。先用 HTTP 头打一个已知服务验证 |
-| 成员列表为空但能看到「附近节点」 | 正常：附近是单方发现，成为**成员**需要双方互相审批。用 `ConnectPeer` 主动连一次触发审批 |
+| 成员列表为空但 `Peers()` 非空 | 正常：成员需要双方互相审批。用 `ConnectPeer` 主动连一次触发审批；未审批的同群节点会自动参与控制协作，但不会出现在成员表里（也拿不到虚拟 IP） |
 | 编辑器里一切正常、真机崩在 `CallStatic` | 门面方法签名对不上。跑 `build.py` 看 javap 校验是否报缺方法（漏 `@JvmStatic` 或被 R8 裁掉） |
 | `UnityException: … can only be called from the main thread` | 见「已知限制 3」 |
 

@@ -33,6 +33,16 @@ sdk/android/app/build/
 sdk/android/local.properties
 sdk/android/app/libs/*.aar
 sdk/android/dist/
+# Android 签名私钥及其 base64 编码：绝不入库（CI 用 GitHub Secret 注入，
+# 落地位置是 runner 的 $RUNNER_TEMP，不在工作区）。.jks/.keystore 可能放在任意目录，
+# 这里一律忽略，防止手滑把 release 证书提交上去。
+sdk/android/*.jks
+sdk/android/*.keystore
+sdk/android/*.jks.b64
+sdk/android/*.keystore.b64
+# ⚠️ gradlew / gradlew.bat / gradle/wrapper/ **不要**加进忽略列表：
+# 仓库当前不提交 wrapper，CI 每次用 `gradle wrapper` 现场生成；但本地若生成过，
+# 提交它能让本地与 CI 用同一套 Gradle 版本（见 docs/android-release.md）。
 sdk/android-plugin/**/build/
 sdk/android-plugin/**/.gradle/
 sdk/android-plugin/plugin/local.properties

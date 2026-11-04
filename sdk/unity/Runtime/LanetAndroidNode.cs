@@ -126,7 +126,11 @@ namespace Lanet.Sdk
         public static LanetPeerInfo[] Peers()
             => LanetJson.ParseArray<LanetPeerInfo>(CallString("peers"));
 
-        /// <summary>附近节点（发现到但未互信）。</summary>
+        /// <summary>
+        /// 已废弃：「附近在线节点」功能自 0.5.109 起整体删除，本方法恒返回空数组。
+        /// 要添加设备请用 <see cref="Connect"/>；本机是被申请方时在 <see cref="Pending"/> 里审批。
+        /// </summary>
+        [System.Obsolete("附近节点功能已删除，请改用 Connect() / Pending()")]
         public static LanetNearbyInfo[] Nearby()
             => LanetJson.ParseArray<LanetNearbyInfo>(CallString("nearby"));
 

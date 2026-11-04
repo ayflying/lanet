@@ -99,7 +99,12 @@ namespace Lanet.Sdk
         public string last_ip;
     }
 
-    /// <summary>附近节点一项（发现到但未互信，可用于「发现新设备」列表）。</summary>
+    /// <summary>
+    /// 已废弃（0.5.109 起「附近在线节点」功能整体删除）。保留类型只为兼容既有
+    /// 反序列化调用，<see cref="LanetAndroidNode.Nearby"/> 现在恒返回空数组。
+    /// 要添加设备请用 <c>Connect(连接码/节点 ID)</c>；本机是被申请方时用
+    /// <c>Pending()</c> 审批。
+    /// </summary>
     [Serializable]
     public class LanetNearbyInfo
     {

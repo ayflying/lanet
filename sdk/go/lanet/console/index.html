@@ -90,7 +90,7 @@
   .msg { font-size:12px; margin-top:8px; min-height:18px; }
   .msg.ok { color:var(--ok); } .msg.bad { color:var(--bad); }
   .empty { color:var(--muted); font-size:13px; }
-  /* 附近 / 待审批：一行一个节点的卡片式列表。
+  /* 待审批：一行一个节点的卡片式列表。
      ⚠️ 这组类必须有定义：早期版本只写 class="listitem" 却没给样式，
      于是这些行是裸 div（连 align-items 都因为没有 flex 容器而失效），
      长 PeerID 直接把行撑成两截，是「列表不好看」的根因。 */
@@ -117,7 +117,7 @@
      删除 del 是 2px 6px + 13px 字），靠 padding 撑出来的高度能差 10px，
      同一行高矮不齐。这里显式钉死 height 并统一字号与水平内边距，
      删除按钮只保留「无底色 + 红字」这一点视觉差异。
-     表格操作列与附近/待审批卡片列表共用同一套尺寸。 */
+     表格操作列与待审批卡片列表共用同一套尺寸。 */
   td button, td button.mdetail, td button.del,
   .listitem .li-acts button {
     height:28px; padding:0 12px; font-size:12.5px; line-height:1; white-space:nowrap;
@@ -209,7 +209,7 @@
   </div>
 </div>
 
-<!-- 备注弹框（给成员 / 附近节点起一个本机可读的别名） -->
+<!-- 备注弹框（给成员 / 待审批节点起一个本机可读的别名） -->
 <div class="overlay" id="notesOverlay" style="display:none" onclick="if(event.target===this)closeNotes()">
   <div class="modal" style="max-width:460px">
     <h2>设置备注</h2>
@@ -283,12 +283,6 @@
         <div class="sub" style="color:#8a94a6">家庭宽带公网地址变化后旧种子会失效，需重新复制分享。</div>
       </div>
     </details>
-  </div>
-  <div class="card" id="nearbyCard" style="display:none">
-    <h2>附近在线节点 <span class="tag unknown" id="nearbyBadge">0</span></h2>
-    <div class="sub" style="margin-bottom:8px">仅展示近期已确认在线、尚未互相信任的节点；仅被网络发现并不代表在线。点「申请连接」向对方发起好友申请（对方同意后双向连通）；被删除过的好友重新上线后也可在这里申请连接。</div>
-    <div id="nearbyList"></div>
-    <div class="msg" id="nearbyMsg" style="display:none"></div>
   </div>
   <div class="card">
     <h2>成员与链路 <button class="ghost" style="float:right;font-size:12px;padding:2px 10px" onclick="openInfoModal()">本机信息</button></h2>
@@ -573,11 +567,11 @@ async function fetchState(signal) {
   // 防御旧版后端/异常响应返回 null：任何列表字段缺失都兜底为空数组，
   // 保证 loadState 不中断（一处抛错会让后面的 renderConnect 全部失效）。
   S.rules = S.rules || []; S.forwards = S.forwards || [];
-  S.members = S.members || []; S.pending = S.pending || []; S.nearby = S.nearby || [];
+  S.members = S.members || []; S.pending = S.pending || [];
   $('bRules').textContent = S.rules.length;
   $('bForwards').textContent = S.forwards.length;
   if (!networkRulesBusy) { renderRules(); renderForwards(); }
-  renderConnect(); renderSeed(); renderPublicDHT(); renderNearby();
+  renderConnect(); renderSeed(); renderPublicDHT();
 }
 
 // ---- 连接其他节点（统一入口：节点 ID 或完整地址，自动识别） ----
@@ -695,79 +689,6 @@ function renderConnect() {
 // selfPeerID 本机节点 ID（列表渲染统一用它排除「自己」）。
 function selfPeerID() { return (S && S.info && S.info.peer_id) || ''; }
 
-// renderNearby 渲染后端确认在线的未信任节点，提供双向审批的连接入口。
-function renderNearby() {
-  const card = $('nearbyCard');
-  if (!S) { card.style.display = 'none'; return; }
-  const standalone = (S.info && (S.info.group_id === 'standalone' || String(S.info.group || '').startsWith('standalone-')));
-  if (!standalone) { card.style.display = 'none'; return; }
-  // 在线状态由后端探测确认；这里仅防御本机、已信任成员及重复行。
-  const selfID = selfPeerID();
-  const friendIDs = new Set((S.members || []).map(m => m.peer_id));
-  const seen = new Set();
-  const rows = (S.nearby || []).filter(n => {
-    if (!n.peer_id || n.peer_id === selfID) return false;
-    if (friendIDs.has(n.peer_id)) return false;
-    if (seen.has(n.peer_id)) return false;
-    seen.add(n.peer_id);
-    return true;
-  });
-  $('nearbyBadge').textContent = rows.length;
-  card.style.display = '';
-  if (!rows.length) {
-    $('nearbyList').innerHTML = '<div class="empty" style="margin:8px 0">附近暂无已确认在线的未信任节点</div>';
-    return;
-  }
-  $('nearbyList').innerHTML = rows.map(n => {
-    const pid = esc(n.peer_id);
-    const name = n.name ? String(n.name).trim() : '';
-    const notes = n.notes ? String(n.notes).trim() : '';
-    const nm = `<b>${esc(name || '设备名未提供')}</b>`;
-    const note = notes ? `&nbsp;<span class="li-pid">备注：${esc(notes)}</span>` : '';
-    // 申请后进入的是「对方」的待审批列表（本机看不到对方审批状态），
-    // 故这里始终提供按钮，重复点击幂等（后端去重，不会刷屏）。
-    return `<div class="listitem">
-      ${listAvatar(name)}
-      <div class="li-main">
-        <div class="li-name">${nm}${note}<span class="li-pid" title="点击复制完整节点 ID：${pid}"
-             onclick="copyText('${pid}', this)">${esc(shortPeerID(n.peer_id))}</span></div>
-        <div class="li-meta">已确认在线 · 未信任</div>
-      </div>
-      <div class="li-acts">
-        <button class="ghost" onclick="openNotesModal('${pid}')">备注</button>
-        <button class="ghost" onclick="reconnectNearby('${pid}', this)">申请连接</button>
-      </div>
-    </div>`;
-  }).join('');
-}
-
-// reconnectNearby 从附近列表向某节点发起连接申请。
-async function reconnectNearby(peerID, btn) {
-  if (btn) btn.disabled = true;
-  flash('nearbyMsg', '正在向对方发起连接申请…', true);
-  try {
-    const r = await fetch('/api/nearby', { method: 'POST',
-      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ peer_id: peerID }) });
-    const res = await r.json().catch(() => ({}));
-    if (!r.ok) { flash('nearbyMsg', '申请失败：' + (res.error || ''), false); return; }
-    if (res.pending) {
-      flash('nearbyMsg', res.message || '已提交连接申请，等待对方同意', true);
-    } else if (res.searching) {
-      flash('nearbyMsg', res.message || '已记录，正在查找对方地址，查到后自动连接…', true);
-    } else {
-      const _ni = findPeerDisplay(peerID);
-      const _nwho = _ni.notes || _ni.name || res.name;
-      flash('nearbyMsg', (res.already_member ? '该设备已在成员列表中，无需重复添加 · ' : '') +
-        (_nwho ? '已连接「' + esc(_nwho) + '」' : '已连接') + (res.virtual_ip ? '（虚拟 IP ' + res.virtual_ip + '）' : ''), true);
-    }
-    loadState();
-  } catch (e) {
-    flash('nearbyMsg', '操作失败：' + e, false);
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-}
-
 // ---- 删除好友（双向，居中确认） ----
 let _confirmAction = null;
 function askConfirm(title, body, action) {
@@ -781,11 +702,11 @@ function closeConfirm() { $('confirmOverlay').style.display = 'none'; _confirmAc
 
 // ---- 备注（本机给设备起别名，离线也认得出谁是谁） ----
 let _notesPeerID = '';
-// findPeerDisplay 在成员 / 附近 / 待审批三张列表里查某个节点的展示信息。
+// findPeerDisplay 在成员 / 待审批两张列表里查某个节点的展示信息。
 // 备注弹框只需要 peer_id 就能打开，要显示的名字在这里现查——避免把用户备注
 // 塞进 HTML 属性（那要处理引号转义，容易出错）。
 function findPeerDisplay(peerID) {
-  const pools = [(S && S.members) || [], (S && S.nearby) || [], (S && S.pending) || []];
+  const pools = [(S && S.members) || [], (S && S.pending) || []];
   for (const pool of pools) {
     const hit = pool.find(x => x.peer_id === peerID);
     if (hit) return hit;
@@ -852,7 +773,7 @@ function removeFriend(peerID, name) {
     `确定删除 ${label} 吗？<br><br>` +
     `<b>这是双向删除</b>：对方在线会立即收到通知并把它那边的本机也删除；` +
     `若对方当前离线，下次它连接本机时会自动同步删除。` +
-    `删除后如果还能发现对方，它会回到双方的「附近」列表，可重新申请连接。`,
+    `删除后对方若想重新加入，需要你再次同意它的连接申请（或由你重新粘贴它的连接码添加）。`,
     async () => {
       const r = await fetch('/api/peers', { method: 'POST',
         headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ peer_id: peerID }) });

@@ -241,10 +241,6 @@ type Config struct {
 	// ClearUnfriended 保留用于源码兼容；发现服务不再自动消费删除墓碑。
 	// 删除仅由用户显式重新添加/批准解除，防止 auto_accept 复活。
 	ClearUnfriended func(peerID string)
-	// OnSeenUntrusted 被动发现「未被信任」的同群节点时回调（DHT/mDNS
-	// provider 记录），由上层持久化到「附近」列表并在控制台展示。
-	// 只报公开可发现信息（节点 ID + 地址），无身份泄漏。可能被并发调用。
-	OnSeenUntrusted func(peerID string, addrs []string, source string)
 	// OnUnfriendReceived 删除好友关系被确认时回调，两种触发路径：
 	//   1) 收到对端在线时的 unfriend 协议推送（对端主动删除了本机）；
 	//   2) 本机出向握手收到 rejection=unfriended（对端早已删除本机、此前离线）。
@@ -359,14 +355,12 @@ type Discovery struct {
 
 	// protoInfo / protoUnfriend 控制面协议 ID（0.5.34 起按群密钥派生）。
 	// LegacyProtocols 开启时退回历史固定常量 ProtocolInfo / ProtocolUnfriend。
-	// 派生 ID 让异群节点 multistream 协商即失败：无效握手、待审批/附近污染、
+	// 派生 ID 让异群节点 multistream 协商即失败：无效握手、待审批污染、
 	// 探测流量在传输层就被挡掉（详见 pkg/protocol 包注释）。
 	protoInfo     libprotocol.ID
 	protoUnfriend libprotocol.ID
-	protoNearby   libprotocol.ID
 	protoControl  libprotocol.ID
 	control       controlState
-	nearbyGate    nearbyRateLimiter
 	// protoInfoAlt / protoUnfriendAlt 历史固定协议 ID（派生模式下非空）：
 	// 同群新老版本混跑过渡用——出向建流时作为候选兜底（对端只认固定 ID
 	// 时仍能握手成功），入向也注册同一 handler（跨群伪造不了载荷里的群
@@ -379,6 +373,10 @@ type Discovery struct {
 	mu             sync.RWMutex
 	members        map[string]*Member // peerID -> member
 	expiredMembers memberQuarantine   // 回收成员须真实握手后才能重新发布
+	// vaddrs 同群虚拟 IPv4 占用表（PeerID ↔ 虚拟 IP），保证本群内地址唯一。
+	// 与 members 同受 mu 保护，且**每次成员表写入/删除后都必须调用
+	// claimVirtualIPsLocked** 做全量同步（见 vaddr_conflict.go 锁纪律）。
+	vaddrs *virtualIPTable
 
 	// unfriendedAt 复活防护表：近期收到删除好友通知（unfriend / Forget）
 	// 的节点 -> 通知处理时间。与 members 同受 mu 保护，读写必须在同一
@@ -391,9 +389,6 @@ type Discovery struct {
 	publicStartedAt    time.Time // 公共 DHT 开启时刻（剩余时长展示用）
 
 	trigger chan struct{} // 立即触发一轮发现（用户手动添加节点后不等周期）
-
-	nearbySeenMu sync.Mutex           // 附近上报去抖（独立锁，不与 members 混用）
-	nearbySeen   map[string]time.Time // peerID -> 上次上报时间
 
 	advFailMu sync.Mutex // DHT 广播失败日志降噪计数（独立锁）
 
@@ -485,7 +480,6 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		members:      make(map[string]*Member),
 		unfriendedAt: make(map[string]time.Time),
 		trigger:      make(chan struct{}, 1),
-		nearbySeen:   make(map[string]time.Time),
 	}
 	d.serviceCtx, d.serviceCancel = context.WithCancel(ctx)
 	cooldown := 120 * time.Second
@@ -518,8 +512,13 @@ func New(ctx context.Context, h host.Host, cfg Config) (*Discovery, error) {
 		// 与「群内种子表 / 全域种子表物理隔离」在协议层一一对应。
 		d.protoSeedsGroup = lproto.GroupProtoID(lproto.BaseSeeds, d.groupKey)
 	}
-	d.protoNearby = lproto.GroupProtoID("nearby-name", d.groupKey)
 	d.protoControl = lproto.GroupProtoID("control", d.groupKey)
+	// 占用表初始化必须早于 selfIP：本机地址也要参与冲突裁决。
+	d.mu.Lock()
+	if d.vaddrs == nil {
+		d.vaddrs = newVirtualIPTable()
+	}
+	d.mu.Unlock()
 	d.selfIP = DeriveVirtualIP(d.groupKey, h.ID().String())
 	d.selfIPv6 = DeriveVirtualIPv6(d.groupKey, h.ID().String())
 
@@ -655,7 +654,6 @@ func (d *Discovery) Start(ctx context.Context) error {
 	if d.serviceCtx != nil && d.serviceCtx.Err() != nil {
 		return d.serviceCtx.Err()
 	}
-	d.host.SetStreamHandler(d.protoNearby, d.handleNearby)
 	d.host.SetStreamHandler(d.protoControl, d.handleControl)
 	d.host.SetStreamHandler(d.protoInfo, d.gateControl("info", d.handleInfo))
 	d.host.SetStreamHandler(d.protoUnfriend, d.gateControl("unfriend", d.handleUnfriend))
@@ -976,12 +974,16 @@ func (d *Discovery) Reconnect(ctx context.Context, ai peer.AddrInfo) (string, er
 	}
 	if _, ok := d.members[ai.ID.String()]; !ok {
 		d.members[ai.ID.String()] = &Member{
-			PeerID: ai.ID.String(), VirtualIP: DeriveVirtualIP(d.groupKey, ai.ID.String()),
+			PeerID: ai.ID.String(), VirtualIP: d.alignedVirtualIP(ai.ID.String()),
 			VirtualIPv6: DeriveVirtualIPv6(d.groupKey, ai.ID.String()), Source: "warmup",
 			Addrs: toStrings(addrs), FirstSeen: time.Now(), LastDiscovered: time.Now(),
 		}
+		updated := d.claimVirtualIPsLocked()
+		d.mu.Unlock()
+		d.logVirtualIPConflicts(updated)
+	} else {
+		d.mu.Unlock()
 	}
-	d.mu.Unlock()
 	return ai.ID.String(), d.identifyExplicit(ctx, ai.ID)
 }
 
@@ -1007,15 +1009,19 @@ func (d *Discovery) RequestConnect(ctx context.Context, ai peer.AddrInfo) (strin
 	if _, ok := d.members[ai.ID.String()]; !ok {
 		d.members[ai.ID.String()] = &Member{
 			PeerID:         ai.ID.String(),
-			VirtualIP:      DeriveVirtualIP(d.groupKey, ai.ID.String()),
+			VirtualIP:      d.alignedVirtualIP(ai.ID.String()),
 			VirtualIPv6:    DeriveVirtualIPv6(d.groupKey, ai.ID.String()),
 			Source:         "manual",
 			Addrs:          toStrings(addrs),
 			FirstSeen:      time.Now(),
 			LastDiscovered: time.Now(),
 		}
+		updated := d.claimVirtualIPsLocked()
+		d.mu.Unlock()
+		d.logVirtualIPConflicts(updated)
+	} else {
+		d.mu.Unlock()
 	}
-	d.mu.Unlock()
 	if err := d.identifyExplicit(context.WithValue(ctx, connectRequestKey{}, true), ai.ID); err != nil {
 		return ai.ID.String(), err
 	}
@@ -1113,7 +1119,10 @@ func (d *Discovery) reapExpired() {
 			delete(d.members, id)
 		}
 	}
+	// 成员离开成员表 → 其虚拟 IP 占用必须立即释放，否则后来者会被迫改派。
+	updated := d.claimVirtualIPsLocked()
 	d.mu.Unlock()
+	d.logVirtualIPConflicts(updated)
 	if len(removed) > 0 && !d.cfg.Quiet {
 		names := make([]string, 0, len(removed))
 		for _, m := range removed {
@@ -1331,9 +1340,9 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) (
 		d.logf("清理节点 %s 的 %d 条不可达地址（回环/链路本地/circuit）", id.ShortString(), n)
 	}
 
-	// 审批门：陌生节点不进成员表、不建连（完全隔离）。
-	// 但发现到的地址仍写入 peerstore —— 地址本身不是权限，连接与否由审批门
-	// 决定；缓存地址的收益是「用户输入对方节点 ID 时能立刻查到地址」，
+	// 审批门：陌生节点不进成员表、不能作为业务成员被访问（路由完全隔离）。
+	// 但发现到的地址仍写入 peerstore —— 地址本身不是权限，能不能被当成成员
+	// 访问由审批门决定；缓存地址的收益是「用户输入对方节点 ID 时能立刻查到地址」，
 	// 不必等下一轮发现。这里**不**上报待审批：被动发现只是「知道有这个人」，
 	// 不代表对方申请连接，记入待审批只会让列表被同网段无关节点刷屏。
 	// 真正的申请由入向握手（handleInfo）或用户主动添加（RequestConnect）产生。
@@ -1347,9 +1356,13 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) (
 		if len(addrs) > 0 {
 			d.host.Peerstore().AddAddrs(id, addrs, time.Hour)
 		}
-		// 同群可见但未信任 → 上报「附近」列表（上层持久化后在控制台展示，
-		// 用户可一键申请连接）。被动发现不建连、不泄漏身份，语义不变。
-		d.reportNearby(id, addrs, source)
+		// 同群可见但未信任 → 不进成员表、界面上也不出现（「附近在线节点」已删除）。
+		//
+		// 边界（P2P 连接 ≠ 业务成员）：这里仍然排队一次组证明协作，
+		// 未审批的同群节点照样会自动建立 libp2p 连接、交换控制线索（成员摘要 /
+		// 地址线索 / PEX / 种子交换 / 更新分发），不需要用户点任何按钮。
+		// 审批门管的是「能不能被当成成员访问」：虚拟 IP 路由、隧道、端口转发、
+		// 成员表可见性与 ping 都在下面的 trusted 分支之后才解锁。
 		// 同组控制协作不等于成员授权：只在独立证明协议中交换连接线索。
 		d.queueControl(peer.AddrInfo{ID: id, Addrs: addrs})
 		return
@@ -1362,7 +1375,7 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) (
 	if !ok {
 		if d.unfriendGuardBlocked(id.String()) {
 			d.mu.Unlock()
-			return // 刚被删除好友的节点，迟到的发现记录不复活成员、也不上报附近
+			return // 刚被删除好友的节点，迟到的发现记录不复活成员
 		}
 		if d.expiredMembers.requiresHandshake(id.String()) {
 			d.mu.Unlock()
@@ -1376,22 +1389,30 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) (
 		inserted = true
 		m = &Member{
 			PeerID:         id.String(),
-			VirtualIP:      DeriveVirtualIP(d.groupKey, id.String()),
+			VirtualIP:      d.alignedVirtualIP(id.String()),
 			VirtualIPv6:    DeriveVirtualIPv6(d.groupKey, id.String()),
 			Source:         source,
 			FirstSeen:      time.Now(),
 			LastDiscovered: time.Now(),
 		}
 		d.members[id.String()] = m
-	} else if m.Source == "inbound" && source != "" && source != "inbound" {
+	}
+	if !inserted && m.Source == "inbound" && source != "" && source != "inbound" {
 		// 入向握手可能抢先到达；真实发现成功后补齐来源，避免永久停留在占位来源。
 		m.Source = source
 	}
 	if len(addrs) > 0 {
 		m.Addrs = toStrings(addrs)
 	}
+	// 新成员入表时，与成员表写操作同一临界区同步虚拟 IP 占用表并回写裁决
+	// 结果（非新成员不需要：成员集合没变，裁决不会变）。
+	var vaddrUpdated []string
+	if inserted {
+		vaddrUpdated = d.claimVirtualIPsLocked()
+	}
 	snapshot := cloneMember(*m)
 	d.mu.Unlock()
+	d.logVirtualIPConflicts(vaddrUpdated)
 
 	// peerstore 记录地址，供 Connect / 隧道直连使用。
 	if len(addrs) > 0 {
@@ -1418,6 +1439,7 @@ func (d *Discovery) connectAndIdentifyContext(ctx context.Context, id peer.ID) e
 	if !d.trustPolicyPassive(id.String(), nil, "") {
 		d.mu.Lock()
 		delete(d.members, id.String())
+		d.releaseVirtualIPsLocked()
 		d.mu.Unlock()
 		return fmt.Errorf("对端尚未通过本地连接审批，无法主动建连")
 	}
@@ -1440,6 +1462,7 @@ func (d *Discovery) connectAndIdentifyContext(ctx context.Context, id peer.ID) e
 			d.logf("节点 %s 与本节点不在同一网络，握手被对端静默拒绝", id.ShortString())
 			d.mu.Lock()
 			delete(d.members, id.String())
+			d.releaseVirtualIPsLocked()
 			d.mu.Unlock()
 			return err
 		}
@@ -1453,6 +1476,7 @@ func (d *Discovery) connectAndIdentifyContext(ctx context.Context, id peer.ID) e
 	if info.Rejected != "" {
 		d.mu.Lock()
 		delete(d.members, id.String())
+		d.releaseVirtualIPsLocked()
 		d.mu.Unlock()
 		if info.Rejected == rejectionUnfriended {
 			d.logf("节点 %s 已删除本机好友，本机同步移除", id.ShortString())
@@ -1467,6 +1491,7 @@ func (d *Discovery) connectAndIdentifyContext(ctx context.Context, id peer.ID) e
 		d.logf("忽略异群节点 %s", id.ShortString())
 		d.mu.Lock()
 		delete(d.members, id.String())
+		d.releaseVirtualIPsLocked()
 		d.mu.Unlock()
 		return ErrGroupMismatch
 	}
@@ -1478,6 +1503,7 @@ func (d *Discovery) connectAndIdentifyContext(ctx context.Context, id peer.ID) e
 	// 确认同群即检查公共 DHT 退出（公共网络模式无私有 DHT，同样适用）。
 	d.maybeRetirePublicDHT()
 	d.mu.Lock()
+	var vaddrUpdated []string
 	if m := d.verifiedMemberLocked(id.String(), "revalidated"); m != nil {
 		m.Addrs = toStrings(p2pkit.CleanUnderlayAddrs(d.host.Peerstore().Addrs(id)))
 		m.Name = info.Name
@@ -1491,11 +1517,15 @@ func (d *Discovery) connectAndIdentifyContext(ctx context.Context, id peer.ID) e
 			m.LocalIPs = info.LocalIPs
 		}
 		m.LastSeen = time.Now()
+		// verifiedMemberLocked 可能刚从空表恢复该成员（新建 Member），
+		// 也要在同一临界区同步虚拟 IP 占用表。
+		vaddrUpdated = d.claimVirtualIPsLocked()
 	} else {
 		d.mu.Unlock()
 		return nil
 	}
 	d.mu.Unlock()
+	d.logVirtualIPConflicts(vaddrUpdated)
 	d.mu.RLock()
 	m := d.members[id.String()]
 	var snapshot Member
@@ -1566,7 +1596,7 @@ func (d *Discovery) pexAllow(remote string, now time.Time) bool {
 
 // applyMemberHints 消化对端带来的成员摘要：逐条走 addMember 的完整审批门
 // （信任检查 / unfriend 墓碑 / 地址清洗 / peerstore / 建连确认）。摘要里的
-// 节点若不可信，addMember 会走「附近」上报路径，不会建连——PEX 不产生
+// 节点若不可信，addMember 只做控制协作排队、不会建连——PEX 不产生
 // 任何越权连接。
 func (d *Discovery) applyMemberHints(hints []memberHint) {
 	if len(hints) > pexMaxMembers {
@@ -1731,15 +1761,17 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	// unfriend 通知的迟到握手（见 unfriendGuardTTL）。
 	d.mu.Lock()
 	m, ok := d.members[remote.String()]
+	inserted := false
 	if !ok {
 		if d.unfriendGuardBlocked(remote.String()) {
 			d.mu.Unlock()
 			d.logf("忽略节点 %s 的迟到握手：删除好友通知刚处理过，不复活成员", remote.ShortString())
 			return
 		}
+		inserted = true
 		m = &Member{
 			PeerID:         remote.String(),
-			VirtualIP:      DeriveVirtualIP(d.groupKey, remote.String()),
+			VirtualIP:      d.alignedVirtualIP(remote.String()),
 			VirtualIPv6:    DeriveVirtualIPv6(d.groupKey, remote.String()),
 			Source:         "inbound",
 			Addrs:          toStrings(addrs),
@@ -1765,8 +1797,14 @@ func (d *Discovery) handleInfo(s network.Stream) {
 	}
 	m.LastSeen = time.Now()
 	d.expiredMembers.verified(remote.String())
+	var vaddrUpdated []string
+	if inserted {
+		// 新成员入表：同一临界区同步占位表并回写裁决结果。
+		vaddrUpdated = d.claimVirtualIPsLocked()
+	}
 	snapshot := cloneMember(*m)
 	d.mu.Unlock()
+	d.logVirtualIPConflicts(vaddrUpdated)
 	d.emit(snapshot)
 	// 对端地址入 peerstore：后续建立隧道/直连要用（与成员表同步）。
 	if len(addrs) > 0 {
@@ -1865,7 +1903,7 @@ func (d *Discovery) fetchInfo(ctx context.Context, id peer.ID) (infoPayload, err
 	return resp, nil
 }
 
-// ---- 双向删除好友（unfriend 协议 + 附近上报） ----
+// ---- 双向删除好友（unfriend 协议） ----
 
 // unfriendPayload 删除好友通知载荷。Group 群指纹防止跨网误删（不同网络
 // 密钥的节点即使端口暴露也拨不进这条协议——校验失败直接丢弃）。
@@ -1883,6 +1921,7 @@ func (d *Discovery) Forget(peerID string) {
 	}
 	d.mu.Lock()
 	delete(d.members, id.String())
+	d.releaseVirtualIPsLocked()
 	d.markUnfriendedLocked(id.String())
 	d.mu.Unlock()
 	for _, c := range d.host.Network().ConnsToPeer(id) {
@@ -1940,6 +1979,7 @@ func (d *Discovery) handleUnfriend(s network.Stream) {
 	// 没有 guard 就会把刚删除的成员写回成员表（复活，「删了还在」）。
 	d.mu.Lock()
 	delete(d.members, remote.String())
+	d.releaseVirtualIPsLocked()
 	d.markUnfriendedLocked(remote.String())
 	d.mu.Unlock()
 	if d.cfg.OnUnfriendReceived != nil {
@@ -1983,31 +2023,6 @@ func (d *Discovery) markUnfriendedLocked(peerID string) {
 func (d *Discovery) unfriendGuardBlocked(peerID string) bool {
 	t, banned := d.unfriendedAt[peerID]
 	return banned && time.Since(t) < unfriendGuardTTL
-}
-
-// reportNearby 被动发现未信任节点时上报「附近」回调（带去抖：同一节点
-// 最短 30s 上报一次，防每轮发现都刷库）。仅在 Config.OnSeenUntrusted
-// 非 nil 时生效。
-func (d *Discovery) reportNearby(id peer.ID, addrs []ma.Multiaddr, source string) {
-	if d.cfg.OnSeenUntrusted == nil {
-		return
-	}
-	key := id.String()
-	d.nearbySeenMu.Lock()
-	if last, ok := d.nearbySeen[key]; ok && time.Since(last) < 30*time.Second {
-		d.nearbySeenMu.Unlock()
-		return
-	}
-	if len(d.nearbySeen) > 4096 { // 防 map 无界增长（极端大网）
-		for k, t := range d.nearbySeen {
-			if time.Since(t) > time.Hour {
-				delete(d.nearbySeen, k)
-			}
-		}
-	}
-	d.nearbySeen[key] = time.Now()
-	d.nearbySeenMu.Unlock()
-	go d.cfg.OnSeenUntrusted(key, toStrings(addrs), source)
 }
 
 // Resolve 实现 tunnel.GroupNetMap：按 IPv4 或 IPv6 虚拟地址解析成员。
@@ -2129,7 +2144,7 @@ func (d *Discovery) Close() error {
 		d.protocolMu.Lock()
 		if d.host != nil {
 			if d.protocolsStarted {
-				for _, p := range []libprotocol.ID{d.protoControl, d.protoNearby, d.protoInfo, d.protoInfoAlt, d.protoUnfriend, d.protoUnfriendAlt} {
+				for _, p := range []libprotocol.ID{d.protoControl, d.protoInfo, d.protoInfoAlt, d.protoUnfriend, d.protoUnfriendAlt} {
 					if p != "" {
 						d.host.RemoveStreamHandler(p)
 					}
