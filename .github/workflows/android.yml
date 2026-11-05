@@ -339,7 +339,7 @@ jobs:
 
       - name: 编译 APK
         id: assemble
-        working-directory: sdk/android
+        working-directory: sdk/go/mobile
         shell: bash
         env:
           # Gradle 里通过 System.getenv 读这四个变量决定签名方式（见 app/build.gradle.kts）。
@@ -350,6 +350,20 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          # ⚠️ 注意当前工作目录：本步骤沿用 gomobile bind 的 sdk/go/mobile，
+          # 与 bind 里 `cp lanet.aar ../android/app/libs/` 的相对路径保持同一基准。
+          # 2026-11-05 第六次实跑就栽在这里：bind 从 sdk/go/mobile 出发把 AAR 拷到
+          # sdk/android/app/libs/，而编译步骤的 working-directory 是 sdk/android，
+          # 于是检查的 `app/libs/lanet.aar` 实际指向 sdk/android/app/libs...
+          # 但 bind 拷的是同一个地方——真正的问题是 bind 步骤的 working-directory
+          # 是 sdk/go/mobile 而编译步骤是 sdk/android，两套相对路径各自成立却彼此错位，
+          # 日志里上一行刚打印 26M 文件到位、下一行就说它不存在。
+          # 现在两个步骤统一在 sdk/go/mobile 下，路径只有一套写法。
+          HOST_DIR="../android"
+          if [ ! -f "$HOST_DIR/app/libs/lanet.aar" ]; then
+            echo "::error::编译前 $HOST_DIR/app/libs/lanet.aar 不存在（gomobile 产物丢失或被清理）"
+            exit 1
+          fi
           TASK="assembleDebug"
           OUT_DIR="app/build/outputs/apk/debug"
           if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
@@ -359,20 +373,16 @@ jobs:
           # --no-daemon：CI 单次构建，守护进程只会拖慢收尾；
           # --stacktrace：失败时给出 Gradle 内部调用栈，便于区分「AGP 配置错」与「编译错」。
           #
-          # ⚠️ 这里**不能**加 clean（2026-11-05 第五次实跑实测踩过）：
-          # `./gradlew clean` 会删掉整个 app/build/ 以及 app/ 目录下的构建输入，
-          # 而 lanet.aar 就放在 app/libs/ 里 —— clean 之后 AAR 消失，Gradle 报
-          # `lanet.aar (No such file or directory)`，看起来像「文件没拷进来」，其实是
-          # 被自己的 clean 删了。CI 每次都是全新 clone + 全新 Gradle 缓存目录，本来就没有
-          # 增量残留，所以 clean 在这里零收益。
-          # 本地想清残留请手动 `rm -rf app/build`，不要靠这一步的 clean。
-          if [ ! -f app/libs/lanet.aar ]; then
-            echo "::error::编译前 app/libs/lanet.aar 不存在（gomobile 步骤的产物丢失或被清理）"
-            exit 1
-          fi
-          ./gradlew --no-daemon --stacktrace "$TASK"
-          echo "out_dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
-          ls -lh "$OUT_DIR"
+          # ⚠️ 这里刻意**不用** clean：CI 每次都是全新 clone + 全新 Gradle 缓存目录，
+          # 本来就没有增量残留，clean 零收益；而 `./gradlew clean` 会把 app/ 下不属于
+          # 任何 task 输出的 app/libs/lanet.aar 一并清掉，反而制造故障。
+          # 本地想清残留请手动 `rm -rf sdk/android/app/build`。
+          ( cd "$HOST_DIR" && ./gradlew --no-daemon --stacktrace "$TASK" )
+          # 输出值统一成「相对仓库根」的路径（已含 sdk/android/ 前缀）：后续三步
+          # （校验版本号 / 验签 / 改名）都直接 find "$OUT_DIR"，不再各自拼前缀，
+          # 共用同一套基准，不会因为各自 cwd 不同而错位。
+          echo "out_dir=$HOST_DIR/$OUT_DIR" >> "$GITHUB_OUTPUT"
+          ls -lh "$HOST_DIR/$OUT_DIR"
 
       # 校验 Gradle 实际打出来的 versionName/versionCode 与 VERSION 推导值一致。
       # 这一步防的是「VERSION 改了但 APK 还在用旧版本号」这类静默漂移：
@@ -385,9 +395,10 @@ jobs:
           set -euo pipefail
           # ⚠️ 不用 `find ... | head -1`：pipefail 下 head 提前关闭读端会让 find 收到
           # SIGPIPE（141），多命中时会误判失败。`-print -quit` 找到第一个就退出，无管道。
-          APK="$(find "sdk/android/$OUT_DIR" -maxdepth 1 -name '*.apk' -print -quit)"
+          # OUT_DIR 由「编译 APK」步骤输出，已是相对仓库根、含 sdk/android/ 前缀的路径。
+          APK="$(find "$OUT_DIR" -maxdepth 1 -name '*.apk' -print -quit)"
           if [ -z "$APK" ]; then
-            echo "::error::在 sdk/android/$OUT_DIR 下没找到 APK"
+            echo "::error::在 $OUT_DIR 下没找到 APK"
             exit 1
           fi
           AAPT2="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/aapt2"
@@ -418,7 +429,7 @@ jobs:
           set -euo pipefail
           # ⚠️ 不用 `find ... | head -1`：pipefail 下 head 提前关闭读端会让 find 收到
           # SIGPIPE（141），多命中时会误判失败。`-print -quit` 找到第一个就退出，无管道。
-          APK="$(find "sdk/android/$OUT_DIR" -maxdepth 1 -name '*.apk' -print -quit)"
+          APK="$(find "$OUT_DIR" -maxdepth 1 -name '*.apk' -print -quit)"
           APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
           "$APKSIGNER" verify --print-certs "$APK" | tee apk-certs.txt
           {
@@ -441,7 +452,7 @@ jobs:
           mkdir -p dist
           # ⚠️ 不用 `find ... | head -1`：pipefail 下 head 提前关闭读端会让 find 收到
           # SIGPIPE（141），多命中时会误判失败。`-print -quit` 找到第一个就退出，无管道。
-          APK="$(find "sdk/android/$OUT_DIR" -maxdepth 1 -name '*.apk' -print -quit)"
+          APK="$(find "$OUT_DIR" -maxdepth 1 -name '*.apk' -print -quit)"
           OUT="dist/lanet-${{ steps.ver.outputs.version }}-android.apk"
           cp "$APK" "$OUT"
           # sha256 的格式与 release.yml 里别的平台完全一致（"<hash>  <文件名>"），
