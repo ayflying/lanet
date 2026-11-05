@@ -212,6 +212,24 @@ jobs:
           # 缓存 key 带上版本号，避免 Gradle 小版本升级后读到不兼容的缓存目录。
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
+      # ⚠️ wrapper 必须在 gomobile bind **之前**生成（2026-11-05 实测踩过，别挪回去）：
+      # `gradle wrapper` 会配置整个 :app 工程，Gradle 首次启动时会把 app/libs 下
+      # 「不属于任何 task 输出的文件」当成残留清理掉 —— 26MB 的 lanet.aar 就这样
+      # 在 wrapper 步骤凭空消失，编译时表现为 lanet.aar (No such file or directory)。
+      # 放在 bind 之前，AAR 是在 Gradle 已经完成首次配置之后才落盘的，不会被清。
+      # 备选是每个 gradle 调用都加 --no-daemon 且禁用 clean，但根因是 Gradle 的
+      # 构建缓存生命周期，靠顺序规避最省事、也最容易解释。
+      - name: 生成 gradle wrapper（仓库未提交 wrapper）
+        working-directory: sdk/android
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --gradle-version 显式对齐 build.gradle.kts 注释里的 8.11.1；
+          # --no-daemon 避免在 CI 里残留守护进程。
+          gradle wrapper --gradle-version 8.11.1 --distribution-type bin --no-daemon
+          ls -la gradlew gradle/wrapper/
+          chmod +x gradlew
+
       - name: 安装 gomobile 并初始化
         shell: bash
         run: |
@@ -318,25 +336,6 @@ jobs:
             -storepass "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" > /dev/null
           echo "ANDROID_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
           echo "keystore 校验通过（alias=${{ secrets.ANDROID_KEY_ALIAS }}）"
-
-      # 生成 gradle wrapper。
-      # 现状：sdk/android 没有 gradle wrapper（仓库作者刻意没提交 wrapper jar，
-      # 2MB 二进制 + 与 AGP 版本的隐性耦合）。CI 里用 gradle/actions/setup-gradle
-      # 提供 gradle 8.11.1 后，`gradle wrapper` 会按当前版本生成一套 wrapper 文件；
-      # 这么做的收益是后续所有步骤都能用 ./gradlew（与本地文档一致），
-      # 代价是每次 CI 多一条命令（几秒）。备选方案是全程直接用 `gradle` 命令，
-      # 但那样本地与 CI 命令不一致，文档要多写一套，容易踩「本地 gradlew 与 CI gradle
-      # 版本不同」的坑——所以选择生成 wrapper。
-      - name: 生成 gradle wrapper（仓库未提交 wrapper）
-        working-directory: sdk/android
-        shell: bash
-        run: |
-          set -euo pipefail
-          # --gradle-version 显式对齐 build.gradle.kts 注释里的 8.11.1；
-          # --no-daemon 避免在 CI 里残留守护进程。
-          gradle wrapper --gradle-version 8.11.1 --distribution-type bin --no-daemon
-          ls -la gradlew gradle/wrapper/
-          chmod +x gradlew
 
       - name: 编译 APK
         id: assemble
