@@ -269,9 +269,30 @@ jobs:
             -o lanet.aar .
           ls -lh lanet.aar
           # 产物拷到宿主工程的 libs/（该文件在 .gitignore 里忽略，构建前必须现编）。
-          mkdir -p ../android/app/libs
-          cp lanet.aar ../android/app/libs/lanet.aar
-          ls -lh ../android/app/libs/lanet.aar
+          # ⚠️ 相对路径是 ../../android 而不是 ../android：本步骤的 cwd 是 sdk/go/mobile，
+          # 上一级是 sdk/go，再上一级才是 sdk，宿主工程在 sdk/android。
+          # 2026-11-05 前几次实跑写成了 ../android，`mkdir -p` 会老老实实造出
+          # sdk/go/android/app/libs/ 这个不存在的目录，cp 也「成功」，日志里 ls 还
+          # 打印出 26M —— 一切看起来都对，直到 Gradle 去 sdk/android/app/libs 找不到文件。
+          # （那个误建的 sdk/go/android/ 目录在 CI 里随容器销毁，本地会被 .gitignore 挡住的
+          # 只是 app/libs/*.aar，目录本身可能残留，务必别提交。）
+          AAR_DEST="../../android/app/libs"
+          mkdir -p "$AAR_DEST"
+          cp lanet.aar "$AAR_DEST/lanet.aar"
+          ls -lh "$AAR_DEST/lanet.aar"
+          # 立刻回读校验：`cp` 到错误目录同样会返回 0，只有断言「目标路径真有文件、
+          # 且就是 sdk/android 下那份」才能在 bind 这一步就把路径错误暴露出来，
+          # 而不是等到二十步之后 Gradle 报 No such file。
+          if [ ! -s "$AAR_DEST/lanet.aar" ]; then
+            echo "::error::AAR 拷贝后校验失败：$AAR_DEST/lanet.aar 不存在或为空"
+            exit 1
+          fi
+          # 反查宿主的 build.gradle.kts 确实出现在同一父目录下，确认 AAR 落在对的工程里。
+          if [ ! -f "$AAR_DEST/../build.gradle.kts" ]; then
+            echo "::error::AAR 落点不是 sdk/android 宿主工程：$AAR_DEST"
+            exit 1
+          fi
+          echo "AAR 已就位：$(cd "$AAR_DEST" && pwd)/lanet.aar"
 
       # 签名判断只能靠 env 中转：GitHub Actions 的 if: 条件里**不允许** secrets 上下文，
       # 写成 `if: secrets.ANDROID_KEYSTORE_BASE64 != ''` 会让整个 workflow 校验失败、
@@ -350,16 +371,10 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          # ⚠️ 注意当前工作目录：本步骤沿用 gomobile bind 的 sdk/go/mobile，
-          # 与 bind 里 `cp lanet.aar ../android/app/libs/` 的相对路径保持同一基准。
-          # 2026-11-05 第六次实跑就栽在这里：bind 从 sdk/go/mobile 出发把 AAR 拷到
-          # sdk/android/app/libs/，而编译步骤的 working-directory 是 sdk/android，
-          # 于是检查的 `app/libs/lanet.aar` 实际指向 sdk/android/app/libs...
-          # 但 bind 拷的是同一个地方——真正的问题是 bind 步骤的 working-directory
-          # 是 sdk/go/mobile 而编译步骤是 sdk/android，两套相对路径各自成立却彼此错位，
-          # 日志里上一行刚打印 26M 文件到位、下一行就说它不存在。
-          # 现在两个步骤统一在 sdk/go/mobile 下，路径只有一套写法。
-          HOST_DIR="../android"
+          # 本步骤沿用 gomobile bind 的 working-directory（sdk/go/mobile），
+          # 因此到宿主工程 sdk/android 的相对路径是 ../../android，
+          # 与 bind 步骤共用同一个常量，两处任何一处改错都会在下面的断言里立刻炸出来。
+          HOST_DIR="../../android"
           if [ ! -f "$HOST_DIR/app/libs/lanet.aar" ]; then
             echo "::error::编译前 $HOST_DIR/app/libs/lanet.aar 不存在（gomobile 产物丢失或被清理）"
             exit 1
