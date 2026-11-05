@@ -1,4 +1,4 @@
-package com.lanet.demo
+package com.ayflying.lanet
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -32,8 +32,8 @@ class LanetVpnService : VpnService() {
         private const val CHANNEL_ID = "lanet-vpn"
         private const val NOTIFICATION_ID = 1001
 
-        const val ACTION_START = "com.lanet.demo.action.START"
-        const val ACTION_STOP = "com.lanet.demo.action.STOP"
+        const val ACTION_START = "com.ayflying.lanet.action.START"
+        const val ACTION_STOP = "com.ayflying.lanet.action.STOP"
         const val EXTRA_NAME = "name"
         const val EXTRA_NETWORK_KEY = "network_key"
         const val EXTRA_BOOTSTRAP = "bootstrap"

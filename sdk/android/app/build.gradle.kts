@@ -61,11 +61,20 @@ val apkVersionCode: Int =
         ?: versionCodeOf(apkVersionName)
 
 android {
-    namespace = "com.lanet.demo"
+    // 包名与 applicationId 统一改成 com.ayflying.lanet（原 com.lanet.demo 是演示工程遗留）。
+    // 注意这是**破坏性变更**：安卓把包名当应用身份，改包名后新包与旧包在同一台机器上
+    // 是两个独立应用，不会互相覆盖，旧包的 files/（身份密钥、地址簿）也不会自动迁移。
+    // 升级前先 `adb uninstall com.lanet.demo`，否则会同时装两个图标。
+    //
+    // namespace 决定 R 类和 BuildConfig 生成在哪个包下，必须与源码目录结构
+    // sdk/android/app/src/main/java/com/ayflying/lanet/ 一致，否则 Kotlin 编译找不到符号。
+    // 两者刻意保持同一个值：namespace 与 applicationId 分歧时，代码里写死的
+    // "com.lanet.demo.action.START" 这类隐式 Intent action 会跟着出问题。
+    namespace = "com.ayflying.lanet"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.lanet.demo"
+        applicationId = "com.ayflying.lanet"
         // 21 与 gomobile bind -androidapi 21 对齐：低于该值 Go 运行时无法启动。
         minSdk = 21
         targetSdk = 35

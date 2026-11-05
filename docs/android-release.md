@@ -103,7 +103,7 @@ versionCode = major*1000000 + minor*10000 + patch
 > - 因此它只适合**验证与内测**，**不适合正式分发**，更不能上应用商店。
 > - 包之间可以互相覆盖安装（同一个 debug 证书），升级不会因签名不一致被拒。
 > - 换到 release 签名后**不能覆盖安装**已装的 debug 包，必须先卸载再装
->   （`adb uninstall com.lanet.demo`），因为证书变了。旧包的 `files/` 目录（身份密钥、地址簿）
+>   （`adb uninstall com.ayflying.lanet`），因为证书变了。旧包的 `files/` 目录（身份密钥、地址簿）
 >   会一起被删，PeerID 与虚拟 IP 会变，需要重新入网/审批。
 
 缺 Secret 时 workflow **不会失败**——这是刻意的：用户要的是「CI 能自动出 APK」，

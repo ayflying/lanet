@@ -1,4 +1,4 @@
-package com.lanet.demo
+package com.ayflying.lanet
 
 import android.util.Log
 import com.lanet.mobile.Node

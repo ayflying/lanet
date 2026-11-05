@@ -1,4 +1,4 @@
-package com.lanet.demo
+package com.ayflying.lanet
 
 import android.app.Activity
 import android.content.Context

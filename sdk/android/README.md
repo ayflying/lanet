@@ -90,7 +90,7 @@ print(os.path.getsize("app-debug.apk"), sum(i.compress_size for i in z.infolist(
 ```bash
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 
-adb shell am start -n com.lanet.demo/.MainActivity \
+adb shell am start -n com.ayflying.lanet/.MainActivity \
   --es name mumu-emu \
   --es netkey yunloli \
   --es seed "/ip4/192.168.50.170/tcp/49440/p2p/12D3KooW…" \
@@ -139,14 +139,14 @@ ping -n 4 10.7.144.45
    产出 debug 签名 APK：装得上、能跑通，但证书是公开的 `debug.keystore`，**任何持有同款
    debug 证书的人都能做出覆盖安装你这份包的 APK**，不适合正式分发。切到 release 签名的
    4 个 Secret 与操作步骤见 [`docs/android-release.md`](../../docs/android-release.md)。
-   另外：debug 包与 release 包**不能互相覆盖安装**，切换前要 `adb uninstall com.lanet.demo`。
+   另外：debug 包与 release 包**不能互相覆盖安装**，切换前要 `adb uninstall com.ayflying.lanet`。
 
 1. **Android 把 uid 2000（adb shell）排除在 VPN 之外**（日志里 `Uids: {1-1999, 2001-99999}`）。
    用 `adb shell` 起的监听进程**无法被群内访问**——它的回包不走 tun0。要验证「手机当服务端」，
    得让 App 自己的 uid 来跑：
 
    ```bash
-   adb shell "run-as com.lanet.demo sh -c 'nohup toybox nc -L -p 9100 echo OK >/dev/null 2>&1 &'"
+   adb shell "run-as com.ayflying.lanet sh -c 'nohup toybox nc -L -p 9100 echo OK >/dev/null 2>&1 &'"
    # 然后从群内另一台机器 nc 10.7.144.45 9100
    ```
 

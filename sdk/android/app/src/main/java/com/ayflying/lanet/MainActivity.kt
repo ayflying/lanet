@@ -1,4 +1,4 @@
-package com.lanet.demo
+package com.ayflying.lanet
 
 import android.Manifest
 import android.app.Activity
@@ -65,7 +65,7 @@ class MainActivity : Activity() {
     /**
      * 支持从 intent 带参启动，便于用 adb 脚本化验证（不必手点输入框）：
      *
-     *	adb shell am start -n com.lanet.demo/.MainActivity \
+     *	adb shell am start -n com.ayflying.lanet/.MainActivity \
      *	  --es name mix3 --es netkey yunloli \
      *	  --es seed "lanet://…" --ez autostart true
      *
