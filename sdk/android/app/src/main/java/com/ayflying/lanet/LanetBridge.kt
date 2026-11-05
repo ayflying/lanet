@@ -144,6 +144,15 @@ object LanetBridge {
 
     fun inviteCode(): String = node?.inviteCode() ?: ""
 
+    /**
+     * 内置 Web 控制台的实际地址（形如 http://127.0.0.1:54321）；未运行时为空串。
+     *
+     * App 的控制界面就是这份网页（内嵌 WebView 加载），所以这里的地址是「进主界面」
+     * 的唯一入口。端口由 Go 侧让内核分配（Client 里配置的是 127.0.0.1:0），不是固定
+     * 8900，因此调用方**不能**自己拼地址。
+     */
+    fun consoleUrl(): String = node?.consoleURL() ?: ""
+
     fun seedAddrs(): JSONArray = try {
         JSONArray(node?.seedAddrs() ?: "[]")
     } catch (t: Throwable) {

@@ -150,7 +150,11 @@ function pollingHarness(fetchImpl) {
     h.elements.set(id, { textContent: '', innerHTML: '', style: {} });
   }
   // Only unrelated panels are stubbed; network renderers and PUTs remain real.
-  for (const name of ['renderMembers', 'renderConnect', 'renderSeed', 'renderPublicDHT']) h.context[name] = () => {};
+  // renderShareCard 也在这里桩掉：它只画成员页顶部的「我的连接码」卡片，与本文件
+  // 验证的防火墙/端口转发/Rules 逻辑无关。桩掉的好处是 fetchState 的测试不必为
+  // 它准备 DOM 节点；坏处是漏了新加的渲染函数会直接 ReferenceError —— 这正是
+  // 我们希望暴露的退化。
+  for (const name of ['renderMembers', 'renderConnect', 'renderSeed', 'renderPublicDHT', 'renderShareCard']) h.context[name] = () => {};
   const start = html.indexOf('async function fetchState(');
   const end = html.indexOf('// ----', start);
   assert.ok(start >= 0 && end > start, 'extract actual fetchState through the next section marker');

@@ -144,9 +144,18 @@ func (n *Node) Start(configJSON string) error {
 		IdentityFile:    filepath.Join(o.DataDir, "node.key"),
 		DBPath:          filepath.Join(o.DataDir, "lanet.db"),
 		StateFile:       filepath.Join(o.DataDir, "state.json"),
-		// 移动端不启内置 Web 控制台：手机上没有浏览器，8900 端口也无意义，
-		// 而且会和同机的桌面实例抢端口。
-		ConsoleAddr:     "-",
+		// 移动端**启用**内置 Web 控制台，作为 App 的控制界面（内嵌 H5）。
+		//
+		// 历史：早期这里是 "-"（关闭），理由是「手机没有浏览器，8900 端口无意义」。
+		// 现在 App 改用 WebView 内嵌同一份控制台页面，这个理由不再成立，反而关掉
+		// 会逼着我们在 Kotlin 里重做一套页签/成员/防火墙/转发界面。复用网页控制台
+		// 的好处是界面只维护一处，App 与浏览器自动一致。
+		//
+		// 地址固定绑 127.0.0.1（不写 0.0.0.0）：控制台没有任何认证，绑到公网可达的
+		// 地址等于把别人的网络控制权敞开。端口用 0 让内核挑空闲端口，避免与同机
+		// 桌面实例或第二个 App 实例抢 8900；实际端口回填进 consoleURL 由
+		// ConsoleURL() 取回给 WebView。
+		ConsoleAddr:     "127.0.0.1:0",
 		AutoAccept:      o.AutoAccept,
 		RequireApproval: o.RequireApproval,
 		Version:         o.Version,
@@ -234,6 +243,9 @@ func (n *Node) Status() string {
 		"tun_fd":        n.tunFD(),
 		"mobile":        mobileVersion,
 		"firewall":      string(fwMode),
+		// 控制台实际地址：App 侧用它决定 WebView 加载哪一屏，也便于排查
+		// 「WebView 白屏」时确认端口是否真的起来了。
+		"console_url": c.ConsoleURL(),
 	}
 	return toJSON(st)
 }
@@ -381,6 +393,21 @@ func (n *Node) InviteCode() string {
 		return ""
 	}
 	return c.InviteCode()
+}
+
+// ConsoleURL 内置 Web 控制台的实际访问地址（形如 http://127.0.0.1:54321）。
+//
+// App 把这个地址交给 WebView 加载，整块控制界面（成员与链路、防火墙、端口转发、
+// 公网入口、运行日志）就都是网页那一份，Kotlin 侧不需要重复实现任何一屏。
+//
+// 未运行时返回空串：控制台的监听 socket 随 Client 一起关闭，此时地址没有意义。
+// 端口是内核分配的（非固定 8900），所以调用方**不能**自己拼地址，必须读这里。
+func (n *Node) ConsoleURL() string {
+	c := n.current()
+	if c == nil {
+		return ""
+	}
+	return c.ConsoleURL()
 }
 
 // SeedAddrs 本机可作为引导种子使用的 multiaddr 列表（JSON 数组）。

@@ -8,42 +8,43 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.InputType
 import android.view.ViewGroup
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
+import android.widget.FrameLayout
 import android.widget.Toast
-import org.json.JSONArray
 
 /**
- * 演示界面：不依赖任何 res 布局文件，全部用代码搭出来。
+ * App 主界面：**两屏**，切换关系一目了然。
  *
- * 这样做的理由很实际——这个 Activity 的首要职责是「证明 AAR 里的 Go 节点
- * 能在真机上入网」，界面只是操作面板；用 XML 只会多出一堆和验证无关的文件。
- * 真正要把能力接进 uni-app 时走的是原生插件那条路（见 sdk/android-plugin）。
+ *  1. 启动屏（[StartScreen]）：本机名称 / 网络密钥 / 引导节点 + 一键入网。
+ *  2. 控制台屏（[ConsoleWebView]）：入网成功后自动切换，加载 Go 内置的网页控制台。
+ *     成员与链路、入向防火墙、端口转发、公网入口、运行日志、本机连接码分享
+ *     全部在这份网页里，按页签隔离。
  *
- * 界面上的字段全部对应 sdk/go/mobile/node.go 里返回的 JSON 契约，键名不能
- * 凭感觉写：status 里的网络组指纹叫 group（不是 network_group），成员表里
- * 也没有 online 字段，只有 platform / version / path。
+ * 为什么分屏而不是像以前那样全堆一页：启动参数和日常运维是两件事，操作频率
+ * 差一个数量级。混在一起的结果是「想看一眼成员，得先滚过三个输入框」。
+ *
+ * 状态机（判定逻辑集中在 [syncScreen]）：
+ *   - 节点未运行 → 启动屏
+ *   - 节点运行中且有 console URL → 控制台屏
+ *   - 节点运行中但还没拿到 URL（启动瞬间）→ 停在启动屏并继续轮询
  */
 class MainActivity : Activity() {
 
-    private lateinit var nameInput: EditText
-    private lateinit var keyInput: EditText
-    private lateinit var seedInput: EditText
-    private lateinit var connectInput: EditText
-    private lateinit var approveInput: EditText
-    private lateinit var output: TextView
-    private lateinit var startBtn: Button
+    private lateinit var root: ViewGroup
+    private lateinit var start: StartScreen
+    private var console: ConsoleWebView? = null
 
-    /** autoconnect 用：待自动拨号的目标地址。 */
-    private var autoConnectTarget: String? = null
+    /** 当前显示的是哪一屏；null 表示还没决定。 */
+    private var showingConsole: Boolean? = null
+
+    /** WebView 当前加载的地址：用于避免轮询触发重复 load（见 [syncScreen]）。 */
+    private var loadedUrl = ""
 
     private val ui = Handler(Looper.getMainLooper())
     private var polling = false
+
+    /** autoconnect 用：待自动拨号的目标地址。 */
+    private var autoConnectTarget: String? = null
 
     /** 是否自动同意陌生节点（由 adb 参数 autoaccept 控制，默认关=人工审批）。 */
     private var autoAccept = false
@@ -58,8 +59,18 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
 
-        setContentView(buildUi())
+        // 根容器用 FrameLayout：两屏都是「整屏占满」，切换时 removeAllViews + addView
+        // 即可，不需要 Fragment 那套生命周期开销（这个 App 只有两屏）。
+        root = FrameLayout(this)
+        setContentView(root)
+
+        start = StartScreen(this)
+        start.startBtn.setOnClickListener { toggle() }
+        start.seedInput.setText(defaultSeed())
+
         applyIntentExtras()
+        syncScreen()
+        startPolling()
     }
 
     /**
@@ -74,116 +85,85 @@ class MainActivity : Activity() {
      */
     private fun applyIntentExtras() {
         val i = intent ?: return
-        i.getStringExtra("name")?.let { nameInput.setText(it) }
-        i.getStringExtra("netkey")?.let { keyInput.setText(it) }
-        i.getStringExtra("seed")?.let { seedInput.setText(it) }
-        i.getStringExtra("peer")?.let { connectInput.setText(it) }
+        i.getStringExtra("name")?.let { start.nameInput.setText(it) }
+        i.getStringExtra("netkey")?.let { start.keyInput.setText(it) }
+        i.getStringExtra("seed")?.let { start.seedInput.setText(it) }
         autoAccept = i.getBooleanExtra("autoaccept", false)
         i.getStringExtra("peer")?.takeIf { i.getBooleanExtra("autoconnect", false) }?.let {
             autoConnectTarget = it
         }
         if (i.getBooleanExtra("autostart", false)) {
-            startBtn.post { toggle() }
+            start.startBtn.post { toggle() }
         }
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    // ---------------------------------------------------------------- 屏幕切换
 
-    private fun buildUi(): ViewGroup {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
+    /**
+     * 根据节点实际状态决定显示哪一屏。反复调用是安全的（幂等），
+     * 轮询里每秒都会走到这里，因此**不要**在这里做重活。
+     */
+    private fun syncScreen() {
+        val running = LanetVpnService.running || LanetBridge.isRunning()
+        val consoleUrl = if (running) LanetBridge.consoleUrl() else ""
+
+        val wantConsole = running && consoleUrl.isNotEmpty()
+        if (showingConsole == wantConsole) {
+            // 已经在控制台屏：只在**地址真的变了**时重新加载。
+            // 轮询是 1 秒一次，无条件 load 会让 WebView 每秒重新拉一次页面，
+            // 表现为界面不停闪、输入框里的内容被冲掉、日志区滚动位置丢失。
+            if (wantConsole && loadedUrl != consoleUrl) console?.load(consoleUrl)
+            return
         }
 
-        root.addView(TextView(this).apply {
-            text = "Lanet 移动端（Go 核心 + VpnService）"
-            textSize = 18f
-        })
-
-        nameInput = EditText(this).apply { hint = "本机名称，如 pixel-8" }
-        keyInput = EditText(this).apply { hint = "网络密钥（留空 = 本机专属网）" }
-        seedInput = EditText(this).apply {
-            hint = "引导节点地址，多个用逗号分隔（可空）"
-            setText(defaultSeed())
-        }
-        connectInput = EditText(this).apply {
-            hint = "对端连接码 lanet://… 或裸 PeerID"
-            inputType = InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-        }
-        approveInput = EditText(this).apply {
-            hint = "填 PeerID（见下方待审批列表）"
-            inputType = InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-        }
-
-        root.addView(label("名称"))
-        root.addView(nameInput)
-        root.addView(label("网络密钥"))
-        root.addView(keyInput)
-        root.addView(label("引导节点（bootstrap，填已在网成员的地址/连接码）"))
-        root.addView(seedInput)
-
-        startBtn = Button(this).apply {
-            text = "建立虚拟网卡并入网"
-            setOnClickListener { toggle() }
-        }
-        root.addView(startBtn)
-
-        root.addView(label("主动连接对端 —— 对方拨入不会进本机待审批，必须本机主动连一次"))
-        root.addView(connectInput)
-        root.addView(Button(this).apply {
-            text = "连接"
-            setOnClickListener { doConnect() }
-        })
-
-        root.addView(label("审批 —— 陌生节点申请入网时用（PeerID 见下方「待审批」）"))
-        root.addView(approveInput)
-        root.addView(Button(this).apply {
-            text = "同意 / 拒绝"
-            setOnClickListener { doApprove() }
-        })
-
-        root.addView(Button(this).apply {
-            text = "刷新状态 / 成员"
-            setOnClickListener { refresh() }
-        })
-
-        output = TextView(this).apply {
-            textSize = 12f
-            typeface = android.graphics.Typeface.MONOSPACE
-            setTextIsSelectable(true)
-            text = "尚未启动"
-        }
-        // 状态区直接进 root，由最外层 ScrollView 统一滚动。
-        // 这里曾用「内层 ScrollView + weight=1」把状态区钉在底部，但模拟器/手机横屏时
-        // 输入框和按钮加起来就占满屏幕，weight=1 被压缩到 0 高度，状态区（虚拟 IP、
-        // 入向防火墙、成员表）整块看不见——实测 bounds 只剩 24px。整页一起滚才治本。
-        root.addView(output)
-
-        return ScrollView(this).apply { addView(root) }
+        if (wantConsole) showConsole(consoleUrl) else showStart()
     }
 
-    private fun label(t: String) = TextView(this).apply {
-        text = t
-        textSize = 12f
-        setPadding(0, dp(8), 0, 0)
+    private fun showStart() {
+        console?.destroy()
+        console = null
+        showingConsole = false
+        loadedUrl = ""
+        start.startBtn.text = "建立虚拟网卡并入网"
+        root.removeAllViews()
+        root.addView(start.build(), matchParent())
     }
 
-    /** 引导节点默认值：上一次填过的地址会留在本地，免得每次重敲。 */
-    private fun defaultSeed(): String =
-        getSharedPreferences("lanet", Context.MODE_PRIVATE).getString("seed", "") ?: ""
+    private fun showConsole(url: String) {
+        val c = ConsoleWebView(this)
+        c.onShare = { text -> sharePlainText(text) }
+        c.onLoadFailed = {
+            // 控制台加载不出来（节点已停）→ 退回启动屏，避免停在白屏。
+            ui.post { if (showingConsole == true) { LanetVpnService.resetRunning(); syncScreen() } }
+        }
+        console = c
+        showingConsole = true
+        root.removeAllViews()
+        root.addView(c.asView(), matchParent())
+        c.load(url)
+        loadedUrl = url
+    }
+
+    private fun matchParent() = ViewGroup.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.MATCH_PARENT,
+    )
+
+    // ---------------------------------------------------------------- 启动/停止
 
     private fun toggle() {
         if (LanetVpnService.running || LanetBridge.isRunning()) {
             LanetVpnService.stop(this)
             LanetBridge.stop()
             LanetVpnService.resetRunning()
-            startBtn.text = "建立虚拟网卡并入网"
-            refresh()
+            syncScreen()
             return
         }
-        val name = nameInput.text.toString().trim().ifEmpty { "android-" + Build.MODEL }
-        val key = keyInput.text.toString().trim()
-        val seeds = seedInput.text.toString().split(",").map { it.trim() }.filter { it.isNotEmpty() }
+
+        val name = start.nameInput.text.toString().trim().ifEmpty { "android-" + Build.MODEL }
+        val key = start.keyInput.text.toString().trim()
+        val seeds = start.seedInput.text.toString()
+            .split(",").map { it.trim() }.filter { it.isNotEmpty() }
         getSharedPreferences("lanet", Context.MODE_PRIVATE).edit()
             .putString("seed", seeds.joinToString(",")).apply()
 
@@ -191,125 +171,66 @@ class MainActivity : Activity() {
         VpnAuthProxyActivity.request(
             this, name, key, seeds, wantTun = true, autoAccept = autoAccept,
         )
-        startBtn.text = "停止"
+        start.startBtn.text = "启动中…"
         startPolling()
     }
 
-    private fun doConnect() {
-        val addr = connectInput.text.toString().trim()
-        if (addr.isEmpty()) {
-            toast("请先填连接码或 PeerID")
-            return
-        }
-        try {
-            val r = LanetBridge.connect(addr)
-            output.text = "连接结果：\n$r\n\n" + render()
-        } catch (t: Throwable) {
-            toast("连接失败：${t.message}")
-        }
-    }
-
-    private fun doApprove() {
-        val pid = approveInput.text.toString().trim()
-        if (pid.isEmpty()) {
-            toast("请先填 PeerID")
-            return
-        }
-        // 这个 Demo 用一个输入框配一个按钮省事：先试同意，失败再试拒绝。
-        // 真实 UI 应该按行给两个明确按钮，并把返回的 name/虚拟 IP 回显出来。
-        try {
-            LanetBridge.approve(pid, true)
-            toast("已同意 $pid")
-        } catch (t: Throwable) {
-            try {
-                LanetBridge.approve(pid, false)
-                toast("已拒绝 $pid")
-            } catch (t2: Throwable) {
-                toast("审批失败：${t2.message}")
-            }
-        }
-        refresh()
-    }
-
-    private fun refresh() {
-        if (LanetVpnService.lastError != null && !LanetBridge.isRunning()) {
-            output.text = "错误：${LanetVpnService.lastError}"
-            return
-        }
-        output.text = try {
-            render()
-        } catch (t: Throwable) {
-            "读取状态失败：${t.message}"
-        }
-    }
-
-    private fun render(): String {
-        val sb = StringBuilder()
-        val st = LanetBridge.status()
-        sb.append("运行中：${st.optBoolean("running", false)}\n")
-        st.optString("virtual_ip", "").takeIf { it.isNotEmpty() }
-            ?.let { sb.append("虚拟 IP：$it\n") }
-        st.optString("peer_id", "").takeIf { it.isNotEmpty() }
-            ?.let { sb.append("PeerID：$it\n") }
-        st.optString("group", "").takeIf { it.isNotEmpty() }
-            ?.let { sb.append("网络组：$it\n") }
-        st.optString("firewall", "").takeIf { it.isNotEmpty() }
-            ?.let { sb.append("入向防火墙：$it\n") }
-        if (st.optInt("tun_fd", 0) > 0) {
-            sb.append("虚拟网卡：已接管 (fd=${st.optInt("tun_fd")})\n")
-        } else {
-            sb.append("虚拟网卡：未接管（应用层模式，虚拟 IP 不可 ping）\n")
-        }
-
-        appendList(sb, "成员", LanetBridge.members())
-        appendList(sb, "待审批", LanetBridge.pending())
-        appendList(sb, "已信任", LanetBridge.peers())
-        appendList(sb, "附近", LanetBridge.nearby())
-
-        val invite = LanetBridge.inviteCode()
-        if (invite.isNotEmpty()) sb.append("\n本机连接码（发给对方）：\n$invite\n")
-        return sb.toString()
-    }
-
-    private fun appendList(sb: StringBuilder, title: String, arr: JSONArray) {
-        sb.append("\n$title (${arr.length()})：\n")
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            val name = o.optString("name", "").ifEmpty { "-" }
-            val ip = o.optString("virtual_ip", o.optString("last_ip", "-"))
-            val pid = o.optString("peer_id", "").take(16)
-            val extra = listOf(
-                o.optString("version", ""),
-                o.optString("platform", "").ifEmpty { o.optString("source", "") },
-                o.optString("reason", ""),
-            ).filter { it.isNotEmpty() }.joinToString(" ")
-            sb.append("  · $name  $ip  $extra  $pid\n")
-        }
-    }
+    // ---------------------------------------------------------------- 轮询
 
     private fun startPolling() {
         if (polling) return
         polling = true
         ui.postDelayed(object : Runnable {
             override fun run() {
-                refresh()
-                // autoconnect：入网是异步的，必须等节点真的起来再拨，否则
-                // 会拿到「节点未运行」。放在轮询里比 sleep 猜测可靠。
-                autoConnectTarget?.let { target ->
-                    if (LanetBridge.isRunning()) {
-                        autoConnectTarget = null
-                        connectInput.setText(target)
-                        doConnect()
-                    }
-                }
+                syncScreen()
+                syncAutoConnect()
+                // 停止后仍多跑几轮，让「启动中 → 已停止」的状态变化能被观察到。
                 if (LanetVpnService.running || LanetBridge.isRunning()) {
-                    ui.postDelayed(this, 3000)
+                    ui.postDelayed(this, 1000)
                 } else {
                     polling = false
                 }
             }
-        }, 1500)
+        }, 800)
     }
+
+    /** autoconnect：入网是异步的，必须等节点真的起来再拨，否则会拿到「节点未运行」。 */
+    private fun syncAutoConnect() {
+        val target = autoConnectTarget ?: return
+        if (!LanetBridge.isRunning()) return
+        autoConnectTarget = null
+        try {
+            LanetBridge.connect(target)
+            toast("已自动连接 $target")
+        } catch (t: Throwable) {
+            toast("自动连接失败：${t.message}")
+        }
+    }
+
+    // ---------------------------------------------------------------- 生命周期
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        // 返回键优先交给网页历史栈：控制台里点进详情页后，返回应该回上一页而不是直接退出。
+        val c = console
+        if (showingConsole == true && c != null && c.canGoBack()) {
+            c.goBack()
+            return
+        }
+        super.onBackPressed()
+    }
+
+    override fun onDestroy() {
+        polling = false
+        ui.removeCallbacksAndMessages(null)
+        console?.destroy()
+        console = null
+        super.onDestroy()
+    }
+
+    /** 引导节点默认值：上一次填过的地址会留在本地，免得每次重敲。 */
+    private fun defaultSeed(): String =
+        getSharedPreferences("lanet", Context.MODE_PRIVATE).getString("seed", "") ?: ""
 
     private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
 }

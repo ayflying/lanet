@@ -225,6 +225,28 @@
 </div>
 
 <div class="panel active" id="pMembers">
+  <!--
+    本机连接码分享卡片：放在成员页签**最顶部且常驻可见**。
+    这里刻意与下面「连接其他节点」卡片里的 #myNodeID 分开，理由是用户想分享
+    连接码时是「我」这个视角，不需要先看到一堆添加/审批控件，也不该被
+    connectCard 的 standalone 判定挡住（那个卡片在非 standalone 网络下整块隐藏）。
+  -->
+  <div class="card" id="shareCard" style="display:none">
+    <h2>我的连接码 <span class="tag unknown">发给对方即可入网</span></h2>
+    <div class="sub" style="margin-bottom:8px">把这一串发给要用本机入网的人或设备，对方粘贴后点连接即可。首次连接需本机在下方「待审批的连接申请」里同意。</div>
+    <div class="row">
+      <textarea id="shareCode" class="readonly-addr" rows="2" readonly
+                onclick="copyText($('shareCode').value, $('shareCode'))"
+                title="点击即复制"
+                placeholder="入网后显示…"></textarea>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="ghost" id="shareCopyBtn" onclick="copyShareCode()">复制</button>
+      <button id="shareSendBtn" onclick="shareShareCode()">分享</button>
+    </div>
+    <div class="sub" id="shareCodeHint" style="color:#8a94a6;margin-top:8px"></div>
+  </div>
+
   <div class="card" id="connectCard" style="display:none">
     <h2>连接其他节点 <span class="tag unknown">连接码直连</span></h2>
     <div class="sub" style="margin-bottom:8px">把对方发来的<b>连接码</b>（lanet://… 开头）粘贴进去点连接即可；也支持纯节点 ID 或完整连接地址。首次连接需对方在控制台<b>同意</b>，同意一次即永久信任，之后自动重连。</div>
@@ -571,6 +593,9 @@ async function fetchState(signal) {
   $('bRules').textContent = S.rules.length;
   $('bForwards').textContent = S.forwards.length;
   if (!networkRulesBusy) { renderRules(); renderForwards(); }
+  // renderShareCard 放在最前：它是成员页签的首屏内容，其余卡片再怎么显示/隐藏
+  // 都不该影响「本机连接码」的可见性。
+  renderShareCard();
   renderConnect(); renderSeed(); renderPublicDHT();
 }
 
@@ -630,6 +655,59 @@ async function resolvePending(peerID, approve) {
   } catch (e) {
     flash('peerMsg', '操作失败：' + e, false);
   }
+}
+
+// renderShareCard 渲染顶部「我的连接码」卡片。
+//
+// 与 renderConnect 里的 #myNodeID 共用同一份数据源（S.invite_code），但两者**不合并**：
+// connectCard 只在 standalone 网络下显示，而分享连接码在任何网络形态下都有意义。
+function renderShareCard() {
+  const card = $('shareCard');
+  if (!card) return;
+  if (!S) { card.style.display = 'none'; return; }
+  const code = S.invite_code || (S.info && S.info.peer_id) || '';
+  if (!code) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  const box = $('shareCode');
+  if (box.value !== code) { box.value = code; autoGrow(box); }
+  const hint = $('shareCodeHint');
+  if (hint) {
+    const at = code.indexOf('@');
+    const n = at >= 0 ? code.slice(at + 1).split(',').filter(Boolean).length : 0;
+    hint.textContent = n > 1
+      ? `已带上本机 ${n} 个地址（按可达性排序），对方会逐个尝试，任一可达即连通。地址变化后需重新分享。`
+      : '连接码含节点 ID 与直拨地址。地址变化后需重新分享。';
+  }
+}
+
+// 复制连接码：复用 copyText（它同时处理 Clipboard API 与老式 execCommand 回退）。
+function copyShareCode() {
+  const code = $('shareCode').value || '';
+  if (!code) { flash('shareCodeHint', '还没有连接码，先入网', false); return; }
+  copyText(code, $('shareCopyBtn'));
+}
+
+// 分享连接码：优先走 App 注入的原生桥（弹系统分享面板，能发到微信/便签等），
+// 浏览器里没有这个桥，退化为「复制到剪贴板 + 提示」，并尝试 Web Share API。
+function shareShareCode() {
+  const code = $('shareCode').value || '';
+  if (!code) { flash('shareCodeHint', '还没有连接码，先入网', false); return; }
+  const text = '加入我的 lanet 网络，用这个连接码：\n' + code;
+  // 原生桥由 App 的 ConsoleWebView 注入（window.LanetAndroid.shareText）。
+  if (window.LanetAndroid && typeof window.LanetAndroid.shareText === 'function') {
+    try {
+      window.LanetAndroid.shareText(text);
+      return;
+    } catch (e) { /* 桥异常时继续走下面的网页方案 */ }
+  }
+  if (navigator.share) {
+    navigator.share({ title: 'lanet 连接码', text: text }).catch(() => {
+      copyText(code, $('shareSendBtn'));
+    });
+    return;
+  }
+  copyText(code, $('shareSendBtn'));
+  flash('shareCodeHint', '当前环境不支持系统分享，已复制到剪贴板', true);
 }
 
 // renderConnect 渲染「连接其他节点」卡片：本机连接码 + 待审批列表。

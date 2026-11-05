@@ -24,12 +24,25 @@
         android:allowBackup="false"
         android:label="@string/app_name"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.DeviceDefault.DayNight">
 
+        <!--
+          android:screenOrientation="portrait"：强制竖屏。
+          这个 App 的控制台是竖向列表式的（成员表、规则表、日志），横屏下表格会被
+          压得很窄，加上键盘弹出后可用高度骤减，体验明显更差，所以直接锁竖屏。
+
+          android:usesCleartextTraffic（在 application 上）是必需的：内嵌的网页控制台
+          跑在 http://127.0.0.1:<port>，而 targetSdk 28+ 默认禁止明文 HTTP，不打开这个
+          开关 WebView 会报 net::ERR_CLEARTEXT_NOT_PERMITTED，表现为一片白屏。
+          只对回环地址有用，不构成对外暴露风险（控制台监听地址固定 127.0.0.1）。
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="@string/app_name">
+            android:label="@string/app_name"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
