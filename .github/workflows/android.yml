@@ -144,16 +144,34 @@ jobs:
         run: |
           set -euo pipefail
           # 许可由上面的 setup-android@v4 统一接受（它自己会跑 sdkmanager --licenses，
-          # 内部处理了 `yes` 的 SIGPIPE 问题）。这里只负责装我们点名的四个包。
+          # 内部处理了 `yes` 的 SIGPIPE 问题）。这里只负责装我们点名的包。
           #
           # sdkmanager 的 SDK 根目录从 action 导出的 ANDROID_SDK_ROOT 取，不自己猜路径：
-          # action 已经把 cmdline-tools/22.0/bin 加进 PATH，所以直接敲 sdkmanager 即可。
+          # action 已经把 cmdline-tools 加进 PATH，所以直接敲 sdkmanager 即可。
           SDK_ROOT="$ANDROID_SDK_ROOT"
+          #
+          # ⚠️ 包名必须是**完整路径名**：`platforms;android-35`，不能只写 `android-35`。
+          # 2026-11-05 第四次实跑就是栽在这：`sdkmanager android-35` 报
+          # `Warning: Failed to find package 'android-35'` 并 exit 1，而镜像里
+          # platforms/android-35 明明是装好的 —— sdkmanager 只认 <大类>;<子项> 这种写法。
+          # ANDROID_PLATFORM 环境变量保持 `android-35`（AGP 和 adb 那边用的是短名），
+          # 所以这里在拼装时补上 `platforms;` 前缀，两个名字各归各位，不要混用。
           sdkmanager \
-            "$ANDROID_PLATFORM" \
+            "platforms;$ANDROID_PLATFORM" \
             "platform-tools" \
             "build-tools;$ANDROID_BUILD_TOOLS" \
             "ndk;$ANDROID_NDK_VERSION"
+          # 校验关键目录到位：sdkmanager 静默跳过已安装包时不会报错，但目录缺失会
+          # 在几步之后以「AGP 找不到 platform」的形式失败，日志隔得太远不好查。
+          for required in \
+            "$SDK_ROOT/platforms/$ANDROID_PLATFORM" \
+            "$SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS" \
+            "$SDK_ROOT/ndk/$ANDROID_NDK_VERSION"; do
+            if [ ! -d "$required" ]; then
+              echo "::error::安装后缺少目录：$required"
+              exit 1
+            fi
+          done
           # 三个变量都要：gomobile 读 ANDROID_NDK_HOME（老名字），AGP 读 ANDROID_HOME，
           # 本地 SDK 布局读 ANDROID_SDK_ROOT。历史上缺一个就会出现「找得到 NDK、找不到 adb」
           # 或反之，统一都导出到 GITHUB_ENV 供后续所有步骤共用。
