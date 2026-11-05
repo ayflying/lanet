@@ -119,60 +119,37 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # ⚠️ 不直接用 android-actions/setup-android@v3：2026-11-05 首次实跑实测在该步骤失败，
-      # 报「Warning: Failed to find package 'tools'」→ sdkmanager 退出码 1。原因是这个 action
-      # 内部会执行 `sdkmanager tools` 去装旧式 SDK Tools 包，而新版 cmdline-tools 的仓库里
-      # 已经没有 `tools` 这个包了（Google 早就把它拆成 build-tools/platform-tools 等）。
-      # ubuntu-latest 镜像本身预装了完整的 Android SDK（/usr/local/lib/android/sdk），
-      # 我们只需要「定位 SDK + 接受许可 + 装我们点名的几个包」，因此改成手写步骤：
-      # 既绕开那个失效的包名，也不依赖 action 的内部实现。
-      - name: 定位 Android SDK（runner 镜像预装）
-        shell: bash
-        run: |
-          set -euo pipefail
-          # 优先用环境里已有的 ANDROID_SDK_ROOT / ANDROID_HOME；都没有就落到镜像固定路径。
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          if [ ! -d "$SDK_ROOT" ]; then
-            echo "::error::找不到 Android SDK（$SDK_ROOT）。runner 镜像变了？请检查 ubuntu-latest 预装列表。"
-            exit 1
-          fi
-          # cmdline-tools 的 sdkmanager 位置在不同镜像版本里有 latest/16.0 等差异，按目录探测。
-          SDKMANAGER=""
-          for candidate in "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager; do
-            if [ -x "$candidate" ]; then SDKMANAGER="$candidate"; fi
-          done
-          if [ -z "$SDKMANAGER" ]; then
-            echo "::error::$SDK_ROOT/cmdline-tools/*/bin/sdkmanager 不存在，无法安装 SDK 包。"
-            exit 1
-          fi
-          echo "SDK_ROOT=$SDK_ROOT"
-          echo "SDKMANAGER=$SDKMANAGER"
-          echo "SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-          # 写进 GITHUB_PATH 后才能在后继步骤里直接调用 sdkmanager（步骤内的 shell 变量不跨步骤）。
-          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+      # Android SDK：用官方 action 的 **v4**（不是 v3）。
+      #
+      # 版本选择的依据（2026-11-05 三次实跑 + 上游 README 核对，别随手改回 v3）：
+      #   - v3 内部会执行 `sdkmanager tools`。Google 已经不再提供 `tools` 这个包，
+      #     v3 因此直接红：`Warning: Failed to find package 'tools'` + exit 1。
+      #     上游已在 v4 里把 `tools` 从默认 packages 移除（官方 README 有专门一节说明），
+      #     显式传入时也只警告不失败 —— 也就是说 v3 的故障在 v4 已被修掉。
+      #   - v4 会下载它自带版本的 cmdline-tools（22.0）并加进 PATH。这一点很关键：
+      #     我实测过「直接用 runner 镜像预装的 cmdline-tools/latest」，它读远程仓库时
+      #     只能加载到 7%，随即报 `Failed to find package 'android-35'`（连 platform 都
+      #     找不到），说明镜像里那一份的仓库索引是坏的/不兼容的，不能依赖。
+      #   - v4 还附带 problem matcher，Gradle/Kotlin 报错能在日志里直接标红定位。
+      # packages 传空串：我们下面要用 sdkmanager 精确点名 platform 35 / build-tools /
+      # NDK 三个包，让 action 只负责「装 cmdline-tools + 接受许可 + 配 PATH」，避免它
+      # 多装一份 platform-tools（镜像里已经有了，重复下载纯浪费时间）。
+      - name: Set up Android SDK（cmdline-tools 22.0 + 自动接受许可）
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ""
 
-      - name: 接受 SDK 许可并安装 platform 35 / build-tools / NDK
+      - name: 安装 platform 35 / build-tools / NDK
         shell: bash
         run: |
           set -euo pipefail
-          # 许可必须**先**接受再装包：反过来时 sdkmanager 会在装包过程中卡在 y/N 交互上，
-          # 在 CI 里表现为超时或 exit 1。
+          # 许可由上面的 setup-android@v4 统一接受（它自己会跑 sdkmanager --licenses，
+          # 内部处理了 `yes` 的 SIGPIPE 问题）。这里只负责装我们点名的四个包。
           #
-          # ⚠️ 这里刻意**不用** `yes | sdkmanager --licenses`：2026-11-05 第二次实跑实测，
-          # 在 `set -o pipefail` 下 `yes` 会因为 sdkmanager 读完所有许可后提前关掉读端而
-          # 收到 SIGPIPE（退出码 141），pipefail 把整条管道判成失败 -> 步骤红，但许可其实
-          # 已经全部接受成功（日志里能看到 All SDK package licenses accepted）。
-          # 改成把固定数量的 y 写进临时文件再重定向：全程没有可能被 SIGPIPE 杀掉的写入方
-          # 进程，退出码只反映 sdkmanager 自己的结果。
-          # 数量取 500：远超当前 SDK 许可条目数（约 10 条），多余的 y 由 sdkmanager 忽略。
-          LIC_ANSWER="$(mktemp)"
-          for _ in $(seq 1 500); do echo y; done > "$LIC_ANSWER"
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses < "$LIC_ANSWER" > /dev/null
-          rm -f "$LIC_ANSWER"
-          # --sdk_root 显式给，避免 sdkmanager 把包装到别处（它默认取自身所在树的上级，
-          # 而 cmdline-tools 多版本共存时会猜错）。
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+          # sdkmanager 的 SDK 根目录从 action 导出的 ANDROID_SDK_ROOT 取，不自己猜路径：
+          # action 已经把 cmdline-tools/22.0/bin 加进 PATH，所以直接敲 sdkmanager 即可。
+          SDK_ROOT="$ANDROID_SDK_ROOT"
+          sdkmanager \
             "$ANDROID_PLATFORM" \
             "platform-tools" \
             "build-tools;$ANDROID_BUILD_TOOLS" \
