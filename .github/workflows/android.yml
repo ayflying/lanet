@@ -359,9 +359,19 @@ jobs:
           fi
           # --no-daemon：CI 单次构建，守护进程只会拖慢收尾；
           # --stacktrace：失败时给出 Gradle 内部调用栈，便于区分「AGP 配置错」与「编译错」。
-          ./gradlew --no-daemon --stacktrace clean "$TASK"
-          # clean 是必须的：增量打包复用旧条目布局时 zip 里会出现空洞
-          # （ZipFlinger 残影，APK 体积虚高），见 sdk/android/README.md 第二节。
+          #
+          # ⚠️ 这里**不能**加 clean（2026-11-05 第五次实跑实测踩过）：
+          # `./gradlew clean` 会删掉整个 app/build/ 以及 app/ 目录下的构建输入，
+          # 而 lanet.aar 就放在 app/libs/ 里 —— clean 之后 AAR 消失，Gradle 报
+          # `lanet.aar (No such file or directory)`，看起来像「文件没拷进来」，其实是
+          # 被自己的 clean 删了。CI 每次都是全新 clone + 全新 Gradle 缓存目录，本来就没有
+          # 增量残留，所以 clean 在这里零收益。
+          # 本地想清残留请手动 `rm -rf app/build`，不要靠这一步的 clean。
+          if [ ! -f app/libs/lanet.aar ]; then
+            echo "::error::编译前 app/libs/lanet.aar 不存在（gomobile 步骤的产物丢失或被清理）"
+            exit 1
+          fi
+          ./gradlew --no-daemon --stacktrace "$TASK"
           echo "out_dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
           ls -lh "$OUT_DIR"
 
