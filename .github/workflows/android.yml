@@ -393,10 +393,10 @@ jobs:
           # 任何 task 输出的 app/libs/lanet.aar 一并清掉，反而制造故障。
           # 本地想清残留请手动 `rm -rf sdk/android/app/build`。
           ( cd "$HOST_DIR" && ./gradlew --no-daemon --stacktrace "$TASK" )
-          # 输出值统一成「相对仓库根」的路径（已含 sdk/android/ 前缀）：后续三步
-          # （校验版本号 / 验签 / 改名）都直接 find "$OUT_DIR"，不再各自拼前缀，
-          # 共用同一套基准，不会因为各自 cwd 不同而错位。
-          echo "out_dir=$HOST_DIR/$OUT_DIR" >> "$GITHUB_OUTPUT"
+          # 输出成**相对仓库根**的路径：后续三步（校验版本号 / 验签 / 改名）的
+          # working-directory 都是仓库根，HOST_DIR 里的 ../.. 在它们那里并不成立，
+          # 直接给 sdk/android/ 前缀才是唯一各处都通行的基准。
+          echo "out_dir=sdk/android/$OUT_DIR" >> "$GITHUB_OUTPUT"
           ls -lh "$HOST_DIR/$OUT_DIR"
 
       # 校验 Gradle 实际打出来的 versionName/versionCode 与 VERSION 推导值一致。
