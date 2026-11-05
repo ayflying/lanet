@@ -157,8 +157,19 @@ jobs:
         run: |
           set -euo pipefail
           # 许可必须**先**接受再装包：反过来时 sdkmanager 会在装包过程中卡在 y/N 交互上，
-          # 在 CI 里表现为超时或 exit 1。`yes |` 是为了让交互式提问全部拿到 y。
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null
+          # 在 CI 里表现为超时或 exit 1。
+          #
+          # ⚠️ 这里刻意**不用** `yes | sdkmanager --licenses`：2026-11-05 第二次实跑实测，
+          # 在 `set -o pipefail` 下 `yes` 会因为 sdkmanager 读完所有许可后提前关掉读端而
+          # 收到 SIGPIPE（退出码 141），pipefail 把整条管道判成失败 -> 步骤红，但许可其实
+          # 已经全部接受成功（日志里能看到 All SDK package licenses accepted）。
+          # 改成把固定数量的 y 写进临时文件再重定向：全程没有可能被 SIGPIPE 杀掉的写入方
+          # 进程，退出码只反映 sdkmanager 自己的结果。
+          # 数量取 500：远超当前 SDK 许可条目数（约 10 条），多余的 y 由 sdkmanager 忽略。
+          LIC_ANSWER="$(mktemp)"
+          for _ in $(seq 1 500); do echo y; done > "$LIC_ANSWER"
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses < "$LIC_ANSWER" > /dev/null
+          rm -f "$LIC_ANSWER"
           # --sdk_root 显式给，避免 sdkmanager 把包装到别处（它默认取自身所在树的上级，
           # 而 cmdline-tools 多版本共存时会猜错）。
           "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
@@ -368,13 +379,17 @@ jobs:
           OUT_DIR: ${{ steps.assemble.outputs.out_dir }}
         run: |
           set -euo pipefail
-          APK="$(find "sdk/android/$OUT_DIR" -maxdepth 1 -name '*.apk' | head -1)"
+          # ⚠️ 不用 `find ... | head -1`：pipefail 下 head 提前关闭读端会让 find 收到
+          # SIGPIPE（141），多命中时会误判失败。`-print -quit` 找到第一个就退出，无管道。
+          APK="$(find "sdk/android/$OUT_DIR" -maxdepth 1 -name '*.apk' -print -quit)"
           if [ -z "$APK" ]; then
             echo "::error::在 sdk/android/$OUT_DIR 下没找到 APK"
             exit 1
           fi
           AAPT2="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/aapt2"
-          BADGING="$("$AAPT2" dump badging "$APK" | head -1)"
+          # 同理不用 `| head -1`：aapt2 输出多行时 head 提前退出会触发 SIGPIPE。
+          # badging 的第一行就是 package 行，sed 取首行等价且没有管道。
+          BADGING="$("$AAPT2" dump badging "$APK" | sed -n '1p')"
           echo "$BADGING"
           GOT_NAME="$(sed -n "s/.*versionName='\([^']*\)'.*/\1/p" <<< "$BADGING")"
           GOT_CODE="$(sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" <<< "$BADGING")"
@@ -397,7 +412,9 @@ jobs:
           OUT_DIR: ${{ steps.assemble.outputs.out_dir }}
         run: |
           set -euo pipefail
-          APK="$(find "sdk/android/$OUT_DIR" -maxdepth 1 -name '*.apk' | head -1)"
+          # ⚠️ 不用 `find ... | head -1`：pipefail 下 head 提前关闭读端会让 find 收到
+          # SIGPIPE（141），多命中时会误判失败。`-print -quit` 找到第一个就退出，无管道。
+          APK="$(find "sdk/android/$OUT_DIR" -maxdepth 1 -name '*.apk' -print -quit)"
           APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
           "$APKSIGNER" verify --print-certs "$APK" | tee apk-certs.txt
           {
@@ -418,7 +435,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          APK="$(find "sdk/android/$OUT_DIR" -maxdepth 1 -name '*.apk' | head -1)"
+          # ⚠️ 不用 `find ... | head -1`：pipefail 下 head 提前关闭读端会让 find 收到
+          # SIGPIPE（141），多命中时会误判失败。`-print -quit` 找到第一个就退出，无管道。
+          APK="$(find "sdk/android/$OUT_DIR" -maxdepth 1 -name '*.apk' -print -quit)"
           OUT="dist/lanet-${{ steps.ver.outputs.version }}-android.apk"
           cp "$APK" "$OUT"
           # sha256 的格式与 release.yml 里别的平台完全一致（"<hash>  <文件名>"），
