@@ -276,10 +276,12 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 	// 备注（notes）更是只有本机才有。
 	nameIdx := c.PeerNameIndex()
 	lastSeenIdx := make(map[string]time.Time)
-	for _, p := range c.TrustedPeers() {
+	trusted := c.TrustedPeers()
+	for _, p := range trusted {
 		lastSeenIdx[p.PeerID] = p.LastSeen
 	}
 	members := []memberView{}
+	seen := make(map[string]bool, len(trusted))
 	for _, m := range c.NetMap().Members {
 		online := false
 		if pid, err := peer.Decode(m.PeerID); err == nil {
@@ -309,6 +311,57 @@ func (c *Client) apiState(w http.ResponseWriter, r *http.Request) {
 		}
 		if !lastSeen.IsZero() {
 			mv.LastSeen = lastSeen.Unix()
+		}
+		seen[m.PeerID] = true
+		members = append(members, mv)
+	}
+	// 回填「已信任但当前不在成员表」的节点，统一标记为离线。
+	//
+	// 为什么需要这一步：成员表（disc.members）是**内存中的实时视图**，Discovery
+	// 每轮 reapExpired() 会把超过 memberTTL（默认 10 分钟）无通讯的节点直接
+	// delete 掉（见 pkg/serverless/serverless.go）。也就是说节点下线十分钟后
+	// 连记录都不在了，控制台自然无从显示——用户看到的是「人凭空消失」，
+	// 而不是「离线」。但信任关系与备注存在持久化的地址簿（peersdb）里，
+	// 数据一直都在，只是没有并进成员列表。
+	//
+	// 语义边界：只回填 Trusted=true 的节点。地址簿里还有「连过但没审批」的
+	// 记录，那类属于陌生节点，混进成员列表会让人误以为是网络成员。
+	//
+	// 展示上仍按原有约定：备注优先于对端自报名（前端 label 取 notes || name），
+	// 两个都空时前端会退化成节点 ID 缩写，所以这里不做额外兜底。
+	selfID := c.Info().PeerID
+	for _, p := range trusted {
+		if seen[p.PeerID] {
+			continue
+		}
+		// 跳过本机自己：身份文件换过之后地址簿里可能留下指向当前身份的历史行，
+		// 展示成「一个离线的我」纯属误导。
+		if selfID == p.PeerID {
+			continue
+		}
+		name, notes := p.Name, p.Notes
+		if info, ok := nameIdx[p.PeerID]; ok {
+			if name == "" {
+				name = info.Name
+			}
+			if notes == "" {
+				notes = info.Notes
+			}
+		}
+		mv := memberView{
+			PeerID: p.PeerID, Name: name, Notes: notes,
+			// 离线成员的虚拟 IP 取地址簿里记录的上次使用值：节点重新上线并领到
+			// 同一个 IP 时前后一致；若重连后被重新派生，实时表那条会覆盖这里。
+			VirtualIP: p.LastIP,
+			Online:    false,
+			// 离线路径未知：留给前端渲染成「—」，不要伪造 direct/relay。
+			Path: "",
+		}
+		if !p.FirstSeen.IsZero() {
+			mv.FirstSeen = p.FirstSeen.Unix()
+		}
+		if !p.LastSeen.IsZero() {
+			mv.LastSeen = p.LastSeen.Unix()
 		}
 		members = append(members, mv)
 	}
