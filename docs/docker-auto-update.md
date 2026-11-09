@@ -16,6 +16,13 @@ Docker 与裸机节点一样强制启动 P2P 自动更新，不提供关闭自�
 
 以前明确禁用容器更新的版本，必须先更新一次镜像来安装监督器；旧程序无法凭空获得此能力。保留原 `/data` 数据卷即可保留节点身份、配置与后续升级程序。
 
+## 编排层约束（宝塔面板托管的栈）
+
+- Docker 会把传给 `docker compose -f` 的**每个**文件永久写进项目标签 `com.docker.compose.project.config_files`。升级时不要把备份目录里的临时 overlay（如 `/root/lanet-backup-*/upgrade.yaml`）当第二个 `-f` 传进去：备份目录一旦清理，面板「容器编排」与 `docker compose ls` 就指向不存在的文件（表现为“文件不存在”），栈也无法再被干净接管。正确做法是只改编排文件里的 `image` tag，然后在该目录执行一次 `docker compose up -d`，让标签始终只指向面板托管的那一个文件。
+- `network_mode: host` 时 `ports:` 映射不生效（Docker 只告警并丢弃），端口由宿主机防火墙放行；同一份文件里不要既写 host 又写端口映射。
+- host 模式让容器看到宿主机全部网卡（含 `docker0` / `br-*` 的 `172.x.0.1`），必须用 `LANET_ADVERTISE` 声明外界真正可达的地址，否则这些不可达地址会被写进连接码与地址簿，其它成员反复空拨。bridge 模式同理：容器自报的 docker 内网地址也要靠 `LANET_ADVERTISE` 换成宿主映射地址。
+- Docker 捕获的标准错误不受应用内日志轮转约束，`logging` 段需设 `max-size` / `max-file`；再用 `mem_limit` / `pids_limit` 给宿主机兜底。
+
 无需挂载 `/var/run/docker.sock`，无需 `privileged` 或宿主机 PID namespace。TUN 所需 NET_ADMIN 与自动更新无关。
 
 ## 安全与边界
