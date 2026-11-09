@@ -44,4 +44,6 @@ VOLUME ["/data"]
 # 否则默认落在 /usr/local/bin（非 root 不可写，控制台「节点配置」保存会静默失败）。
 ENV LANET_CONSOLE=0.0.0.0:8900
 ENV LANET_CONFIG=/data/lanet.json
+# 同一程序首先作为监督器运行；更新仅切换子进程，PID1和持久卷保持稳定。
+# 不挂载docker.sock；P2P候选与启动扫描都必须经过内置发布公钥验签。
 ENTRYPOINT ["pvn-node"]

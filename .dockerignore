@@ -1,0 +1,15 @@
+# 私钥和本机认证资料绝不能进入远端构建上下文或缓存。
+secrets/
+**/*.pem
+**/*.key
+.env
+.env.*
+.git/
+.workbuddy/
+.tmp*/
+tmp/
+outputs/
+**/__pycache__/
+**/*.log
+**/*.test.exe
+**/*.test

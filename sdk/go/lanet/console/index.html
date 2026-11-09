@@ -1605,8 +1605,8 @@ function renderUpdateModal() {
     : '当前已是最新版本，无需更新。';
   // 容器内不能就地替换二进制（换了也会随容器重建丢失），隐藏「立即更新并重启」，
   // 改成在说明区给出编排层命令——否则用户会反复点更新、反复看到版本没变。
-  $('updApply').style.display = (has && !updInfo.container) ? '' : 'none';
-  if (has && updInfo.container) {
+  $('updApply').style.display = (has && (!updInfo.container || updInfo.managed_runtime)) ? '' : 'none';
+  if (has && updInfo.container && !updInfo.managed_runtime) {
     $('updNotes').innerHTML +=
       '<div style="margin-top:10px;padding:10px;border:1px solid var(--warn,#b8860b);border-radius:6px">' +
       '<b>容器环境请用编排层更新</b><br>' +

@@ -124,14 +124,9 @@ func readConfigToken(path string) string {
 	return nc.GitHubToken
 }
 
-// errUpdateInContainer 容器内拒绝「下载并替换自身」。
-//
-// 自替换写入容器可写层：普通 restart 保留它，recreate 才会丢失它。
-// 更关键的是，本程序作为 PID 1 时，「派生 helper 后退出」会结束整个容器，
-// helper 随之被终止，残留标记可触发反复启动退出。因此按部署策略禁止
-// 容器内自替换，镜像升级统一交给编排层。
-var errUpdateInContainer = errors.New(
-	"容器环境不支持在程序内更新（新程序会随容器重建丢失）：请在宿主机的 Compose 项目目录执行 docker compose pull && docker compose up -d 更新镜像")
+// 仅未受监督的旧容器进程不能直接退出PID1；正式镜像在main入口自动接管，
+// 并通过持久运行槽升级。该错误不是关闭Docker自动更新的配置项。
+var errUpdateInContainer = errors.New("旧容器进程尚未接入自动更新监督器，需要先升级镜像以启用安全自动更新")
 
 // containerized 判断当前是否跑在容器里，供测试替换（默认按标记文件探测）。
 var containerized = runningInContainer
@@ -172,10 +167,10 @@ func updateRoutes(cancel context.CancelFunc) map[string]http.HandlerFunc {
 				"checked_at":  at.Format(time.RFC3339),
 				"cache_ttl_s": int(updateCacheTTL.Seconds()),
 				"timed_out":   timedOut,
-				// container 让控制台隐藏「立即更新并重启」按钮，改为提示走编排层：
-				// 容器内替换二进制只会随容器重建丢失，探不到这一点就会让用户
-				// 反复点更新、反复看到版本没变。
-				"container": containerized(),
+				// 容器事实与受监督能力分开：新镜像允许自动及手动安全更新。
+				"container":           containerized(),
+				"auto_update_enabled": true,
+				"managed_runtime":     os.Getenv("LANET_CONTAINER_CHILD") == "1",
 			})
 		},
 		"POST /api/update/apply": func(w http.ResponseWriter, r *http.Request) {
@@ -200,7 +195,7 @@ func updateRoutes(cancel context.CancelFunc) map[string]http.HandlerFunc {
 		"POST /api/restart": func(w http.ResponseWriter, r *http.Request) {
 			// 进程无法可靠获知 Docker 的 restart policy；退出可能是永久停服。
 			// 不返回虚假的重启成功，统一交由宿主机编排层执行。
-			if containerized() {
+			if containerized() && os.Getenv("LANET_CONTAINER_CHILD") != "1" {
 				writeJSONLocal(w, http.StatusConflict, map[string]string{"error": "容器内不执行进程自重启：请在宿主机执行 docker compose restart"})
 				return
 			}
@@ -389,11 +384,10 @@ func (u *updateState) snapshot() (checked, hasUpdate, needToken bool, latest, no
 // 同一个 exe；已有一轮更新在途时直接拒绝——避免「升级窗口里又点一次」造成
 // 重复下载、重复替换、反复重启。
 //
-// 容器环境直接拒绝（见 errUpdateInContainer）：替换写入的是容器可写层，
-// 容器一重建就丢；而 0.5.98 的启动入口会「见标记就派生 helper 后立刻退出」，
-// 容器在 PID 1 退出时杀掉 helper，导致永远应用不上、陷入重启循环。
+// 容器通过同一签名槽发布候选，再由父监督器切换；绝不覆盖PID1程序。
+// 未受监督的旧容器不能走裸机helper，需要先迁移到新镜像。
 func applyUpdate() (err error) {
-	if containerized() {
+	if containerized() && os.Getenv("LANET_CONTAINER_CHILD") != "1" {
 		return errUpdateInContainer
 	}
 	if !acquireUpdate() {
@@ -415,6 +409,12 @@ func applyUpdate() (err error) {
 	}
 	exePath := selfExe()
 	exeDir := filepath.Dir(exePath)
+	if containerized() {
+		exeDir = containerRuntimeDir()
+		if err := os.MkdirAll(exeDir, 0700); err != nil {
+			return err
+		}
+	}
 	workDir, err := os.MkdirTemp(exeDir, "update-")
 	if err != nil {
 		return fmt.Errorf("创建临时目录失败: %w", err)
@@ -438,13 +438,33 @@ func applyUpdate() (err error) {
 
 	// 解出 lanet(.exe)（Windows 同时解出 wintun.dll，若被占用则跳过）。
 	newExe := filepath.Join(workDir, "lanet-new"+extOf())
-	if err = extractBinary(archivePath, assetName, newExe, exeDir); err != nil {
+	manifestDir := exeDir
+	if containerized() {
+		manifestDir = workDir
+	}
+	if err = extractBinary(archivePath, assetName, newExe, manifestDir); err != nil {
 		return fmt.Errorf("解压失败: %w", err)
 	}
 
 	// 更新先落到安装目录的确定性暂存名；运行中的程序不替换自身。
 	// 下次进程启动（普通重启或 Windows 服务重启）时会消费该候选。
 	stagedPath := pendingUpdatePath(exePath)
+	if containerized() {
+		// GitHub 与 P2P 统一走强制签名验证，不接受仅有校验和的容器升级。
+		raw, readErr := os.ReadFile(filepath.Join(manifestDir, "update-manifest.json"))
+		if readErr != nil {
+			return fmt.Errorf("容器更新缺少签名清单: %w", readErr)
+		}
+		var m selfupdate.Manifest
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return err
+		}
+		if err := containerStageUpdate(newExe, m); err != nil {
+			return err
+		}
+		landed = true
+		return nil
+	}
 	if err := stageNewBinary(newExe, exePath); err != nil {
 		return fmt.Errorf("暂存更新失败: %w", err)
 	}
@@ -934,7 +954,11 @@ func restartSelf(delay time.Duration) {
 		log.Printf("[node] 重启程序: %s %v", exe, os.Args[1:])
 		// 防御内部调用：容器未必配置自动重启，保持当前进程存活最安全。
 		if containerized() {
-			log.Printf("[node] 容器内跳过进程自重启，请由宿主机编排层重启")
+			if os.Getenv("LANET_CONTAINER_CHILD") == "1" && containerRuntimeDir() != "" {
+				// 父监督器保持 PID 1 存活，Wait 后释放旧实例资源再启动候选。
+				os.Exit(42)
+			}
+			log.Printf("[node] 尚未接入容器监督器，保留当前进程")
 			return
 		}
 		if _, err := os.Stat(pendingUpdateMarkerPath(exe)); err == nil {

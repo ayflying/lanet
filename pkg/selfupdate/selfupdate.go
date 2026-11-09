@@ -193,6 +193,8 @@ type Config struct {
 	Platform string
 	// ExePath 本地主程序路径（既是分发源也是替换目标）。
 	ExePath string
+	// DownloadDir 显式可写暂存目录；容器镜像根目录可只读，下载放持久卷。
+	DownloadDir string
 	// ManifestPath 本地版本清单文件（保存最近一次验证过的 head，
 	// 重启后作为新版本的分发凭证）。默认 exe 同目录 update-manifest.json。
 	ManifestPath string
@@ -932,7 +934,13 @@ func (c *Coordinator) requestManifest(ctx context.Context, id string) (Manifest,
 
 // download 从 sample 中随机选一个持有目标版本的成员下载文件到临时路径。
 func (c *Coordinator) download(ctx context.Context, m Manifest, candidates []PeerInfo) (string, error) {
-	dir := filepath.Dir(c.cfg.ExePath)
+	dir := c.cfg.DownloadDir
+	if dir == "" {
+		dir = filepath.Dir(c.cfg.ExePath)
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
 	tmp := filepath.Join(dir, fmt.Sprintf("selfupdate-%s.tmp", m.SHA256[:12]))
 	// 随机起试，直到一个成功。
 	order := make([]PeerInfo, len(candidates))

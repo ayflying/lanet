@@ -198,7 +198,8 @@ func TestP2PFileTransfer(t *testing.T) {
 	cfgR := Config{
 		CurrentVersion: "0.1.0",
 		Platform:       "windows/amd64",
-		ExePath:        filepath.Join(dir, "lanet-old.exe"),
+		ExePath:        filepath.Join(dir, "read-only-image", "lanet-old.exe"),
+		DownloadDir:    filepath.Join(dir, "writable-runtime"),
 		PublicKey:      pubB64,
 		Quiet:          true,
 	}
@@ -221,9 +222,15 @@ func TestP2PFileTransfer(t *testing.T) {
 	}
 
 	// 2) 下载文件。
-	dest := filepath.Join(dir, "downloaded.tmp")
-	if err = cRequester.requestFile(ctx, hProvider.ID().String(), got, dest); err != nil {
+	dest, err := cRequester.download(ctx, got, []PeerInfo{{ID: hProvider.ID().String()}})
+	if err != nil {
 		t.Fatalf("下载失败: %v", err)
+	}
+	if filepath.Dir(dest) != cfgR.DownloadDir {
+		t.Fatalf("未使用可写运行目录: %s", dest)
+	}
+	if _, err := os.Stat(filepath.Dir(cfgR.ExePath)); !os.IsNotExist(err) {
+		t.Fatalf("下载不应触碰只读镜像目录: %v", err)
 	}
 	gotBin, err := os.ReadFile(dest)
 	if err != nil {
@@ -279,15 +286,15 @@ func TestDerivedProtocolRateLimited(t *testing.T) {
 	gk := []byte("group-secret-key")
 	hProvider := newTestHost(t)
 	cProvider := New(hProvider, staticPeers{}, Config{
-		CurrentVersion:      "9.9.9",
-		Platform:            "windows/amd64",
-		ExePath:             srcExe,
-		ManifestPath:        manifestPath,
-		PublicKey:           pubB64,
-		CheckInterval:       time.Hour, // 不触发自动巡检
-		Quiet:               true,
-		GroupKey:            gk,
-		PerPeerMinInterval:  time.Hour, // 把同对端间隔压到极大，凸显限流
+		CurrentVersion:       "9.9.9",
+		Platform:             "windows/amd64",
+		ExePath:              srcExe,
+		ManifestPath:         manifestPath,
+		PublicKey:            pubB64,
+		CheckInterval:        time.Hour, // 不触发自动巡检
+		Quiet:                true,
+		GroupKey:             gk,
+		PerPeerMinInterval:   time.Hour, // 把同对端间隔压到极大，凸显限流
 		FileDownloadCooldown: time.Hour,
 	}, nil)
 	if _, ok := cProvider.SelfManifest(); !ok {

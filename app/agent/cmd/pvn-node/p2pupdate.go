@@ -1,7 +1,7 @@
 package main
 
 // p2pupdate.go P2P 自更新接线：
-//   - 容器环境自动禁用（容器内替换二进制会被镜像回滚，更新走编排层）；
+//   - 容器与裸机均自动更新：容器通过持久运行槽及常驻监督器切换；
 //   - 候选来源 = 成员表 ∪ 私有 DHT 路由表，覆盖**整个 lanet 私有 DHT 网络**
 //     ——不同网络密钥、没加过好友、甚至只是被 DHT 路由过的节点都算，发现更高
 //     版本即征询；
@@ -135,9 +135,6 @@ func StartP2PUpdate(ctx context.Context, c *lanet.Client, version string, exeDir
 	if version == "" || version == "dev" {
 		return "dev 构建（版本号不可比）"
 	}
-	if containerized() {
-		return "容器环境（更新走编排层）"
-	}
 	exePath, err := os.Executable()
 	if err != nil {
 		return "无法定位自身程序: " + err.Error()
@@ -151,6 +148,7 @@ func StartP2PUpdate(ctx context.Context, c *lanet.Client, version string, exeDir
 		CurrentVersion: version,
 		Platform:       runtime.GOOS + "/" + runtime.GOARCH,
 		ExePath:        exePath,
+		DownloadDir:    containerRuntimeDir(),
 		ManifestPath:   filepath.Join(exeDir, "update-manifest.json"),
 		// 巡检节奏：「发现新版本立即升级」——启动 30 秒后先比一轮版本，
 		// 之后每 5 分钟一轮。候选来自内存视图（成员表/路由表），
@@ -181,7 +179,11 @@ var (
 // applyP2PUpdateLocked 接收下载前已取得的闸门，不再次 acquire。
 func applyP2PUpdateLocked(newPath string, m selfupdate.Manifest, exePath string) {
 	log.Printf("[p2p-update] 新版本 v%s 下载校验完成，替换程序", m.Version)
-	if err := installP2PBinary(newPath, exePath); err != nil {
+	install := func() error { return installP2PBinary(newPath, exePath) }
+	if containerRuntimeDir() != "" {
+		install = func() error { return containerStageUpdate(newPath, m) }
+	}
+	if err := install(); err != nil {
 		log.Printf("[p2p-update] 替换程序失败（不中断运行）: %v", err)
 		releaseUpdate() // 没落地，允许下轮重试
 		return

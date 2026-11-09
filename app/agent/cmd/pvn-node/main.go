@@ -57,6 +57,9 @@ func echoProtoFor(groupKey []byte, legacy bool) libprotocol.ID {
 var version = "dev"
 
 func main() {
+	if runContainerSupervisor() {
+		return
+	}
 	if runUpdateHelper() {
 		return
 	}
@@ -383,6 +386,8 @@ func runNode(parent context.Context, serviceMode bool) {
 	// 控制台端口可能向后回退，把**实际**地址补写进锁文件：后面被拒绝启动的
 	// 实例靠它把用户直接送到正在跑的那份控制台上。
 	instLock.refresh(effName, node.ConsoleURL())
+	// 仅通知持有本次启动随机路径的父监督器；不依赖外网在线人数。
+	signalContainerReady()
 
 	// ---- .lanet DNS 的系统路由（Windows NRPT 规则）----
 	// 节点以管理员运行，把 *.lanet 查询定向到内置 DNS（127.0.0.1:53）。
@@ -401,7 +406,7 @@ func runNode(parent context.Context, serviceMode bool) {
 	// 每次启动后台检查一次更新（预拉发行说明，控制台弹框即点即显）。
 	StartUpdateCheck(firstNonEmpty(os.Getenv("GITHUB_TOKEN"), readConfigToken(*config)))
 
-	// P2P 自动更新（去中心化分发；强制开启，仅 dev/容器环境自动禁用）。
+	// P2P 自动更新强制开启；Docker 由持久化运行槽与父监督器安全切换。
 	if reason := StartP2PUpdate(ctx, node, version, filepath.Dir(*config)); reason != "" {
 		log.Printf("[p2p-update] 已禁用：%s", reason)
 	}
@@ -679,6 +684,7 @@ const probeHeartbeatInterval = 10 * time.Minute
 //     证明成员仍被持续探测且可达；
 //   - FAIL 与 OK 同规则：持续失败由 probeBackoff 限频（最坏 1 次/分钟），
 //     进入持续失败后降为心跳节奏。
+//
 // 探测与保温节奏不受影响，只影响日志输出。
 type probeLogThrottle struct {
 	mu    sync.Mutex

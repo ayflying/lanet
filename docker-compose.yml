@@ -106,6 +106,7 @@ services:
     volumes:
       # 命名卷：node.key / lanet.json / state.json / lanet.db / lanet.log 全部落在这里，
       # 首次挂载自动继承镜像内 /data 属主，重建容器身份与虚拟 IP 不变。
+      # /data/runtime 保存验签后的自动升级程序；旧镜像重建仍使用已确认新版。
       - lanet-node-data:/data
     # ---- TUN 虚拟网卡（默认启用，与上方 LANET_TUN: "true" 配套）----
     # 权限段已默认放开：容器内可直接创建 TUN 网卡，成员可 ping 通本节点虚拟 IP。
