@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -42,6 +43,8 @@ type Service struct {
 	dials       map[peer.ID]*dialFlight
 	activeDials int
 	waiters     int
+	retry       retryState
+	owned       ownedRegistry
 }
 
 const (
@@ -124,6 +127,12 @@ func (s *Service) OpenStreamToVirtualIPProtocol(ctx context.Context, virtualIP s
 // 用于「同群新老版本混跑」过渡期（如探测协议既发派生 ID 又发历史固定 ID），
 // 省去协商失败后再拨一次的往返。
 func (s *Service) OpenStreamToVirtualIPProtocols(ctx context.Context, virtualIP string, protos []libprotocol.ID) (_ network.Stream, _ bool, resultErr error) {
+	s.owned.Lock()
+	closed := s.owned.closed
+	s.owned.Unlock()
+	if closed {
+		return nil, false, fmt.Errorf("tunnel service closed")
+	}
 	ctx, cancel := context.WithTimeout(ctx, totalDialTimeout)
 	defer cancel()
 	route, ok := s.netmapCli.Resolve(virtualIP)
@@ -155,16 +164,12 @@ func (s *Service) OpenStreamToVirtualIPProtocols(ctx context.Context, virtualIP 
 		if err := ctx.Err(); err != nil {
 			return nil, false, err
 		}
-		if len(s.self.Network().ConnsToPeer(target)) == 0 {
-			if flight.err != nil {
-				return nil, false, flight.err
-			}
-			return nil, false, fmt.Errorf("tunnel connection to %s lost before opening stream", target)
-		}
+		// Flights share connection establishment, never application streams or
+		// protocol errors. Retry only existing exact healthy paths here.
 		s.mu.Lock()
 		if s.activeDials >= maxConcurrentDials {
 			s.mu.Unlock()
-			return nil, false, fmt.Errorf("tunnel concurrent dial limit reached")
+			return nil, false, ErrRetryLimited
 		}
 		s.activeDials++
 		s.mu.Unlock()
@@ -194,50 +199,88 @@ func (s *Service) OpenStreamToVirtualIPProtocols(ctx context.Context, virtualIP 
 
 	dialCtx, cancel := context.WithTimeout(ctx, s.dialTimeout)
 	defer cancel()
-
-	// 1) 已有连接直接开流（可能由打洞/AutoRelay/此前 probe 建立）。
-	//    必须最先尝试：对同一 peer 反复 Connect 会触发 libp2p dial
-	//    backoff，且 addrs 里常混有 127.0.0.1/169.254 等不可达地址，
-	//    逐个试会耗尽 dialTimeout——而此时连接明明是健康的。
-	if len(s.self.Network().ConnsToPeer(target)) > 0 {
-		stream, streamErr := s.openStream(dialCtx, target, protos...)
-		if streamErr == nil {
-			viaRelay := hasCircuit(stream.Conn().RemoteMultiaddr())
-			s.markRelay(route.PeerID, viaRelay)
-			return stream, viaRelay, nil
-		}
+	// Existing healthy conns bypass dial cooldown/rate. All stream attempts are
+	// still subject to the bounded flight/concurrency admission above.
+	stream, reuseErr := s.openStream(dialCtx, target, protos...)
+	if reuseErr == nil {
+		viaRelay := hasCircuit(stream.Conn().RemoteMultiaddr())
+		s.markRelay(route.PeerID, viaRelay)
+		return stream, viaRelay, nil
 	}
-
-	// 2) 主动建连：不带 Addrs，让 libp2p 用 peerstore 中的全部已知地址
-	//    （含此前 probe/identify 学到的内网直连地址）。带 Addrs 强制拨号
-	//    会踩通告地址里的脏数据（观测到的 NAT 公网地址 hairpin 不通等），
-	//    反而错过物理可达的内网路径。
-	directErr := s.self.Connect(dialCtx, peer.AddrInfo{ID: target})
+	if protocolRejected(reuseErr) {
+		return nil, false, reuseErr
+	}
+	if err := s.admitAttempt(target); err != nil {
+		return nil, false, err
+	}
+	success := false
+	defer func() { s.finishAttempt(target, success) }()
+	// ForceDirectDial is the documented escape from a stale relay conn; it does
+	// NOT close it. Relay fallback below uses exact authenticated transport Dial.
+	recoveryCtx, recoveryCancel := context.WithTimeout(ctx, s.dialTimeout)
+	defer recoveryCancel()
+	directErr := s.self.Connect(network.WithForceDirectDial(recoveryCtx, "tunnel direct recovery"), peer.AddrInfo{ID: target})
 	if directErr == nil {
-		stream, streamErr := s.openStream(dialCtx, target, protos...)
-		if streamErr == nil {
-			viaRelay := hasCircuit(stream.Conn().RemoteMultiaddr())
-			s.markRelay(route.PeerID, viaRelay)
-			return stream, viaRelay, nil
+		stream, directErr = s.openStream(recoveryCtx, target, protos...)
+		if directErr == nil {
+			success = true
+			via := hasCircuit(stream.Conn().RemoteMultiaddr())
+			s.markRelay(route.PeerID, via)
+			return stream, via, nil
 		}
-		directErr = streamErr
 	}
-
-	// 3) 中继保底：逐个候选 Relay 预约，成功即经中继转发。
 	stream, relayErr := s.openViaRelay(ctx, target, protos...)
 	if relayErr != nil {
-		return nil, false, fmt.Errorf("direct and relay dial both failed: direct=%s relay=%s",
-			describeDirect(route, directErr), compactError(relayErr))
+		return nil, false, fmt.Errorf("direct and relay dial both failed: direct=%s relay=%s", describeDirect(route, directErr), compactError(relayErr))
 	}
-	viaRelay := hasCircuit(stream.Conn().RemoteMultiaddr())
-	s.markRelay(route.PeerID, viaRelay)
-	return stream, viaRelay, nil
+	success = true
+	via := hasCircuit(stream.Conn().RemoteMultiaddr())
+	s.markRelay(route.PeerID, via)
+	return stream, via, nil
 }
 
 func (s *Service) openStream(ctx context.Context, target peer.ID, protos ...libprotocol.ID) (network.Stream, error) {
-	// Circuit v2 connections are limited; explicitly allow application streams on
-	// the fallback path without bypassing transport or application trust checks.
-	return s.self.NewStream(network.WithAllowLimitedConn(ctx, "tunnel relay fallback"), target, protos...)
+	conns := s.privateConnections(target)
+	conns = append(conns, s.self.Network().ConnsToPeer(target)...)
+	var lastErr error
+	for i, c := range conns {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if c.IsClosed() || s.pathBlocked(target, pathKey(c)) {
+			continue
+		}
+		budget := 3 * time.Second
+		if deadline, ok := ctx.Deadline(); ok {
+			share := time.Until(deadline) / time.Duration(len(conns)-i)
+			if share < budget {
+				budget = share
+			}
+		}
+		pathCtx, cancel := context.WithTimeout(ctx, budget)
+		st, err := negotiateOnConn(pathCtx, c, protos...)
+		cancel()
+		// Parent expiration is not evidence against this or any later conn.
+		if ctx.Err() != nil {
+			if st != nil {
+				_ = st.Reset()
+			}
+			return nil, ctx.Err()
+		}
+		if err == nil {
+			s.selectObservationConn(target, st.Conn().ID())
+			return st, nil
+		}
+		lastErr = err
+		// Unsupported application protocols do not prove path failure.
+		if !protocolRejected(err) && !errors.Is(err, context.Canceled) {
+			s.recordFailure(target, pathKey(c), err)
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no healthy tunnel connection to %s", target)
+	}
+	return nil, lastErr
 }
 
 func (s *Service) openViaRelay(ctx context.Context, target peer.ID, protos ...libprotocol.ID) (network.Stream, error) {
@@ -255,9 +298,26 @@ func (s *Service) openViaRelay(ctx context.Context, target peer.ID, protos ...li
 	if len(candidates) > maxRelayCandidates {
 		candidates = candidates[:maxRelayCandidates]
 	}
+	// Inspect at most ten records, but charge only concrete usable candidates
+	// against the three-attempt budget. Persist the next position per PeerID so
+	// long-lived failures at the front cannot starve later relay reservations.
+	s.mu.Lock()
+	state := s.stateLocked(target, time.Now())
+	if state == nil {
+		s.mu.Unlock()
+		return nil, ErrRetryLimited
+	}
+	start := state.relayCursor % len(candidates)
+	s.mu.Unlock()
 	var lastErr error
 	seen := make(map[peer.ID]bool)
-	for i, candidate := range candidates {
+	attempted := 0
+	for i := 0; i < len(candidates) && attempted < 3; i++ {
+		index := (start + i) % len(candidates)
+		candidate := candidates[index]
+		s.mu.Lock()
+		state.relayCursor = (index + 1) % len(candidates)
+		s.mu.Unlock()
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -269,8 +329,11 @@ func (s *Service) openViaRelay(ctx context.Context, target peer.ID, protos ...li
 		// initiator does not help and can reject relays that already serve the target.
 		// Attempt the actual circuit, and switch candidates on NO_RESERVATION etc.
 		var circuitAddrs []ma.Multiaddr
-		for _, addr := range candidate.Addrs {
-			if addr == nil || hasCircuit(addr) {
+		for j, addr := range candidate.Addrs {
+			if j >= 12 || len(circuitAddrs) >= 2 {
+				break
+			}
+			if addr == nil || len(addr.Bytes()) > 2048 || hasCircuit(addr) {
 				continue
 			}
 			base := addr
@@ -297,20 +360,51 @@ func (s *Service) openViaRelay(ctx context.Context, target peer.ID, protos ...li
 				budget = share
 			}
 		}
+		key := addressKey(circuitAddrs[0])
+		if s.pathBlocked(target, key) {
+			continue
+		}
+		attempted++
 		connectCtx, cancel := context.WithTimeout(ctx, budget)
-		connectCtx = network.WithAllowLimitedConn(connectCtx, "tunnel relay fallback")
-		connectErr := s.self.Connect(connectCtx, peer.AddrInfo{ID: target, Addrs: circuitAddrs})
-		if connectErr != nil {
-			cancel()
-			lastErr = fmt.Errorf("connect via %s (target reservation required): %w", candidate.ID, connectErr)
-			continue
+		// At most two concrete addresses per candidate; no peerstore pollution.
+		if len(circuitAddrs) > 2 {
+			circuitAddrs = circuitAddrs[:2]
 		}
-		stream, streamErr := s.openStream(connectCtx, target, protos...)
+		var stream network.Stream
+		for _, addr := range circuitAddrs {
+			// Each actual relay dial consumes global attempt budget as well as
+			// the outer per-peer recovery admission. Limits survive fast errors.
+			if err := s.admitAttempt(target); err != nil {
+				lastErr = err
+				break
+			}
+			conn, dialErr := s.dialRelayAddress(connectCtx, target, addr)
+			if dialErr != nil {
+				lastErr = dialErr
+				continue
+			}
+			stream, lastErr = negotiateOnConn(connectCtx, conn, protos...)
+			if lastErr == nil && pathKey(stream.Conn()) == key {
+				break
+			}
+			if stream != nil {
+				_ = stream.Reset()
+				stream = nil
+			}
+			// Safe to close ONLY this newly allocated tunnel-owned conn.
+			_ = conn.Close()
+		}
 		cancel()
-		if streamErr != nil {
-			lastErr = fmt.Errorf("open stream via %s: %w", candidate.ID, streamErr)
+		if stream == nil {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("relay path validation failed")
+			}
+			if !protocolRejected(lastErr) {
+				s.recordFailure(target, key, lastErr)
+			}
 			continue
 		}
+		s.selectObservationConn(target, stream.Conn().ID())
 		return stream, nil
 	}
 	if lastErr == nil {

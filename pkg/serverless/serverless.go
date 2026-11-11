@@ -361,6 +361,7 @@ type Discovery struct {
 	protoUnfriend libprotocol.ID
 	protoControl  libprotocol.ID
 	control       controlState
+	relayReservations relayReservationState
 	// protoInfoAlt / protoUnfriendAlt 历史固定协议 ID（派生模式下非空）：
 	// 同群新老版本混跑过渡用——出向建流时作为候选兜底（对端只认固定 ID
 	// 时仍能握手成功），入向也注册同一 handler（跨群伪造不了载荷里的群
@@ -1352,6 +1353,9 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) (
 	// 记录 / mDNS）每轮都会重新发现同一批节点，用 trustPolicy 会让同一句
 	// 假「连接申请」按发现周期刷屏，并在控制台「待审批」里堆出根本没人
 	// 申请过的条目（含已下线节点留下的陈旧 provider 记录）。
+	// 中继准入只认独立的同组挑战证明；好友也走相同有界握手刷新，
+	// 不能因好友身份绕过证明，也不把控制协作写入业务成员表。
+	d.queueControl(peer.AddrInfo{ID: id, Addrs: addrs})
 	if !d.trustPolicyPassive(id.String(), toStrings(addrs), "") {
 		if len(addrs) > 0 {
 			d.host.Peerstore().AddAddrs(id, addrs, time.Hour)
@@ -1364,7 +1368,6 @@ func (d *Discovery) addMember(id peer.ID, addrs []ma.Multiaddr, source string) (
 		// 审批门管的是「能不能被当成成员访问」：虚拟 IP 路由、隧道、端口转发、
 		// 成员表可见性与 ping 都在下面的 trusted 分支之后才解锁。
 		// 同组控制协作不等于成员授权：只在独立证明协议中交换连接线索。
-		d.queueControl(peer.AddrInfo{ID: id, Addrs: addrs})
 		return
 	}
 

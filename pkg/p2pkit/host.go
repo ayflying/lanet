@@ -40,8 +40,14 @@ func isLanetOverlayIP(ip netip.Addr) bool {
 type HostSpec struct {
 	ListenAddrs  []string
 	RelayService bool
-	RelaySource  autorelay.PeerSource
-	UserAgent    string
+	// RelayACL optionally restricts reservation/CONNECT membership. It applies
+	// to every relay entry point; nil preserves open low-level compatibility.
+	// Finite resource/admission budgets are always enforced even with nil ACL.
+	// Callbacks must be concurrent-safe nonblocking local lookups, without
+	// network I/O or relay reentry. Rejected identities spend no traffic quota.
+	RelayACL    relayv2.ACLFilter
+	RelaySource autorelay.PeerSource
+	UserAgent   string
 	// Identity 节点私钥（可空 = 随机生成）。传入持久化密钥可使
 	// PeerID 跨重启稳定，从而无服务器模式下的派生虚拟 IP 也稳定。
 	Identity crypto.PrivKey
@@ -52,7 +58,7 @@ type HostSpec struct {
 	WebRTCAddrs []string
 	// HolePunching 启用 DCUtR 打洞（独立于 RelaySource；无服务器模式用）。
 	HolePunching bool
-	// RelayServiceDedicated 专用中继模式：无限配额 + 强制声明公网可达。
+	// RelayServiceDedicated 专用中继模式：强制声明公网可达，但仍受硬预算约束。
 	// 普通 P2P 节点（客户端即服务端）不要开启，用 RelayService 即可。
 	RelayServiceDedicated bool
 	// RelayServiceAlways 无条件启动 Circuit Relay v2 hop 服务。
@@ -93,16 +99,23 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 			options = append(options, libp2p.ListenAddrStrings(addrs...))
 		}
 	}
-	if spec.RelayService {
+	var relayOptions []relayv2.Option
+	var relayRM network.ResourceManager
+	if spec.RelayService || spec.RelayServiceAlways || spec.RelayServiceDedicated {
+		var err error
+		relayRM, err = relayResourceManager()
+		if err != nil {
+			return nil, fmt.Errorf("create relay resource manager: %w", err)
+		}
+		options = append(options, libp2p.ResourceManager(relayRM))
+		relayOptions = nodeRelayOptions(spec.RelayACL)
 		if spec.RelayServiceDedicated {
-			options = append(options,
-				libp2p.ForceReachabilityPublic(),
-				libp2p.EnableRelayService(relayv2.WithInfiniteLimits()),
-			)
-		} else {
-			// 长期组网连接不能受打洞临时通道的两分钟/128KiB限制；
-			// 只取消单条连接限额，预约数、并发数及资源管理器仍然有界。
-			options = append(options, libp2p.EnableRelayService(nodeRelayOptions()...))
+			options = append(options, libp2p.ForceReachabilityPublic())
+		}
+		// Never register two hop services on the same host: share one budget,
+		// and let Always choose the explicit (reachability-independent) entry.
+		if !spec.RelayServiceAlways {
+			options = append(options, libp2p.EnableRelayService(relayOptions...))
 		}
 	}
 	if spec.RelaySource != nil {
@@ -117,11 +130,14 @@ func NewHost(ctx context.Context, spec HostSpec) (host.Host, error) {
 
 	h, err := libp2p.New(options...)
 	if err != nil {
+		if relayRM != nil {
+			_ = relayRM.Close()
+		}
 		return nil, fmt.Errorf("create libp2p host: %w", err)
 	}
 	if spec.RelayServiceAlways {
-		// 底层 hop 服务与 AutoNAT 模式共用长期连接策略，避免两套入口漏改。
-		if _, err = relayv2.New(h, nodeRelayOptions()...); err != nil {
+		// Explicit and reachability-driven services share the exact same policy.
+		if _, err = relayv2.New(h, relayOptions...); err != nil {
 			_ = h.Close()
 			return nil, fmt.Errorf("start relay service: %w", err)
 		}

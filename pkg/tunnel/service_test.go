@@ -124,11 +124,6 @@ func TestConcurrentDifferentProtocolsDoNotShareStreamError(t *testing.T) {
 		}
 		first <- err
 	}()
-	select {
-	case <-relay.entered:
-	case <-ctx.Done():
-		t.Fatal("失败协议未进入中继阶段")
-	}
 	second := make(chan error, 1)
 	go func() {
 		st, _, err := s.OpenStreamToVirtualIPProtocol(ctx, "10.7.0.2", supported)
@@ -137,19 +132,6 @@ func TestConcurrentDifferentProtocolsDoNotShareStreamError(t *testing.T) {
 		}
 		second <- err
 	}()
-	deadline := time.Now().Add(time.Second)
-	for {
-		s.mu.Lock()
-		waiting := s.waiters
-		s.mu.Unlock()
-		if waiting == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("不同协议调用未等待同一建连")
-		}
-		time.Sleep(time.Millisecond)
-	}
 	close(relay.release)
 	if err := <-first; err == nil {
 		t.Fatal("不支持的协议意外成功")

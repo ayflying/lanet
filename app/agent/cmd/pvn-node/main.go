@@ -660,7 +660,14 @@ func probeOnce(ctx context.Context, node *lanet.Client, plog *probeLogThrottle, 
 		return false
 	}
 	payload := fmt.Sprintf("probe-%d", start.UnixMilli())
-	err = probeExchange(pctx, stream, []byte(payload))
+	// 建连预算不挤占echo测量窗口，否则慢拨号后的短超时会误判路径。
+	echoCtx, echoCancel := context.WithTimeout(ctx, probeTimeout)
+	defer echoCancel()
+	echoStart := time.Now()
+	err = probeExchange(echoCtx, stream, []byte(payload))
+	if ctx.Err() == nil {
+		node.ReportProbeResult(stream, time.Since(echoStart), err)
+	}
 	via := "direct"
 	if viaRelay {
 		via = "relay"

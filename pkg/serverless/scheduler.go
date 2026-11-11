@@ -21,10 +21,14 @@ type discoveryCall struct {
 	done           chan struct{}
 	err            error
 	connectRequest bool
+	generation     uint64
 }
 type discoveryRetry struct {
-	failures int
-	next     time.Time
+	failures   int
+	next       time.Time
+	generation uint64
+	addresses  string
+	wakeAfter  time.Time
 }
 type discoveryScheduler struct {
 	ctx      context.Context
@@ -66,7 +70,7 @@ func (s *discoveryScheduler) submitMode(id peer.ID, explicit, connectRequest boo
 	if !explicit && s.now().Before(s.retry[id].next) {
 		return nil, nil
 	}
-	call := &discoveryCall{id: id, done: make(chan struct{}), connectRequest: connectRequest}
+	call := &discoveryCall{id: id, done: make(chan struct{}), connectRequest: connectRequest, generation: s.retry[id].generation}
 	select {
 	case s.queue <- call:
 		s.calls[id] = call
@@ -114,8 +118,11 @@ func (s *discoveryScheduler) worker() {
 			call.err = err
 			delete(s.calls, call.id)
 			r := s.retry[call.id]
-			if err == nil {
-				r = discoveryRetry{next: s.now().Add(s.cooldown)}
+			if r.generation != call.generation {
+				// 迟到的旧地址拨号结果不能覆盖新地址已经获得的重试机会。
+			} else if err == nil {
+				r.failures = 0
+				r.next = s.now().Add(s.cooldown)
 			} else {
 				r.failures++
 				if r.failures > 5 {
@@ -171,6 +178,9 @@ func (s *discoveryScheduler) request(ctx context.Context, id peer.ID) error {
 }
 func (d *Discovery) scheduleIdentify(id peer.ID) {
 	if d.scheduler != nil {
+		if d.host != nil {
+			d.scheduler.noteAddresses(id, d.host.Peerstore().Addrs(id))
+		}
 		_, _ = d.scheduler.submit(id, false)
 	}
 }

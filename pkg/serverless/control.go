@@ -38,7 +38,8 @@ type controlAttempt struct {
 }
 
 // A control proof establishes only possession of the group key, never friendship,
-// pending approval, relay permission, or authority to initiate a business handshake.
+// pending approval, or authority to initiate a business handshake. Fresh proofs may
+// authorize bounded relay cooperation, independently of business trust.
 // This cache and its limiter deliberately do not share the members mutex.
 type controlState struct {
 	mu    sync.Mutex
@@ -159,7 +160,8 @@ func (d *Discovery) ControlPeers() []peer.AddrInfo { return d.control.snapshot(t
 //   - 但它**不是**可访问主机：连接审批（pending/approve）管的是「能不能被当成成员
 //     访问」——虚拟 IP 路由、隧道、端口转发、成员表可见性、ping，全部由审批门
 //     之后才解锁。未审批节点既不进 members 表，也拿不到虚拟地址；
-//   - 证明只证明「持有群密钥」，绝不等于好友、待审批、中继授权或可发起业务握手的授权。
+//   - 证明只证明「持有群密钥」，绝不等于好友、待审批或可发起业务握手的授权。
+//     新鲜证明仅可供有配额的中继协作准入，仍不授予任何业务权限。
 //     因此这里刻意不共享 members 的锁，也不调用任何 OnPending 回调。
 //
 // queueControl reserves capacity before spawning: no goroutine queue, no approval

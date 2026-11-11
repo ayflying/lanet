@@ -22,7 +22,7 @@ func TestNodeRelayLargeTransfer(t *testing.T) {
 	testNodeRelayTransfer(t, 0)
 }
 
-// 常规测试检查预约返回的无连接限额及大流量；显式长测另外跨过默认120秒。
+// 常规测试检查预约返回的有限连接预算及大流量；显式长测另外跨过默认120秒。
 func TestNodeRelayBeyondDefaultDuration(t *testing.T) {
 	if os.Getenv("LANET_LONG_RELAY_TEST") != "1" {
 		t.Skip("设置 LANET_LONG_RELAY_TEST=1 执行超过两分钟的真实中继长测")
@@ -52,8 +52,8 @@ func testNodeRelayTransfer(t *testing.T, duration time.Duration) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reservation.LimitDuration != 0 || reservation.LimitData != 0 {
-		t.Fatalf("普通节点仍宣告临时连接限额: duration=%s data=%d", reservation.LimitDuration, reservation.LimitData)
+	if reservation.LimitDuration != relayCircuitDuration || reservation.LimitData != uint64(relayCircuitBytes) {
+		t.Fatalf("中继硬预算不匹配: duration=%s data=%d", reservation.LimitDuration, reservation.LimitData)
 	}
 	const proto protocol.ID = "/lanet/relay-policy-regression/1"
 	target.SetStreamHandler(proto, func(st network.Stream) {

@@ -444,7 +444,9 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 		spec.Identity = identity
 	}
 	var disc *serverless.Discovery
+	groupRelayACL := &relayGroupACL{}
 	if cfg.Standalone {
+		spec.RelayACL = groupRelayACL
 		// 无服务器：节点即服务端（无条件启动 hop 中继），打洞直连优先，
 		// 成员表充当 relay 候选。
 		spec.RelayServiceAlways = true
@@ -511,6 +513,7 @@ func New(ctx context.Context, cfg Config) (c *Client, err error) {
 			OnUnfriendReceived:     c.onUnfriendReceived,
 		})
 		if err == nil {
+			groupRelayACL.discovery.Store(disc)
 			disc.OnDiscovered(c.persistVerifiedMember)
 			err = disc.Start(c.rootCtx)
 		}
@@ -1326,6 +1329,10 @@ func (c *Client) Close() error {
 			if err := c.disc.Close(); err != nil {
 				c.logf("发现服务关闭失败（忽略）: %v", err)
 			}
+		}
+		// 隧道专有中转连接不属于host连接池，必须显式回收。
+		if c.tunnelSvc != nil {
+			_ = c.tunnelSvc.Close()
 		}
 		// 8. libp2p Host（最后关，其余子资源都已先行释放）。
 		if c.node != nil {

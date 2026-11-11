@@ -143,7 +143,7 @@ func (d *Discovery) collectRelayCandidates(ctx context.Context, number int) []pe
 		})
 	}
 
-	// 第二层：成员表里的同群节点（含好友与被动发现到的同密钥节点）。
+	// 第二层：已信任且近期握手成功的业务成员。
 	for _, m := range d.members {
 		if m.PeerID == self.String() || m.LastSeen.IsZero() || m.LastSeen.Before(cutoff) || !d.trustedNow(m.PeerID) {
 			continue
@@ -159,6 +159,23 @@ func (d *Discovery) collectRelayCandidates(ctx context.Context, number int) []pe
 		candidates = append(candidates, relayCandidate{
 			id: id, peerID: m.PeerID, lastSeen: m.LastSeen, addrs: addrs,
 			connected: relayDirectConnection(d.host.Network(), id), hop: hop(id), tier: 1,
+		})
+	}
+
+	// 第三层：仅拥有新鲜同组挑战证明的协作节点，不进入业务 members。
+	// 未验证的 hints 不在 ControlPeers 中；仍受 hop 能力、直连可达性及
+	// 下层预约/连接/字节预算约束。同组身份不能解锁好友业务权限。
+	for _, ai := range d.ControlPeers() {
+		if ai.ID == self || !hop(ai.ID) {
+			continue
+		}
+		addrs := relayUsableAddrs(ai.Addrs)
+		if len(addrs) == 0 {
+			continue
+		}
+		candidates = append(candidates, relayCandidate{
+			id: ai.ID, peerID: ai.ID.String(), addrs: addrs,
+			connected: relayDirectConnection(d.host.Network(), ai.ID), hop: true, tier: 2,
 		})
 	}
 
@@ -261,7 +278,7 @@ func (d *Discovery) reserveRelayCandidates(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return reserveRelayCandidates(ctx, d.host, candidates)
+	return d.reserveManaged(ctx, candidates)
 }
 
 func reserveRelayCandidates(ctx context.Context, h host.Host, candidates []peer.AddrInfo) error {

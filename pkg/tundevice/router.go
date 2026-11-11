@@ -156,6 +156,9 @@ type peerFlow struct {
 	// 点不同，仲裁留下的 kept 流也可能早已在读 —— 用 CAS 保证同一条流只有一个
 	// 读循环，否则两个 goroutine 并发 Read 同一条字节流会把包拆坏。
 	pumped atomic.Bool
+	// localReset suppresses path-failure feedback for a locally cancelled write.
+	// Set before Reset so the concurrent read pump cannot mistake it for I/O loss.
+	localReset atomic.Bool
 	// writeMu 串行化同一字节流上的包写入：IPv4 与 IPv6 的出向 worker 是两条
 	// 独立队列，但最终汇聚到同一条流，不加锁会让字节交错、接收端无法分帧。
 	writeMu sync.Mutex
@@ -700,7 +703,10 @@ func (r *Router) forwardPacket(ctx context.Context, packet []byte) error {
 	defer flow.writes.Add(-1)
 
 	// 关闭/取消时 Reset 打断阻塞写；正常返回立刻撤销回调。
-	resetFn := context.AfterFunc(ctx, func() { _ = flow.stream.Reset() })
+	resetFn := context.AfterFunc(ctx, func() {
+		flow.localReset.Store(true)
+		_ = flow.stream.Reset()
+	})
 	defer resetFn()
 
 	flow.writeMu.Lock()
@@ -711,6 +717,9 @@ func (r *Router) forwardPacket(ctx context.Context, packet []byte) error {
 	}
 	flow.writeMu.Unlock()
 	if err != nil {
+		if ctx.Err() == nil {
+			r.reportFlowFailure(flow, err)
+		}
 		r.retireFlow(flow, "write failed")
 		return fmt.Errorf("write to %s (peer %s): %w", destination, target.ShortString(), err)
 	}
@@ -902,6 +911,7 @@ func (r *Router) pumpFromStream(flow *peerFlow) {
 		if err != nil {
 			// EOF 才是对端正常关闭；Reset、超时和传输错误必须保留原始原因。
 			reason = streamReadExitReason(flow.stream, err)
+			r.reportFlowFailure(flow, err)
 			return
 		}
 		// 被仲裁淘汰后立即停止往 TUN 投递：老流与新流同时活着会让对端的包
@@ -916,7 +926,11 @@ func (r *Router) pumpFromStream(flow *peerFlow) {
 		flow.touch()
 		// 隧道是字节流，必须按 IP 包边界切分后再逐个写 TUN。
 		for _, pkt := range framer.feed(readBuf[:n]) {
-			r.writeInbound(bufs, sizes, pkt, writeOffset)
+			// 传输层认证的是 flow.peer；包头源地址也必须属于这个 peer，
+			// 否则同群节点可伪造另一成员的地址绕过按源 IP 的防火墙规则。
+			if r.acceptFlowSource(flow, pkt) {
+				r.writeInbound(bufs, sizes, pkt, writeOffset)
+			}
 		}
 	}
 }
@@ -1076,7 +1090,11 @@ func (r *Router) retireFlow(flow *peerFlow, reason string) {
 	// 否则与 Close() 里的 r.closed = true 构成数据竞争（race 检测失败）。
 	closed := r.closed
 	r.mu.Unlock()
+	r.closeRetiredFlow(flow, reason, closed)
+}
 
+// closeRetiredFlow 收尾已经成功 CAS 退役并摘表的流；不得再触碰流表。
+func (r *Router) closeRetiredFlow(flow *peerFlow, reason string, closed bool) {
 	if closed {
 		_ = flow.stream.Reset()
 		return
