@@ -116,7 +116,7 @@
      （详情 mdetail 是 3px 10px + 12px 字、备注继承基础 button 的 7px 14px + 13px 字、
      删除 del 是 2px 6px + 13px 字），靠 padding 撑出来的高度能差 10px，
      同一行高矮不齐。这里显式钉死 height 并统一字号与水平内边距，
-     删除按钮只保留「无底色 + 红字」这一点视觉差异。
+     删除入口默认无底色红字，成员列表单独覆盖为红底白字。
      表格操作列与待审批卡片列表共用同一套尺寸。 */
   td button, td button.mdetail, td button.del,
   .listitem .li-acts button {
@@ -124,6 +124,10 @@
     display:inline-flex; align-items:center; justify-content:center;
     vertical-align:middle; }
   td button.del { padding:0 8px; }
+  /* 仅成员列表的危险操作使用实心红按钮，不改变其他表格删除入口。 */
+  #members button.del { background:var(--bad); color:#fff; }
+  #members button.del:hover { filter:brightness(.9); }
+  #members button.del:focus-visible { outline:2px solid var(--bad); outline-offset:2px; }
   @media (max-width: 720px) {
     body { padding:12px; }
     h1 { font-size:16px; }
