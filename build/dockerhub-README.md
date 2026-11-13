@@ -27,7 +27,7 @@ docker pull ghcr.io/ayflying/lanet-node:latest
 
 ## 运行 Standalone 节点
 
-使用项目维护的 [Docker Compose 配置](https://github.com/ayflying/lanet/blob/main/docker-compose.yml)，并参考 [Linux 容器部署说明](https://github.com/ayflying/lanet/blob/main/README.md#公网节点容器)。使用 Docker Hub 时，将 Compose 服务的 image 替换为 `docker.io/ayflying/lanet-node:latest`，或指定版本标签。
+使用项目维护的 [Docker Compose 配置](https://github.com/ayflying/lanet/blob/main/docker-compose.yml)，并参考 [Linux 容器部署说明](https://github.com/ayflying/lanet/blob/main/README.md#公网节点容器)。Compose 默认使用 Docker Hub 镜像 `docker.io/ayflying/lanet-node:latest`，无需再替换地址；也可按需固定版本标签。
 
 ```bash
 git clone https://github.com/ayflying/lanet.git

@@ -2,7 +2,8 @@
 # Lanet 公网节点容器编排（仅 Linux；Windows 用发行包 lanet.exe，与此文件无关）。
 # 用途：部署在一台有公网 IP 的 VPS 上，充当整个网络的引导 + 中继节点，
 # 让各自 NAT 后的成员稳定互通（直连优先，打洞失败经本节点中继转发）。
-# 镜像由 GitHub Actions 自动构建推送：ghcr.io/ayflying/lanet-node（linux/amd64+arm64）。
+# 默认从 Docker Hub 拉取：docker.io/ayflying/lanet-node（linux/amd64+arm64）。
+# GitHub Actions 同步发布到 GHCR，可按需替换镜像地址作为备用源。
 #
 #   启动：改好下方 environment 后
 #         docker compose up -d
@@ -19,7 +20,7 @@
 
 services:
   node:
-    image: ghcr.io/ayflying/lanet-node:latest
+    image: docker.io/ayflying/lanet-node:latest
     container_name: lanet-node
     restart: unless-stopped
     # 文件日志轮转不能限制 Docker 捕获的标准错误，需单独设置保留预算。

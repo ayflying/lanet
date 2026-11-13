@@ -179,7 +179,8 @@ sudo ./lanet -name server-1 -key 'our-network-key'
 ### 公网节点容器
 
 把根目录 [`docker-compose.yml`](./docker-compose.yml) 放到有公网 IP 的 Linux
-主机，修改 `environment` 后启动：
+主机，默认从 Docker Hub 拉取 `docker.io/ayflying/lanet-node:latest`；修改
+`environment` 后启动（网络、权限与数据卷配置不变）：
 
 ```bash
 git clone https://github.com/ayflying/lanet.git
