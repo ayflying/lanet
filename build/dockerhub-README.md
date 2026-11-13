@@ -6,16 +6,13 @@
 - [当前版本](https://github.com/ayflying/lanet/blob/main/VERSION)
 - [发行包](https://github.com/ayflying/lanet/releases)
 
-## 镜像列表
+## 官方 P2P 镜像
 
-四种镜像均支持 **linux/amd64** 和 **linux/arm64**，同步发布到 Docker Hub 与 GHCR。
+官方只发布 **`lanet-node`** 一个 P2P 镜像，同一个程序兼具普通节点、引导和中继能力，内置 Web 控制台，无需另行部署控制面或独立中继。支持 **linux/amd64** 和 **linux/arm64**，同步发布到 Docker Hub 与 GHCR。
 
 | Docker Hub | 对应 GHCR 镜像 | 用途 |
 |---|---|---|
 | [ayflying/lanet-node](https://hub.docker.com/r/ayflying/lanet-node) | `ghcr.io/ayflying/lanet-node` | Standalone P2P 节点，内置 Web 控制台，推荐用于自建节点 |
-| [ayflying/lanet-ctl](https://hub.docker.com/r/ayflying/lanet-ctl) | `ghcr.io/ayflying/lanet-ctl` | 托管模式控制面：群组、邀请码与成员目录 |
-| [ayflying/lanet-relay](https://hub.docker.com/r/ayflying/lanet-relay) | `ghcr.io/ayflying/lanet-relay` | 托管模式独立中继 |
-| [ayflying/lanet-agent](https://hub.docker.com/r/ayflying/lanet-agent) | `ghcr.io/ayflying/lanet-agent` | 托管模式客户端 |
 
 两个镜像仓库接收同一次构建的相同标签：分支名、语义化版本（完整版本、主次版本、主版本）、根目录 `VERSION` 与短 Git SHA。`latest` 显式跟随 `main`；语义化版本发布也保留 metadata-action 自动生成的 `latest`。生产部署建议固定版本标签。
 
@@ -44,17 +41,8 @@ docker compose logs -f node
 - 将 Web 控制台 `8900` 端口对外开放前，务必设置强 `LANET_CONSOLE_PASSWORD`，并通过宿主机防火墙限制访问。
 - 默认需要连接审批。仅在明确接受自动信任风险时，为无人值守节点启用 `LANET_AUTO_ACCEPT`。
 
-## 托管模式文档
-
-Standalone 不需要部署以下中心服务。需要中心群组目录和邀请码时，参考各组件说明：
-
-- [控制面](https://github.com/ayflying/lanet/blob/main/app/ctl/README.MD)
-- [独立中继](https://github.com/ayflying/lanet/blob/main/app/relay/README.MD)
-- [托管客户端与节点命令](https://github.com/ayflying/lanet/blob/main/app/agent/README.MD)
-- [SDK 总览](https://github.com/ayflying/lanet/blob/main/sdk/README.md)
-
 ## 发布与支持
 
-[容器发布工作流](https://github.com/ayflying/lanet/blob/main/.github/workflows/docker.yml) 在稳定性测试通过后构建并推送镜像。独立任务将本说明同步到四个 Docker Hub 仓库；说明同步不阻塞镜像构建，文档变更也会触发同步。
+[容器发布工作流](https://github.com/ayflying/lanet/blob/main/.github/workflows/docker.yml) 在稳定性测试通过后构建并推送镜像。独立任务将本说明同步到 Docker Hub 的 `ayflying/lanet-node` 仓库；说明同步不阻塞镜像构建，文档变更也会触发同步。
 
 问题反馈请前往 [GitHub Issues](https://github.com/ayflying/lanet/issues)。最新配置、安全边界及排障信息以 [项目说明](https://github.com/ayflying/lanet/blob/main/README.md) 为准。
