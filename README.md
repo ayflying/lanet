@@ -634,17 +634,36 @@ Lanet SDK 在成员表内解析，当前不会自动注册到 Windows/Linux 系�
 
 | 流水线 | 产物 |
 |---|---|
-| `docker` | `lanet-ctl`、`lanet-relay`、`lanet-agent`、`lanet-node` 的 amd64/arm64 GHCR 镜像 |
+| `docker` | `lanet-ctl`、`lanet-relay`、`lanet-agent`、`lanet-node` 的 linux/amd64、linux/arm64 镜像，同步发布到 GHCR 和 Docker Hub；独立同步 Docker Hub 仓库说明 |
 | `release` | Windows amd64、Linux amd64/arm64 压缩包、`sha256sums.txt` 和签名 `manifest.json` |
 
-镜像地址：
+镜像地址（两端使用相同标签，可按网络环境选择）：
 
-```text
-ghcr.io/ayflying/lanet-ctl:latest
-ghcr.io/ayflying/lanet-relay:latest
-ghcr.io/ayflying/lanet-agent:latest
-ghcr.io/ayflying/lanet-node:latest
+| 组件 | GHCR | Docker Hub |
+|---|---|---|
+| 托管控制面 | `ghcr.io/ayflying/lanet-ctl` | [ayflying/lanet-ctl](https://hub.docker.com/r/ayflying/lanet-ctl) |
+| 独立中继 | `ghcr.io/ayflying/lanet-relay` | [ayflying/lanet-relay](https://hub.docker.com/r/ayflying/lanet-relay) |
+| 托管客户端 | `ghcr.io/ayflying/lanet-agent` | [ayflying/lanet-agent](https://hub.docker.com/r/ayflying/lanet-agent) |
+| Standalone 节点 | `ghcr.io/ayflying/lanet-node` | [ayflying/lanet-node](https://hub.docker.com/r/ayflying/lanet-node) |
+
+```bash
+docker pull ghcr.io/ayflying/lanet-node:latest
+# Docker Hub 等价地址（省略 docker.io/ 也可以）
+docker pull docker.io/ayflying/lanet-node:latest
 ```
+
+发布沿用 `main` 分支变更、`v*` tag 和手动触发；镜像构建仍须先通过稳定性测试。
+四组件在一次构建中同时推送两个 registry，保留分支名、语义化版本（完整版本、
+主次版本、主版本）、根目录 `VERSION` 和短 SHA 标签；`latest` 显式跟随 `main`
+（语义化版本 tag 也沿用 metadata-action 自动生成的 `latest`）。建议生产部署固定版本标签。
+Docker Hub 登录使用仓库 Secret `DOCKERHUB_USER`（未配置时默认 `ayflying`）与
+`DOCKERHUB_TOKEN`，镜像命名空间为 `ayflying`；GHCR 继续使用 `GITHUB_TOKEN`。
+
+Docker Hub 四个仓库的说明使用专用 [`build/dockerhub-README.md`](./build/dockerhub-README.md)，
+其中 GitHub 文档链接均为绝对地址，避免根 README 的相对链接在 Docker Hub 上失效。
+根 README、专用 README 或工作流变更均会触发同步；说明同步是独立矩阵 job，
+不作为镜像构建的前置条件，失败不会阻止构建或推送。`DOCKERHUB_TOKEN` 还需满足
+说明同步 action 要求的 Read/Write/Delete 权限；若同步失败，可单独检查该 job 日志。
 
 发布包中的 `wintun.dll` 来自 Wintun 0.14.1，必须与 Windows 可执行文件一起分发。
 

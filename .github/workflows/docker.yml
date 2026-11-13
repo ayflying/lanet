@@ -1,8 +1,8 @@
 # =================================================================================
 # Lanet 容器镜像 CI：自动编译服务端（ctl/relay）与客户端（agent/node）镜像，
-# 推送到 ghcr.io/ayflying/lanet-{ctl,relay,agent,node}。
+# 同步推送到 ghcr.io/ayflying 与 docker.io/ayflying 下的 lanet-{ctl,relay,agent,node}。
 #
-# 触发：push 到 main（含代码/Dockerfile/CI/VERSION 变更）或手动 workflow_dispatch。
+# 触发：push 到 main（含代码/Dockerfile/CI/VERSION/README 变更）、v* tag 或手动 workflow_dispatch。
 # 标签策略：分支名 / 语义化版本 tag（v1.2.3 → 1.2.3, 1.2, 1）/ 根目录 VERSION
 # 文件内容（如 0.2.1）/ latest。改代码先改 VERSION 再提交，镜像即带版本号。
 # =================================================================================
@@ -19,6 +19,7 @@ on:
       - "go.sum"
       - "build/**"
       - "VERSION"
+      - "README.md"
       - ".github/workflows/docker.yml"
       - ".github/workflows/stability.yml"
   workflow_dispatch:
@@ -26,6 +27,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+  DOCKERHUB_IMAGE_PREFIX: docker.io/ayflying
 
 jobs:
   stability:
@@ -72,11 +74,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USER || 'ayflying' }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Docker meta (tags & labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}
+          images: |
+            ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}
+            ${{ env.DOCKERHUB_IMAGE_PREFIX }}/${{ matrix.image }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -100,3 +111,26 @@ jobs:
             VERSION=${{ steps.ver.outputs.version }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,scope=${{ matrix.name }},mode=max
+
+  # 独立于 stability/build：说明同步失败不会阻止镜像构建或推送。
+  dockerhub-description:
+    name: Docker Hub description (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [lanet-ctl, lanet-relay, lanet-agent, lanet-node]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync Docker Hub description
+        uses: peter-evans/dockerhub-description@432a30c9e07499fd01da9f8a49f0faf9e0ca5b77 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USER || 'ayflying' }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ayflying/${{ matrix.image }}
+          short-description: Lanet encrypted P2P virtual LAN - ${{ matrix.image }}
+          readme-filepath: ./build/dockerhub-README.md
