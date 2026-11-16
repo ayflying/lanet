@@ -27,7 +27,10 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
-  DOCKERHUB_IMAGE_PREFIX: docker.io/ayflying
+  # Docker Hub 账号取自仓库 Variables「DOCKERHUB_USERNAME」，
+  # 未配置时回退到仓库 owner，避免把账号写死在工作流里。
+  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME || github.repository_owner }}
+  DOCKERHUB_IMAGE_PREFIX: docker.io/${{ vars.DOCKERHUB_USERNAME || github.repository_owner }}
 
 # 新提交取代旧提交，避免同一分支重复占用多架构构建资源。
 concurrency:
@@ -114,8 +117,8 @@ jobs:
       - name: Sync Docker Hub description
         uses: peter-evans/dockerhub-description@432a30c9e07499fd01da9f8a49f0faf9e0ca5b77 # v4
         with:
-          username: ${{ secrets.DOCKERHUB_USER || 'ayflying' }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ayflying/lanet-node
+          repository: ${{ env.DOCKERHUB_USERNAME }}/lanet-node
           short-description: Lanet encrypted P2P virtual LAN - lanet-node
           readme-filepath: ./build/dockerhub-README.md
