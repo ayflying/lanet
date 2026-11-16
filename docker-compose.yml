@@ -4,9 +4,6 @@
 # 让各自 NAT 后的成员稳定互通（直连优先，打洞失败经本节点中继转发）。
 # 默认从 Docker Hub 拉取：docker.io/ayflying/lanet-node（linux/amd64+arm64）。
 # GitHub Actions 同步发布到 GHCR，可按需替换镜像地址作为备用源。
-# 镜像地址支持两个环境变量（写在同目录 .env 或命令行）：
-#   DOCKERHUB_USERNAME  镜像账号，默认 ayflying（fork 后改成自己的账号）
-#   LANET_IMAGE_TAG     镜像标签，默认 latest（生产建议固定版本号，如 0.6.5）
 #
 #   启动：改好下方 environment 后
 #         docker compose up -d
@@ -23,9 +20,7 @@
 
 services:
   node:
-    # 镜像仓库账号：默认官方 ayflying（Docker Hub 与 GHCR 同账号）；
-    # 自建或 fork 时用 .env 里的 DOCKERHUB_USERNAME 覆盖，无需改本文件。
-    image: docker.io/${DOCKERHUB_USERNAME:-ayflying}/lanet-node:${LANET_IMAGE_TAG:-latest}
+    image: docker.io/ayflying/lanet-node:latest
     container_name: lanet-node
     restart: unless-stopped
     # 文件日志轮转不能限制 Docker 捕获的标准错误，需单独设置保留预算。

@@ -658,8 +658,7 @@ docker pull docker.io/ayflying/lanet-node:latest
 （语义化版本 tag 也沿用 metadata-action 自动生成的 `latest`）。建议生产部署固定版本标签。
 Docker Hub 登录使用仓库 Variables `DOCKERHUB_USERNAME`（未配置时回退到仓库 owner）与
 Secret `DOCKERHUB_TOKEN`，镜像命名空间随之确定；GHCR 继续使用 `GITHUB_TOKEN`。
-容器编排里的镜像账号沿用同一变量名：`docker compose` 同目录 `.env` 写
-`DOCKERHUB_USERNAME=你的账号` 即可换成自建镜像，标签用 `LANET_IMAGE_TAG` 固定版本。
+容器编排里的镜像地址固定为 `docker.io/ayflying/lanet-node:latest`，即本仓库的官方发布地址。
 
 Docker Hub `lanet-node` 仓库的说明使用专用 [`build/dockerhub-README.md`](./build/dockerhub-README.md)，
 其中 GitHub 文档链接均为绝对地址，避免根 README 的相对链接在 Docker Hub 上失效。
