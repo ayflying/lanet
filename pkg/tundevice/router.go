@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ayflying/pvn/pkg/firewall"
+	"github.com/ayflying/pvn/pkg/protocol"
 	tunnel "github.com/ayflying/pvn/pkg/tunnel"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -69,6 +70,8 @@ func packetWriteOffset() int {
 type Router struct {
 	device Device
 	tunnel *tunnel.Service
+	// 仅启动前设置；零值保持智能压缩默认开启。
+	disableCompression bool
 	// fw 统一入向防火墙（nil = 不启用）：对隧道流入向的每个 IP 包
 	// 按「源虚拟 IP + 协议 + 目标端口」判定，拒绝的包直接丢弃。
 	fw *firewall.Firewall
@@ -141,7 +144,8 @@ type outboundWorker struct {
 // network.Stream 是字节流，若多个 goroutine 并发 Write，IP 包字节可能交错，
 // 接收端将无法按 IPv4 total_length 分帧 —— 同一字节流上的包写入必须串行。
 type peerFlow struct {
-	stream network.Stream
+	stream        network.Stream
+	frameWriteBuf []byte // 仅在 writeMu 内复用，旧协议不分配
 	// peer 是流的对端 PeerID，也是流表的键。
 	peer peer.ID
 	// initiator 是这条流的发起方：出向流是本机，入向流是对端。
@@ -711,7 +715,7 @@ func (r *Router) forwardPacket(ctx context.Context, packet []byte) error {
 
 	flow.writeMu.Lock()
 	flow.stream.SetWriteDeadline(time.Now().Add(outboundWriteDeadline))
-	_, err = flow.stream.Write(packet)
+	err = flow.writePacket(packet)
 	if err == nil {
 		flow.touch()
 	}
@@ -768,7 +772,7 @@ func (r *Router) flowTo(ctx context.Context, target peer.ID, destination string)
 
 // dialStream 真实拨号，并用对称仲裁把流装进流表。
 func (r *Router) dialStream(ctx context.Context, target peer.ID, destination string) (*peerFlow, error) {
-	stream, viaRelay, err := r.tunnel.OpenStreamToVirtualIP(ctx, destination)
+	stream, viaRelay, err := r.tunnel.OpenStreamToVirtualIPProtocols(ctx, destination, r.InboundProtocols())
 	if err != nil {
 		// 本次拨号尚未注册流；并发入向流可能已被注册，不能误删。
 		return nil, err
@@ -904,10 +908,23 @@ func (r *Router) pumpFromStream(flow *peerFlow) {
 	writeOffset := packetWriteOffset()
 	bufs := make([][]byte, 1)
 	sizes := make([]int, 1)
-	readBuf := make([]byte, maxPacketSize)
-	framer := &ipFramer{}
+	var readBuf []byte
+	var framer ipFramer
+	var frames packetFrameReader
+	compressed := flow.stream.Protocol() == protocol.TunnelSnappy
+	if !compressed {
+		readBuf = make([]byte, maxPacketSize)
+	}
 	for {
-		n, err := flow.stream.Read(readBuf)
+		var n int
+		var pkt []byte
+		var err error
+		if compressed {
+			pkt, err = frames.read(flow.stream)
+			n = len(pkt)
+		} else {
+			n, err = flow.stream.Read(readBuf)
+		}
 		if err != nil {
 			// EOF 才是对端正常关闭；Reset、超时和传输错误必须保留原始原因。
 			reason = streamReadExitReason(flow.stream, err)
@@ -924,7 +941,13 @@ func (r *Router) pumpFromStream(flow *peerFlow) {
 			continue
 		}
 		flow.touch()
-		// 隧道是字节流，必须按 IP 包边界切分后再逐个写 TUN。
+		if compressed {
+			if r.acceptFlowSource(flow, pkt) {
+				r.writeInbound(bufs, sizes, pkt, writeOffset)
+			}
+			continue
+		}
+		// 旧隧道是裸字节流，必须按 IP 包边界切分后再逐个写 TUN。
 		for _, pkt := range framer.feed(readBuf[:n]) {
 			// 传输层认证的是 flow.peer；包头源地址也必须属于这个 peer，
 			// 否则同群节点可伪造另一成员的地址绕过按源 IP 的防火墙规则。

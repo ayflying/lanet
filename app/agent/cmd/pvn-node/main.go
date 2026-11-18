@@ -246,6 +246,7 @@ func runNode(parent context.Context, serviceMode bool) {
 	if *tun != "@@unset@@" {
 		effTun = parseBoolLike(*tun)
 	}
+	effTunCompression := nc.tunCompressionEnabled()
 	// 公共 DHT 开关优先级：显式命令行/环境变量 > 配置文件 > 默认关闭。
 	// 环境变量与命令行共用 "@@unset@@" 哨兵：只有真正传了值才覆盖配置，
 	// 避免「配置文件写 false、命令行没传」时被误判为开启（或反之）。
@@ -295,6 +296,7 @@ func runNode(parent context.Context, serviceMode bool) {
 		EnablePublicDHT:    effPublic,
 		PublicDHTMinutes:   effPublicMin,
 		Tun:                effTun,
+		TunCompression:     effTunCompression,
 		AutoAccept:         effAutoAccept,
 		RequireApproval:    effRequireApproval,
 		DBPath:             effDBPath,
@@ -351,6 +353,7 @@ func runNode(parent context.Context, serviceMode bool) {
 		StateFile:        filepath.Join(filepath.Dir(*config), "state.json"),
 		ConsoleExtra:     extra,
 		Tun:              effTun,
+		TunCompression:   &effTunCompression,
 		Version:          version,
 		Platform:         runtime.GOOS + "/" + runtime.GOARCH,
 		// 连接审批（加好友式）：陌生节点需用户同意后才能互连；
@@ -966,7 +969,7 @@ func defaultIdentityPath(configPath string) string {
 	return filepath.Join(dir, "node.key")
 }
 
-// nodeConfig lanet.json 配置文件结构（字段与命令行参数一一对应）。
+// nodeConfig lanet.json 配置文件结构。
 // 双击/零参数启动时全靠它；Web 控制台「节点配置」编辑的就是这个文件，
 // 保存后重启程序生效（防火墙与转发映射在控制台里是热生效的，不在此列）。
 type nodeConfig struct {
@@ -1010,6 +1013,8 @@ type nodeConfig struct {
 	PublicDHTMinutes int   `json:"public_dht_minutes,omitempty"`
 	ProbeSec         int   `json:"probe_seconds"`
 	Tun              *bool `json:"tun,omitempty"` // 虚拟网卡 TUN；nil = 默认开启（兼容旧配置文件）
+	// TunCompression 控制 TUN 智能压缩；nil = 默认开启，重启生效。
+	TunCompression *bool `json:"tun_compression,omitempty"`
 	// dns 字段已移除：.lanet DNS 强制开启（无开关），旧配置遗留 dns 键被忽略。
 	// self_update 字段已移除：P2P 自动更新强制开启（签名信任锚保证安全）。
 	// 旧配置文件里遗留的 self_update 键会被 json 忽略，无副作用。
@@ -1064,11 +1069,16 @@ func defaultNodeConfig() *nodeConfig {
 		PublicDHTMinutes: 10,
 		ProbeSec:         20,
 		Tun:              boolPtr(true),
+		TunCompression:   boolPtr(true),
 		// 连接审批默认开启：陌生节点需用户同意后才互连（类似加好友）。
 		// 无人值守的中央服务器可把 auto_accept 置 true 免除人工审批。
 		RequireApproval: boolPtr(true),
 		AutoAccept:      boolPtr(false),
 	}
+}
+
+func (nc *nodeConfig) tunCompressionEnabled() bool {
+	return nc.TunCompression == nil || *nc.TunCompression
 }
 
 // resolveTriBool 三态布尔解析：显式传值（"true"/"false"/"1"/"0"）优先，
@@ -1123,6 +1133,7 @@ type nodeRuntime struct {
 	EnablePublicDHT  bool
 	PublicDHTMinutes int
 	Tun              bool
+	TunCompression   bool
 	// 连接审批（加好友式）：RequireApproval 是否需要用户同意；
 	// AutoAccept 自动同意（无人值守中央服务器）；DBPath 地址簿路径。
 	RequireApproval bool
@@ -1193,6 +1204,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime, nodeRef func() *lanet.Client
 				"public_dht_minutes": publicDHTMinutesOr(nc.PublicDHTMinutes),
 				"probe_seconds":      nc.ProbeSec,
 				"tun":                tunOn,
+				"tun_compression":    nc.tunCompressionEnabled(),
 				"autorun":            isAutorunEnabled(),
 				"autorun_supported":  autorunSupported(),
 				"autorun_kind":       autorunKind(),
@@ -1215,6 +1227,7 @@ func nodeConfigRoutes(path string, eff nodeRuntime, nodeRef func() *lanet.Client
 					"enable_public_dht":    eff.EnablePublicDHT,
 					"public_dht_minutes":   eff.PublicDHTMinutes,
 					"tun":                  eff.Tun,
+					"tun_compression":      eff.TunCompression,
 					"require_approval":     eff.RequireApproval,
 					"auto_accept":          eff.AutoAccept,
 					"db_path":              eff.DBPath,
@@ -1343,6 +1356,9 @@ func nodeConfigRoutes(path string, eff nodeRuntime, nodeRef func() *lanet.Client
 			}
 			if req.Tun == nil {
 				req.Tun = prev.Tun // 页面未提供（旧版控制台）时保留原值
+			}
+			if req.TunCompression == nil {
+				req.TunCompression = prev.TunCompression
 			}
 			// 连接审批：页面未提供（旧版控制台）时保留原值。
 			if req.RequireApproval == nil {

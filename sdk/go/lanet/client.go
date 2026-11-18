@@ -226,6 +226,9 @@ type Config struct {
 	// Windows 需管理员权限、Linux 需 /dev/net/tun + CAP_NET_ADMIN；
 	// 创建失败时自动降级为仅应用层（Dial/PortFWD 不受影响），不阻断入网。
 	Tun bool
+	// TunCompression 控制 TUN 智能压缩（nil = 默认开启，false = 仅使用旧版 TUN 协议）。
+	// 仅在 New 时读取，不影响应用流或传输层加密。
+	TunCompression *bool
 	// TunName TUN 网卡名，默认 "lanet"。
 	TunName string
 	// TunFD Android 外部 TUN：由宿主 VpnService 建立虚拟网卡后交出的文件
@@ -1150,6 +1153,7 @@ func (c *Client) startTUN(ctx context.Context) {
 	c.tunMu.Lock()
 	c.tunDevice = device
 	router := tundevice.New(device, c.tunnelSvc)
+	router.SetCompressionEnabled(c.cfg.TunCompression == nil || *c.cfg.TunCompression)
 	router.SetFirewall(c.fw)
 	router.SetLocalIP(func() netip.Addr {
 		ip, _ := netip.ParseAddr(c.myIP)
@@ -1162,17 +1166,17 @@ func (c *Client) startTUN(ctx context.Context) {
 		<-ctx.Done()
 		_ = device.Close()
 	}()
-	go router.Run(ctx)
-	// 关键接线：TUN 已就绪时，/pvn/tunnel/1.0.0 入向流必须写回 TUN 网卡
-	// （对端主动发来的 IP 包）。没有这行，本节点永远收不到对端的包
-	// ——ping 双向 100% 丢包的核心根因（此前该协议被宿主的 echo handler
-	// 吞掉，IP 包从未进入本机协议栈）。此时宿主的 OnStream 不再作用于
-	// Tunnel 协议（见 OnStream 注释），应用流场景请改用 DialProtocol+自定义协议。
-	c.node.SetStreamHandler(protocol.Tunnel, func(stream network.Stream) {
-		virtualIP := c.virtualIPByPeer(stream.Conn().RemotePeer().String())
-		_, virtualIPv6 := c.virtualIPAliasesByPeer(stream.Conn().RemotePeer().String())
+	// 所有 TUN 协议共用同一入向处理器：通过已认证的 libp2p PeerID 查成员地址，
+	// 再交给 Router 执行入向检查并写回网卡。OnStream 不再接管旧版
+	// Tunnel 协议（见 OnStream 注释），应用流请用 DialProtocol + 自定义协议。
+	handleTUN := func(stream network.Stream) {
+		virtualIP, virtualIPv6 := c.virtualIPAliasesByPeer(stream.Conn().RemotePeer().String())
 		router.ServeInboundStreamAliases(virtualIP, virtualIPv6, stream)
-	})
+	}
+	for _, id := range router.InboundProtocols() {
+		c.node.SetStreamHandler(id, handleTUN)
+	}
+	go router.Run(ctx)
 	// Windows Wintun 按成员维护 /32 on-link 路由，与 WireGuard 的 AllowedIPs
 	// 路由形态一致。L3 Wintun 没有二层 ARP，应同时写入永久邻居占位项；否则
 	// Windows 会把对端项变成 Unreachable，IP 包根本不会进入 TUN。只增量添加，

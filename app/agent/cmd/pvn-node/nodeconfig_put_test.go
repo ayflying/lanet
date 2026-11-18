@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -136,4 +137,60 @@ func TestNodeConfigPutDisableDefaultSeed(t *testing.T) {
 	if got.DisableDefaultSeed != nil && *got.DisableDefaultSeed {
 		t.Fatalf("③ disable_default_seed 应为 false/nil，实际 %v", got.DisableDefaultSeed)
 	}
+}
+
+func TestNodeConfigTunCompression(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lanet.json")
+	base, created := loadNodeConfig(path)
+	if !created || base.TunCompression == nil || !*base.TunCompression {
+		t.Fatal("new configuration must explicitly enable TUN compression")
+	}
+	base.TunCompression = nil // legacy file with no setting
+	if err := base.save(path); err != nil {
+		t.Fatal(err)
+	}
+	loaded, created := loadNodeConfig(path)
+	if created || !loaded.tunCompressionEnabled() {
+		t.Fatal("an existing configuration without the setting must enable TUN compression")
+	}
+	newRoutes := func(compression bool) map[string]http.HandlerFunc {
+		return nodeConfigRoutes(path, nodeRuntime{TunCompression: compression}, func() *lanet.Client { return nil })
+	}
+	routes := newRoutes(loaded.tunCompressionEnabled())
+	checkGet := func(routes map[string]http.HandlerFunc, saved, running bool) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		routes["GET /api/node-config"](rec, httptest.NewRequest(http.MethodGet, "/api/node-config", nil))
+		var got struct {
+			Compression *bool `json:"tun_compression"`
+			Runtime     struct {
+				Compression *bool `json:"tun_compression"`
+			} `json:"runtime"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); rec.Code != http.StatusOK || err != nil ||
+			got.Compression == nil || *got.Compression != saved || got.Runtime.Compression == nil || *got.Runtime.Compression != running {
+			t.Fatalf("GET compression want saved=%t, running=%t: status=%d, err=%v, body=%s", saved, running, rec.Code, err, rec.Body)
+		}
+	}
+	put := func(body string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		routes["PUT /api/node-config"](rec, httptest.NewRequest(http.MethodPut, "/api/node-config", strings.NewReader(body)))
+		var got struct {
+			RestartRequired bool `json:"restart_required"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); rec.Code != http.StatusOK || err != nil || !got.RestartRequired {
+			t.Fatalf("PUT must save for restart: status=%d, err=%v, body=%s", rec.Code, err, rec.Body)
+		}
+	}
+	checkGet(routes, true, true)
+	put(`{"name":"node","console":"127.0.0.1:8900","tun_compression":false}`)
+	checkGet(routes, false, true)
+	put(`{"name":"renamed","console":"127.0.0.1:8900"}`)
+	checkGet(routes, false, true)
+	loaded, _ = loadNodeConfig(path)
+	if loaded.TunCompression == nil || loaded.tunCompressionEnabled() {
+		t.Fatal("explicit false must survive an omitted field on PUT and a reload")
+	}
+	checkGet(newRoutes(loaded.tunCompressionEnabled()), false, false)
 }

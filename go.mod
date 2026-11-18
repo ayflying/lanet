@@ -5,6 +5,7 @@ go 1.25.7
 require (
 	github.com/getlantern/systray v1.2.2
 	github.com/gogf/gf/v2 v2.10.3
+	github.com/golang/snappy v1.0.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/ipfs/go-cid v0.6.2
 	github.com/libp2p/go-libp2p v0.49.0

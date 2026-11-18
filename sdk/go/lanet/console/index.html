@@ -484,6 +484,13 @@
         <input type="checkbox" id="cTun"> 虚拟网卡 TUN（IP 层互通：ping / 任意端口直达虚拟 IP，需管理员权限运行）
       </label>
     </div>
+    <div class="row">
+      <label style="display:flex;gap:6px;align-items:center">
+        <input type="checkbox" id="cTunCompression" aria-describedby="cTunCompressionHelp cTunCompressionState"> TUN 智能压缩（默认开启）
+      </label>
+    </div>
+    <div class="sub" id="cTunCompressionHelp" style="margin:2px 0 0">仅作用于虚拟网卡流量。双方都支持并开启时，仅压缩能减少传输量的数据包；否则使用旧版协议，仍保持传输加密。保存节点配置并重启程序后生效。</div>
+    <div class="sub" id="cTunCompressionState" style="margin:2px 0 0" role="status"></div>
     <div class="row" style="margin-top:10px">
       <label style="display:flex;gap:6px;align-items:center">
         <input type="checkbox" id="cAutoAccept" onchange="saveApproval()"> 自动同意所有连接申请（默认关闭）
@@ -1445,6 +1452,13 @@ async function loadNodeConfig() {
     // 运行中/已退出只影响徽标，不再回写复选框。
     setPublicBox(!!c.enable_public_dht);
     $('cTun').checked = c.tun === undefined ? true : !!c.tun;
+    const compressionSaved = c.tun_compression !== false;
+    $('cTunCompression').checked = compressionSaved;
+    const compressionRunning = c.runtime?.tun_compression;
+    $('cTunCompressionState').textContent = typeof compressionRunning === 'boolean'
+      ? '当前进程设置：' + (compressionRunning ? '开启' : '关闭') +
+        (compressionRunning !== compressionSaved ? '；已保存的变更将在重启后生效。' : '。')
+      : '';
     // 连接审批开关（配置意图，重启生效）：勾选=免审核自动同意；兼容旧配置 require_approval=false（效果同为免审核）。
     $('cAutoAccept').checked = !!c.auto_accept || c.require_approval === false;
     if (c.autorun_supported) {
@@ -1488,6 +1502,7 @@ async function saveNodeConfig() {
     enable_public_dht: cfgPublicDHT,
     public_dht_minutes: parseInt($('cPublicMin').value, 10) || 10,
     tun: $('cTun').checked,
+    tun_compression: $('cTunCompression').checked,
     require_approval: true,
     auto_accept: $('cAutoAccept').checked,
     autorun: $('cAutorunRow').style.display !== 'none' ? $('cAutorun').checked : undefined,
