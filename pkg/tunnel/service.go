@@ -10,6 +10,7 @@ import (
 	"time"
 
 	netmapclient "github.com/ayflying/pvn/pkg/netmapclient"
+	"github.com/ayflying/pvn/pkg/p2pkit"
 	"github.com/ayflying/pvn/pkg/protocol"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -328,26 +329,10 @@ func (s *Service) openViaRelay(ctx context.Context, target peer.ID, protos ...li
 		// The TARGET must hold a reservation on this relay. Reserving only the
 		// initiator does not help and can reject relays that already serve the target.
 		// Attempt the actual circuit, and switch candidates on NO_RESERVATION etc.
-		var circuitAddrs []ma.Multiaddr
-		for j, addr := range candidate.Addrs {
-			if j >= 12 || len(circuitAddrs) >= 2 {
-				break
-			}
-			if addr == nil || len(addr.Bytes()) > 2048 || hasCircuit(addr) {
-				continue
-			}
-			base := addr
-			if _, err := base.ValueForProtocol(ma.P_P2P); err == nil {
-				ai, err := peer.AddrInfoFromP2pAddr(base)
-				if err != nil || ai.ID != candidate.ID || len(ai.Addrs) == 0 {
-					continue
-				}
-				base = ai.Addrs[0]
-			}
-			circuitAddrs = append(circuitAddrs, base.
-				Encapsulate(ma.StringCast("/p2p/"+candidate.ID.String())).
-				Encapsulate(ma.StringCast("/p2p-circuit/p2p/"+target.String())))
-		}
+		// 路径地址统一由 p2pkit.CircuitAddrs 构造：控制面的中继兜底拨号复用
+		// 同一份筛选与拼接逻辑，避免数据面/控制面各自演化出「一条能通、另一
+		// 条永远通不了」的半死状态。
+		circuitAddrs := p2pkit.CircuitAddrs(candidate, target, 2)
 		if len(circuitAddrs) == 0 {
 			continue
 		}

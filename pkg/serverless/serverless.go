@@ -795,7 +795,12 @@ func (d *Discovery) DialSeed(ctx context.Context, addrs []string) (string, error
 			if errors.Is(err, ErrNotApproved) || errors.Is(err, ErrUnfriended) || errors.Is(err, ErrGroupMismatch) {
 				return ai.ID.String(), err
 			}
-			lastErr = fmt.Errorf("已连通但同群校验失败（网络密钥或渠道不一致）: %w", err)
+			// 这里**不能**再说「同群校验失败（网络密钥或渠道不一致）」：
+			// 跨群在 1495 行附近已由 ErrGroupMismatch 单独识别并原样上抛，
+			// 走到这一行的只是链路层失败（流重置、超时、协商失败）。
+			// 2026-11-20 实测：两端群指纹一致（同为 sdk 渠道）时同样报这句，
+			// 把「中继链路抖动」误导成「密钥配错了」，排查方向被带偏。
+			lastErr = fmt.Errorf("已连通但成员信息交换失败: %w", err)
 			continue
 		}
 		d.logf("已按连接种子直连成员 %s（未使用公共 DHT）", ai.ID.ShortString())
@@ -1446,16 +1451,22 @@ func (d *Discovery) connectAndIdentifyContext(ctx context.Context, id peer.ID) e
 		d.mu.Unlock()
 		return fmt.Errorf("对端尚未通过本地连接审批，无法主动建连")
 	}
-	connCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
 	connectedness := d.host.Network().Connectedness(id)
 	if connectedness != network.Connected && connectedness != network.Limited {
-		if err := d.host.Connect(connCtx, peer.AddrInfo{ID: id}); err != nil {
+		// 直连优先，失败后经中继兜底。控制面缺这条兜底时，NAT 后的成员
+		// 永远是离线状态，数据面的中继兜底（tunnel.openViaRelay）也永远
+		// 触发不了——它要求成员先被确认才拿得到 netmap 路由。
+		if err := d.connectMember(ctx, id); err != nil {
 			d.logf("连接成员 %s 失败: %v", id.ShortString(), err)
 			return fmt.Errorf("建连失败: %w", err)
 		}
 	}
-	info, err := d.fetchInfo(connCtx, id)
+	// 握手用独立预算：建连（尤其经中继）可能已经耗掉大半时间，与建连共用
+	// 一个 ctx 会让握手只剩零头，表现为「刚连上就被流重置」，被误判成抖动
+	// 甚至不同群。
+	infoCtx, cancelInfo := context.WithTimeout(ctx, infoHandshakeTimeout)
+	defer cancelInfo()
+	info, err := d.fetchInfo(infoCtx, id)
 	if err != nil {
 		// 跨群拒绝：对端静默关流的特征已在上游识别为 ErrGroupMismatch。
 		// 这是终局结论（不是抖动），把它从成员表摘掉，避免界面出现
