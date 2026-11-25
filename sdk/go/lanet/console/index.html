@@ -229,12 +229,7 @@
 </div>
 
 <div class="panel active" id="pMembers">
-  <!--
-    本机连接码分享卡片：放在成员页签**最顶部且常驻可见**。
-    这里刻意与下面「连接其他节点」卡片里的 #myNodeID 分开，理由是用户想分享
-    连接码时是「我」这个视角，不需要先看到一堆添加/审批控件，也不该被
-    connectCard 的 standalone 判定挡住（那个卡片在非 standalone 网络下整块隐藏）。
-  -->
+  <!-- 本机连接码只在成员页顶部展示，不受「连接其他节点」卡片的网络模式限制。 -->
   <div class="card" id="shareCard" style="display:none">
     <h2>我的连接码 <span class="tag unknown">发给对方即可入网</span></h2>
     <div class="sub" style="margin-bottom:8px">把这一串发给要用本机入网的人或设备，对方粘贴后点连接即可。首次连接需本机在下方「待审批的连接申请」里同意。</div>
@@ -254,16 +249,6 @@
   <div class="card" id="connectCard" style="display:none">
     <h2>连接其他节点 <span class="tag unknown">连接码直连</span></h2>
     <div class="sub" style="margin-bottom:8px">把对方发来的<b>连接码</b>（lanet://… 开头）粘贴进去点连接即可；也支持纯节点 ID 或完整连接地址。首次连接需对方在控制台<b>同意</b>，同意一次即永久信任，之后自动重连。</div>
-    <div class="kvstack"><b>我的连接码</b>
-      <div class="row">
-        <textarea id="myNodeID" class="readonly-addr" rows="2" readonly
-                  onclick="copyText($('myNodeID').value, $('myNodeID'))"
-                  title="点击即复制"
-                  placeholder="加载中…"></textarea>
-        <button class="ghost" id="myNodeIDBtn" onclick="copyText($('myNodeID').value, $('myNodeIDBtn'))">复制</button>
-      </div>
-      <div class="sub" id="myNodeIDHint" style="color:#8a94a6">连接码 = 节点 ID + 直拨地址合一串，对方粘贴这一串即可发起连接（一串顶过去两串）。地址变化后需重新复制分享。</div>
-    </div>
     <div class="kvstack"><b>添加节点</b>
       <div class="row">
         <textarea id="peerInput" class="addr-input" rows="2"
@@ -538,10 +523,9 @@ function autoGrow(el) {
   el.style.height = '0px';
   el.style.height = (el.scrollHeight + border) + 'px';
 }
-// autoGrowAddrs 刷新卡片里四个地址框的高度。状态每 10s 轮询重渲染一次，
-// 渲染完必须跟着调一次，否则内容变了高度还是旧的。
+// autoGrowAddrs 在状态重渲染后刷新连接卡片内的地址框高度。
 function autoGrowAddrs() {
-  ['myNodeID', 'peerInput', 'seedMine', 'seedInput'].forEach(id => autoGrow($(id)));
+  ['peerInput', 'seedMine', 'seedInput'].forEach(id => autoGrow($(id)));
 }
 
 // 单飞请求、完成后计时；暂停时取消请求，恢复时不与旧请求重叠。
@@ -669,9 +653,6 @@ async function resolvePending(peerID, approve) {
 }
 
 // renderShareCard 渲染顶部「我的连接码」卡片。
-//
-// 与 renderConnect 里的 #myNodeID 共用同一份数据源（S.invite_code），但两者**不合并**：
-// connectCard 只在 standalone 网络下显示，而分享连接码在任何网络形态下都有意义。
 function renderShareCard() {
   const card = $('shareCard');
   if (!card) return;
@@ -721,27 +702,13 @@ function shareShareCode() {
   flash('shareCodeHint', '当前环境不支持系统分享，已复制到剪贴板', true);
 }
 
-// renderConnect 渲染「连接其他节点」卡片：本机连接码 + 待审批列表。
+// renderConnect 控制「连接其他节点」卡片的可见性并渲染待审批列表。
 function renderConnect() {
   const card = $('connectCard');
   if (!S) { card.style.display = 'none'; return; }
   const standalone = (S.info && (S.info.group_id === 'standalone' || String(S.info.group || '').startsWith('standalone-')));
   if (!standalone) { card.style.display = 'none'; return; }
   card.style.display = '';
-  // 连接码 = 节点 ID + 直拨地址合一串（lanet://ID@ip1:port1,ip2:port2,…）；
-  // 后端未返回时回退纯节点 ID。地址是按可达性排好序的**多块网卡**，
-  // 故这里同时把「带上几块网卡」讲清楚，避免用户以为只分享了某一块。
-  const code = S.invite_code || (S.info && S.info.peer_id) || '';
-  $('myNodeID').value = code;
-  autoGrow($('myNodeID'));
-  const codeHint = $('myNodeIDHint');
-  if (codeHint) {
-    const at = code.indexOf('@');
-    const n = at >= 0 ? code.slice(at + 1).split(',').filter(Boolean).length : 0;
-    codeHint.textContent = n > 1
-      ? `已带上本机 ${n} 个网卡地址（公网 IPv6 / 局域网等按可达性排序），对方会逐个尝试，任一可达即连通。地址变化后需重新复制分享。`
-      : '连接码 = 节点 ID + 直拨地址合一串，对方粘贴这一串即可发起连接（一串顶过去两串）。地址变化后需重新复制分享。';
-  }
   // 待审批列表（过滤掉本机自己：身份文件换过之后，历史观察表里可能留下
   // 指向当前身份的残留行，展示成「陌生节点申请连接」是纯误导）。
   const pending = (S.pending || []).filter(p => p.peer_id && p.peer_id !== selfPeerID());
